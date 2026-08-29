@@ -1,7 +1,18 @@
+"""Port-level health helpers.
+
+Kept for backwards compatibility with callers written before the service
+layer existed. New code should use :mod:`local_ai_stack.services`, which
+prefers real HTTP health endpoints and reports UP/DOWN/DEGRADED/UNKNOWN.
+"""
+
 from __future__ import annotations
 
-import socket
 from dataclasses import dataclass
+
+from .probes import ProbeOutcome, tcp_probe
+from .services import DEFAULT_SERVICE_SPECS
+
+LEGACY_TIMEOUT = 0.35
 
 
 @dataclass(frozen=True)
@@ -12,20 +23,12 @@ class PortHealth:
     reachable: bool
 
 
-DEFAULT_SERVICES = (
-    ("Ollama", "127.0.0.1", 11434),
-    ("Open WebUI", "127.0.0.1", 8080),
-    ("ComfyUI", "127.0.0.1", 8188),
-)
+DEFAULT_SERVICES = tuple((s.name, s.host, s.port) for s in DEFAULT_SERVICE_SPECS)
 
 
-def check_port(name: str, host: str, port: int, timeout: float = 0.35) -> PortHealth:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            reachable = True
-    except OSError:
-        reachable = False
-    return PortHealth(name, host, port, reachable)
+def check_port(name: str, host: str, port: int, timeout: float = LEGACY_TIMEOUT) -> PortHealth:
+    result = tcp_probe(host, port, timeout)
+    return PortHealth(name, host, port, result.outcome is ProbeOutcome.OK)
 
 
 def check_default_services() -> list[PortHealth]:

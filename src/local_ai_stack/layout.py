@@ -27,8 +27,8 @@ from pathlib import Path
 
 from platformdirs import user_data_dir
 
-APP_NAME = "LocalAIStack"
-ENV_ROOT = "LOCAL_AI_STACK_ROOT"
+APP_NAME = "PepitosAIHub"
+ENV_ROOT = "PEPITOS_AI_HUB_ROOT"
 
 
 class LayoutError(RuntimeError):
@@ -36,7 +36,7 @@ class LayoutError(RuntimeError):
 
 
 def _collapse_duplicate_tail(path: Path) -> Path:
-    """Evita LocalAIStack\\LocalAIStack quando a base ja termina no app name."""
+    """Evita PepitosAIHub\\PepitosAIHub quando a base ja termina no app name."""
     if path.name == APP_NAME and path.parent.name == APP_NAME:
         return path.parent
     return path
@@ -46,7 +46,10 @@ def default_root(env: Mapping[str, str] | None = None) -> Path:
     """Root padrao da instalacao.
 
     Ordem: variavel de ambiente explicita, senao o diretorio de dados do
-    usuario. No Windows isso equivale a %LOCALAPPDATA%\\LocalAIStack.
+    usuario. No Windows isso equivale a %LOCALAPPDATA%\\PepitosAIHub.
+
+    Este e o root do modo DEFAULT. Os modos portable e custom vivem em
+    installation.py: o layout so recebe um root ja resolvido.
     """
     environ = os.environ if env is None else env
     override = (environ.get(ENV_ROOT) or "").strip()

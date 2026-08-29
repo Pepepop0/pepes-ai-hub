@@ -44,8 +44,8 @@ def render_profile_details(profile: Profile, facts: SystemFacts) -> str:
     if report.selected_gpu is not None:
         lines.append(
             f"GPU used: {escape(report.selected_gpu.name)} — "
-            f"{report.selected_gpu.vram_mib} MiB "
-            f"({report.selected_gpu.vram_mib / MIB_PER_GIB:.1f} GiB displayed)"
+            f"{report.selected_gpu.vram_total_mib} MiB "
+            f"({report.selected_gpu.vram_total_mib / MIB_PER_GIB:.1f} GiB displayed)"
         )
     for blocker in report.blockers:
         lines.append(f"[red]BLOCKER · {escape(blocker.message)}[/red]")
@@ -110,8 +110,8 @@ class LocalAIStackApp(App):
     def _system_summary(self) -> str:
         gpu = (
             "\n".join(
-                f"- {escape(item.name)}: {item.vram_mib} MiB "
-                f"({item.vram_mib / MIB_PER_GIB:.1f} GiB displayed)"
+                f"- {escape(item.name)}: {item.vram_total_mib} MiB "
+                f"({item.vram_total_mib / MIB_PER_GIB:.1f} GiB displayed)"
                 for item in self.facts.gpus
             )
             if self.facts.gpus

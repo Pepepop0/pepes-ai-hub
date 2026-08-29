@@ -14,7 +14,7 @@ def doctor_text() -> str:
     ]
     if f.gpus:
         lines += [
-            f"GPU {i}: {g.name} — {g.vram_mib} MiB ({g.vram_mib / 1024:.1f} GiB)"
+            f"GPU {i}: {g.name} — {g.vram_total_mib} MiB ({g.vram_total_mib / 1024:.1f} GiB)"
             for i, g in enumerate(f.gpus)
         ]
     else:

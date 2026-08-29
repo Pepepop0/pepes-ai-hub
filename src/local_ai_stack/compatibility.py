@@ -58,7 +58,7 @@ def evaluate_compatibility(facts: SystemFacts, profile: Profile) -> Compatibilit
     if not facts.git_available:
         blockers.append(CompatibilityIssue("git_missing", "Git is required but was not detected."))
 
-    selected_gpu = max(facts.gpus, key=lambda gpu: gpu.vram_mib, default=None)
+    selected_gpu = max(facts.gpus, key=lambda gpu: gpu.vram_total_mib, default=None)
     if profile.hardware.gpu_vendor == "nvidia" and (
         not facts.nvidia_smi_available or selected_gpu is None
     ):
@@ -69,7 +69,7 @@ def evaluate_compatibility(facts: SystemFacts, profile: Profile) -> Compatibilit
             )
         )
     elif selected_gpu is not None:
-        available = selected_gpu.vram_mib
+        available = selected_gpu.vram_total_mib
         required = profile.hardware.min_vram_mib
         recommended = profile.hardware.recommended_vram_mib
         tolerance = profile.hardware.vram_tolerance_mib

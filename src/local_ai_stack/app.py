@@ -1,20 +1,30 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
-from textual.widgets import Button
+from textual.widgets import Button, Input, Select
 
+from .config import InstalledConfig
+from .installation import InstallLocationMode
 from .profiles import Profile, load_profiles
 from .runtime import StackRuntime, stack_runtime
 from .system import SystemFacts, detect_system
 from .tui.navigation import DEFAULT_ITEM, SIDEBAR_ROUTES, Section
 from .tui.presenters import render_profile_details
 from .tui.styles import APP_CSS
-from .tui.widgets import ContextSidebar, FooterBar, MainContent, RightRail, TopNavigation
+from .tui.widgets import (
+    ContextSidebar,
+    FooterBar,
+    InstallationLocationPanel,
+    MainContent,
+    RightRail,
+    TopNavigation,
+)
 
 __all__ = ["LocalAIStackApp", "render_profile_details", "run_tui"]
 
@@ -41,6 +51,7 @@ class LocalAIStackApp(App):
         facts: SystemFacts | None = None,
         profiles: list[Profile] | tuple[Profile, ...] | None = None,
         runtime_snapshot: StackRuntime | None = None,
+        installed_config: InstalledConfig | None = None,
     ) -> None:
         super().__init__()
         self.profiles = tuple(
@@ -52,10 +63,22 @@ class LocalAIStackApp(App):
         self.runtime_snapshot = (
             runtime_snapshot if runtime_snapshot is not None else stack_runtime()
         )
-        self.selected_profile = next(
-            (profile for profile in self.profiles if profile.id == "pepe"),
-            self.profiles[0],
+        default_profile = next(
+            (profile for profile in self.profiles if profile.id == "pepe"), self.profiles[0]
         )
+        self.installed_config = installed_config or InstalledConfig(profile_id=default_profile.id)
+        self.selected_profile = next(
+            (
+                profile
+                for profile in self.profiles
+                if profile.id == self.installed_config.profile_id
+            ),
+            default_profile,
+        )
+        if self.installed_config.profile_id != self.selected_profile.id:
+            self.installed_config = replace(
+                self.installed_config, profile_id=self.selected_profile.id
+            )
         self.active_section = Section.DASHBOARD
 
     def compose(self) -> ComposeResult:
@@ -67,8 +90,15 @@ class LocalAIStackApp(App):
                 self.runtime_snapshot,
                 self.profiles,
                 self.selected_profile,
+                self.installed_config,
+                project_root(),
             )
-            yield RightRail(self.selected_profile, self.facts, self.runtime_snapshot)
+            yield RightRail(
+                self.selected_profile,
+                self.facts,
+                self.runtime_snapshot,
+                self.installed_config.general.ui,
+            )
         yield FooterBar()
 
     def show_section(self, section: Section) -> None:
@@ -90,8 +120,25 @@ class LocalAIStackApp(App):
         if profile is None:
             return
         self.selected_profile = profile
+        self.installed_config = replace(self.installed_config, profile_id=profile.id)
         self.query_one(MainContent).select_profile(profile)
+        self.query_one(MainContent).update_config(self.installed_config)
         self.query_one(RightRail).select_profile(profile)
+
+    def select_installation_mode(self, mode: InstallLocationMode) -> None:
+        panel = self.query_one(InstallationLocationPanel)
+        location = panel.select_mode(mode)
+        if location is not None:
+            self._set_installation(location)
+
+    def validate_custom_installation(self, value: str) -> None:
+        location = self.query_one(InstallationLocationPanel).validate_custom(value)
+        if location is not None:
+            self._set_installation(location)
+
+    def _set_installation(self, location) -> None:
+        self.installed_config = self.installed_config.with_installation(location)
+        self.query_one(MainContent).update_config(self.installed_config)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
@@ -104,6 +151,16 @@ class LocalAIStackApp(App):
         elif button_id == "right-rail-toggle":
             self.query_one(RightRail).toggle_collapsed()
         event.stop()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "installation-location-mode":
+            self.select_installation_mode(InstallLocationMode(event.value))
+            event.stop()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "installation-custom-root":
+            self.validate_custom_installation(event.value)
+            event.stop()
 
     def action_show_section(self, section: str) -> None:
         self.show_section(Section(section))

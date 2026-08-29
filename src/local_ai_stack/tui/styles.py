@@ -69,6 +69,41 @@ Screen {
     overflow-y: auto;
 }
 
+#installation-location-title {
+    height: 2;
+}
+
+#installation-mode-label,
+#installation-custom-label {
+    margin-top: 1;
+    color: $text-muted;
+}
+
+#installation-location-mode,
+#installation-custom-root {
+    width: 100%;
+    max-width: 80;
+}
+
+#installation-location-error {
+    min-height: 1;
+    margin-top: 1;
+    color: $error;
+}
+
+#installation-location-preview {
+    height: auto;
+    min-height: 3;
+    margin-top: 1;
+    padding: 1;
+    border: round $secondary;
+}
+
+#installation-location-note {
+    margin-top: 1;
+    color: $text-muted;
+}
+
 #profile-actions {
     height: 3;
     margin-bottom: 1;
@@ -97,6 +132,10 @@ Screen {
 #right-rail.collapsed {
     width: 12;
     min-width: 12;
+}
+
+#right-rail.hidden {
+    display: none;
 }
 
 #right-rail.collapsed .rail-content {

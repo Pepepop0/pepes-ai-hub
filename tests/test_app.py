@@ -2,9 +2,11 @@ import asyncio
 import unicodedata
 from pathlib import Path
 
-from textual.widgets import Button, Static
+from textual.widgets import Button, Input, Select, Static
 
 from local_ai_stack.app import LocalAIStackApp, render_profile_details
+from local_ai_stack.config import GeneralConfig, InstalledConfig, UiConfig
+from local_ai_stack.installation import InstallLocation, InstallLocationMode
 from local_ai_stack.layout import ENV_ROOT
 from local_ai_stack.processes import (
     DEFAULT_PROCESS_SPECS,
@@ -60,12 +62,16 @@ def all_profiles() -> list[Profile]:
 
 
 def make_app(
-    *, profiles: list[Profile] | None = None, facts: SystemFacts | None = None
+    *,
+    profiles: list[Profile] | None = None,
+    facts: SystemFacts | None = None,
+    installed_config: InstalledConfig | None = None,
 ) -> LocalAIStackApp:
     return LocalAIStackApp(
         facts=facts or reference_facts(),
         profiles=profiles or all_profiles(),
         runtime_snapshot=stopped_runtime(),
+        installed_config=installed_config,
     )
 
 
@@ -240,3 +246,85 @@ def test_opening_tui_does_not_create_stack_layout(tmp_path, monkeypatch):
 
     asyncio.run(mount_app())
     assert not stack_root.exists()
+
+
+def test_install_location_modes_resolve_for_preview_without_creating_directories(tmp_path):
+    custom_root = tmp_path / "custom-stack"
+
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test(size=(100, 36)) as pilot:
+            await pilot.press("2")
+            await pilot.click("#side-installation-location")
+            selector = app.query_one("#installation-location-mode", Select)
+            preview = app.query_one("#installation-location-preview", Static)
+
+            selector.value = InstallLocationMode.PORTABLE
+            await pilot.pause()
+            assert app.installed_config.installation == InstallLocation.portable()
+            assert str(preview.content).endswith(r"pepito's_ai_hub\stack[/b]")
+
+            selector.value = InstallLocationMode.CUSTOM
+            await pilot.pause()
+            custom_input = app.query_one("#installation-custom-root", Input)
+            assert custom_input.display
+            custom_input.value = str(custom_root)
+            await pilot.pause()
+            assert app.installed_config.installation == InstallLocation.custom(custom_root)
+            assert "custom-stack" in str(preview.content)
+
+            selector.value = InstallLocationMode.DEFAULT
+            await pilot.pause()
+            assert app.installed_config.installation == InstallLocation.default()
+            assert not custom_input.display
+
+    asyncio.run(exercise())
+    assert not custom_root.exists()
+    assert not (ROOT / "stack").exists()
+
+
+def test_relative_custom_location_shows_inline_error_and_is_not_accepted():
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test() as pilot:
+            selector = app.query_one("#installation-location-mode", Select)
+            selector.value = InstallLocationMode.CUSTOM
+            custom_input = app.query_one("#installation-custom-root", Input)
+            custom_input.value = "relative/stack"
+            await pilot.pause()
+            error = str(app.query_one("#installation-location-error", Static).content)
+            assert "Invalid custom location" in error
+            assert "absolute path" in error
+            assert app.installed_config.installation == InstallLocation.default()
+
+    asyncio.run(exercise())
+
+
+def test_ui_config_controls_rail_and_settings_views():
+    config = InstalledConfig(
+        profile_id="capella",
+        general=GeneralConfig(
+            ui=UiConfig(
+                theme="custom-theme",
+                pet="custom-pet",
+                right_rail_visible=False,
+                right_rail_expanded=False,
+            )
+        ),
+    )
+
+    async def exercise() -> None:
+        app = make_app(installed_config=config)
+        async with app.run_test():
+            rail = app.query_one(RightRail)
+            assert not rail.display
+            assert rail.is_collapsed
+            assert app.selected_profile.id == "capella"
+
+            interface = str(app.query_one("#view-settings-interface", Static).content)
+            assert "Theme: custom-theme" in interface
+            assert "Pet: custom-pet" in interface
+            assert "Right rail visible: no" in interface
+            assert "Right rail expanded: no" in interface
+
+    asyncio.run(exercise())

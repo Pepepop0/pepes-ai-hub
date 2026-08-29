@@ -3,6 +3,7 @@ from __future__ import annotations
 from rich.markup import escape
 
 from ..compatibility import evaluate_compatibility
+from ..config import InstalledConfig
 from ..planning import build_install_plan
 from ..profiles import MIB_PER_GIB, Profile
 from ..runtime import ServiceRuntime, StackRuntime
@@ -160,6 +161,38 @@ def render_install_stack(profile: Profile) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def render_general_settings(config: InstalledConfig) -> str:
+    return "\n".join(
+        [
+            "[b]General settings[/b]",
+            "",
+            f"Profile: {escape(config.profile_id)}",
+            f"Stack: {escape(config.stack_id)}",
+            f"Installation mode: {escape(config.installation.mode.value)}",
+            "",
+            "[dim]Configuration is active in memory only. Nothing is persisted yet.[/dim]",
+        ]
+    )
+
+
+def render_interface_settings(config: InstalledConfig) -> str:
+    ui = config.general.ui
+    theme = ui.theme or "Profile default"
+    pet = ui.pet or "Profile default"
+    return "\n".join(
+        [
+            "[b]Interface settings[/b]",
+            "",
+            f"Theme: {escape(theme)}",
+            f"Pet: {escape(pet)}",
+            f"Right rail visible: {'yes' if ui.right_rail_visible else 'no'}",
+            f"Right rail expanded: {'yes' if ui.right_rail_expanded else 'no'}",
+            "",
+            "[dim]Unset theme and pet values inherit the selected profile defaults.[/dim]",
+        ]
+    )
 
 
 def placeholder(title: str, message: str) -> str:

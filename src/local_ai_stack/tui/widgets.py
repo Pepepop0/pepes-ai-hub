@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, ContentSwitcher, Label, Static
+from textual.widgets import Button, ContentSwitcher, Input, Label, Select, Static
 
+from ..config import InstalledConfig, UiConfig
+from ..installation import (
+    InstallLocation,
+    InstallLocationError,
+    InstallLocationMode,
+    resolve_installation,
+)
 from ..profiles import Profile
 from ..runtime import StackRuntime
 from ..system import SystemFacts
@@ -18,11 +27,103 @@ from .navigation import (
 from .presenters import (
     placeholder,
     render_dashboard,
+    render_general_settings,
     render_install_plan,
     render_install_stack,
+    render_interface_settings,
     render_profile_details,
     render_service,
 )
+
+
+class InstallationLocationPanel(VerticalScroll):
+    """Resolve installation intent for preview without touching the filesystem."""
+
+    OPTIONS = tuple((mode.value.capitalize(), mode) for mode in InstallLocationMode)
+
+    def __init__(self, location: InstallLocation, repo_root: Path) -> None:
+        super().__init__(id=route_id(Section.INSTALLATION, "location"), classes="route-view")
+        self.location = location
+        self.repo_root = repo_root
+
+    def compose(self) -> ComposeResult:
+        yield Static("[b]Installation location[/b]", id="installation-location-title")
+        yield Label("Mode", id="installation-mode-label")
+        yield Select(
+            self.OPTIONS,
+            value=self.location.mode,
+            allow_blank=False,
+            id="installation-location-mode",
+        )
+        custom = self.location.root if self.location.mode is InstallLocationMode.CUSTOM else None
+        yield Label("Absolute custom path", id="installation-custom-label")
+        yield Input(
+            "" if custom is None else str(custom),
+            placeholder=r"D:\PepitosAIHub",
+            id="installation-custom-root",
+        )
+        yield Static("", id="installation-location-error")
+        yield Static("", id="installation-location-preview")
+        yield Static(
+            "Preview only. Resolving this location creates no directories.",
+            id="installation-location-note",
+        )
+
+    def on_mount(self) -> None:
+        for indicator in self.query(".down-arrow"):
+            indicator.update("v")
+        for indicator in self.query(".up-arrow"):
+            indicator.update("^")
+        self._show_custom(self.location.mode is InstallLocationMode.CUSTOM)
+        self._show_resolved(self.location)
+
+    def select_mode(self, mode: InstallLocationMode) -> InstallLocation | None:
+        self._show_custom(mode is InstallLocationMode.CUSTOM)
+        if mode is InstallLocationMode.CUSTOM:
+            return self.validate_custom(self.query_one("#installation-custom-root", Input).value)
+        location = InstallLocation(mode=mode)
+        self._show_resolved(location)
+        return location
+
+    def validate_custom(self, value: str) -> InstallLocation | None:
+        if not value.strip():
+            self._show_error("Enter an absolute path for the Custom location.")
+            return None
+        try:
+            location = InstallLocation.custom(value)
+        except InstallLocationError as exc:
+            self._show_error(f"Invalid custom location: {exc}")
+            return None
+        self._show_resolved(location)
+        return location
+
+    def _show_custom(self, visible: bool) -> None:
+        self.query_one("#installation-custom-label", Label).display = visible
+        self.query_one("#installation-custom-root", Input).display = visible
+
+    def _show_error(self, message: str) -> None:
+        self.query_one("#installation-location-error", Static).update(message)
+        self.query_one("#installation-location-preview", Static).update("")
+
+    def _show_resolved(self, location: InstallLocation) -> None:
+        try:
+            resolved = resolve_installation(location, repo_root=self.repo_root)
+        except InstallLocationError as exc:
+            self._show_error(f"Could not resolve location: {exc}")
+            return
+        self.location = location
+        self.query_one("#installation-location-error", Static).update("")
+        self.query_one("#installation-location-preview", Static).update(
+            f"Resolved root\n[b]{self._display_path(resolved.root)}[/b]"
+        )
+
+    @staticmethod
+    def _display_path(path: Path) -> str:
+        try:
+            relative = path.relative_to(Path.home())
+        except ValueError:
+            return str(path)
+        return str(Path("%USERPROFILE%") / relative)
 
 
 class TopNavigation(Horizontal):
@@ -128,6 +229,8 @@ class MainContent(ContentSwitcher):
         runtime: StackRuntime,
         profiles: tuple[Profile, ...],
         selected: Profile,
+        config: InstalledConfig,
+        repo_root: Path,
     ) -> None:
         super().__init__(
             id="main-content",
@@ -137,6 +240,8 @@ class MainContent(ContentSwitcher):
         self.runtime_snapshot = runtime
         self.profiles = profiles
         self.selected_profile = selected
+        self.config = config
+        self.repo_root = repo_root
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -169,23 +274,24 @@ class MainContent(ContentSwitcher):
             id=route_id(Section.INSTALLATION, "stack"),
             classes="route-view",
         )
-        yield Static(
-            placeholder(
-                "Installation location",
-                "Configuration backend pending. Opening this view creates no directories.",
-            ),
-            id=route_id(Section.INSTALLATION, "location"),
-            classes="route-view",
-        )
+        yield InstallationLocationPanel(self.config.installation, self.repo_root)
         yield Static(
             render_install_plan(self.selected_profile),
             id=route_id(Section.INSTALLATION, "plan"),
             classes="route-view",
         )
 
+        yield Static(
+            render_general_settings(self.config),
+            id=route_id(Section.SETTINGS, "general"),
+            classes="route-view",
+        )
+        yield Static(
+            render_interface_settings(self.config),
+            id=route_id(Section.SETTINGS, "interface"),
+            classes="route-view",
+        )
         for item_id, title, message in (
-            ("general", "General settings", "Configuration Architecture integration pending."),
-            ("interface", "Interface settings", "Theme backend integration pending."),
             ("runtime", "Runtime settings", "Runtime controls are not available in this round."),
             ("advanced", "Advanced settings", "No advanced settings are exposed yet."),
         ):
@@ -211,6 +317,15 @@ class MainContent(ContentSwitcher):
             render_dashboard(self.facts, self.runtime_snapshot, profile)
         )
 
+    def update_config(self, config: InstalledConfig) -> None:
+        self.config = config
+        self.query_one(f"#{route_id(Section.SETTINGS, 'general')}", Static).update(
+            render_general_settings(config)
+        )
+        self.query_one(f"#{route_id(Section.SETTINGS, 'interface')}", Static).update(
+            render_interface_settings(config)
+        )
+
 
 class PetSlot(Static):
     """Minimal text surface that a future pet backend may update."""
@@ -225,8 +340,14 @@ class RightRail(Vertical):
         profile: Profile,
         facts: SystemFacts,
         runtime: StackRuntime,
+        ui: UiConfig,
     ) -> None:
-        super().__init__(id="right-rail")
+        classes = []
+        if not ui.right_rail_visible:
+            classes.append("hidden")
+        if not ui.right_rail_expanded:
+            classes.append("collapsed")
+        super().__init__(id="right-rail", classes=" ".join(classes))
         self.profile = profile
         self.facts = facts
         self.runtime_snapshot = runtime
@@ -245,7 +366,7 @@ class RightRail(Vertical):
             yield Static(gpu_text, id="rail-gpu")
             yield Static("Stack", classes="rail-heading")
             yield Static(self.runtime_snapshot.state.value, id="rail-stack", classes="rail-value")
-        yield Button("Collapse", id="right-rail-toggle")
+        yield Button("Expand" if self.is_collapsed else "Collapse", id="right-rail-toggle")
 
     @property
     def is_collapsed(self) -> bool:

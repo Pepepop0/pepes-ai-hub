@@ -43,6 +43,33 @@ class ProcessInfo:
     name: str = ""
     exe: str | None = None
     cmdline: str = ""
+    create_time: float | None = None
+
+
+class LookupOutcome(str, Enum):
+    """Result of asking the OS about one specific pid."""
+
+    FOUND = "found"
+    NOT_FOUND = "not_found"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class ProcessLookup:
+    """One pid, answered honestly.
+
+    ``NOT_FOUND`` means the pid is gone. ``UNAVAILABLE`` means we could not
+    look: the two must never be confused, because only the first one proves a
+    registered process is really dead.
+    """
+
+    outcome: LookupOutcome
+    process: ProcessInfo | None = None
+    detail: str = ""
+
+    @property
+    def found(self) -> bool:
+        return self.outcome is LookupOutcome.FOUND
 
 
 @dataclass(frozen=True)
@@ -110,7 +137,7 @@ def list_processes(*, exclude_self: bool = True) -> ProcessReport:
         return ProcessReport(ScanOutcome.UNAVAILABLE, detail="psutil is not installed")
     own_pid = os.getpid()
     try:
-        raw = list(psutil.process_iter(["pid", "name", "exe", "cmdline"]))
+        raw = list(psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time"]))
     except (psutil.Error, NotImplementedError, OSError) as exc:
         return ProcessReport(ScanOutcome.UNAVAILABLE, detail=_unavailable_detail(exc))
     processes = []
@@ -121,6 +148,43 @@ def list_processes(*, exclude_self: bool = True) -> ProcessReport:
             continue
         cmdline = info.get("cmdline") or []
         processes.append(
-            ProcessInfo(pid, info.get("name") or "", info.get("exe"), " ".join(cmdline))
+            ProcessInfo(
+                pid,
+                info.get("name") or "",
+                info.get("exe"),
+                " ".join(cmdline),
+                info.get("create_time"),
+            )
         )
     return ProcessReport(ScanOutcome.OK, tuple(processes))
+
+
+def lookup_process(pid: int) -> ProcessLookup:
+    """Inspect a single pid, distinguishing "gone" from "cannot tell"."""
+    if psutil is None:
+        return ProcessLookup(LookupOutcome.UNAVAILABLE, detail="psutil is not installed")
+    if pid <= 0:
+        return ProcessLookup(LookupOutcome.NOT_FOUND, detail=f"invalid pid {pid}")
+    try:
+        proc = psutil.Process(pid)
+        with proc.oneshot():
+            name = _best_effort(proc.name) or ""
+            exe = _best_effort(proc.exe)
+            cmdline = _best_effort(proc.cmdline) or []
+            create_time = _best_effort(proc.create_time)
+    except psutil.NoSuchProcess:
+        return ProcessLookup(LookupOutcome.NOT_FOUND, detail=f"no process with pid {pid}")
+    except (psutil.Error, NotImplementedError, OSError) as exc:
+        return ProcessLookup(LookupOutcome.UNAVAILABLE, detail=_unavailable_detail(exc))
+    return ProcessLookup(
+        LookupOutcome.FOUND,
+        ProcessInfo(pid, name, exe, " ".join(cmdline), create_time),
+    )
+
+
+def _best_effort(getter):
+    """Read one psutil attribute, tolerating a denied or racing process."""
+    try:
+        return getter()
+    except (psutil.Error, OSError):
+        return None

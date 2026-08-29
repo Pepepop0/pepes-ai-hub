@@ -160,12 +160,12 @@ Screen {
 }
 
 #pet-slot {
-    /* Fixed and square on screen: 35 cells wide by 17 rows, and a terminal
-       cell is about half as wide as it is tall. The pet never resizes it. */
+    /* Fixed and square on screen: a terminal cell is about half as wide as it
+       is tall, so 31 cells by 15 rows reads as a square. No border and no
+       label: the character is the only thing in the box. */
     width: 100%;
-    height: 17;
+    height: 15;
     padding: 1;
-    border: round $secondary;
     color: $text-muted;
 }
 

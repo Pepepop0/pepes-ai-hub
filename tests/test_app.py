@@ -404,7 +404,6 @@ def test_capella_shows_hello_kitty_instead_of_the_unavailable_notice():
             assert "Pet unavailable" not in content
             assert r"(\/)" not in content, "Claw must not be substituted for Capella"
             assert unsafe_characters(content) == ()
-            assert str(app.query_one("#rail-theme", Static).content) == "Capella"
             assert app.theme == "pepitos-capella"
 
     asyncio.run(exercise())

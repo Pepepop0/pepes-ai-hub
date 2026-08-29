@@ -442,7 +442,8 @@ class PetSlot(Static):
     business, decided in :mod:`local_ai_stack.renderer`.
     """
 
-    REFRESH_INTERVAL = 0.25
+    # Fast enough that a blink and the arc of a hop both read as motion.
+    REFRESH_INTERVAL = 0.12
 
     def __init__(
         self,
@@ -517,14 +518,11 @@ class RightRail(Vertical):
         with Vertical(classes="rail-content"):
             yield Static("Profile", classes="rail-heading")
             yield Static(self.profile.name, id="rail-profile", classes="rail-value")
-            yield Static("Pet area", classes="rail-heading")
             yield PetSlot(
                 self.appearance.pet_text,
                 animator=self.appearance.animator,
                 id="pet-slot",
             )
-            yield Static("Theme", classes="rail-heading")
-            yield Static(self.appearance.theme_text, id="rail-theme", classes="rail-value")
             yield Static("GPU / VRAM", classes="rail-heading")
             yield Static(gpu_text, id="rail-gpu")
             yield Static("Stack", classes="rail-heading")
@@ -549,7 +547,6 @@ class RightRail(Vertical):
         self.profile = profile
         self.appearance = appearance
         self.query_one("#rail-profile", Static).update(profile.name)
-        self.query_one("#rail-theme", Static).update(appearance.theme_text)
         self.query_one(PetSlot).set_animator(appearance.animator, appearance.pet_text)
 
     def set_pet_text(self, text: str) -> None:

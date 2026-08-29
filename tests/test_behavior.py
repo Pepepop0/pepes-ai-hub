@@ -93,11 +93,14 @@ def sample(micro: MicroBehavior, *, until: float = 60.0, step: float = 0.05):
 def test_shipped_behavior_manifest_parses():
     document = load_behavior_document(HELLO_KITTY / BEHAVIOR_MANIFEST)
     assert document.id == "hello-kitty"
-    assert document.config.blink.min_interval_s == 1.8
-    assert document.config.blink.max_interval_s == 4.5
-    assert document.config.jump.min_duration_s == 0.4
+    assert document.config.blink.min_interval_s == 0.9
+    assert document.config.blink.max_interval_s == 2.6
+    assert document.config.blink.min_duration_s == 0.26
+    assert document.config.jump.min_duration_s == 0.9
+    assert document.config.jump.max_duration_s == 1.5
     assert document.config.jump.max_height_rows == 2
-    assert document.config.jump.blink_convergence_chance == 0.25
+    assert document.config.jump.hang_ratio == 0.46
+    assert document.config.jump.blink_convergence_chance == 0.30
     assert document.render.open_frame == "base/open.txt"
     assert document.render.preserve_canvas_height is True
 

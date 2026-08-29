@@ -81,6 +81,9 @@ class JumpConfig:
     min_height_rows: int = 1
     max_height_rows: int = 2
     blink_convergence_chance: float = 0.25
+    # Share of the hop spent at the top. Raising it buys hang time without
+    # making the whole jump slower.
+    hang_ratio: float = 0.24
 
 
 @dataclass(frozen=True)
@@ -159,14 +162,28 @@ class _JumpChannel:
     next_at: float = 0.0
 
 
-# Fractions of the hop used for each phase. Crouch and land sit on the ground,
-# so the drawing only ever moves during up/apex/down.
-_PHASE_BOUNDS: tuple[tuple[float, JumpPhase], ...] = (
-    (0.12, JumpPhase.CROUCH),
-    (0.38, JumpPhase.UP),
-    (0.62, JumpPhase.APEX),
-    (0.88, JumpPhase.DOWN),
-)
+# Relative weights of the phases that are not the hang itself. Crouch and land
+# sit on the ground, so the drawing only ever moves during up/apex/down.
+_CROUCH_WEIGHT = 0.12
+_RISE_WEIGHT = 0.26
+_FALL_WEIGHT = 0.26
+_LAND_WEIGHT = 0.12
+_TRAVEL_WEIGHT = _CROUCH_WEIGHT + _RISE_WEIGHT + _FALL_WEIGHT + _LAND_WEIGHT
+
+
+def phase_bounds(hang_ratio: float) -> tuple[tuple[float, JumpPhase], ...]:
+    """Split one hop into phases, giving ``hang_ratio`` of it to the apex."""
+    unit = (1.0 - hang_ratio) / _TRAVEL_WEIGHT
+    crouch = _CROUCH_WEIGHT * unit
+    rise = crouch + _RISE_WEIGHT * unit
+    apex = rise + hang_ratio
+    fall = apex + _FALL_WEIGHT * unit
+    return (
+        (crouch, JumpPhase.CROUCH),
+        (rise, JumpPhase.UP),
+        (apex, JumpPhase.APEX),
+        (fall, JumpPhase.DOWN),
+    )
 
 
 class MicroBehavior:
@@ -292,7 +309,7 @@ class MicroBehavior:
             return JumpPhase.GROUND
         elapsed = (now - self._jump.started_at) / self._jump.duration_s
         progress = min(1.0, max(0.0, elapsed))
-        for bound, phase in _PHASE_BOUNDS:
+        for bound, phase in phase_bounds(self.config.jump.hang_ratio):
             if progress < bound:
                 return phase
         return JumpPhase.LAND
@@ -418,6 +435,7 @@ def _jump_config(data: dict[str, Any], source: Path | str) -> JumpConfig:
         "min_height_rows",
         "max_height_rows",
         "blink_convergence_chance",
+        "hang_ratio",
     }
     unknown = sorted(str(key) for key in data if str(key) not in known)
     if unknown:
@@ -449,6 +467,9 @@ def _jump_config(data: dict[str, Any], source: Path | str) -> JumpConfig:
     )
     if max_height < min_height:
         raise _error(source, f"{prefix}.max_height_rows", "must be >= min_height_rows")
+    hang_ratio = _chance(data.get("hang_ratio", default.hang_ratio), source, f"{prefix}.hang_ratio")
+    if not 0.0 < hang_ratio < 1.0:
+        raise _error(source, f"{prefix}.hang_ratio", "must be between 0 and 1, exclusive")
     return JumpConfig(
         _boolean(data.get("enabled", True), source, f"{prefix}.enabled"),
         interval[0],
@@ -462,6 +483,7 @@ def _jump_config(data: dict[str, Any], source: Path | str) -> JumpConfig:
             source,
             f"{prefix}.blink_convergence_chance",
         ),
+        hang_ratio,
     )
 
 

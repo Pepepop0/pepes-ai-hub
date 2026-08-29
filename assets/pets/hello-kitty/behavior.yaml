@@ -4,21 +4,25 @@ id: hello-kitty
 micro_animations:
   blink:
     enabled: true
-    min_interval_ms: 1800
-    max_interval_ms: 4500
-    min_duration_ms: 120
-    max_duration_ms: 220
-    double_blink_chance: 0.10
+    # Blinks often, and holds each one long enough to read at a 0.12s refresh.
+    min_interval_ms: 900
+    max_interval_ms: 2600
+    min_duration_ms: 260
+    max_duration_ms: 420
+    double_blink_chance: 0.18
 
   jump:
     enabled: true
-    min_interval_ms: 2500
-    max_interval_ms: 6500
-    min_duration_ms: 400
-    max_duration_ms: 700
+    # Hops often, stays up a while: nearly half of each hop is spent at the
+    # top, so the character reads as floating rather than twitching.
+    min_interval_ms: 1600
+    max_interval_ms: 4000
+    min_duration_ms: 900
+    max_duration_ms: 1500
     min_height_rows: 1
     max_height_rows: 2
-    blink_convergence_chance: 0.25
+    hang_ratio: 0.46
+    blink_convergence_chance: 0.30
 
 render:
   open_frame: base/open.txt

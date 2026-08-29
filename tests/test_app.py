@@ -4,9 +4,14 @@ from pathlib import Path
 
 from textual.widgets import Button, Input, Select, Static
 
-from local_ai_stack.app import LocalAIStackApp, render_profile_details
+from local_ai_stack.app import LocalAIStackApp, project_root, render_profile_details
 from local_ai_stack.config import GeneralConfig, InstalledConfig, UiConfig
-from local_ai_stack.installation import InstallLocation, InstallLocationMode
+from local_ai_stack.installation import (
+    PORTABLE_DIR_NAME,
+    InstallLocation,
+    InstallLocationMode,
+    resolve_installation,
+)
 from local_ai_stack.layout import ENV_ROOT
 from local_ai_stack.pets import PetState
 from local_ai_stack.processes import (
@@ -254,6 +259,12 @@ def test_opening_tui_does_not_create_stack_layout(tmp_path, monkeypatch):
 
 def test_install_location_modes_resolve_for_preview_without_creating_directories(tmp_path):
     custom_root = tmp_path / "custom-stack"
+    # Derived, never spelled out: the portable root is whatever workspace the
+    # app resolved plus PORTABLE_DIR_NAME, so this passes in a checkout or in a
+    # worktree under any directory name.
+    portable_root = resolve_installation(InstallLocation.portable(), repo_root=project_root()).root
+    assert portable_root == project_root() / PORTABLE_DIR_NAME
+    portable_tail = str(Path(portable_root.parent.name) / portable_root.name)
 
     async def exercise() -> None:
         app = make_app()
@@ -266,7 +277,7 @@ def test_install_location_modes_resolve_for_preview_without_creating_directories
             selector.value = InstallLocationMode.PORTABLE
             await pilot.pause()
             assert app.installed_config.installation == InstallLocation.portable()
-            assert str(preview.content).endswith(r"pepito's_ai_hub\stack[/b]")
+            assert str(preview.content).endswith(f"{portable_tail}[/b]")
 
             selector.value = InstallLocationMode.CUSTOM
             await pilot.pause()
@@ -284,7 +295,7 @@ def test_install_location_modes_resolve_for_preview_without_creating_directories
 
     asyncio.run(exercise())
     assert not custom_root.exists()
-    assert not (ROOT / "stack").exists()
+    assert not portable_root.exists()
 
 
 def test_relative_custom_location_shows_inline_error_and_is_not_accepted():

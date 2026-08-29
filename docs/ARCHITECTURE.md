@@ -42,6 +42,11 @@ A 5070 12 GB não deve assumir LLM + FLUX residentes juntos. Direção futura: L
 
 Single RTX 5090 32 GB, mesma arquitetura e APIs, porém com modelos maiores e política de VRAM relaxada.
 
+## Fronteiras entre camadas
+
+Como planning, provisioning e runtime se ligam — e o que managed vs external
+permite ou proíbe — está em [INTEGRATION.md](INTEGRATION.md).
+
 ## Princípios
 
 Declarative over imperative; profiles não contêm código; provisioner não decide hardware; runtime não instala; pin de versões; idempotência; falhar cedo; logs claros; nenhuma mutação silenciosa.

@@ -13,6 +13,12 @@ Whether the service actually serves is a health question, answered by
 :mod:`local_ai_stack.services`, and the two are never merged into one verdict.
 
 Launching is generic: it knows argv, cwd, env and log files, not services.
+
+**Known limitation: child processes.** ``stop`` ends the process we registered,
+not the tree below it. ``ollama serve`` can leave an ``ollama runner`` child
+behind. Killing a whole tree is deliberately not done here: it would require an
+ownership policy per child process, and without one the risk is ending
+something that was never ours. See docs/INTEGRATION.md.
 """
 
 from __future__ import annotations

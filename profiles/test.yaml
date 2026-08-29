@@ -8,6 +8,7 @@ hardware:
   gpu_vendor: nvidia
   min_vram_gb: 8
   recommended_vram_gb: 12
+  vram_tolerance_mib: 128
   notes: O objetivo é validar a stack, não maximizar qualidade.
 
 services:

@@ -10,7 +10,12 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class GPUInfo:
     name: str
-    vram_mb: int
+    vram_mib: int
+
+    @property
+    def vram_mb(self) -> int:
+        """Backward-compatible alias; nvidia-smi reports this value in MiB."""
+        return self.vram_mib
 
 
 @dataclass(frozen=True)

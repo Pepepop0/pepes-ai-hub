@@ -6,13 +6,37 @@ from typing import Any
 
 import yaml
 
+PROFILE_SCHEMA_VERSION = 1
+MIB_PER_GIB = 1024
+
 
 @dataclass(frozen=True)
 class HardwareRequirement:
     os: str
     gpu_vendor: str
-    min_vram_gb: int
-    recommended_vram_gb: int
+    min_vram_mib: int
+    recommended_vram_mib: int
+    vram_tolerance_mib: int
+    notes: str = ""
+
+    @property
+    def min_vram_gb(self) -> int | float:
+        return _gib_value(self.min_vram_mib)
+
+    @property
+    def recommended_vram_gb(self) -> int | float:
+        return _gib_value(self.recommended_vram_mib)
+
+
+@dataclass(frozen=True)
+class ServiceConfig:
+    enabled: bool
+    port: int
+
+
+@dataclass(frozen=True)
+class WorkflowConfig:
+    manifest_id: str
 
 
 @dataclass(frozen=True)
@@ -22,6 +46,11 @@ class Profile:
     name: str
     description: str
     hardware: HardwareRequirement
+    services: dict[str, ServiceConfig]
+    features: dict[str, bool]
+    models: dict[str, dict[str, Any]]
+    workflows: dict[str, WorkflowConfig]
+    runtime: dict[str, bool]
     raw: dict[str, Any]
 
 
@@ -29,32 +58,263 @@ class ProfileError(ValueError):
     pass
 
 
-def load_profile(path: Path) -> Profile:
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ProfileError(f"{path}: profile root must be a mapping")
-    required = ("schema_version", "id", "name", "hardware")
-    missing = [k for k in required if k not in data]
+def _gib_value(vram_mib: int) -> int | float:
+    value = vram_mib / MIB_PER_GIB
+    return int(value) if value.is_integer() else value
+
+
+def _error(source: Path | str, field: str, message: str) -> ProfileError:
+    location = f"{source}: {field}" if field else str(source)
+    return ProfileError(f"{location}: {message}")
+
+
+def _mapping(value: Any, source: Path | str, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise _error(source, field, "must be a mapping")
+    return value
+
+
+def _required(
+    data: dict[str, Any], fields: tuple[str, ...], source: Path | str, prefix: str = ""
+) -> None:
+    missing = [field for field in fields if field not in data]
     if missing:
-        raise ProfileError(f"{path}: missing required fields: {', '.join(missing)}")
-    hw = data["hardware"]
-    for key in ("os", "gpu_vendor", "min_vram_gb", "recommended_vram_gb"):
-        if key not in hw:
-            raise ProfileError(f"{path}: hardware.{key} is required")
-    return Profile(
-        int(data["schema_version"]),
-        str(data["id"]),
-        str(data["name"]),
-        str(data.get("description", "")),
-        HardwareRequirement(
-            str(hw["os"]),
-            str(hw["gpu_vendor"]),
-            int(hw["min_vram_gb"]),
-            int(hw["recommended_vram_gb"]),
+        label = f"{prefix}." if prefix else ""
+        raise _error(
+            source,
+            prefix,
+            f"missing required fields: {', '.join(label + key for key in missing)}",
+        )
+
+
+def _reject_unknown(
+    data: dict[str, Any], allowed: set[str], source: Path | str, field: str
+) -> None:
+    unknown = sorted((str(key) for key in data if key not in allowed), key=str.casefold)
+    if unknown:
+        raise _error(source, field, f"unknown fields: {', '.join(unknown)}")
+
+
+def _string(value: Any, source: Path | str, field: str, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        qualifier = "a string" if allow_empty else "a non-empty string"
+        raise _error(source, field, f"must be {qualifier}")
+    return value
+
+
+def _integer(value: Any, source: Path | str, field: str, *, minimum: int = 0) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise _error(source, field, f"must be an integer >= {minimum}")
+    return value
+
+
+def _boolean(value: Any, source: Path | str, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise _error(source, field, "must be a boolean")
+    return value
+
+
+def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profile:
+    root = _mapping(data, source, "profile root")
+    _reject_unknown(
+        root,
+        {
+            "schema_version",
+            "id",
+            "name",
+            "description",
+            "hardware",
+            "services",
+            "features",
+            "models",
+            "workflows",
+            "runtime",
+        },
+        source,
+        "profile root",
+    )
+    _required(
+        root,
+        (
+            "schema_version",
+            "id",
+            "name",
+            "hardware",
+            "services",
+            "features",
+            "models",
+            "runtime",
         ),
-        data,
+        source,
+    )
+
+    schema_version = _integer(root["schema_version"], source, "schema_version", minimum=1)
+    if schema_version != PROFILE_SCHEMA_VERSION:
+        raise _error(
+            source,
+            "schema_version",
+            f"unsupported version {schema_version}; expected {PROFILE_SCHEMA_VERSION}",
+        )
+
+    profile_id = _string(root["id"], source, "id")
+    if not profile_id[0].isalpha() or not all(
+        c.islower() or c.isdigit() or c in "_-" for c in profile_id
+    ):
+        raise _error(
+            source,
+            "id",
+            "must use lowercase letters, digits, '_' or '-' and start with a letter",
+        )
+
+    hardware_data = _mapping(root["hardware"], source, "hardware")
+    _reject_unknown(
+        hardware_data,
+        {
+            "os",
+            "gpu_vendor",
+            "min_vram_gb",
+            "recommended_vram_gb",
+            "vram_tolerance_mib",
+            "notes",
+        },
+        source,
+        "hardware",
+    )
+    _required(
+        hardware_data,
+        ("os", "gpu_vendor", "min_vram_gb", "recommended_vram_gb"),
+        source,
+        "hardware",
+    )
+    min_vram_gib = _integer(hardware_data["min_vram_gb"], source, "hardware.min_vram_gb", minimum=1)
+    recommended_vram_gib = _integer(
+        hardware_data["recommended_vram_gb"],
+        source,
+        "hardware.recommended_vram_gb",
+        minimum=1,
+    )
+    if recommended_vram_gib < min_vram_gib:
+        raise _error(
+            source,
+            "hardware.recommended_vram_gb",
+            "must be >= hardware.min_vram_gb",
+        )
+    tolerance_mib = _integer(
+        hardware_data.get("vram_tolerance_mib", 0),
+        source,
+        "hardware.vram_tolerance_mib",
+    )
+    if tolerance_mib > MIB_PER_GIB:
+        raise _error(source, "hardware.vram_tolerance_mib", f"must be <= {MIB_PER_GIB}")
+    os_name = _string(hardware_data["os"], source, "hardware.os").lower()
+    if os_name != "windows":
+        raise _error(source, "hardware.os", "only 'windows' is supported")
+    gpu_vendor = _string(hardware_data["gpu_vendor"], source, "hardware.gpu_vendor").lower()
+    if gpu_vendor != "nvidia":
+        raise _error(source, "hardware.gpu_vendor", "only 'nvidia' is supported")
+
+    services_data = _mapping(root["services"], source, "services")
+    if not services_data:
+        raise _error(source, "services", "must define at least one service")
+    services: dict[str, ServiceConfig] = {}
+    for service_id, service_value in services_data.items():
+        _string(service_id, source, "services key")
+        service = _mapping(service_value, source, f"services.{service_id}")
+        _reject_unknown(
+            service,
+            {"enabled", "port"},
+            source,
+            f"services.{service_id}",
+        )
+        _required(service, ("enabled", "port"), source, f"services.{service_id}")
+        port = _integer(service["port"], source, f"services.{service_id}.port", minimum=1)
+        if port > 65535:
+            raise _error(source, f"services.{service_id}.port", "must be <= 65535")
+        services[service_id] = ServiceConfig(
+            enabled=_boolean(service["enabled"], source, f"services.{service_id}.enabled"),
+            port=port,
+        )
+
+    features_data = _mapping(root["features"], source, "features")
+    features = {
+        _string(key, source, "features key"): _boolean(value, source, f"features.{key}")
+        for key, value in features_data.items()
+    }
+
+    models_data = _mapping(root["models"], source, "models")
+    models = {
+        _string(key, source, "models key"): _mapping(value, source, f"models.{key}")
+        for key, value in models_data.items()
+    }
+
+    workflows_data = _mapping(root.get("workflows", {}), source, "workflows")
+    workflows: dict[str, WorkflowConfig] = {}
+    for workflow_id, workflow_value in workflows_data.items():
+        workflow = _mapping(workflow_value, source, f"workflows.{workflow_id}")
+        _reject_unknown(
+            workflow,
+            {"manifest_id"},
+            source,
+            f"workflows.{workflow_id}",
+        )
+        _required(workflow, ("manifest_id",), source, f"workflows.{workflow_id}")
+        workflows[_string(workflow_id, source, "workflows key")] = WorkflowConfig(
+            manifest_id=_string(
+                workflow["manifest_id"],
+                source,
+                f"workflows.{workflow_id}.manifest_id",
+            )
+        )
+
+    runtime_data = _mapping(root["runtime"], source, "runtime")
+    runtime = {
+        _string(key, source, "runtime key"): _boolean(value, source, f"runtime.{key}")
+        for key, value in runtime_data.items()
+    }
+
+    return Profile(
+        schema_version=schema_version,
+        id=profile_id,
+        name=_string(root["name"], source, "name"),
+        description=_string(root.get("description", ""), source, "description", allow_empty=True),
+        hardware=HardwareRequirement(
+            os=os_name,
+            gpu_vendor=gpu_vendor,
+            min_vram_mib=min_vram_gib * MIB_PER_GIB,
+            recommended_vram_mib=recommended_vram_gib * MIB_PER_GIB,
+            vram_tolerance_mib=tolerance_mib,
+            notes=_string(
+                hardware_data.get("notes", ""),
+                source,
+                "hardware.notes",
+                allow_empty=True,
+            ),
+        ),
+        services=services,
+        features=features,
+        models=models,
+        workflows=workflows,
+        runtime=runtime,
+        raw=root,
     )
 
 
+def load_profile(path: Path) -> Profile:
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ProfileError(f"{path}: could not read profile: {exc}") from exc
+    return validate_profile_data(data, path)
+
+
 def load_profiles(directory: Path) -> list[Profile]:
-    return [load_profile(p) for p in sorted(directory.glob("*.yaml"))]
+    profiles = [load_profile(path) for path in sorted(directory.glob("*.yaml"))]
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for profile in profiles:
+        if profile.id in seen:
+            duplicates.add(profile.id)
+        seen.add(profile.id)
+    if duplicates:
+        raise ProfileError(f"{directory}: duplicate profile ids: {', '.join(sorted(duplicates))}")
+    return profiles

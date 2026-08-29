@@ -8,6 +8,7 @@ hardware:
   gpu_vendor: nvidia
   min_vram_gb: 32
   recommended_vram_gb: 32
+  vram_tolerance_mib: 128
   notes: Single RTX 5090. Multi-GPU fora do escopo v0.1.
 
 services:

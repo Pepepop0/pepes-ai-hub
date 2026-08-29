@@ -8,10 +8,10 @@
 - [x] skeleton Python / TUI / Doctor / testes
 
 ## M1 — TUI + Planning
-- [ ] schema formal
-- [ ] profile details
-- [ ] compatibility engine
-- [ ] install plan
+- [x] schema formal
+- [x] profile details
+- [x] compatibility engine
+- [x] install plan dry-run
 - [ ] logs TUI
 - [ ] confirmação antes de mudanças
 

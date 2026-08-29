@@ -42,6 +42,10 @@ def default_executor_factory(installation: ResolvedInstallation) -> PlanExecutor
     return plan_executor(provision_context(installation))
 
 
+# Below this many columns the right rail gives its width back to the content.
+WIDE_TERMINAL_COLUMNS = 90
+
+
 class LocalAIStackApp(App):
     TITLE = "Pepito's AI Hub"
     SUB_TITLE = "Local AI Stack Manager"
@@ -184,6 +188,10 @@ class LocalAIStackApp(App):
     def _set_installation(self, location) -> None:
         self.installed_config = self.installed_config.with_installation(location)
         self.query_one(MainContent).update_config(self.installed_config)
+
+    def on_resize(self) -> None:
+        """Narrow terminals get a narrow rail; the pet scales itself to match."""
+        self.query_one(RightRail).set_narrow(self.size.width < WIDE_TERMINAL_COLUMNS)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""

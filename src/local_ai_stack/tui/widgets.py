@@ -457,13 +457,26 @@ class PetSlot(Static):
     def on_mount(self) -> None:
         self.set_interval(self.REFRESH_INTERVAL, self.refresh_frame)
 
+    def on_resize(self) -> None:
+        """Let the art re-fit the slot. A renderer without art ignores this."""
+        if self._fit_to_slot():
+            self.refresh_frame()
+
+    def _fit_to_slot(self) -> bool:
+        fit = getattr(self.animator, "fit_to_width", None)
+        return bool(fit and self.size.width and fit(self.size.width))
+
     def refresh_frame(self, now: float | None = None) -> None:
         if self.animator is not None:
             self.update(self.animator.current_text(now))
 
     def set_animator(self, animator: PetRenderer | None, fallback_text: str) -> None:
         self.animator = animator
-        self.update(fallback_text if animator is None else animator.current_text())
+        if animator is None:
+            self.update(fallback_text)
+            return
+        self._fit_to_slot()
+        self.update(animator.current_text())
 
     def set_state(self, state: PetState, *, now: float | None = None) -> bool:
         if self.animator is None:
@@ -521,6 +534,10 @@ class RightRail(Vertical):
     @property
     def is_collapsed(self) -> bool:
         return self.has_class("collapsed")
+
+    def set_narrow(self, narrow: bool) -> None:
+        """Give back rail width when the terminal cannot spare it."""
+        self.set_class(narrow, "narrow")
 
     def toggle_collapsed(self) -> None:
         self.toggle_class("collapsed")

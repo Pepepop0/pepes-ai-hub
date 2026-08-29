@@ -29,6 +29,142 @@ from .pets import PetAnimation, PetAnimator, PetDefinition, PetFrame, PetState
 # U+2800 BRAILLE PATTERN BLANK draws nothing but is not whitespace, so braille
 # art pads with it. Both count as an empty row for the purpose of a hop.
 BLANK_CHARACTERS = " ⠀"
+BRAILLE_BLANK = "⠀"
+BRAILLE_BASE = 0x2800
+BRAILLE_LAST = 0x28FF
+# A braille cell is a 2x4 dot matrix, and the dot-to-bit mapping is not linear:
+# dots 1-6 fill the first three rows column by column, then 7 and 8 close it.
+DOT_BITS: dict[tuple[int, int], int] = {
+    (0, 0): 0x01,
+    (1, 0): 0x02,
+    (2, 0): 0x04,
+    (3, 0): 0x40,
+    (0, 1): 0x08,
+    (1, 1): 0x10,
+    (2, 1): 0x20,
+    (3, 1): 0x80,
+}
+CELL_DOT_ROWS = 4
+CELL_DOT_COLUMNS = 2
+
+
+def braille_to_dots(lines: Sequence[str]) -> list[list[bool]]:
+    """Explode braille cells into the dot bitmap they encode."""
+    if not lines:
+        return []
+    width = max(len(line) for line in lines)
+    grid = [[False] * (width * CELL_DOT_COLUMNS) for _ in range(len(lines) * CELL_DOT_ROWS)]
+    for row, line in enumerate(lines):
+        for column, char in enumerate(line.ljust(width)):
+            value = ord(char) - BRAILLE_BASE
+            if not 0 <= value <= 0xFF:
+                continue
+            for (dot_row, dot_column), bit in DOT_BITS.items():
+                if value & bit:
+                    grid[row * CELL_DOT_ROWS + dot_row][column * CELL_DOT_COLUMNS + dot_column] = (
+                        True
+                    )
+    return grid
+
+
+def dots_to_braille(grid: Sequence[Sequence[bool]]) -> tuple[str, ...]:
+    """Pack a dot bitmap back into braille cells."""
+    height = len(grid)
+    width = len(grid[0]) if height else 0
+    rows: list[str] = []
+    for row in range(0, height, CELL_DOT_ROWS):
+        cells: list[str] = []
+        for column in range(0, width, CELL_DOT_COLUMNS):
+            value = 0
+            for (dot_row, dot_column), bit in DOT_BITS.items():
+                y, x = row + dot_row, column + dot_column
+                if y < height and x < width and grid[y][x]:
+                    value |= bit
+            cells.append(chr(BRAILLE_BASE + value))
+        rows.append("".join(cells))
+    return tuple(rows)
+
+
+def ink_bounds(grid: Sequence[Sequence[bool]]) -> tuple[int, int, int, int] | None:
+    """Bounding box of every lit dot, or None when the bitmap is empty."""
+    rows = [y for y, row in enumerate(grid) if any(row)]
+    if not rows:
+        return None
+    width = len(grid[0])
+    columns = [x for x in range(width) if any(row[x] for row in grid)]
+    return rows[0], rows[-1], columns[0], columns[-1]
+
+
+def crop_to_ink(grid: Sequence[Sequence[bool]]) -> list[list[bool]]:
+    bounds = ink_bounds(grid)
+    if bounds is None:
+        return [list(row) for row in grid]
+    top, bottom, left, right = bounds
+    return [list(row[left : right + 1]) for row in grid[top : bottom + 1]]
+
+
+def downscale_dots(
+    grid: Sequence[Sequence[bool]], factor: int, threshold: int | None = None
+) -> list[list[bool]]:
+    """Shrink a dot bitmap by an integer factor, keeping the aspect ratio.
+
+    A block of ``factor**2`` dots becomes one dot when enough of it is lit, so
+    thin strokes survive and solid areas stay solid.
+    """
+    if factor <= 1 or not grid:
+        return [list(row) for row in grid]
+    height, width = len(grid), len(grid[0])
+    limit = max(1, factor * factor // 2) if threshold is None else threshold
+    scaled: list[list[bool]] = []
+    for y in range(0, height, factor):
+        row: list[bool] = []
+        for x in range(0, width, factor):
+            lit = sum(
+                1
+                for dy in range(factor)
+                for dx in range(factor)
+                if y + dy < height and x + dx < width and grid[y + dy][x + dx]
+            )
+            row.append(lit >= limit)
+        scaled.append(row)
+    return scaled
+
+
+def scale_to_width(
+    frames: Mapping[str, Sequence[str]], max_width: int, *, crop: bool = True
+) -> dict[str, tuple[str, ...]]:
+    """Fit braille art into ``max_width`` cells, identically for every frame.
+
+    Cropping and scaling are computed once across all frames together, so the
+    drawings keep their alignment and a blink cannot shift the character.
+    """
+    grids = {name: braille_to_dots(lines) for name, lines in frames.items()}
+    if crop:
+        union = _union_bounds(grids.values())
+        if union is not None:
+            top, bottom, left, right = union
+            grids = {
+                name: [list(row[left : right + 1]) for row in grid[top : bottom + 1]]
+                for name, grid in grids.items()
+            }
+    dot_width = max((len(grid[0]) for grid in grids.values() if grid), default=0)
+    cells_per_row = dot_width / CELL_DOT_COLUMNS
+    factor = 1
+    while cells_per_row / factor > max_width:
+        factor += 1
+    return {name: dots_to_braille(downscale_dots(grid, factor)) for name, grid in grids.items()}
+
+
+def _union_bounds(grids) -> tuple[int, int, int, int] | None:
+    boxes = [box for box in (ink_bounds(grid) for grid in grids) if box is not None]
+    if not boxes:
+        return None
+    return (
+        min(box[0] for box in boxes),
+        max(box[1] for box in boxes),
+        min(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
 
 
 @runtime_checkable
@@ -112,13 +248,49 @@ class MicroBehaviorRenderer:
         rng: random.Random | None = None,
     ) -> None:
         self._animator = animator
-        self._canvases = normalize_canvas(frames)
+        self._render = render or RenderConfig()
+        self._frames = dict(frames)
+        self._fit_width: int | None = None
+        self._canvases = self._prepare(self._frames)
         if EyeState.OPEN.value not in self._canvases:
             raise ValueError("a micro-behavior renderer needs at least an 'open' frame")
-        self._render = render or RenderConfig()
         self.behavior = MicroBehavior(
             config, now=animator.started_at if now is None else now, rng=rng
         )
+
+    def _target_width(self) -> int | None:
+        """The narrower of what the asset asks for and what the caller offers."""
+        declared, available = self._render.max_width, self._fit_width
+        if declared is None:
+            return available
+        return declared if available is None else min(declared, available)
+
+    def _prepare(self, frames: Mapping[str, PetFrame]) -> dict[str, tuple[str, ...]]:
+        """Fit the art to the canvas once, not on every tick."""
+        canvases = normalize_canvas(frames)
+        target = self._target_width()
+        if target is not None:
+            canvases = scale_to_width(canvases, target, crop=self._render.crop_to_ink)
+            canvases = normalize_canvas({name: PetFrame(lines) for name, lines in canvases.items()})
+        headroom = self._render.headroom_rows
+        if headroom:
+            width = max((len(lines[0]) for lines in canvases.values() if lines), default=0)
+            blank = BRAILLE_BLANK * width
+            canvases = {name: (blank,) * headroom + lines for name, lines in canvases.items()}
+        return canvases
+
+    def fit_to_width(self, cells: int) -> bool:
+        """Re-fit the art to the space the view actually has.
+
+        Called on resize, never per tick. Returns whether anything changed, so
+        the caller can skip a redraw.
+        """
+        width = max(1, int(cells))
+        if width == self._fit_width:
+            return False
+        self._fit_width = width
+        self._canvases = self._prepare(self._frames)
+        return True
 
     # --- the animator-shaped surface the rail already speaks ---------------
 

@@ -25,3 +25,9 @@ render:
   closed_frame: base/closed.txt
   anchor: bottom
   preserve_canvas_height: true
+  # The art is drawn at 62x31 cells; the right rail is narrower than that, so
+  # the braille bitmap is cropped to its ink and scaled down to fit. The files
+  # on disk stay untouched at full resolution.
+  crop_to_ink: true
+  max_width: 31
+  headroom_rows: 2

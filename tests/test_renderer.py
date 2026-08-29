@@ -26,10 +26,16 @@ from local_ai_stack.renderer import (
     BLANK_CHARACTERS,
     MicroBehaviorRenderer,
     blank_rows_at_top,
+    braille_to_dots,
     build_pet_renderer,
+    crop_to_ink,
+    dots_to_braille,
+    downscale_dots,
+    ink_bounds,
     is_blank_row,
     normalize_canvas,
     raise_drawing,
+    scale_to_width,
 )
 
 REPO = Path(__file__).resolve().parents[1]
@@ -123,7 +129,7 @@ def test_the_shipped_hello_kitty_renders_through_its_behavior():
     renderer = hello_kitty()
     assert renderer.pet.id == "hello-kitty"
     assert renderer.state is PetState.IDLE
-    assert renderer.canvas_size == (62, 31)
+    assert renderer.canvas_size == (31, 13)
     assert renderer.current_text(0.0)
 
 
@@ -134,7 +140,7 @@ def test_the_canvas_never_changes_size_while_the_character_moves():
     while moment < 90:
         sizes.add(dimensions(renderer.current_text(moment)))
         moment += 0.05
-    assert sizes == {(31, 62)}
+    assert sizes == {(13, 31)}
 
 
 def test_no_visible_row_is_ever_lost_to_a_hop():
@@ -223,6 +229,70 @@ def test_a_renderer_needs_an_open_frame():
 
 
 # --- asset-driven selection ------------------------------------------------
+
+
+def test_art_is_scaled_to_the_width_the_view_offers():
+    renderer = hello_kitty()
+    assert renderer.canvas_size == (31, 13)
+    assert renderer.fit_to_width(16) is True
+    assert renderer.canvas_size[0] <= 16
+    assert renderer.fit_to_width(16) is False, "re-fitting the same width is a no-op"
+    assert renderer.fit_to_width(200) is True
+    # Never larger than the asset itself asks for.
+    assert renderer.canvas_size == (31, 13)
+
+
+def test_scaling_keeps_every_frame_aligned():
+    """Open and closed must scale identically, or a blink would shift the art."""
+    pet = load_pet_by_id("hello-kitty", ASSETS)
+    scaled = scale_to_width(
+        {name: frame.lines for name, frame in pet.behavior.frames.items()}, 20, crop=True
+    )
+    assert {len(lines) for lines in scaled.values()} == {len(scaled["open"])}
+    assert {len(lines[0]) for lines in scaled.values()} == {len(scaled["open"][0])}
+    assert scaled["open"] != scaled["closed"]
+
+
+def test_scaling_survives_a_hop_without_changing_the_canvas():
+    renderer = hello_kitty(seed=7)
+    renderer.fit_to_width(18)
+    sizes = {dimensions(text) for text in walk(renderer, until=60)}
+    assert len(sizes) == 1
+
+
+def test_braille_round_trips_through_its_dot_bitmap():
+    lines = ("⣿⠀", "⠁⣤")
+    assert dots_to_braille(braille_to_dots(lines)) == lines
+
+
+def test_downscaling_halves_the_bitmap():
+    grid = [[True] * 8 for _ in range(8)]
+    smaller = downscale_dots(grid, 2)
+    assert len(smaller) == 4
+    assert len(smaller[0]) == 4
+    assert all(all(row) for row in smaller)
+
+
+def test_downscaling_drops_sparse_blocks_and_keeps_solid_ones():
+    grid = [[False] * 4 for _ in range(4)]
+    grid[0][0] = True  # one lit dot in a 2x2 block: below the threshold
+    grid[2][2] = grid[2][3] = grid[3][2] = True  # three of four: solid enough
+    smaller = downscale_dots(grid, 2)
+    assert smaller[0][0] is False
+    assert smaller[1][1] is True
+
+
+def test_cropping_removes_the_empty_margin():
+    grid = [[False] * 5 for _ in range(5)]
+    grid[2][1] = grid[2][2] = True
+    assert ink_bounds(grid) == (2, 2, 1, 2)
+    assert crop_to_ink(grid) == [[True, True]]
+
+
+def test_cropping_an_empty_bitmap_is_harmless():
+    grid = [[False] * 3 for _ in range(2)]
+    assert ink_bounds(grid) is None
+    assert crop_to_ink(grid) == grid
 
 
 def test_the_asset_decides_the_renderer_not_the_caller():

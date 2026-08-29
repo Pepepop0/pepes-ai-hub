@@ -121,12 +121,18 @@ Screen {
 }
 
 #right-rail {
-    width: 24;
-    min-width: 18;
+    /* Wide enough for the pet canvas plus the slot's border and padding,
+       but allowed to shrink on a narrow terminal: the pet scales to fit. */
+    width: 38;
+    min-width: 20;
     height: 100%;
     padding: 1;
     background: $panel;
     border-left: tall $secondary;
+}
+
+#right-rail.narrow {
+    width: 24;
 }
 
 #right-rail.collapsed {
@@ -154,7 +160,10 @@ Screen {
 }
 
 #pet-slot {
-    min-height: 5;
+    /* Fixed and square on screen: 35 cells wide by 17 rows, and a terminal
+       cell is about half as wide as it is tall. The pet never resizes it. */
+    width: 100%;
+    height: 17;
     padding: 1;
     border: round $secondary;
     color: $text-muted;

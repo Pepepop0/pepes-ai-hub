@@ -85,12 +85,22 @@ class JumpConfig:
 
 @dataclass(frozen=True)
 class RenderConfig:
-    """Which frames the behavior draws with, and how the canvas is anchored."""
+    """Which frames the behavior draws with, and how they fit the canvas.
+
+    ``max_width`` lets an asset ship art at full resolution and still fit a
+    narrow rail: the renderer picks the largest integer scale that fits, so the
+    file on disk never has to be redrawn for a layout change.
+    ``headroom_rows`` reserves blank rows above the drawing for the hop, which
+    matters once cropping has removed the art's own empty margin.
+    """
 
     open_frame: str = "base/open.txt"
     closed_frame: str = "base/closed.txt"
     anchor: str = "bottom"
     preserve_canvas_height: bool = True
+    max_width: int | None = None
+    crop_to_ink: bool = False
+    headroom_rows: int = 0
 
     @property
     def frames(self) -> dict[str, str]:
@@ -489,7 +499,15 @@ def validate_behavior_data(data: Any, source: Path | str = "<behavior>") -> Beha
     )
 
     render_data = _mapping(root.get("render", {}), source, "render")
-    known_render = {"open_frame", "closed_frame", "anchor", "preserve_canvas_height"}
+    known_render = {
+        "open_frame",
+        "closed_frame",
+        "anchor",
+        "preserve_canvas_height",
+        "max_width",
+        "crop_to_ink",
+        "headroom_rows",
+    }
     unknown_render = sorted(str(key) for key in render_data if str(key) not in known_render)
     if unknown_render:
         raise _error(source, "render", f"unknown fields: {', '.join(unknown_render)}")
@@ -497,6 +515,12 @@ def validate_behavior_data(data: Any, source: Path | str = "<behavior>") -> Beha
     anchor = render_data.get("anchor", defaults.anchor)
     if anchor not in {"bottom", "top"}:
         raise _error(source, "render.anchor", "must be 'bottom' or 'top'")
+    raw_max_width = render_data.get("max_width")
+    max_width = (
+        None
+        if raw_max_width is None
+        else _integer(raw_max_width, source, "render.max_width", minimum=1)
+    )
     render = RenderConfig(
         _relative_frame(
             render_data.get("open_frame", defaults.open_frame), source, "render.open_frame"
@@ -509,6 +533,16 @@ def validate_behavior_data(data: Any, source: Path | str = "<behavior>") -> Beha
             render_data.get("preserve_canvas_height", defaults.preserve_canvas_height),
             source,
             "render.preserve_canvas_height",
+        ),
+        max_width,
+        _boolean(
+            render_data.get("crop_to_ink", defaults.crop_to_ink), source, "render.crop_to_ink"
+        ),
+        _integer(
+            render_data.get("headroom_rows", defaults.headroom_rows),
+            source,
+            "render.headroom_rows",
+            minimum=0,
         ),
     )
     return BehaviorDocument(

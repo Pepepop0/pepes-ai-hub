@@ -461,6 +461,61 @@ def test_hello_kitty_keeps_the_rail_the_same_size_while_it_moves():
     asyncio.run(exercise())
 
 
+def test_the_rail_gives_width_back_on_a_narrow_terminal():
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.press("2")
+            await pilot.click("#profile-capella")
+            await pilot.pause()
+            rail = app.query_one(RightRail)
+            pet = app.query_one(PetSlot)
+            assert rail.has_class("narrow")
+            art = str(pet.content).splitlines()
+            assert max(len(line) for line in art) <= pet.size.width
+            # The layout still works: the other profile is reachable.
+            await pilot.click("#profile-pepe")
+            await pilot.pause()
+            assert pet.animator.pet.id == "claw"
+
+    asyncio.run(exercise())
+
+
+def test_a_wide_terminal_gets_the_full_size_pet():
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("2")
+            await pilot.click("#profile-capella")
+            await pilot.pause()
+            rail = app.query_one(RightRail)
+            pet = app.query_one(PetSlot)
+            assert not rail.has_class("narrow")
+            art = str(pet.content).splitlines()
+            assert max(len(line) for line in art) == 31
+            assert len(art) == 13
+
+    asyncio.run(exercise())
+
+
+def test_the_pet_box_keeps_one_size_whatever_the_pet_is():
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            pet = app.query_one(PetSlot)
+            claw_box = pet.size
+            await pilot.press("2")
+            await pilot.click("#profile-capella")
+            await pilot.pause()
+            assert pet.size == claw_box
+            started_at = pet.animator.started_at
+            for step in range(60):
+                pet.refresh_frame(started_at + step * 0.25)
+                assert pet.size == claw_box
+
+    asyncio.run(exercise())
+
+
 def test_hello_kitty_survives_rail_collapse_and_expand():
     async def exercise() -> None:
         app = make_app()

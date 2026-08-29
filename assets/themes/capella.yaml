@@ -1,0 +1,17 @@
+schema_version: 1
+id: capella
+display_name: Capella
+description: Tema padrao do profile Capella. Violeta sobre fundo escuro.
+dark: true
+
+colors:
+  background: "#110e17"
+  surface: "#1b1724"
+  border: "#38304a"
+  text: "#ece6f5"
+  muted: "#948aa8"
+  accent: "#a77bf0"
+  success: "#5ec98d"
+  warning: "#e3ab53"
+  error: "#e46a7b"
+  info: "#6fa9e8"

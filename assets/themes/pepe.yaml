@@ -1,0 +1,17 @@
+schema_version: 1
+id: pepe
+display_name: Pepe
+description: Tema padrao do profile Pepe. Verde-agua sobre fundo escuro.
+dark: true
+
+colors:
+  background: "#0e1512"
+  surface: "#16211d"
+  border: "#2c3f38"
+  text: "#e2f0ea"
+  muted: "#7d968d"
+  accent: "#3fbf8f"
+  success: "#4cd07d"
+  warning: "#e0a53f"
+  error: "#e05c5c"
+  info: "#54a8d6"

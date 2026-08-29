@@ -1,0 +1,28 @@
+schema_version: 1
+id: claw
+name: Claw
+description: >-
+  Caranguejo em arte de terminal. Referencia visual: o mascote Clawd do projeto
+  clawd-tank (crab pixel-art com moods idle/working/happy/alert/sleeping).
+  Nenhum asset ou codigo daquele projeto foi copiado: estes frames sao originais,
+  ASCII puro, sem emoji.
+
+animations:
+  idle:
+    fps: 1.5
+    loop: true
+  working:
+    frame_duration_ms: 180
+    loop: true
+  success:
+    fps: 4
+    loop: false
+  warning:
+    fps: 3
+    loop: true
+  error:
+    fps: 3
+    loop: true
+  sleeping:
+    frame_duration_ms: 1200
+    loop: true

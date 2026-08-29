@@ -1,6 +1,9 @@
 schema_version: 1
 id: capella
 name: Capella
+ui:
+  default_pet: hello-kitty
+  default_theme: capella
 description: RTX 5090 32 GB — single GPU profile.
 
 hardware:

@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .pets import PetState
+from .profiles import Profile
 from .services import ServiceState
 
 STACK_PET_STATES: Mapping[ServiceState, PetState] = {
@@ -35,8 +36,8 @@ STACK_PET_STATES: Mapping[ServiceState, PetState] = {
     ServiceState.UNKNOWN: PetState.WARNING,
 }
 
-DEFAULT_PET = "claw"
-DEFAULT_THEME = "pepe"
+DEFAULT_PET = "none"
+DEFAULT_THEME = "neutral"
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,7 @@ class Appearance:
 DEFAULT_APPEARANCE_BY_PROFILE: Mapping[str, Appearance] = {
     "pepe": Appearance("claw", "pepe"),
     "capella": Appearance("hello-kitty", "capella"),
-    "test": Appearance("claw", "pepe"),
+    "test": Appearance("none", "neutral"),
 }
 
 FALLBACK_APPEARANCE = Appearance(DEFAULT_PET, DEFAULT_THEME)
@@ -64,12 +65,23 @@ def pet_state_for_stack(state: ServiceState) -> PetState:
 
 
 def resolve_appearance(
-    profile_id: str,
+    profile: str | Profile,
     *,
     pet_id: str | None = None,
     theme_id: str | None = None,
     defaults: Mapping[str, Appearance] = DEFAULT_APPEARANCE_BY_PROFILE,
 ) -> Appearance:
-    """Pick a pet and theme for a profile; explicit overrides always win."""
-    base = defaults.get(profile_id, FALLBACK_APPEARANCE)
-    return Appearance(pet_id or base.pet_id, theme_id or base.theme_id)
+    """Resolve profile defaults plus explicit General configuration overrides."""
+    profile_id = profile.id if isinstance(profile, Profile) else profile
+    fallback = defaults.get(profile_id, FALLBACK_APPEARANCE)
+    if isinstance(profile, Profile):
+        base = Appearance(
+            profile.ui.default_pet or fallback.pet_id,
+            profile.ui.default_theme or fallback.theme_id,
+        )
+    else:
+        base = fallback
+    return Appearance(
+        base.pet_id if pet_id is None else pet_id,
+        base.theme_id if theme_id is None else theme_id,
+    )

@@ -1,6 +1,9 @@
 schema_version: 1
 id: test
 name: Test
+ui:
+  default_pet: none
+  default_theme: neutral
 description: Profile leve para smoke-test universal dentro do escopo Windows/NVIDIA.
 
 hardware:

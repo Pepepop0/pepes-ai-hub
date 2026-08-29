@@ -30,6 +30,22 @@ def test_capella_requires_more_vram():
     assert p["capella"].hardware.min_vram_mib > p["pepe"].hardware.min_vram_mib
 
 
+def test_profiles_declare_ui_defaults_separately_from_installed_config():
+    profiles = {profile.id: profile for profile in load_profiles(ROOT / "profiles")}
+    assert (
+        profiles["pepe"].ui.default_pet,
+        profiles["pepe"].ui.default_theme,
+    ) == ("claw", "pepe")
+    assert (
+        profiles["capella"].ui.default_pet,
+        profiles["capella"].ui.default_theme,
+    ) == ("hello-kitty", "capella")
+    assert (
+        profiles["test"].ui.default_pet,
+        profiles["test"].ui.default_theme,
+    ) == ("none", "neutral")
+
+
 def test_profile_vram_is_normalized_to_mib():
     profile = load_profile(ROOT / "profiles" / "pepe.yaml")
     assert profile.hardware.min_vram_mib == 12 * 1024

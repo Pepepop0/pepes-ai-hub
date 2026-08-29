@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-ENV_ASSETS_ROOT = "LOCAL_AI_STACK_ASSETS"
+ENV_ASSETS_ROOT = "PEPITOS_AI_HUB_ASSETS"
 
 
 def project_root() -> Path:
@@ -23,7 +23,7 @@ def project_root() -> Path:
 
 
 def assets_directory() -> Path:
-    """The asset root, overridable with ``LOCAL_AI_STACK_ASSETS``."""
+    """The asset root, overridable with ``PEPITOS_AI_HUB_ASSETS``."""
     override = os.environ.get(ENV_ASSETS_ROOT, "").strip()
     if override:
         return Path(override).expanduser()

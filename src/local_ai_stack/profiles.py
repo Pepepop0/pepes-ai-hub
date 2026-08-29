@@ -40,11 +40,18 @@ class WorkflowConfig:
 
 
 @dataclass(frozen=True)
+class ProfileUiDefaults:
+    default_pet: str | None = None
+    default_theme: str | None = None
+
+
+@dataclass(frozen=True)
 class Profile:
     schema_version: int
     id: str
     name: str
     description: str
+    ui: ProfileUiDefaults
     hardware: HardwareRequirement
     services: dict[str, ServiceConfig]
     features: dict[str, bool]
@@ -123,6 +130,7 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
             "id",
             "name",
             "description",
+            "ui",
             "hardware",
             "services",
             "features",
@@ -165,6 +173,24 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
             "id",
             "must use lowercase letters, digits, '_' or '-' and start with a letter",
         )
+
+    ui_data = _mapping(root.get("ui", {}), source, "ui")
+    _reject_unknown(ui_data, {"default_pet", "default_theme"}, source, "ui")
+
+    def optional_ui_id(field: str) -> str | None:
+        value = ui_data.get(field)
+        if value is None:
+            return None
+        identifier = _string(value, source, f"ui.{field}")
+        if not identifier[0].isalpha() or not all(
+            char.islower() or char.isdigit() or char in "_-" for char in identifier
+        ):
+            raise _error(
+                source,
+                f"ui.{field}",
+                "must use lowercase letters, digits, '_' or '-' and start with a letter",
+            )
+        return identifier
 
     hardware_data = _mapping(root["hardware"], source, "hardware")
     _reject_unknown(
@@ -277,6 +303,10 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
         id=profile_id,
         name=_string(root["name"], source, "name"),
         description=_string(root.get("description", ""), source, "description", allow_empty=True),
+        ui=ProfileUiDefaults(
+            default_pet=optional_ui_id("default_pet"),
+            default_theme=optional_ui_id("default_theme"),
+        ),
         hardware=HardwareRequirement(
             os=os_name,
             gpu_vendor=gpu_vendor,

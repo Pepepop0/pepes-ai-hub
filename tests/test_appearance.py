@@ -16,6 +16,7 @@ from local_ai_stack.appearance import (
     resolve_appearance,
 )
 from local_ai_stack.pets import PetAnimator, PetState, available_pets, load_pet_by_id
+from local_ai_stack.profiles import load_profile
 from local_ai_stack.services import ServiceState
 from local_ai_stack.themes import available_themes
 
@@ -53,9 +54,23 @@ def test_profile_defaults_are_declared():
     assert resolve_appearance("unknown-profile") == FALLBACK_APPEARANCE
 
 
+def test_profile_document_is_the_primary_source_of_appearance_defaults():
+    profile = load_profile(REPO / "profiles" / "pepe.yaml")
+    custom_fallbacks = {"pepe": Appearance("none", "neutral")}
+    assert resolve_appearance(profile, defaults=custom_fallbacks) == Appearance("claw", "pepe")
+
+
 def test_overrides_win_over_profile_defaults():
     assert resolve_appearance("pepe", theme_id="capella") == Appearance("claw", "capella")
     assert resolve_appearance("capella", pet_id="claw").pet_id == "claw"
+
+
+def test_none_overrides_preserve_profile_defaults_and_explicit_values_win():
+    profile = load_profile(REPO / "profiles" / "capella.yaml")
+    assert resolve_appearance(profile, pet_id=None, theme_id=None) == Appearance(
+        "hello-kitty", "capella"
+    )
+    assert resolve_appearance(profile, pet_id="claw", theme_id="pepe") == Appearance("claw", "pepe")
 
 
 def test_pepe_appearance_resolves_to_shipped_assets():

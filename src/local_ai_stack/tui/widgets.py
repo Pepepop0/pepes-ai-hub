@@ -13,9 +13,11 @@ from ..installation import (
     InstallLocationMode,
     resolve_installation,
 )
+from ..pets import PetAnimator, PetState
 from ..profiles import Profile
 from ..runtime import StackRuntime
 from ..system import SystemFacts
+from .appearance import TuiAppearance
 from .navigation import (
     DEFAULT_ITEM,
     SECTION_ITEMS,
@@ -328,7 +330,37 @@ class MainContent(ContentSwitcher):
 
 
 class PetSlot(Static):
-    """Minimal text surface that a future pet backend may update."""
+    """Textual-owned refresh loop over the backend's passive animator."""
+
+    REFRESH_INTERVAL = 0.25
+
+    def __init__(
+        self,
+        text: str = "",
+        *,
+        animator: PetAnimator | None = None,
+        id: str | None = None,
+    ) -> None:
+        super().__init__(text, markup=False, id=id)
+        self.animator = animator
+
+    def on_mount(self) -> None:
+        self.set_interval(self.REFRESH_INTERVAL, self.refresh_frame)
+
+    def refresh_frame(self, now: float | None = None) -> None:
+        if self.animator is not None:
+            self.update(self.animator.current_text(now))
+
+    def set_animator(self, animator: PetAnimator | None, fallback_text: str) -> None:
+        self.animator = animator
+        self.update(fallback_text if animator is None else animator.current_text())
+
+    def set_state(self, state: PetState, *, now: float | None = None) -> bool:
+        if self.animator is None:
+            return False
+        changed = self.animator.set_state(state, now=now)
+        self.refresh_frame(now)
+        return changed
 
     def set_pet_text(self, text: str) -> None:
         self.update(text)
@@ -341,6 +373,7 @@ class RightRail(Vertical):
         facts: SystemFacts,
         runtime: StackRuntime,
         ui: UiConfig,
+        appearance: TuiAppearance,
     ) -> None:
         classes = []
         if not ui.right_rail_visible:
@@ -351,6 +384,7 @@ class RightRail(Vertical):
         self.profile = profile
         self.facts = facts
         self.runtime_snapshot = runtime
+        self.appearance = appearance
 
     def compose(self) -> ComposeResult:
         gpu_text = "No NVIDIA GPU"
@@ -361,7 +395,13 @@ class RightRail(Vertical):
             yield Static("Profile", classes="rail-heading")
             yield Static(self.profile.name, id="rail-profile", classes="rail-value")
             yield Static("Pet area", classes="rail-heading")
-            yield PetSlot("Pet backend not connected", id="pet-slot")
+            yield PetSlot(
+                self.appearance.pet_text,
+                animator=self.appearance.animator,
+                id="pet-slot",
+            )
+            yield Static("Theme", classes="rail-heading")
+            yield Static(self.appearance.theme_text, id="rail-theme", classes="rail-value")
             yield Static("GPU / VRAM", classes="rail-heading")
             yield Static(gpu_text, id="rail-gpu")
             yield Static("Stack", classes="rail-heading")
@@ -378,9 +418,12 @@ class RightRail(Vertical):
             "Expand" if self.is_collapsed else "Collapse"
         )
 
-    def select_profile(self, profile: Profile) -> None:
+    def select_profile(self, profile: Profile, appearance: TuiAppearance) -> None:
         self.profile = profile
+        self.appearance = appearance
         self.query_one("#rail-profile", Static).update(profile.name)
+        self.query_one("#rail-theme", Static).update(appearance.theme_text)
+        self.query_one(PetSlot).set_animator(appearance.animator, appearance.pet_text)
 
     def set_pet_text(self, text: str) -> None:
         self.query_one(PetSlot).set_pet_text(text)

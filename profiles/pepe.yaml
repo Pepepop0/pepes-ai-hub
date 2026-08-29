@@ -1,6 +1,9 @@
 schema_version: 1
 id: pepe
 name: Pepe
+ui:
+  default_pet: claw
+  default_theme: pepe
 description: RTX 5070 12 GB — profile pessoal de referência.
 
 hardware:

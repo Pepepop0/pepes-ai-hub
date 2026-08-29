@@ -14,6 +14,7 @@ from .installation import InstallLocationMode
 from .profiles import Profile, load_profiles
 from .runtime import StackRuntime, stack_runtime
 from .system import SystemFacts, detect_system
+from .tui.appearance import TuiAppearance, resolve_tui_appearance, textual_theme
 from .tui.navigation import DEFAULT_ITEM, SIDEBAR_ROUTES, Section
 from .tui.presenters import render_profile_details
 from .tui.styles import APP_CSS
@@ -79,6 +80,7 @@ class LocalAIStackApp(App):
             self.installed_config = replace(
                 self.installed_config, profile_id=self.selected_profile.id
             )
+        self.current_appearance = self._resolve_appearance(self.selected_profile)
         self.active_section = Section.DASHBOARD
 
     def compose(self) -> ComposeResult:
@@ -98,8 +100,12 @@ class LocalAIStackApp(App):
                 self.facts,
                 self.runtime_snapshot,
                 self.installed_config.general.ui,
+                self.current_appearance,
             )
         yield FooterBar()
+
+    def on_mount(self) -> None:
+        self._activate_theme(self.current_appearance)
 
     def show_section(self, section: Section) -> None:
         self.active_section = section
@@ -121,9 +127,26 @@ class LocalAIStackApp(App):
             return
         self.selected_profile = profile
         self.installed_config = replace(self.installed_config, profile_id=profile.id)
+        self.current_appearance = self._resolve_appearance(profile)
         self.query_one(MainContent).select_profile(profile)
         self.query_one(MainContent).update_config(self.installed_config)
-        self.query_one(RightRail).select_profile(profile)
+        self.query_one(RightRail).select_profile(profile, self.current_appearance)
+        self._activate_theme(self.current_appearance)
+
+    def _resolve_appearance(self, profile: Profile) -> TuiAppearance:
+        return resolve_tui_appearance(
+            profile,
+            self.installed_config.general.ui,
+            self.runtime_snapshot,
+        )
+
+    def _activate_theme(self, appearance: TuiAppearance) -> None:
+        if appearance.theme is None:
+            self.theme = "textual-dark"
+            return
+        theme = textual_theme(appearance.theme)
+        self.register_theme(theme)
+        self.theme = theme.name
 
     def select_installation_mode(self, mode: InstallLocationMode) -> None:
         panel = self.query_one(InstallationLocationPanel)

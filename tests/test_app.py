@@ -8,6 +8,7 @@ from local_ai_stack.app import LocalAIStackApp, render_profile_details
 from local_ai_stack.config import GeneralConfig, InstalledConfig, UiConfig
 from local_ai_stack.installation import InstallLocation, InstallLocationMode
 from local_ai_stack.layout import ENV_ROOT
+from local_ai_stack.pets import PetState
 from local_ai_stack.processes import (
     DEFAULT_PROCESS_SPECS,
     RuntimeProcessState,
@@ -215,7 +216,10 @@ def test_ui_does_not_expose_real_user_name_and_pet_slot_is_text_only():
                 unicodedata.category(character) == "So" for character in f"{text} {labels}"
             )
             pet = app.query_one(PetSlot)
-            assert "backend not connected" in str(pet.content)
+            assert pet.animator is not None
+            assert pet.animator.pet.id == "claw"
+            assert pet.animator.state is PetState.SLEEPING
+            assert "(\\/)" in str(pet.content)
             pet.set_pet_text("Pet backend ready")
             assert str(pet.content) == "Pet backend ready"
 
@@ -326,5 +330,70 @@ def test_ui_config_controls_rail_and_settings_views():
             assert "Pet: custom-pet" in interface
             assert "Right rail visible: no" in interface
             assert "Right rail expanded: no" in interface
+
+    asyncio.run(exercise())
+
+
+def test_capella_missing_pet_is_text_only_and_does_not_reuse_claw():
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test() as pilot:
+            await pilot.press("2")
+            await pilot.click("#profile-capella")
+            await pilot.pause()
+            pet = app.query_one(PetSlot)
+            assert pet.animator is None
+            assert str(pet.content) == "Pet unavailable: hello-kitty"
+            assert "(\\/)" not in str(pet.content)
+            assert str(app.query_one("#rail-theme", Static).content) == "Capella"
+            assert app.theme == "pepitos-capella"
+
+    asyncio.run(exercise())
+
+
+def test_general_appearance_override_wins_in_tui():
+    config = InstalledConfig(
+        profile_id="capella",
+        general=GeneralConfig(ui=UiConfig(pet="claw", theme="pepe")),
+    )
+
+    async def exercise() -> None:
+        app = make_app(installed_config=config)
+        async with app.run_test():
+            pet = app.query_one(PetSlot)
+            assert pet.animator is not None
+            assert pet.animator.pet.id == "claw"
+            assert app.current_appearance.resolved.pet_id == "claw"
+            assert app.current_appearance.resolved.theme_id == "pepe"
+            assert app.theme == "pepitos-pepe"
+
+    asyncio.run(exercise())
+
+
+def test_pet_animation_and_state_survive_rail_collapse():
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test() as pilot:
+            pet = app.query_one(PetSlot)
+            rail = app.query_one(RightRail)
+            animator = pet.animator
+            assert animator is not None
+            started_at = animator.started_at
+
+            pet.refresh_frame(started_at)
+            first = str(pet.content)
+            assert pet.set_state(PetState.SLEEPING, now=started_at + 0.5) is False
+            assert animator.started_at == started_at
+            pet.refresh_frame(started_at + 1.5)
+            assert str(pet.content) != first
+
+            await pilot.click("#right-rail-toggle")
+            await pilot.pause()
+            assert rail.is_collapsed
+            assert pet.animator is animator
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            assert not rail.is_collapsed
+            assert pet.animator is animator
 
     asyncio.run(exercise())

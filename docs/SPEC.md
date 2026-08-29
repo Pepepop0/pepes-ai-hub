@@ -18,7 +18,7 @@
 ## Layout alvo
 
 ```text
-%LOCALAPPDATA%\LocalAIStack\
+%LOCALAPPDATA%\PepitosAIHub\
   apps\
   models\
   data\

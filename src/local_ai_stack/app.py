@@ -1,139 +1,115 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
-from rich.markup import escape
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Footer, Header, Label, ListItem, ListView, Static
+from textual.binding import Binding
+from textual.containers import Horizontal
+from textual.widgets import Button
 
-from .compatibility import evaluate_compatibility
-from .planning import build_install_plan
-from .profiles import MIB_PER_GIB, Profile, load_profiles
+from .profiles import Profile, load_profiles
+from .runtime import StackRuntime, stack_runtime
 from .system import SystemFacts, detect_system
+from .tui.navigation import DEFAULT_ITEM, SIDEBAR_ROUTES, Section
+from .tui.presenters import render_profile_details
+from .tui.styles import APP_CSS
+from .tui.widgets import ContextSidebar, FooterBar, MainContent, RightRail, TopNavigation
+
+__all__ = ["LocalAIStackApp", "render_profile_details", "run_tui"]
 
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def render_profile_details(profile: Profile, facts: SystemFacts) -> str:
-    report = evaluate_compatibility(facts, profile)
-    plan = build_install_plan(profile)
-    requirement = profile.hardware
-
-    status = (
-        "[bold green]COMPATIBLE[/bold green]"
-        if report.compatible
-        else "[bold red]INCOMPATIBLE[/bold red]"
-    )
-    lines = [
-        f"[b]{escape(profile.name)}[/b]",
-        "",
-        escape(profile.description),
-        "",
-        "[b]Requirements[/b]",
-        f"OS: {escape(requirement.os)}",
-        f"GPU vendor: {escape(requirement.gpu_vendor)}",
-        f"Minimum VRAM: {requirement.min_vram_mib} MiB",
-        f"Recommended VRAM: {requirement.recommended_vram_mib} MiB",
-        f"VRAM reporting tolerance: {requirement.vram_tolerance_mib} MiB",
-        "",
-        f"[b]Compatibility[/b]  {status}",
-    ]
-    if report.selected_gpu is not None:
-        lines.append(
-            f"GPU used: {escape(report.selected_gpu.name)} — "
-            f"{report.selected_gpu.vram_total_mib} MiB "
-            f"({report.selected_gpu.vram_total_mib / MIB_PER_GIB:.1f} GiB displayed)"
-        )
-    for blocker in report.blockers:
-        lines.append(f"[red]BLOCKER · {escape(blocker.message)}[/red]")
-    for warning in report.warnings:
-        lines.append(f"[yellow]WARNING · {escape(warning.message)}[/yellow]")
-    if not report.blockers and not report.warnings:
-        lines.append("No compatibility issues detected.")
-
-    lines.extend(
-        [
-            "",
-            "[b]Install plan · DRY-RUN[/b]",
-            "[dim]Preview only. No commands or changes will be executed.[/dim]",
-        ]
-    )
-    lines.extend(
-        f"{step.sequence:02}. [cyan]{step.action.value}[/cyan] · "
-        f"{escape(step.target)} — {escape(step.summary)}"
-        for step in plan.steps
-    )
-    return "\n".join(lines)
-
-
 class LocalAIStackApp(App):
-    TITLE = "Local AI Stack Manager"
-    SUB_TITLE = "Windows / NVIDIA"
-    CSS = """
-    #sidebar { width: 34; border: round $primary; padding: 1; }
-    #details { border: round $secondary; padding: 1 2; }
-    ListView { height: 1fr; }
-    """
+    TITLE = "Pepito's AI Hub"
+    SUB_TITLE = "Local AI Stack Manager"
+    CSS = APP_CSS
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("1", "show_section('dashboard')", "Dashboard"),
+        Binding("2", "show_section('installation')", "Instalação"),
+        Binding("3", "show_section('settings')", "Configurações"),
+        Binding("ctrl+r", "toggle_rail", "Right rail"),
+        Binding("q", "quit", "Quit"),
+    ]
 
     def __init__(
         self,
         *,
         facts: SystemFacts | None = None,
-        profiles: list[Profile] | None = None,
+        profiles: list[Profile] | tuple[Profile, ...] | None = None,
+        runtime_snapshot: StackRuntime | None = None,
     ) -> None:
         super().__init__()
-        self.profiles = profiles
+        self.profiles = tuple(
+            profiles if profiles is not None else load_profiles(project_root() / "profiles")
+        )
+        if not self.profiles:
+            raise ValueError("at least one profile is required")
         self.facts = facts if facts is not None else detect_system()
+        self.runtime_snapshot = (
+            runtime_snapshot if runtime_snapshot is not None else stack_runtime()
+        )
+        self.selected_profile = next(
+            (profile for profile in self.profiles if profile.id == "pepe"),
+            self.profiles[0],
+        )
+        self.active_section = Section.DASHBOARD
 
     def compose(self) -> ComposeResult:
-        if self.profiles is None:
-            self.profiles = load_profiles(project_root() / "profiles")
-        yield Header()
-        with Horizontal():
-            with VerticalScroll(id="sidebar"):
-                yield Label("Profiles")
-                yield ListView(
-                    *[
-                        ListItem(
-                            Label(f"{escape(profile.name)}\n{escape(profile.description)}"),
-                            id=f"profile-{profile.id}",
-                        )
-                        for profile in self.profiles
-                    ]
-                )
-            yield Static(self._system_summary(), id="details")
-        yield Footer()
-
-    def _system_summary(self) -> str:
-        gpu = (
-            "\n".join(
-                f"- {escape(item.name)}: {item.vram_total_mib} MiB "
-                f"({item.vram_total_mib / MIB_PER_GIB:.1f} GiB displayed)"
-                for item in self.facts.gpus
+        yield TopNavigation(self.active_section)
+        with Horizontal(id="workspace"):
+            yield ContextSidebar(self.active_section)
+            yield MainContent(
+                self.facts,
+                self.runtime_snapshot,
+                self.profiles,
+                self.selected_profile,
             )
-            if self.facts.gpus
-            else "- no NVIDIA GPU detected"
-        )
-        return (
-            "[b]Detected system[/b]\n\n"
-            f"OS: {escape(self.facts.os_name)} {escape(self.facts.os_release)}\n"
-            f"Python: {escape(self.facts.python_version)}\n"
-            f"Git: {'OK' if self.facts.git_available else 'missing'}\n"
-            f"nvidia-smi: {'OK' if self.facts.nvidia_smi_available else 'missing'}\n\n"
-            f"[b]GPU[/b]\n{gpu}\n\nSelect a profile to preview compatibility and its "
-            "dry-run install plan."
-        )
+            yield RightRail(self.selected_profile, self.facts, self.runtime_snapshot)
+        yield FooterBar()
 
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        index = event.list_view.index
-        if self.profiles is None or index is None or index >= len(self.profiles):
-            return
-        self.query_one("#details", Static).update(
-            render_profile_details(self.profiles[index], self.facts)
+    def show_section(self, section: Section) -> None:
+        self.active_section = section
+        self.query_one(TopNavigation).set_active(section)
+        self.query_one(ContextSidebar).set_section(section)
+        self.query_one(MainContent).show_route(section, DEFAULT_ITEM[section])
+
+    def show_route(self, section: Section, item_id: str) -> None:
+        if section is not self.active_section:
+            self.show_section(section)
+        self.query_one(ContextSidebar).set_active_item(item_id)
+        self.query_one(MainContent).show_route(section, item_id)
+
+    def select_profile(self, profile_id: str) -> None:
+        profile = next(
+            (candidate for candidate in self.profiles if candidate.id == profile_id), None
         )
+        if profile is None:
+            return
+        self.selected_profile = profile
+        self.query_one(MainContent).select_profile(profile)
+        self.query_one(RightRail).select_profile(profile)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id.startswith("nav-"):
+            self.show_section(Section(button_id.removeprefix("nav-")))
+        elif button_id in SIDEBAR_ROUTES:
+            self.show_route(*SIDEBAR_ROUTES[button_id])
+        elif button_id.startswith("profile-"):
+            self.select_profile(button_id.removeprefix("profile-"))
+        elif button_id == "right-rail-toggle":
+            self.query_one(RightRail).toggle_collapsed()
+        event.stop()
+
+    def action_show_section(self, section: str) -> None:
+        self.show_section(Section(section))
+
+    def action_toggle_rail(self) -> None:
+        self.query_one(RightRail).toggle_collapsed()
 
 
 def run_tui() -> None:

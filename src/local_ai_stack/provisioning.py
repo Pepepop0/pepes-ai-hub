@@ -198,14 +198,20 @@ class RuntimeHandoff:
 
     ``executable`` is set only for AVAILABLE, which in turn happens only for a
     MANAGED install we can prove is ours. Every other availability carries no
-    path at all, so the runtime layer has nothing to launch and cannot invent
-    one. ``detail`` always says why, in words a UI can show unchanged.
+    executable, so the runtime layer has nothing to launch and cannot invent
+    one. ``detected_path`` is separate and merely observational: it is where
+    the component was found, including when it belongs to somebody else.
+
+    ``detail`` says why, in words a UI can show unchanged, and deliberately
+    contains no filesystem path: a path may hold the user's account name, and
+    rendering one is the presentation layer's job, not this layer's.
     """
 
     component_id: str
     availability: LaunchAvailability
     ownership: Ownership = Ownership.NONE
     executable: Path | None = None
+    detected_path: Path | None = None
     version: str | None = None
     detail: str = ""
 
@@ -300,11 +306,12 @@ class Provisioner:
                 component_id=self.component_id,
                 availability=LaunchAvailability.EXTERNAL,
                 ownership=Ownership.EXTERNAL,
+                detected_path=detection.path,
                 version=detection.version,
                 detail=(
-                    f"{name} is installed outside this hub"
-                    f"{f' at {detection.path}' if detection.path else ''}. "
-                    "It is observed only: this manager never starts, stops or replaces it."
+                    f"{name} is installed outside this hub. "
+                    "It is observed only: this manager never starts, stops, replaces "
+                    "or uninstalls it."
                 ),
             )
         if detection.state is ComponentState.NOT_INSTALLED:
@@ -320,6 +327,7 @@ class Provisioner:
                 component_id=self.component_id,
                 availability=LaunchAvailability.UNAVAILABLE,
                 ownership=detection.ownership,
+                detected_path=detection.path,
                 detail=detection.detail or f"{name} is present but not usable.",
             )
         if executable is None or not executable.is_file():
@@ -327,16 +335,15 @@ class Provisioner:
                 component_id=self.component_id,
                 availability=LaunchAvailability.UNAVAILABLE,
                 ownership=Ownership.MANAGED,
-                detail=(
-                    f"{name} is registered as managed but its executable is missing"
-                    f"{f' at {executable}' if executable else ''}."
-                ),
+                detected_path=executable,
+                detail=f"{name} is registered as managed but its executable is missing.",
             )
         return RuntimeHandoff(
             component_id=self.component_id,
             availability=LaunchAvailability.AVAILABLE,
             ownership=Ownership.MANAGED,
             executable=executable,
+            detected_path=executable,
             version=detection.version,
             detail=f"{name} is managed by this hub and can be started.",
         )

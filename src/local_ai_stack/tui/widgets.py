@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from textual.app import ComposeResult
@@ -7,13 +8,17 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, ContentSwitcher, Input, Label, Select, Static
 
 from ..config import InstalledConfig, UiConfig
+from ..execution import ExecutionReport, PlanExecutor
 from ..installation import (
     InstallLocation,
     InstallLocationError,
     InstallLocationMode,
+    ResolvedInstallation,
     resolve_installation,
 )
+from ..integration import IntegrationSnapshot
 from ..pets import PetAnimator, PetState
+from ..planning import build_install_plan
 from ..profiles import Profile
 from ..runtime import StackRuntime
 from ..system import SystemFacts
@@ -27,15 +32,19 @@ from .navigation import (
     sidebar_button_id,
 )
 from .presenters import (
+    display_path,
     placeholder,
     render_dashboard,
     render_general_settings,
     render_install_plan,
     render_install_stack,
     render_interface_settings,
+    render_plan_execution,
     render_profile_details,
     render_service,
 )
+
+PlanExecutorFactory = Callable[[ResolvedInstallation], PlanExecutor]
 
 
 class InstallationLocationPanel(VerticalScroll):
@@ -116,16 +125,98 @@ class InstallationLocationPanel(VerticalScroll):
         self.location = location
         self.query_one("#installation-location-error", Static).update("")
         self.query_one("#installation-location-preview", Static).update(
-            f"Resolved root\n[b]{self._display_path(resolved.root)}[/b]"
+            f"Resolved root\n[b]{display_path(resolved.root)}[/b]"
         )
 
-    @staticmethod
-    def _display_path(path: Path) -> str:
+
+class InstallPlanPanel(VerticalScroll):
+    """The plan, which steps this build can execute, and a dry-run preview.
+
+    Resolving a plan is pure: it maps steps to provisioners and reads nothing
+    from disk, so it is safe to do while the view is being built. Executing the
+    dry-run is not automatic - it happens only when asked - and even then no
+    directory is created, no archive is downloaded and no provisioner mutates
+    anything, because every step receives dry_run=True.
+
+    There is deliberately no control that performs a real install: no
+    production Ollama artifact is pinned yet, and a real apply must never
+    guess a URL.
+    """
+
+    def __init__(
+        self,
+        profile: Profile,
+        config: InstalledConfig,
+        repo_root: Path,
+        executor_factory: PlanExecutorFactory | None = None,
+    ) -> None:
+        super().__init__(id=route_id(Section.INSTALLATION, "plan"), classes="route-view")
+        self.profile = profile
+        self.config = config
+        self.repo_root = repo_root
+        self.executor_factory = executor_factory
+        self.report: ExecutionReport | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._plan_text(), id="install-plan-steps")
+        yield Button("Preview dry-run", id="plan-dry-run", variant="primary")
+        yield Static(render_plan_execution(None), id="install-plan-dry-run")
+        yield Static(
+            "[dim]Real provisioning is unavailable: no pinned Ollama artifact "
+            "with a checksum is configured yet, and this hub never guesses a "
+            "download URL.[/dim]",
+            id="install-plan-note",
+        )
+
+    # --- estado ------------------------------------------------------------
+
+    def _installation(self) -> ResolvedInstallation | None:
         try:
-            relative = path.relative_to(Path.home())
-        except ValueError:
-            return str(path)
-        return str(Path("%USERPROFILE%") / relative)
+            return resolve_installation(self.config.installation, repo_root=self.repo_root)
+        except InstallLocationError:
+            return None
+
+    def _plan_text(self) -> str:
+        installation = self._installation()
+        plan = build_install_plan(self.profile, installation=installation)
+        executor = self._executor(installation)
+        resolution = None if executor is None else executor.resolve(plan)
+        return render_install_plan(plan, resolution)
+
+    def _executor(self, installation: ResolvedInstallation | None) -> PlanExecutor | None:
+        if installation is None or self.executor_factory is None:
+            return None
+        return self.executor_factory(installation)
+
+    def refresh_plan(
+        self, profile: Profile | None = None, config: InstalledConfig | None = None
+    ) -> None:
+        if profile is not None:
+            self.profile = profile
+        if config is not None:
+            self.config = config
+        # A different profile or root describes different work, so the previous
+        # preview no longer belongs to what is on screen.
+        self.report = None
+        self.query_one("#install-plan-steps", Static).update(self._plan_text())
+        self.query_one("#install-plan-dry-run", Static).update(render_plan_execution(None))
+
+    def run_dry_run(self) -> ExecutionReport | None:
+        """Execute the plan with dry_run=True. Creates nothing, downloads nothing."""
+        installation = self._installation()
+        executor = self._executor(installation)
+        if executor is None or installation is None:
+            self.query_one("#install-plan-dry-run", Static).update(
+                placeholder(
+                    "Dry-run preview",
+                    "The install location could not be resolved, so there is no plan to preview.",
+                )
+            )
+            return None
+        plan = build_install_plan(self.profile, installation=installation)
+        self.report = executor.execute(plan, dry_run=True)
+        self.query_one("#install-plan-dry-run", Static).update(render_plan_execution(self.report))
+        return self.report
 
 
 class TopNavigation(Horizontal):
@@ -233,6 +324,8 @@ class MainContent(ContentSwitcher):
         selected: Profile,
         config: InstalledConfig,
         repo_root: Path,
+        integration: IntegrationSnapshot | None = None,
+        executor_factory: PlanExecutorFactory | None = None,
     ) -> None:
         super().__init__(
             id="main-content",
@@ -244,6 +337,8 @@ class MainContent(ContentSwitcher):
         self.selected_profile = selected
         self.config = config
         self.repo_root = repo_root
+        self.integration = integration or IntegrationSnapshot()
+        self.executor_factory = executor_factory
 
     def compose(self) -> ComposeResult:
         yield Static(
@@ -265,7 +360,11 @@ class MainContent(ContentSwitcher):
             ("comfyui", "ComfyUI", "comfyui"),
         ):
             yield Static(
-                render_service(self.runtime_snapshot.by_id(service_id), title),
+                render_service(
+                    self.runtime_snapshot.by_id(service_id),
+                    title,
+                    self.integration.by_service(service_id),
+                ),
                 id=route_id(Section.DASHBOARD, item_id),
                 classes="route-view",
             )
@@ -277,10 +376,11 @@ class MainContent(ContentSwitcher):
             classes="route-view",
         )
         yield InstallationLocationPanel(self.config.installation, self.repo_root)
-        yield Static(
-            render_install_plan(self.selected_profile),
-            id=route_id(Section.INSTALLATION, "plan"),
-            classes="route-view",
+        yield InstallPlanPanel(
+            self.selected_profile,
+            self.config,
+            self.repo_root,
+            self.executor_factory,
         )
 
         yield Static(
@@ -312,9 +412,7 @@ class MainContent(ContentSwitcher):
         self.query_one(f"#{route_id(Section.INSTALLATION, 'stack')}", Static).update(
             render_install_stack(profile)
         )
-        self.query_one(f"#{route_id(Section.INSTALLATION, 'plan')}", Static).update(
-            render_install_plan(profile)
-        )
+        self.query_one(InstallPlanPanel).refresh_plan(profile=profile)
         self.query_one(f"#{route_id(Section.DASHBOARD, 'status')}", Static).update(
             render_dashboard(self.facts, self.runtime_snapshot, profile)
         )
@@ -327,6 +425,12 @@ class MainContent(ContentSwitcher):
         self.query_one(f"#{route_id(Section.SETTINGS, 'interface')}", Static).update(
             render_interface_settings(config)
         )
+        # The plan states where the work would land, so a new install location
+        # is a new plan.
+        self.query_one(InstallPlanPanel).refresh_plan(config=config)
+
+    def run_plan_dry_run(self) -> ExecutionReport | None:
+        return self.query_one(InstallPlanPanel).run_dry_run()
 
 
 class PetSlot(Static):

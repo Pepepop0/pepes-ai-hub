@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar
@@ -10,7 +11,9 @@ from textual.containers import Horizontal
 from textual.widgets import Button, Input, Select
 
 from .config import InstalledConfig
-from .installation import InstallLocationMode
+from .execution import PlanExecutor
+from .installation import InstallLocationMode, ResolvedInstallation, resolve_installation
+from .integration import IntegrationSnapshot, detect_integration, plan_executor, provision_context
 from .profiles import Profile, load_profiles
 from .runtime import StackRuntime, stack_runtime
 from .system import SystemFacts, detect_system
@@ -34,6 +37,11 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def default_executor_factory(installation: ResolvedInstallation) -> PlanExecutor:
+    """The real executor, bound to a resolved install root. Runs nothing by itself."""
+    return plan_executor(provision_context(installation))
+
+
 class LocalAIStackApp(App):
     TITLE = "Pepito's AI Hub"
     SUB_TITLE = "Local AI Stack Manager"
@@ -53,6 +61,8 @@ class LocalAIStackApp(App):
         profiles: list[Profile] | tuple[Profile, ...] | None = None,
         runtime_snapshot: StackRuntime | None = None,
         installed_config: InstalledConfig | None = None,
+        integration: IntegrationSnapshot | None = None,
+        executor_factory: Callable[[ResolvedInstallation], PlanExecutor] | None = None,
     ) -> None:
         super().__init__()
         self.profiles = tuple(
@@ -82,6 +92,16 @@ class LocalAIStackApp(App):
             )
         self.current_appearance = self._resolve_appearance(self.selected_profile)
         self.active_section = Section.DASHBOARD
+        self.executor_factory = executor_factory or default_executor_factory
+        # Read-only: it detects what is installed and who owns it. Detection
+        # creates no directory and starts nothing.
+        self.integration = integration if integration is not None else self._detect_integration()
+
+    def _resolved_installation(self) -> ResolvedInstallation:
+        return resolve_installation(self.installed_config.installation, repo_root=project_root())
+
+    def _detect_integration(self) -> IntegrationSnapshot:
+        return detect_integration(provision_context(self._resolved_installation()))
 
     def compose(self) -> ComposeResult:
         yield TopNavigation(self.active_section)
@@ -94,6 +114,8 @@ class LocalAIStackApp(App):
                 self.selected_profile,
                 self.installed_config,
                 project_root(),
+                self.integration,
+                self.executor_factory,
             )
             yield RightRail(
                 self.selected_profile,
@@ -173,6 +195,10 @@ class LocalAIStackApp(App):
             self.select_profile(button_id.removeprefix("profile-"))
         elif button_id == "right-rail-toggle":
             self.query_one(RightRail).toggle_collapsed()
+        elif button_id == "plan-dry-run":
+            # Preview only: every step runs with dry_run=True, so nothing is
+            # created, downloaded or installed.
+            self.query_one(MainContent).run_plan_dry_run()
         event.stop()
 
     def on_select_changed(self, event: Select.Changed) -> None:

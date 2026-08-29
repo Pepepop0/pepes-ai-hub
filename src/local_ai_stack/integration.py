@@ -126,7 +126,17 @@ class ComponentIntegration:
 
     @property
     def executable(self) -> Path | None:
+        """The path we may launch. None whenever the install is not ours."""
         return self.handoff.executable
+
+    @property
+    def detected_path(self) -> Path | None:
+        """Where the component was found, ours or not. Observational only."""
+        return self.handoff.detected_path
+
+    @property
+    def version(self) -> str | None:
+        return self.handoff.version
 
     @property
     def reason(self) -> str:

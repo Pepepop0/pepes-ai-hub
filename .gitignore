@@ -16,3 +16,6 @@ Thumbs.db
 
 # Portable install: the stack tree lives inside the workspace and is never versioned.
 /stack/
+
+# Editor/agent tooling: local permission and session state, never the product.
+.claude/

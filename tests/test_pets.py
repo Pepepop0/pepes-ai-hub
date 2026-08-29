@@ -321,8 +321,8 @@ def test_validate_pet_data_rejects_a_non_mapping(tmp_path):
 # --- shipped Claw asset ----------------------------------------------------
 
 
-def test_claw_is_the_only_shipped_pet():
-    assert available_pets(ASSETS) == ("claw",)
+def test_shipped_pets_are_claw_and_hello_kitty():
+    assert available_pets(ASSETS) == ("claw", "hello-kitty")
 
 
 def test_claw_loads_with_every_state_this_milestone_promised():

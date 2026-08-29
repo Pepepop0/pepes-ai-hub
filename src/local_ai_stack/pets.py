@@ -42,6 +42,12 @@ from typing import Any
 import yaml
 
 from .assets import default_pets_directory
+from .behavior import (
+    BEHAVIOR_MANIFEST,
+    BehaviorDocument,
+    BehaviorError,
+    load_behavior_document,
+)
 
 PET_SCHEMA_VERSION = 1
 PET_MANIFEST = "pet.yaml"
@@ -214,6 +220,28 @@ class PetAnimation:
 
 
 @dataclass(frozen=True)
+class PetBehaviorAsset:
+    """An optional ``behavior.yaml`` plus the frames it composes with.
+
+    Purely declarative: the pet asset says it wants micro-animations and which
+    drawings they use. Deciding what to do with that belongs to
+    :mod:`local_ai_stack.renderer`, so no consumer needs to special-case a pet
+    id anywhere.
+    """
+
+    document: BehaviorDocument
+    frames: Mapping[str, PetFrame]
+
+    @property
+    def width(self) -> int:
+        return max((frame.width for frame in self.frames.values()), default=0)
+
+    @property
+    def height(self) -> int:
+        return max((frame.height for frame in self.frames.values()), default=0)
+
+
+@dataclass(frozen=True)
 class PetDefinition:
     """Everything the rail needs to draw one pet."""
 
@@ -223,6 +251,7 @@ class PetDefinition:
     description: str
     animations: Mapping[PetState, PetAnimation]
     source: Path | None = None
+    behavior: PetBehaviorAsset | None = None
 
     @property
     def states(self) -> tuple[PetState, ...]:
@@ -438,10 +467,19 @@ def validate_pet_data(
             source=source,
         )
 
+    behavior = _load_behavior_asset(directory)
+    declared_directories = {state.value for state in animations}
+    if behavior is not None:
+        declared_directories |= {
+            Path(relative).parts[0]
+            for relative in behavior.document.render.frames.values()
+            if len(Path(relative).parts) > 1
+        }
+
     undeclared = sorted(
         entry.name
         for entry in directory.iterdir()
-        if entry.is_dir() and entry.name not in {s.value for s in animations}
+        if entry.is_dir() and entry.name not in declared_directories
     )
     if undeclared:
         raise _error(
@@ -461,7 +499,39 @@ def validate_pet_data(
         str(root.get("description", "")).strip(),
         animations,
         directory,
+        behavior,
     )
+
+
+def _load_behavior_asset(directory: Path) -> PetBehaviorAsset | None:
+    """Load ``behavior.yaml`` and its frames, if the asset declares one.
+
+    The frames go through the same terminal-safety validation as animation
+    frames, and must share one canvas size so a redraw can never resize the
+    rail.
+    """
+    manifest = directory / BEHAVIOR_MANIFEST
+    if not manifest.is_file():
+        return None
+    try:
+        document = load_behavior_document(manifest)
+    except BehaviorError as exc:
+        # load_pet() promises PetError, so callers keep one thing to catch and
+        # a broken behavior file degrades like any other broken asset.
+        raise _error(manifest, "", str(exc)) from exc
+    if document.id != directory.name:
+        raise _error(manifest, "id", f"must match the directory name {directory.name!r}")
+    frames: dict[str, PetFrame] = {}
+    for name, relative in document.render.frames.items():
+        path = directory / relative
+        if not path.is_file():
+            raise _error(manifest, f"render.{name}_frame", f"frame not found: {relative}")
+        frames[name] = PetFrame.from_text(path.read_text(encoding="utf-8"), path)
+    sizes = {(frame.height, frame.width) for frame in frames.values()}
+    if len(sizes) > 1:
+        rendered = ", ".join(f"{width}x{height}" for height, width in sorted(sizes))
+        raise _error(manifest, "render", f"frames must share one size, found {rendered}")
+    return PetBehaviorAsset(document, frames)
 
 
 def load_pet(directory: Path) -> PetDefinition:

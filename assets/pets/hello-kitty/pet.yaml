@@ -1,0 +1,9 @@
+schema_version: 1
+id: hello-kitty
+name: Hello Kitty
+description: Capella terminal pet. Base asset supplied by the user; micro-behavior is composed at runtime.
+
+animations:
+  idle:
+    fps: 1
+    loop: true

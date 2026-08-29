@@ -13,3 +13,6 @@ logs/
 runtime/
 downloads/
 Thumbs.db
+
+# Portable install: the stack tree lives inside the workspace and is never versioned.
+/stack/

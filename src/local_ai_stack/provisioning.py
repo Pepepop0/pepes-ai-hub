@@ -18,6 +18,15 @@ structured facts back. It never prompts, never renders and never assumes a
 terminal is attached; progress is emitted as events a caller may consume.
 
 Detection is read-only. Directories are created by apply(), never by detect().
+
+Handing over to the runtime
+---------------------------
+`runtime_handoff()` is the whole surface the runtime layer is allowed to see.
+It answers one question — may this component be launched by us, and with which
+executable — and nothing about archives, markers, downloads or extraction. A
+MANAGED install is the only one that ever yields an executable; an EXTERNAL
+install reports itself as EXTERNAL with no executable, so a caller physically
+cannot use this contract to take ownership of someone else's binary.
 """
 
 from __future__ import annotations
@@ -174,6 +183,50 @@ class ProvisionResult:
         return self.outcome is ProvisionOutcome.INSTALLED
 
 
+class LaunchAvailability(StrEnum):
+    """May the runtime layer start this component, and if not, why not?"""
+
+    AVAILABLE = "available"
+    EXTERNAL = "external"
+    NOT_INSTALLED = "not-installed"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class RuntimeHandoff:
+    """What provisioning tells runtime about one component.
+
+    ``executable`` is set only for AVAILABLE, which in turn happens only for a
+    MANAGED install we can prove is ours. Every other availability carries no
+    path at all, so the runtime layer has nothing to launch and cannot invent
+    one. ``detail`` always says why, in words a UI can show unchanged.
+    """
+
+    component_id: str
+    availability: LaunchAvailability
+    ownership: Ownership = Ownership.NONE
+    executable: Path | None = None
+    version: str | None = None
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if self.availability is LaunchAvailability.AVAILABLE and self.executable is None:
+            raise ValueError("an available handoff must carry the managed executable")
+        if self.availability is not LaunchAvailability.AVAILABLE and self.executable is not None:
+            raise ValueError(
+                f"{self.availability} handoff must not carry an executable; "
+                "only a managed install may be launched by this manager"
+            )
+
+    @property
+    def launchable(self) -> bool:
+        return self.availability is LaunchAvailability.AVAILABLE
+
+    @property
+    def is_external(self) -> bool:
+        return self.ownership is Ownership.EXTERNAL
+
+
 @dataclass
 class ProvisionContext:
     """Everything a provisioner is allowed to touch, passed in explicitly."""
@@ -222,6 +275,71 @@ class Provisioner:
     def verify(self, context: ProvisionContext) -> Detection:
         """Re-detect and confirm usability. Read-only by contract."""
         return self.detect(context)
+
+    def managed_executable(self, context: ProvisionContext) -> Path | None:
+        """The executable of *our* install, if this component has one.
+
+        Subclasses that install a program override this. Returning a path is
+        not a claim that it exists: `runtime_handoff` decides that against the
+        detection, which is the only place ownership is established.
+        """
+        return None
+
+    def runtime_handoff(self, context: ProvisionContext) -> RuntimeHandoff:
+        """Translate the current detection into what the runtime may do.
+
+        The mapping is deliberately narrow. Only a MANAGED install that is
+        actually usable becomes AVAILABLE, and only then is an executable
+        handed over. EXTERNAL is reported as EXTERNAL so a caller can show it
+        and refuse to control it; nothing else can ever yield a path.
+        """
+        detection = self.detect(context)
+        name = self.display_name or self.component_id
+        if detection.is_external:
+            return RuntimeHandoff(
+                component_id=self.component_id,
+                availability=LaunchAvailability.EXTERNAL,
+                ownership=Ownership.EXTERNAL,
+                version=detection.version,
+                detail=(
+                    f"{name} is installed outside this hub"
+                    f"{f' at {detection.path}' if detection.path else ''}. "
+                    "It is observed only: this manager never starts, stops or replaces it."
+                ),
+            )
+        if detection.state is ComponentState.NOT_INSTALLED:
+            return RuntimeHandoff(
+                component_id=self.component_id,
+                availability=LaunchAvailability.NOT_INSTALLED,
+                ownership=Ownership.NONE,
+                detail=f"{name} is not installed, so there is nothing to start.",
+            )
+        executable = self.managed_executable(context)
+        if not detection.is_managed or not detection.is_usable:
+            return RuntimeHandoff(
+                component_id=self.component_id,
+                availability=LaunchAvailability.UNAVAILABLE,
+                ownership=detection.ownership,
+                detail=detection.detail or f"{name} is present but not usable.",
+            )
+        if executable is None or not executable.is_file():
+            return RuntimeHandoff(
+                component_id=self.component_id,
+                availability=LaunchAvailability.UNAVAILABLE,
+                ownership=Ownership.MANAGED,
+                detail=(
+                    f"{name} is registered as managed but its executable is missing"
+                    f"{f' at {executable}' if executable else ''}."
+                ),
+            )
+        return RuntimeHandoff(
+            component_id=self.component_id,
+            availability=LaunchAvailability.AVAILABLE,
+            ownership=Ownership.MANAGED,
+            executable=executable,
+            version=detection.version,
+            detail=f"{name} is managed by this hub and can be started.",
+        )
 
     def plan(self, context: ProvisionContext) -> ProvisionPlan:
         detection = self.detect(context)

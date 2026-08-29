@@ -17,9 +17,10 @@ from ..installation import (
     resolve_installation,
 )
 from ..integration import IntegrationSnapshot
-from ..pets import PetAnimator, PetState
+from ..pets import PetState
 from ..planning import build_install_plan
 from ..profiles import Profile
+from ..renderer import PetRenderer
 from ..runtime import StackRuntime
 from ..system import SystemFacts
 from .appearance import TuiAppearance
@@ -434,7 +435,12 @@ class MainContent(ContentSwitcher):
 
 
 class PetSlot(Static):
-    """Textual-owned refresh loop over the backend's passive animator."""
+    """Textual-owned refresh loop over the backend's passive renderer.
+
+    The widget knows one verb: ask for the current text. Whether that text comes
+    from a simple frame sequence or from composed micro-behaviors is the asset's
+    business, decided in :mod:`local_ai_stack.renderer`.
+    """
 
     REFRESH_INTERVAL = 0.25
 
@@ -442,7 +448,7 @@ class PetSlot(Static):
         self,
         text: str = "",
         *,
-        animator: PetAnimator | None = None,
+        animator: PetRenderer | None = None,
         id: str | None = None,
     ) -> None:
         super().__init__(text, markup=False, id=id)
@@ -455,7 +461,7 @@ class PetSlot(Static):
         if self.animator is not None:
             self.update(self.animator.current_text(now))
 
-    def set_animator(self, animator: PetAnimator | None, fallback_text: str) -> None:
+    def set_animator(self, animator: PetRenderer | None, fallback_text: str) -> None:
         self.animator = animator
         self.update(fallback_text if animator is None else animator.current_text())
 

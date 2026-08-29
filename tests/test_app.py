@@ -15,7 +15,7 @@ from local_ai_stack.installation import (
 )
 from local_ai_stack.integration import ComponentIntegration, IntegrationSnapshot
 from local_ai_stack.layout import ENV_ROOT
-from local_ai_stack.pets import PetState
+from local_ai_stack.pets import PetState, unsafe_characters
 from local_ai_stack.processes import (
     DEFAULT_PROCESS_SPECS,
     RuntimeProcessState,
@@ -28,6 +28,7 @@ from local_ai_stack.provisioning import (
     ProvisionContext,
     RuntimeHandoff,
 )
+from local_ai_stack.renderer import MicroBehaviorRenderer
 from local_ai_stack.runtime import ServiceRuntime, StackRuntime
 from local_ai_stack.services import DEFAULT_SERVICE_SPECS, ServiceState, ServiceStatus
 from local_ai_stack.system import GPUInfo, SystemFacts
@@ -388,7 +389,7 @@ def test_ui_config_controls_rail_and_settings_views():
     asyncio.run(exercise())
 
 
-def test_capella_missing_pet_is_text_only_and_does_not_reuse_claw():
+def test_capella_shows_hello_kitty_instead_of_the_unavailable_notice():
     async def exercise() -> None:
         app = make_app()
         async with app.run_test() as pilot:
@@ -396,11 +397,97 @@ def test_capella_missing_pet_is_text_only_and_does_not_reuse_claw():
             await pilot.click("#profile-capella")
             await pilot.pause()
             pet = app.query_one(PetSlot)
-            assert pet.animator is None
-            assert str(pet.content) == "Pet unavailable: hello-kitty"
-            assert "(\\/)" not in str(pet.content)
+            assert pet.animator is not None
+            assert pet.animator.pet.id == "hello-kitty"
+            assert isinstance(pet.animator, MicroBehaviorRenderer)
+            content = str(pet.content)
+            assert "Pet unavailable" not in content
+            assert r"(\/)" not in content, "Claw must not be substituted for Capella"
+            assert unsafe_characters(content) == ()
             assert str(app.query_one("#rail-theme", Static).content) == "Capella"
             assert app.theme == "pepitos-capella"
+
+    asyncio.run(exercise())
+
+
+def test_switching_profiles_hands_over_the_pet_without_leaking_behavior():
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test() as pilot:
+            pet = app.query_one(PetSlot)
+            claw = pet.animator
+            assert claw.pet.id == "claw"
+
+            await pilot.press("2")
+            await pilot.click("#profile-capella")
+            await pilot.pause()
+            kitty = pet.animator
+            assert kitty is not claw
+            assert kitty.pet.id == "hello-kitty"
+
+            await pilot.click("#profile-pepe")
+            await pilot.pause()
+            back = pet.animator
+            assert back is not kitty
+            assert back.pet.id == "claw"
+            assert not isinstance(back, MicroBehaviorRenderer)
+            assert not hasattr(back, "behavior")
+
+            await pilot.click("#profile-capella")
+            await pilot.pause()
+            again = pet.animator
+            assert again is not kitty, "a fresh behavior, not the discarded one"
+            assert again.behavior is not kitty.behavior
+
+    asyncio.run(exercise())
+
+
+def test_hello_kitty_keeps_the_rail_the_same_size_while_it_moves():
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test() as pilot:
+            await pilot.press("2")
+            await pilot.click("#profile-capella")
+            await pilot.pause()
+            pet = app.query_one(PetSlot)
+            started_at = pet.animator.started_at
+            sizes = set()
+            for step in range(120):
+                pet.refresh_frame(started_at + step * 0.25)
+                lines = str(pet.content).splitlines()
+                sizes.add((len(lines), max(len(line) for line in lines)))
+            assert len(sizes) == 1
+
+    asyncio.run(exercise())
+
+
+def test_hello_kitty_survives_rail_collapse_and_expand():
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test() as pilot:
+            await pilot.press("2")
+            await pilot.click("#profile-capella")
+            await pilot.pause()
+            pet = app.query_one(PetSlot)
+            rail = app.query_one(RightRail)
+            renderer = pet.animator
+            started_at = renderer.started_at
+            pet.refresh_frame(started_at + 5.0)
+            schedule = (renderer.behavior.next_blink_at, renderer.behavior.next_jump_at)
+
+            await pilot.click("#right-rail-toggle")
+            await pilot.pause()
+            assert rail.is_collapsed
+            assert pet.animator is renderer
+
+            await pilot.press("ctrl+r")
+            await pilot.pause()
+            assert not rail.is_collapsed
+            assert pet.animator is renderer
+            assert renderer.started_at == started_at
+            assert (renderer.behavior.next_blink_at, renderer.behavior.next_jump_at) == schedule
+            pet.refresh_frame(started_at + 5.5)
+            assert "Pet unavailable" not in str(pet.content)
 
     asyncio.run(exercise())
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -8,16 +9,24 @@ from textual.theme import Theme
 
 from ..appearance import Appearance, pet_state_for_stack, resolve_appearance
 from ..config import UiConfig
-from ..pets import PetAnimator, PetError, load_pet_by_id
+from ..pets import PetError, load_pet_by_id
 from ..profiles import Profile
+from ..renderer import PetRenderer, build_pet_renderer
 from ..runtime import StackRuntime
 from ..themes import ThemeDefinition, ThemeError, ThemeRole, load_theme_by_id
 
 
 @dataclass(frozen=True)
 class TuiAppearance:
+    """Resolved visuals for one profile.
+
+    ``animator`` is whatever renders the pet: a plain :class:`PetAnimator` for a
+    simple asset, or a behavior-composing renderer for an asset that ships one.
+    The rail treats both the same way, so no widget knows which pet it has.
+    """
+
     resolved: Appearance
-    animator: PetAnimator | None
+    animator: PetRenderer | None
     theme: ThemeDefinition | None
     pet_text: str
     theme_text: str
@@ -31,21 +40,19 @@ def resolve_tui_appearance(
     pets_directory: Path | None = None,
     themes_directory: Path | None = None,
     now: float | None = None,
+    rng: random.Random | None = None,
 ) -> TuiAppearance:
     """Load resolved visual assets; unavailable identities degrade to text only."""
     resolved = resolve_appearance(profile, pet_id=ui.pet, theme_id=ui.theme)
+    moment = time.monotonic() if now is None else now
     try:
         pet = load_pet_by_id(resolved.pet_id, pets_directory)
     except PetError:
         animator = None
         pet_text = f"Pet unavailable: {resolved.pet_id}"
     else:
-        animator = PetAnimator(
-            pet,
-            pet_state_for_stack(runtime.state),
-            now=time.monotonic() if now is None else now,
-        )
-        pet_text = animator.current_text(now)
+        animator = build_pet_renderer(pet, pet_state_for_stack(runtime.state), now=moment, rng=rng)
+        pet_text = animator.current_text(moment)
 
     try:
         theme = load_theme_by_id(resolved.theme_id, themes_directory)

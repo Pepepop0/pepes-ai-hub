@@ -1,8 +1,51 @@
+import random
+
 from local_ai_stack.config import UiConfig
+from local_ai_stack.pets import unsafe_characters
 from local_ai_stack.profiles import load_profile
+from local_ai_stack.renderer import MicroBehaviorRenderer
 from local_ai_stack.themes import ThemeRole
 from local_ai_stack.tui.appearance import resolve_tui_appearance, textual_theme
 from tests.test_app import ROOT, stopped_runtime
+
+
+def test_capella_resolves_the_hello_kitty_asset():
+    capella = load_profile(ROOT / "profiles" / "capella.yaml")
+    appearance = resolve_tui_appearance(
+        capella, UiConfig(), stopped_runtime(), now=0.0, rng=random.Random(3)
+    )
+    assert appearance.resolved.pet_id == "hello-kitty"
+    assert appearance.animator is not None
+    assert appearance.animator.pet.id == "hello-kitty"
+    assert isinstance(appearance.animator, MicroBehaviorRenderer)
+    assert "Pet unavailable" not in appearance.pet_text
+    assert appearance.pet_text == appearance.animator.current_text(0.0)
+    assert appearance.theme_text == "Capella"
+
+
+def test_capella_pet_text_is_terminal_safe_and_stable_in_size():
+    capella = load_profile(ROOT / "profiles" / "capella.yaml")
+    appearance = resolve_tui_appearance(
+        capella, UiConfig(), stopped_runtime(), now=0.0, rng=random.Random(3)
+    )
+    renderer = appearance.animator
+    sizes = set()
+    moment = 0.0
+    while moment < 30:
+        text = renderer.current_text(moment)
+        assert unsafe_characters(text) == ()
+        lines = text.splitlines()
+        sizes.add((len(lines), max(len(line) for line in lines)))
+        moment += 0.25
+    assert len(sizes) == 1
+
+
+def test_pepe_keeps_the_claw_asset():
+    pepe = load_profile(ROOT / "profiles" / "pepe.yaml")
+    appearance = resolve_tui_appearance(pepe, UiConfig(), stopped_runtime(), now=0.0)
+    assert appearance.resolved.pet_id == "claw"
+    assert appearance.animator.pet.id == "claw"
+    assert not isinstance(appearance.animator, MicroBehaviorRenderer)
 
 
 def test_missing_capella_pet_and_theme_degrade_without_identity_substitution(tmp_path):

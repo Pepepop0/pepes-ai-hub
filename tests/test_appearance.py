@@ -79,11 +79,13 @@ def test_pepe_appearance_resolves_to_shipped_assets():
     assert appearance.theme_id in available_themes(THEME_ASSETS)
 
 
-def test_capella_pet_is_declared_but_not_shipped_yet():
-    # Adding assets/pets/hello-kitty/ is enough to satisfy this binding: the
-    # mapping already points at it and no code has to change.
-    assert DEFAULT_APPEARANCE_BY_PROFILE["capella"].pet_id not in available_pets(PET_ASSETS)
-    assert DEFAULT_APPEARANCE_BY_PROFILE["capella"].theme_id in available_themes(THEME_ASSETS)
+def test_capella_appearance_resolves_to_shipped_assets():
+    # The binding needed no code change: dropping assets/pets/hello-kitty/ in
+    # was enough for the declared pet id to resolve.
+    capella = DEFAULT_APPEARANCE_BY_PROFILE["capella"]
+    assert capella.pet_id == "hello-kitty"
+    assert capella.pet_id in available_pets(PET_ASSETS)
+    assert capella.theme_id in available_themes(THEME_ASSETS)
 
 
 def test_stack_state_drives_the_animator_end_to_end():

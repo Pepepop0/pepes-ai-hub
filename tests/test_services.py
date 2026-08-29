@@ -1,8 +1,15 @@
 from __future__ import annotations
 
-import json
-
 import pytest
+from helpers import (
+    NO_LISTENER_SCAN,
+    NOTHING_LISTENING,
+    http_answering,
+    http_failing,
+    listening,
+    tcp_answering,
+    tcp_forbidden,
+)
 
 from local_ai_stack.probes import ProbeOutcome, ProbeResult
 from local_ai_stack.services import (
@@ -14,6 +21,7 @@ from local_ai_stack.services import (
     ServiceState,
     ServiceStatus,
     aggregate_state,
+    aggregate_states,
     check_service,
     check_services,
     check_stack,
@@ -29,31 +37,11 @@ HEALTHY_PAYLOADS = {
 PORT_ONLY_SPEC = ServiceSpec(id="port-only", name="Port Only", port=9999)
 
 
-def http_answering(status: int = 200, payload=None, body: str | None = None):
-    text = body if body is not None else json.dumps(payload if payload is not None else {})
-
-    def probe(url: str, timeout: float) -> ProbeResult:
-        return ProbeResult(ProbeOutcome.OK, f"HTTP {status}", 1.0, status, text)
-
-    return probe
-
-
-def http_failing(outcome: ProbeOutcome, detail: str = "boom"):
-    def probe(url: str, timeout: float) -> ProbeResult:
-        return ProbeResult(outcome, detail, 1.0)
-
-    return probe
-
-
-def tcp_answering(outcome: ProbeOutcome, detail: str = ""):
-    def probe(host: str, port: int, timeout: float) -> ProbeResult:
-        return ProbeResult(outcome, detail, 1.0)
-
-    return probe
-
-
-def tcp_forbidden(host: str, port: int, timeout: float) -> ProbeResult:
-    raise AssertionError("port fallback must not run while the HTTP endpoint answers")
+def check(spec: ServiceSpec, **kwargs) -> ServiceStatus:
+    """check_service with a listener present and no accidental port fallback."""
+    kwargs.setdefault("listeners", listening(spec.port))
+    kwargs.setdefault("tcp", tcp_forbidden)
+    return check_service(spec, **kwargs)
 
 
 def status(state: ServiceState) -> ServiceStatus:
@@ -90,14 +78,56 @@ def test_spec_by_id_returns_spec_or_raises():
         spec_by_id("stable-diffusion")
 
 
+# --- local listener pre-check ----------------------------------------------
+
+
+def test_no_local_listener_is_down_without_any_request():
+    def probe(url: str, timeout: float) -> ProbeResult:
+        raise AssertionError("no request may be sent when nothing is listening")
+
+    result = check_service(OLLAMA_SPEC, http=probe, tcp=tcp_forbidden, listeners=NOTHING_LISTENING)
+    assert result.state is ServiceState.DOWN
+    assert result.checked_via == "listener"
+    assert "no local process listening on 127.0.0.1:11434" in result.detail
+
+
+def test_listener_on_another_port_does_not_count():
+    result = check_service(
+        OLLAMA_SPEC,
+        http=http_answering(payload={"version": "1"}),
+        tcp=tcp_forbidden,
+        listeners=listening(8080),
+    )
+    assert result.state is ServiceState.DOWN
+
+
+def test_wildcard_listener_counts_for_loopback():
+    result = check_service(
+        OPEN_WEBUI_SPEC,
+        http=http_answering(payload={"status": True}),
+        tcp=tcp_forbidden,
+        listeners=listening(8080, host="0.0.0.0"),
+    )
+    assert result.state is ServiceState.UP
+
+
+def test_unavailable_listener_scan_falls_through_to_http():
+    result = check_service(
+        COMFYUI_SPEC,
+        http=http_answering(payload={"system": {}}),
+        tcp=tcp_forbidden,
+        listeners=NO_LISTENER_SCAN,
+    )
+    assert result.state is ServiceState.UP
+    assert result.checked_via == "http"
+
+
 # --- service responding correctly -----------------------------------------
 
 
 @pytest.mark.parametrize("spec", DEFAULT_SERVICE_SPECS, ids=lambda s: s.id)
 def test_service_answering_its_endpoint_is_up(spec):
-    result = check_service(
-        spec, http=http_answering(payload=HEALTHY_PAYLOADS[spec.id]), tcp=tcp_forbidden
-    )
+    result = check(spec, http=http_answering(payload=HEALTHY_PAYLOADS[spec.id]))
     assert result.state is ServiceState.UP
     assert result.healthy
     assert result.checked_via == "http"
@@ -110,7 +140,7 @@ def test_up_check_uses_the_declared_endpoint():
         seen.append((url, timeout))
         return ProbeResult(ProbeOutcome.OK, "HTTP 200", 1.0, 200, '{"version": "1"}')
 
-    check_service(OLLAMA_SPEC, timeout=0.5, http=probe, tcp=tcp_forbidden)
+    check(OLLAMA_SPEC, timeout=0.5, http=probe)
     assert seen == [("http://127.0.0.1:11434/api/version", 0.5)]
 
 
@@ -118,29 +148,25 @@ def test_up_check_uses_the_declared_endpoint():
 
 
 def test_unexpected_status_code_is_degraded():
-    result = check_service(OPEN_WEBUI_SPEC, http=http_answering(status=404), tcp=tcp_forbidden)
+    result = check(OPEN_WEBUI_SPEC, http=http_answering(status=404))
     assert result.state is ServiceState.DEGRADED
     assert "404" in result.detail
 
 
 def test_non_json_body_is_degraded():
-    result = check_service(
-        OLLAMA_SPEC, http=http_answering(body="<html>login</html>"), tcp=tcp_forbidden
-    )
+    result = check(OLLAMA_SPEC, http=http_answering(body="<html>login</html>"))
     assert result.state is ServiceState.DEGRADED
     assert "did not return JSON" in result.detail
 
 
 def test_json_that_is_not_an_object_is_degraded():
-    result = check_service(COMFYUI_SPEC, http=http_answering(body="[]"), tcp=tcp_forbidden)
+    result = check(COMFYUI_SPEC, http=http_answering(body="[]"))
     assert result.state is ServiceState.DEGRADED
     assert "not an object" in result.detail
 
 
 def test_missing_expected_key_is_degraded():
-    result = check_service(
-        COMFYUI_SPEC, http=http_answering(payload={"devices": []}), tcp=tcp_forbidden
-    )
+    result = check(COMFYUI_SPEC, http=http_answering(payload={"devices": []}))
     assert result.state is ServiceState.DEGRADED
     assert "system" in result.detail
 
@@ -148,20 +174,14 @@ def test_missing_expected_key_is_degraded():
 # --- timeout / refused -----------------------------------------------------
 
 
-def test_timeout_is_unknown():
-    result = check_service(
-        OLLAMA_SPEC,
-        http=http_failing(ProbeOutcome.TIMEOUT, "http timeout after 1.50s"),
-        tcp=tcp_forbidden,
-    )
+def test_timeout_with_a_listener_present_is_unknown():
+    result = check(OLLAMA_SPEC, http=http_failing(ProbeOutcome.TIMEOUT, "http timeout after 1.50s"))
     assert result.state is ServiceState.UNKNOWN
     assert "timeout" in result.detail
 
 
 def test_connection_refused_is_down():
-    result = check_service(
-        OPEN_WEBUI_SPEC, http=http_failing(ProbeOutcome.REFUSED), tcp=tcp_forbidden
-    )
+    result = check(OPEN_WEBUI_SPEC, http=http_failing(ProbeOutcome.REFUSED))
     assert result.state is ServiceState.DOWN
     assert result.checked_via == "http"
 
@@ -170,7 +190,7 @@ def test_connection_refused_is_down():
 
 
 def test_transport_error_falls_back_to_open_port_as_degraded():
-    result = check_service(
+    result = check(
         COMFYUI_SPEC,
         http=http_failing(ProbeOutcome.ERROR, "http error: ReadError"),
         tcp=tcp_answering(ProbeOutcome.OK),
@@ -182,7 +202,7 @@ def test_transport_error_falls_back_to_open_port_as_degraded():
 
 
 def test_transport_error_with_refused_port_is_down():
-    result = check_service(
+    result = check(
         COMFYUI_SPEC,
         http=http_failing(ProbeOutcome.ERROR),
         tcp=tcp_answering(ProbeOutcome.REFUSED),
@@ -192,7 +212,7 @@ def test_transport_error_with_refused_port_is_down():
 
 
 def test_transport_error_with_timing_out_port_is_unknown():
-    result = check_service(
+    result = check(
         COMFYUI_SPEC,
         http=http_failing(ProbeOutcome.ERROR),
         tcp=tcp_answering(ProbeOutcome.TIMEOUT, "tcp timeout after 1.50s"),
@@ -201,10 +221,10 @@ def test_transport_error_with_timing_out_port_is_unknown():
 
 
 def test_service_without_endpoint_uses_port_only():
-    up = check_service(
+    up = check(
         PORT_ONLY_SPEC, http=http_failing(ProbeOutcome.ERROR), tcp=tcp_answering(ProbeOutcome.OK)
     )
-    down = check_service(
+    down = check(
         PORT_ONLY_SPEC,
         http=http_failing(ProbeOutcome.ERROR),
         tcp=tcp_answering(ProbeOutcome.REFUSED),
@@ -215,9 +235,8 @@ def test_service_without_endpoint_uses_port_only():
 
 
 def test_real_probes_on_a_closed_port_report_the_service_as_unavailable():
-    # Integration smoke: no service on 65534, so the check must never say UP and
-    # must not raise. DOWN vs UNKNOWN depends on whether the host answers RST or
-    # drops the SYN, so both are accepted here.
+    # Integration smoke: nothing serves 65534, so the check must never say UP
+    # and must not raise, whatever the host does with a closed port.
     spec = ServiceSpec(id="fixture", name="Fixture", port=65534, timeout=0.35)
     result = check_service(spec)
     assert result.state in {ServiceState.DOWN, ServiceState.UNKNOWN}
@@ -243,11 +262,15 @@ def test_real_probes_on_a_closed_port_report_the_service_as_unavailable():
 )
 def test_aggregate_state(states, expected):
     assert aggregate_state(status(s) for s in states) == expected
+    assert aggregate_states(states) == expected
 
 
 def test_check_services_returns_one_status_per_spec():
     results = check_services(
-        DEFAULT_SERVICE_SPECS, http=http_failing(ProbeOutcome.REFUSED), tcp=tcp_forbidden
+        DEFAULT_SERVICE_SPECS,
+        http=http_failing(ProbeOutcome.REFUSED),
+        tcp=tcp_forbidden,
+        listeners=listening(11434, 8080, 8188),
     )
     assert [r.id for r in results] == [s.id for s in DEFAULT_SERVICE_SPECS]
     assert {r.state for r in results} == {ServiceState.DOWN}
@@ -259,7 +282,7 @@ def test_check_stack_aggregates_and_indexes_by_id():
             return ProbeResult(ProbeOutcome.OK, "HTTP 200", 1.0, 200, '{"version": "1"}')
         return ProbeResult(ProbeOutcome.REFUSED, "connection refused", 1.0)
 
-    stack = check_stack(http=probe, tcp=tcp_forbidden)
+    stack = check_stack(http=probe, tcp=tcp_forbidden, listeners=listening(11434, 8080, 8188))
     assert stack.state is ServiceState.DEGRADED
     assert stack.by_id("ollama").state is ServiceState.UP
     assert stack.by_id("comfyui").state is ServiceState.DOWN

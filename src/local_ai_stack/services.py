@@ -7,9 +7,16 @@ This is the runtime-manager health layer: it declares *what* a service is
 
 Health strategy, per SPEC:
 
-* prefer a real HTTP health endpoint over "the port is open";
+* if the local listener scan is trustworthy and nothing is listening on the
+  service port, the service is DOWN — no request is sent at all;
+* otherwise prefer a real HTTP health endpoint over "the port is open";
 * fall back to a plain TCP probe only when no trustworthy endpoint exists,
   or when the HTTP request fails for a reason other than refusal/timeout.
+
+The listener pre-check exists because a host may silently drop packets to a
+closed loopback port instead of refusing them, which would otherwise report a
+plainly stopped service as UNKNOWN after a full timeout. It does not change
+what a timeout means: a real timeout is still UNKNOWN.
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+from .inventory import ListenerReport, list_listeners
 from .probes import DEFAULT_TIMEOUT, ProbeOutcome, ProbeResult, http_probe, tcp_probe
 
 HttpProbe = Callable[[str, float], ProbeResult]
@@ -183,8 +191,23 @@ def check_service(
     timeout: float | None = None,
     http: HttpProbe = http_probe,
     tcp: TcpProbe = tcp_probe,
+    listeners: ListenerReport | None = None,
 ) -> ServiceStatus:
-    """Check one service, preferring its HTTP health endpoint."""
+    """Check one service, preferring its HTTP health endpoint.
+
+    ``listeners`` lets a caller reuse a single local scan across services; when
+    omitted a fresh scan is taken. A report flagged unavailable simply skips the
+    pre-check.
+    """
+    report = list_listeners() if listeners is None else listeners
+    if report.usable and not report.on_port(spec.port, spec.host):
+        return ServiceStatus(
+            spec,
+            ServiceState.DOWN,
+            f"no local process listening on {spec.address}",
+            "listener",
+        )
+
     effective_timeout = spec.timeout if timeout is None else timeout
     endpoint = spec.endpoint
     if endpoint is None:
@@ -214,13 +237,22 @@ def check_services(
     timeout: float | None = None,
     http: HttpProbe = http_probe,
     tcp: TcpProbe = tcp_probe,
+    listeners: ListenerReport | None = None,
 ) -> tuple[ServiceStatus, ...]:
-    return tuple(check_service(s, timeout=timeout, http=http, tcp=tcp) for s in specs)
+    report = list_listeners() if listeners is None else listeners
+    return tuple(
+        check_service(s, timeout=timeout, http=http, tcp=tcp, listeners=report) for s in specs
+    )
 
 
 def aggregate_state(statuses: Iterable[ServiceStatus]) -> ServiceState:
-    """Collapse several service states into one stack-level verdict."""
-    states = [status.state for status in statuses]
+    """Collapse several service statuses into one stack-level verdict."""
+    return aggregate_states(status.state for status in statuses)
+
+
+def aggregate_states(states: Iterable[ServiceState]) -> ServiceState:
+    """Collapse bare states, for callers holding something other than a status."""
+    states = list(states)
     if not states:
         return ServiceState.UNKNOWN
     unique = set(states)
@@ -237,6 +269,7 @@ def check_stack(
     timeout: float | None = None,
     http: HttpProbe = http_probe,
     tcp: TcpProbe = tcp_probe,
+    listeners: ListenerReport | None = None,
 ) -> StackHealth:
-    statuses = check_services(specs, timeout=timeout, http=http, tcp=tcp)
+    statuses = check_services(specs, timeout=timeout, http=http, tcp=tcp, listeners=listeners)
     return StackHealth(statuses, aggregate_state(statuses))

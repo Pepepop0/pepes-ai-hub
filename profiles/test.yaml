@@ -1,0 +1,39 @@
+schema_version: 1
+id: test
+name: Test
+description: Profile leve para smoke-test universal dentro do escopo Windows/NVIDIA.
+
+hardware:
+  os: windows
+  gpu_vendor: nvidia
+  min_vram_gb: 8
+  recommended_vram_gb: 12
+  notes: O objetivo é validar a stack, não maximizar qualidade.
+
+services:
+  ollama: {enabled: true, port: 11434}
+  open_webui: {enabled: true, port: 8080}
+  comfyui: {enabled: true, port: 8188}
+
+features:
+  chat: true
+  vision: true
+  tools: true
+  image_generation: true
+  image_editing: true
+
+models:
+  chat:
+    primary: TBD
+    status: unresolved
+    requirements: [small, vision, native_tool_calling, configurable_alignment]
+  image:
+    diffusion: TBD
+    text_encoder: TBD
+    vae: TBD
+    requirements: [lightweight, text_to_image, image_edit_if_possible]
+
+runtime:
+  aggressive_vram_unload: true
+  prefer_single_heavy_model_resident: true
+  open_browser: true

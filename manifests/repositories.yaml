@@ -1,0 +1,10 @@
+schema_version: 1
+repositories:
+  comfyui:
+    url: https://github.com/comfyanonymous/ComfyUI.git
+    revision: TBD
+    destination: apps/comfyui
+  open_webui:
+    url: https://github.com/open-webui/open-webui.git
+    revision: TBD
+    destination: apps/open-webui

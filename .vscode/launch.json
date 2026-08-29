@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Local AI Stack TUI",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "local_ai_stack",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Local AI Stack Doctor",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "local_ai_stack",
+      "args": [
+        "--doctor"
+      ],
+      "console": "integratedTerminal"
+    }
+  ]
+}

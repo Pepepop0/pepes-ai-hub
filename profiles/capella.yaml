@@ -1,0 +1,42 @@
+schema_version: 1
+id: capella
+name: Capella
+description: RTX 5090 32 GB — single GPU profile.
+
+hardware:
+  os: windows
+  gpu_vendor: nvidia
+  min_vram_gb: 32
+  recommended_vram_gb: 32
+  notes: Single RTX 5090. Multi-GPU fora do escopo v0.1.
+
+services:
+  ollama: {enabled: true, port: 11434}
+  open_webui: {enabled: true, port: 8080}
+  comfyui: {enabled: true, port: 8188}
+
+features:
+  chat: true
+  vision: true
+  tools: true
+  image_generation: true
+  image_editing: true
+
+models:
+  chat:
+    primary: TBD
+    status: unresolved
+    alternatives: []
+  image:
+    diffusion: flux-2-klein-4b-fp8.safetensors
+    text_encoder: qwen_3_4b.safetensors
+    vae: flux2-vae.safetensors
+
+workflows:
+  text_to_image: {manifest_id: flux2_klein_t2i}
+  image_edit: {manifest_id: flux2_klein_edit}
+
+runtime:
+  aggressive_vram_unload: false
+  prefer_single_heavy_model_resident: false
+  open_browser: true

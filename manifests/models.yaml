@@ -1,0 +1,38 @@
+schema_version: 1
+
+ollama:
+  hermes3_8b:
+    id: hermes3:8b
+    capabilities: {text: true, tools: true, vision: false}
+    status: candidate
+  qwen3_5_9b:
+    id: qwen3.5:9b
+    capabilities: {text: true, tools: true, vision: true}
+    status: tested_chat_tool_calling_unreliable_for_image
+  qwen3_8b:
+    id: qwen3:8b
+    capabilities: {text: true, tools: true, vision: false}
+    status: tested
+
+comfyui:
+  flux2_klein_fp8:
+    filename: flux-2-klein-4b-fp8.safetensors
+    type: diffusion_model
+    destination: diffusion_models
+    url: TBD
+    sha256: TBD
+    status: manually_tested
+  qwen_3_4b_encoder:
+    filename: qwen_3_4b.safetensors
+    type: text_encoder
+    destination: text_encoders
+    url: TBD
+    sha256: TBD
+    status: manually_tested
+  flux2_vae:
+    filename: flux2-vae.safetensors
+    type: vae
+    destination: vae
+    url: TBD
+    sha256: TBD
+    status: manually_tested

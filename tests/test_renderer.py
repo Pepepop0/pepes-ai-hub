@@ -256,10 +256,10 @@ def test_scaling_keeps_every_frame_aligned():
     scaled = scale_to_width(
         {name: frame.lines for name, frame in pet.behavior.frames.items()}, 20, crop=True
     )
-    reference = scaled["idle:open"]
+    reference = scaled["idle:closed"]
     assert {len(lines) for lines in scaled.values()} == {len(reference)}
     assert {len(lines[0]) for lines in scaled.values()} == {len(reference[0])}
-    assert scaled["idle:open"] != scaled["idle:closed"]
+    assert len(scaled) == 1, "only the closed frame is a variant now"
 
 
 def test_scaling_survives_a_hop_without_changing_the_canvas():
@@ -373,13 +373,14 @@ def test_two_renderers_do_not_share_behavior_state():
     assert second.behavior.next_blink_at != first.behavior.next_blink_at
 
 
-def test_eye_frames_are_declared_per_state():
+def test_only_the_closed_frame_is_declared_per_state():
+    """There is no 'open' variant: the animation itself provides that frame."""
     pet = load_pet_by_id("hello-kitty", ASSETS)
     assert set(pet.behavior.variants) == {PetState.IDLE}
-    eyes = pet.behavior.variants_for(PetState.IDLE)
-    assert set(eyes) == {EyeState.OPEN.value, EyeState.CLOSED.value}
-    assert eyes["open"].lines != eyes["closed"].lines
+    assert set(pet.behavior.variants_for(PetState.IDLE)) == {EyeState.CLOSED.value}
     assert pet.behavior.variants_for(PetState.WORKING) is None
+    closed = pet.behavior.variants_for(PetState.IDLE)["closed"]
+    assert closed.lines != pet.animation_for(PetState.IDLE).frames[0].lines
 
 
 def test_the_behavior_is_not_a_two_frame_loop():
@@ -388,8 +389,8 @@ def test_the_behavior_is_not_a_two_frame_loop():
     animator = PetAnimator(pet, now=0.0)
     plain = {animator.current_text(moment / 20) for moment in range(1200)}
     lively = set(walk(hello_kitty(seed=4), until=60))
-    assert len(plain) == 2, "the idle animation alone is a two-frame loop"
-    assert len(lively) > len(plain), "behavior adds blink and hop variants"
+    assert len(plain) == 1, "the idle animation on its own is a still drawing"
+    assert len(lively) > len(plain), "behavior adds the blink and the hop"
 
 
 def test_a_disabled_behavior_still_renders_a_still_character():
@@ -447,7 +448,6 @@ render:
   preserve_canvas_height: true
   variants:
     idle:
-      open: base/idle-open.txt
       closed: base/idle-shut.txt
 """
 
@@ -456,7 +456,6 @@ SYNTHETIC_FRAMES = {
     # One line shorter than idle on purpose: the anchor decides where the
     # padding that makes up the difference lands.
     "working/01.txt": " WORK ! \n ###### ",
-    "base/idle-open.txt": "        \n IDLE o \n ====== ",
     "base/idle-shut.txt": "        \n IDLE - \n ====== ",
 }
 
@@ -502,6 +501,12 @@ def test_blink_only_touches_the_states_the_asset_declares(tmp_path):
     assert " IDLE o " in renderer.current_text(0.5)
     assert " IDLE - " in renderer.current_text(1.1)
     assert " IDLE o " in renderer.current_text(1.6)
+
+
+def test_the_shipped_idle_animation_is_a_single_frame():
+    """Two idle frames would blink on their own, which the behavior owns."""
+    pet = load_pet_by_id("hello-kitty", ASSETS)
+    assert pet.animation_for(PetState.IDLE).frame_count == 1
 
 
 def test_a_state_without_variants_never_blinks(tmp_path):
@@ -617,3 +622,145 @@ def test_the_shipped_asset_anchors_to_the_bottom():
     lines = hello_kitty().current_text(0.0).splitlines()
     assert is_blank_row(lines[0]), "headroom for the hop sits above the drawing"
     assert not is_blank_row(lines[-1]), "and the character stands on the floor"
+
+
+# --- a blink must not freeze a multi-frame animation ------------------------
+
+MULTIFRAME_MANIFEST = """schema_version: 1
+id: multiframe
+name: Multiframe
+animations:
+  idle:
+    fps: 2
+    loop: true
+"""
+
+MULTIFRAME_BEHAVIOR = """schema_version: 1
+id: multiframe
+
+micro_animations:
+  blink:
+    enabled: true
+    min_interval_ms: 1000
+    max_interval_ms: 1000
+    min_duration_ms: 400
+    max_duration_ms: 400
+    double_blink_chance: 0.0
+  jump:
+    enabled: false
+
+render:
+  anchor: bottom
+  preserve_canvas_height: true
+  variants:
+    idle:
+      closed: base/shut.txt
+"""
+
+MULTIFRAME_FRAMES = {
+    "idle/01.txt": "       \n SEM-A \n ===== ",
+    "idle/02.txt": "       \n SEM-B \n ===== ",
+    "base/shut.txt": "       \n CLOSED\n ===== ",
+}
+
+
+def multiframe_renderer(tmp_path: Path, *, behavior: str = MULTIFRAME_BEHAVIOR):
+    """A pet whose idle animation really has two distinct semantic frames."""
+    directory = tmp_path / "multiframe"
+    for relative, text in MULTIFRAME_FRAMES.items():
+        # A behavior that declares no variant must not ship an undeclared
+        # directory either: the loader is strict about that on purpose.
+        if relative.startswith("base/") and "variants: {}" in behavior:
+            continue
+        target = directory / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text + "\n", encoding="utf-8")
+    (directory / "pet.yaml").write_text(MULTIFRAME_MANIFEST, encoding="utf-8")
+    (directory / "behavior.yaml").write_text(behavior, encoding="utf-8")
+    pet = load_pet_by_id("multiframe", tmp_path)
+    assert pet.animation_for(PetState.IDLE).frame_count == 2
+    renderer = build_pet_renderer(pet, now=0.0, rng=random.Random(1))
+    assert isinstance(renderer, MicroBehaviorRenderer)
+    return renderer
+
+
+def shown(renderer: MicroBehaviorRenderer, now: float) -> str:
+    """Which of the three drawings is on screen right now."""
+    text = renderer.current_text(now)
+    for label in ("SEM-A", "SEM-B", "CLOSED"):
+        if label in text:
+            return label
+    raise AssertionError(f"unexpected drawing at {now}: {text!r}")
+
+
+def test_a_semantic_animation_keeps_running_under_a_micro_behavior(tmp_path):
+    """The old bug: an 'open' variant replaced every frame, freezing SEM-A."""
+    renderer = multiframe_renderer(tmp_path)
+    # Frames last 0.5s and the blink runs from 1.0s to 1.4s.
+    assert shown(renderer, 0.0) == "SEM-A"
+    assert shown(renderer, 0.6) == "SEM-B"
+    assert shown(renderer, 0.9) == "SEM-B"
+
+
+def test_a_blink_borrows_the_frame_and_gives_it_back(tmp_path):
+    renderer = multiframe_renderer(tmp_path)
+    assert shown(renderer, 0.0) == "SEM-A"
+    assert shown(renderer, 0.6) == "SEM-B"
+    assert shown(renderer, 1.1) == "CLOSED"
+    assert shown(renderer, 1.3) == "CLOSED"
+    # 1.6s is inside the animation's fourth frame slot, so the animation must
+    # come back where it would have been, not where it was when the blink began.
+    assert shown(renderer, 1.6) == "SEM-B"
+    assert shown(renderer, 2.1) == "SEM-A"
+
+
+def test_a_blink_does_not_restart_the_animation(tmp_path):
+    renderer = multiframe_renderer(tmp_path)
+    before = renderer.started_at
+    renderer.current_text(1.1)
+    assert shown(renderer, 1.6) == "SEM-B"
+    assert renderer.started_at == before
+    assert renderer.animator.frame_index(1.6) == 1
+
+
+def test_the_animation_advances_while_the_character_is_airborne(tmp_path):
+    hopping = MULTIFRAME_BEHAVIOR.replace(
+        """  blink:
+    enabled: true""",
+        """  blink:
+    enabled: false""",
+    ).replace(
+        """  jump:
+    enabled: false""",
+        """  jump:
+    enabled: true
+    min_interval_ms: 500
+    max_interval_ms: 500
+    min_duration_ms: 2000
+    max_duration_ms: 2000
+    min_height_rows: 1
+    max_height_rows: 1""",
+    )
+    renderer = multiframe_renderer(tmp_path, behavior=hopping)
+    airborne: set[str] = set()
+    moment = 0.0
+    while moment < 3.0:
+        # Draw first: the behavior only advances when it is asked for a frame.
+        label = shown(renderer, moment)
+        if renderer.behavior.vertical_offset(moment) > 0:
+            airborne.add(label)
+        moment += 0.05
+    assert airborne == {"SEM-A", "SEM-B"}, "a hop must not freeze the animation"
+
+
+def test_a_state_without_a_closed_frame_renders_only_the_animation(tmp_path):
+    bare = MULTIFRAME_BEHAVIOR.replace(
+        """  variants:
+    idle:
+      closed: base/shut.txt""",
+        "  variants: {}",
+    )
+    renderer = multiframe_renderer(tmp_path, behavior=bare)
+    assert renderer.blinks_in(PetState.IDLE) is False
+    seen = {shown(renderer, moment / 20) for moment in range(120)}
+    assert seen == {"SEM-A", "SEM-B"}, "no closed frame means no blink, ever"

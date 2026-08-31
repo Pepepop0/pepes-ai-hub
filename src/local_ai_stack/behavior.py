@@ -91,11 +91,12 @@ class JumpConfig:
 class RenderConfig:
     """How a behavior draws: which frame variants it owns, and how they fit.
 
-    ``variants`` maps a semantic state name to the drawings that replace the
-    animation's own frame while that state is showing — for now an eyes-open
-    and an eyes-closed version. A state the asset says nothing about keeps the
-    frame its animation produces, so blink is an *addition* to the semantic
-    animation and never a replacement for it.
+    ``variants`` maps a semantic state name to the drawings a micro-behavior
+    may borrow while that state is showing — for now only an eyes-closed
+    version, used for the length of a blink. There is no "open" counterpart on
+    purpose: outside a blink the drawing is whatever the animation itself is
+    showing, so blink is an *addition* to the semantic animation and can never
+    freeze or replace it.
 
     ``anchor`` decides where padding goes when a frame is shorter than the
     canvas: ``bottom`` keeps the drawing on the floor, ``top`` keeps it at the
@@ -517,23 +518,32 @@ def _jump_config(data: dict[str, Any], source: Path | str) -> JumpConfig:
 
 
 def _variants(value: Any, source: Path | str) -> dict[str, dict[str, str]]:
-    """Parse ``render.variants``: state name -> eye state -> frame path.
+    """Parse ``render.variants``: state name -> borrowed drawing -> frame path.
+
+    Only ``closed`` is accepted. An "open" frame would have to stand in for the
+    animation's own frames, which is exactly what must not happen, so declaring
+    one is an error rather than a silently ignored key.
 
     State names are checked as plain strings here; mapping them onto the real
     ``PetState`` is the asset loader's job, which keeps this module free of any
     dependency on the pet engine.
     """
     data = _mapping(value, source, "render.variants")
-    known_eyes = {eye.value for eye in EyeState}
+    allowed = {EyeState.CLOSED.value}
     parsed: dict[str, dict[str, str]] = {}
     for state, eyes in data.items():
         field_name = f"render.variants.{state}"
         eye_data = _mapping(eyes, source, field_name)
-        unknown = sorted(str(key) for key in eye_data if str(key) not in known_eyes)
+        unknown = sorted(str(key) for key in eye_data if str(key) not in allowed)
         if unknown:
-            raise _error(source, field_name, f"unknown eye states: {', '.join(unknown)}")
-        if EyeState.OPEN.value not in eye_data:
-            raise _error(source, field_name, f"must declare an '{EyeState.OPEN.value}' frame")
+            raise _error(
+                source,
+                field_name,
+                f"unknown or unsupported frames: {', '.join(unknown)}; "
+                f"only '{EyeState.CLOSED.value}' is borrowed by a micro-behavior",
+            )
+        if EyeState.CLOSED.value not in eye_data:
+            raise _error(source, field_name, f"must declare a '{EyeState.CLOSED.value}' frame")
         parsed[str(state)] = {
             str(eye): _relative_frame(path, source, f"{field_name}.{eye}")
             for eye, path in eye_data.items()

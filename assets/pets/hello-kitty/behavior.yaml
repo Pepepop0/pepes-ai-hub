@@ -25,12 +25,11 @@ micro_animations:
     blink_convergence_chance: 0.30
 
 render:
-  # Blink swaps the drawing only where the asset supplies both versions. Every
-  # other state keeps whatever frame its animation produces, so the semantic
-  # animation stays in charge and blink only adds to it.
+  # A blink borrows this drawing for as long as the eyes are shut. Outside a
+  # blink the frame comes from the animation itself, so the semantic animation
+  # stays in charge; a state with no closed frame here simply never blinks.
   variants:
     idle:
-      open: base/open.txt
       closed: base/closed.txt
   anchor: bottom
   preserve_canvas_height: true

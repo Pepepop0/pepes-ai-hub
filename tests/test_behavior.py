@@ -53,7 +53,7 @@ MANIFEST = {
         },
     },
     "render": {
-        "variants": {"idle": {"open": "base/open.txt", "closed": "base/closed.txt"}},
+        "variants": {"idle": {"closed": "base/closed.txt"}},
         "anchor": "bottom",
         "preserve_canvas_height": True,
     },
@@ -100,9 +100,7 @@ def test_shipped_behavior_manifest_parses():
     assert document.config.jump.max_height_rows == 2
     assert document.config.jump.hang_ratio == 0.46
     assert document.config.jump.blink_convergence_chance == 0.30
-    assert document.render.variants == {
-        "idle": {"open": "base/open.txt", "closed": "base/closed.txt"}
-    }
+    assert document.render.variants == {"idle": {"closed": "base/closed.txt"}}
     assert document.render.anchor == "bottom"
     assert document.render.preserve_canvas_height is True
 
@@ -121,10 +119,15 @@ def test_milliseconds_become_seconds():
         ({"extra": 1}, "unknown fields: extra"),
         ({"micro_animations": {"dancing": {}}}, "unknown channels: dancing"),
         ({"render": {"anchor": "middle"}}, "must be 'bottom' or 'top'"),
-        ({"render": {"variants": {"idle": {"open": "/etc/passwd"}}}}, "relative path"),
-        ({"render": {"variants": {"idle": {"open": "../../x.txt"}}}}, "relative path"),
-        ({"render": {"variants": {"idle": {"closed": "base/closed.txt"}}}}, "must declare an"),
-        ({"render": {"variants": {"idle": {"open": "a.txt", "winking": "b.txt"}}}}, "unknown eye"),
+        ({"render": {"variants": {"idle": {"closed": "/etc/passwd"}}}}, "relative path"),
+        ({"render": {"variants": {"idle": {"closed": "../../x.txt"}}}}, "relative path"),
+        ({"render": {"variants": {"idle": {}}}}, "must declare a 'closed' frame"),
+        ({"render": {"variants": {"idle": {"winking": "b.txt"}}}}, "unknown or unsupported"),
+        # An "open" frame would stand in for the animation's own frames.
+        (
+            {"render": {"variants": {"idle": {"open": "a.txt", "closed": "b.txt"}}}},
+            "unknown or unsupported frames: open",
+        ),
     ],
 )
 def test_malformed_behavior_is_rejected(mutation, message):

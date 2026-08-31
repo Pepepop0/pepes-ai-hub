@@ -371,11 +371,16 @@ class MicroBehaviorRenderer:
         lines = next(iter(self._canvases.values()))
         return len(lines[0]) if lines else 0, len(lines)
 
+    def _closed_frame_for(self, state: PetState) -> str | None:
+        """The eyes-closed drawing for the animation ``state`` resolves to."""
+        animation = self._animator.pet.animation_for(state)
+        eyes = self._variants.get(animation.state) or {}
+        key = _variant_key(animation.state, EyeState.CLOSED.value)
+        return key if EyeState.CLOSED.value in eyes and key in self._canvases else None
+
     def blinks_in(self, state: PetState) -> bool:
         """Whether the asset supplies an eyes-closed drawing for ``state``."""
-        animation = self._animator.pet.animation_for(state)
-        eyes = self._variants.get(animation.state)
-        return bool(eyes) and EyeState.CLOSED.value in eyes
+        return self._closed_frame_for(state) is not None
 
     def _semantic_key(self, now: float) -> str:
         """The frame the animation itself would show right now."""
@@ -383,13 +388,17 @@ class MicroBehaviorRenderer:
         return _animation_key(animation.state, self._animator.frame_index(now))
 
     def _frame_key(self, now: float, blinking: bool) -> str:
-        animation = self._animator.animation
-        eyes = self._variants.get(animation.state)
-        if not eyes:
-            return self._semantic_key(now)
-        eye = EyeState.CLOSED.value if blinking else EyeState.OPEN.value
-        key = _variant_key(animation.state, eye)
-        return key if key in self._canvases else self._semantic_key(now)
+        """The animator owns the drawing; a blink borrows it for a moment.
+
+        There is deliberately no "eyes open" variant: outside a blink the frame
+        is whatever the animation is showing at ``now``, so a multi-frame
+        animation keeps running and a blink never freezes or restarts it.
+        """
+        if blinking:
+            closed = self._closed_frame_for(self._animator.state)
+            if closed is not None:
+                return closed
+        return self._semantic_key(now)
 
     def current_lines(self, now: float | None = None) -> tuple[str, ...]:
         moment = time.monotonic() if now is None else now

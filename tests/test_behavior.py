@@ -53,8 +53,7 @@ MANIFEST = {
         },
     },
     "render": {
-        "open_frame": "base/open.txt",
-        "closed_frame": "base/closed.txt",
+        "variants": {"idle": {"open": "base/open.txt", "closed": "base/closed.txt"}},
         "anchor": "bottom",
         "preserve_canvas_height": True,
     },
@@ -101,7 +100,10 @@ def test_shipped_behavior_manifest_parses():
     assert document.config.jump.max_height_rows == 2
     assert document.config.jump.hang_ratio == 0.46
     assert document.config.jump.blink_convergence_chance == 0.30
-    assert document.render.open_frame == "base/open.txt"
+    assert document.render.variants == {
+        "idle": {"open": "base/open.txt", "closed": "base/closed.txt"}
+    }
+    assert document.render.anchor == "bottom"
     assert document.render.preserve_canvas_height is True
 
 
@@ -119,8 +121,10 @@ def test_milliseconds_become_seconds():
         ({"extra": 1}, "unknown fields: extra"),
         ({"micro_animations": {"dancing": {}}}, "unknown channels: dancing"),
         ({"render": {"anchor": "middle"}}, "must be 'bottom' or 'top'"),
-        ({"render": {"open_frame": "/etc/passwd"}}, "relative path"),
-        ({"render": {"open_frame": "../../secret.txt"}}, "relative path"),
+        ({"render": {"variants": {"idle": {"open": "/etc/passwd"}}}}, "relative path"),
+        ({"render": {"variants": {"idle": {"open": "../../x.txt"}}}}, "relative path"),
+        ({"render": {"variants": {"idle": {"closed": "base/closed.txt"}}}}, "must declare an"),
+        ({"render": {"variants": {"idle": {"open": "a.txt", "winking": "b.txt"}}}}, "unknown eye"),
     ],
 )
 def test_malformed_behavior_is_rejected(mutation, message):
@@ -195,11 +199,110 @@ def test_blink_has_its_own_irregular_schedule():
     assert all(1.8 <= gap <= 4.8 for gap in gaps)
 
 
-def test_double_blinks_are_the_only_short_gaps():
-    doubling = BehaviorConfig(BlinkConfig(double_blink_chance=1.0), JumpConfig(enabled=False))
-    blinks, _, _ = sample(behavior(seed=3, config=doubling), until=30)
-    gaps = [round(b - a, 3) for a, b in itertools.pairwise(blinks)]
-    assert gaps and all(gap < 0.5 for gap in gaps)
+# --- blink sequences -------------------------------------------------------
+
+
+class ScriptedRandom(random.Random):
+    """A Random whose every draw is fixed, so a schedule is fully predictable.
+
+    ``uniform`` is built on ``random``, so pinning that pins every interval and
+    duration to one end of its range as well.
+    """
+
+    def __init__(self, value: float) -> None:
+        super().__init__(0)
+        self._value = value
+
+    def random(self) -> float:
+        return self._value
+
+
+def blink_only(**blink) -> BehaviorConfig:
+    return BehaviorConfig(BlinkConfig(**blink), JumpConfig(enabled=False))
+
+
+def closures(micro: MicroBehavior, *, until: float, step: float = 0.01) -> list[float]:
+    starts: list[float] = []
+    was_blinking = False
+    moment = 0.0
+    while moment < until:
+        blinking = micro.snapshot(moment).blinking
+        if blinking and not was_blinking:
+            starts.append(round(moment, 3))
+        was_blinking = blinking
+        moment += step
+    return starts
+
+
+def sequences(starts: list[float], gap: float = 0.6) -> list[list[float]]:
+    """Group closures that belong to the same blink sequence."""
+    grouped: list[list[float]] = []
+    for start in starts:
+        if grouped and start - grouped[-1][-1] < gap:
+            grouped[-1].append(start)
+        else:
+            grouped.append([start])
+    return grouped
+
+
+def test_a_single_blink_is_one_closure():
+    config = blink_only(
+        min_interval_s=1.0, max_interval_s=1.0, min_duration_s=0.2, max_duration_s=0.2
+    )
+    micro = MicroBehavior(config, now=0.0, rng=ScriptedRandom(0.9))
+    assert all(len(group) == 1 for group in sequences(closures(micro, until=10)))
+
+
+def test_a_double_blink_is_exactly_two_closures():
+    config = blink_only(
+        min_interval_s=1.0,
+        max_interval_s=1.0,
+        min_duration_s=0.2,
+        max_duration_s=0.2,
+        double_blink_chance=1.0,
+    )
+    micro = MicroBehavior(config, now=0.0, rng=ScriptedRandom(0.0))
+    groups = sequences(closures(micro, until=10))
+    assert groups
+    assert all(len(group) == 2 for group in groups), groups
+
+
+def test_a_second_blink_never_starts_a_third():
+    """Even with an RNG that always says 'double', the sequence stops at two."""
+    config = blink_only(
+        min_interval_s=5.0,
+        max_interval_s=5.0,
+        min_duration_s=0.2,
+        max_duration_s=0.2,
+        double_blink_chance=1.0,
+    )
+    micro = MicroBehavior(config, now=0.0, rng=ScriptedRandom(0.0))
+    seen: list[tuple[float, bool]] = []
+    was_blinking = False
+    moment = 0.0
+    while moment < 6.4:  # first blink at 5.0s, next sequence only at ~6.5s
+        blinking = micro.snapshot(moment).blinking
+        if blinking and not was_blinking:
+            seen.append((round(moment, 2), micro.blink_is_second))
+        was_blinking = blinking
+        moment += 0.01
+    assert [is_second for _, is_second in seen] == [False, True]
+    assert micro.double_blink_pending is False
+
+
+def test_the_second_blink_schedules_a_normal_next_blink():
+    config = blink_only(
+        min_interval_s=2.0,
+        max_interval_s=2.0,
+        min_duration_s=0.2,
+        max_duration_s=0.2,
+        double_blink_chance=1.0,
+    )
+    micro = MicroBehavior(config, now=0.0, rng=ScriptedRandom(0.0))
+    groups = sequences(closures(micro, until=12))
+    assert len(groups) >= 2
+    # Sequences are spaced by the normal interval, not by the double-blink gap.
+    assert groups[1][0] - groups[0][-1] > 1.5
 
 
 def test_jump_has_its_own_irregular_schedule():

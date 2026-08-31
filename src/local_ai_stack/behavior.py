@@ -23,6 +23,7 @@ a seeded run is exactly reproducible.
 from __future__ import annotations
 
 import random
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -88,17 +89,23 @@ class JumpConfig:
 
 @dataclass(frozen=True)
 class RenderConfig:
-    """Which frames the behavior draws with, and how they fit the canvas.
+    """How a behavior draws: which frame variants it owns, and how they fit.
 
-    ``max_width`` lets an asset ship art at full resolution and still fit a
-    narrow rail: the renderer picks the largest integer scale that fits, so the
-    file on disk never has to be redrawn for a layout change.
-    ``headroom_rows`` reserves blank rows above the drawing for the hop, which
-    matters once cropping has removed the art's own empty margin.
+    ``variants`` maps a semantic state name to the drawings that replace the
+    animation's own frame while that state is showing — for now an eyes-open
+    and an eyes-closed version. A state the asset says nothing about keeps the
+    frame its animation produces, so blink is an *addition* to the semantic
+    animation and never a replacement for it.
+
+    ``anchor`` decides where padding goes when a frame is shorter than the
+    canvas: ``bottom`` keeps the drawing on the floor, ``top`` keeps it at the
+    ceiling. ``max_width`` lets an asset ship art at full resolution and still
+    fit a narrow rail, and ``headroom_rows`` reserves blank rows above the
+    drawing for the hop, which matters once cropping removed the art's own
+    empty margin.
     """
 
-    open_frame: str = "base/open.txt"
-    closed_frame: str = "base/closed.txt"
+    variants: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     anchor: str = "bottom"
     preserve_canvas_height: bool = True
     max_width: int | None = None
@@ -107,7 +114,12 @@ class RenderConfig:
 
     @property
     def frames(self) -> dict[str, str]:
-        return {EyeState.OPEN.value: self.open_frame, EyeState.CLOSED.value: self.closed_frame}
+        """Every declared drawing, keyed ``<state>:<eye>``."""
+        return {
+            f"{state}:{eye}": path
+            for state, eyes in self.variants.items()
+            for eye, path in eyes.items()
+        }
 
 
 @dataclass(frozen=True)
@@ -151,6 +163,10 @@ class _BlinkChannel:
     duration_s: float = 0.0
     next_at: float = 0.0
     second_blink_at: float | None = None
+    # True while the closure showing is the second half of a double blink.
+    # Only a first blink may roll for a double, so a sequence is one or two
+    # closures and never a chain.
+    is_second: bool = False
 
 
 @dataclass
@@ -216,12 +232,13 @@ class MicroBehavior:
         jump = self.config.jump
         return self.rng.uniform(jump.min_interval_s, jump.max_interval_s)
 
-    def _start_blink(self, now: float) -> None:
+    def _start_blink(self, now: float, *, second: bool = False) -> None:
         blink = self.config.blink
         self._blink.active = True
         self._blink.started_at = now
         self._blink.duration_s = self.rng.uniform(blink.min_duration_s, blink.max_duration_s)
         self._blink.second_blink_at = None
+        self._blink.is_second = second
 
     def _start_jump(self, now: float) -> None:
         jump = self.config.jump
@@ -253,6 +270,15 @@ class MicroBehavior:
         return self._blink.next_at
 
     @property
+    def blink_is_second(self) -> bool:
+        """True while the closure on screen is the second of a double blink."""
+        return self._blink.is_second
+
+    @property
+    def double_blink_pending(self) -> bool:
+        return self._blink.second_blink_at is not None
+
+    @property
     def next_jump_at(self) -> float:
         return self._jump.next_at
 
@@ -280,12 +306,15 @@ class MicroBehavior:
             blink.active = False
             return
         if not blink.active and blink.second_blink_at is not None and now >= blink.second_blink_at:
-            self._start_blink(now)
+            self._start_blink(now, second=True)
         if not blink.active and now >= blink.next_at:
             self._start_blink(now)
         if blink.active and now >= blink.started_at + blink.duration_s:
+            was_second = blink.is_second
             blink.active = False
-            if self.rng.random() < self.config.blink.double_blink_chance:
+            blink.is_second = False
+            # A second closure ends the sequence: it never rolls for another.
+            if not was_second and self.rng.random() < self.config.blink.double_blink_chance:
                 blink.second_blink_at = now + self.rng.uniform(
                     DOUBLE_BLINK_MIN_GAP_S, DOUBLE_BLINK_MAX_GAP_S
                 )
@@ -487,6 +516,31 @@ def _jump_config(data: dict[str, Any], source: Path | str) -> JumpConfig:
     )
 
 
+def _variants(value: Any, source: Path | str) -> dict[str, dict[str, str]]:
+    """Parse ``render.variants``: state name -> eye state -> frame path.
+
+    State names are checked as plain strings here; mapping them onto the real
+    ``PetState`` is the asset loader's job, which keeps this module free of any
+    dependency on the pet engine.
+    """
+    data = _mapping(value, source, "render.variants")
+    known_eyes = {eye.value for eye in EyeState}
+    parsed: dict[str, dict[str, str]] = {}
+    for state, eyes in data.items():
+        field_name = f"render.variants.{state}"
+        eye_data = _mapping(eyes, source, field_name)
+        unknown = sorted(str(key) for key in eye_data if str(key) not in known_eyes)
+        if unknown:
+            raise _error(source, field_name, f"unknown eye states: {', '.join(unknown)}")
+        if EyeState.OPEN.value not in eye_data:
+            raise _error(source, field_name, f"must declare an '{EyeState.OPEN.value}' frame")
+        parsed[str(state)] = {
+            str(eye): _relative_frame(path, source, f"{field_name}.{eye}")
+            for eye, path in eye_data.items()
+        }
+    return parsed
+
+
 def validate_behavior_data(data: Any, source: Path | str = "<behavior>") -> BehaviorDocument:
     root = _mapping(data, source, "behavior root")
     allowed = {"schema_version", "id", "micro_animations", "render"}
@@ -522,8 +576,7 @@ def validate_behavior_data(data: Any, source: Path | str = "<behavior>") -> Beha
 
     render_data = _mapping(root.get("render", {}), source, "render")
     known_render = {
-        "open_frame",
-        "closed_frame",
+        "variants",
         "anchor",
         "preserve_canvas_height",
         "max_width",
@@ -534,6 +587,7 @@ def validate_behavior_data(data: Any, source: Path | str = "<behavior>") -> Beha
     if unknown_render:
         raise _error(source, "render", f"unknown fields: {', '.join(unknown_render)}")
     defaults = RenderConfig()
+    variants = _variants(render_data.get("variants", {}), source)
     anchor = render_data.get("anchor", defaults.anchor)
     if anchor not in {"bottom", "top"}:
         raise _error(source, "render.anchor", "must be 'bottom' or 'top'")
@@ -544,12 +598,7 @@ def validate_behavior_data(data: Any, source: Path | str = "<behavior>") -> Beha
         else _integer(raw_max_width, source, "render.max_width", minimum=1)
     )
     render = RenderConfig(
-        _relative_frame(
-            render_data.get("open_frame", defaults.open_frame), source, "render.open_frame"
-        ),
-        _relative_frame(
-            render_data.get("closed_frame", defaults.closed_frame), source, "render.closed_frame"
-        ),
+        variants,
         anchor,
         _boolean(
             render_data.get("preserve_canvas_height", defaults.preserve_canvas_height),

@@ -25,8 +25,13 @@ micro_animations:
     blink_convergence_chance: 0.30
 
 render:
-  open_frame: base/open.txt
-  closed_frame: base/closed.txt
+  # Blink swaps the drawing only where the asset supplies both versions. Every
+  # other state keeps whatever frame its animation produces, so the semantic
+  # animation stays in charge and blink only adds to it.
+  variants:
+    idle:
+      open: base/open.txt
+      closed: base/closed.txt
   anchor: bottom
   preserve_canvas_height: true
   # The art is drawn at 62x31 cells; the right rail is narrower than that, so

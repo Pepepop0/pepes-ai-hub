@@ -221,16 +221,28 @@ class PetAnimation:
 
 @dataclass(frozen=True)
 class PetBehaviorAsset:
-    """An optional ``behavior.yaml`` plus the frames it composes with.
+    """An optional ``behavior.yaml`` plus the frame variants it composes with.
 
-    Purely declarative: the pet asset says it wants micro-animations and which
-    drawings they use. Deciding what to do with that belongs to
-    :mod:`local_ai_stack.renderer`, so no consumer needs to special-case a pet
-    id anywhere.
+    Purely declarative: the pet asset says it wants micro-animations, and for
+    which semantic states it supplies alternate drawings. Deciding what to do
+    with that belongs to :mod:`local_ai_stack.renderer`, so no consumer needs
+    to special-case a pet id anywhere.
     """
 
     document: BehaviorDocument
-    frames: Mapping[str, PetFrame]
+    variants: Mapping[PetState, Mapping[str, PetFrame]]
+
+    @property
+    def frames(self) -> dict[str, PetFrame]:
+        """Every variant drawing, keyed ``<state>:<eye>``."""
+        return {
+            f"{state.value}:{eye}": frame
+            for state, eyes in self.variants.items()
+            for eye, frame in eyes.items()
+        }
+
+    def variants_for(self, state: PetState) -> Mapping[str, PetFrame] | None:
+        return self.variants.get(state)
 
     @property
     def width(self) -> int:
@@ -521,17 +533,27 @@ def _load_behavior_asset(directory: Path) -> PetBehaviorAsset | None:
         raise _error(manifest, "", str(exc)) from exc
     if document.id != directory.name:
         raise _error(manifest, "id", f"must match the directory name {directory.name!r}")
-    frames: dict[str, PetFrame] = {}
-    for name, relative in document.render.frames.items():
-        path = directory / relative
-        if not path.is_file():
-            raise _error(manifest, f"render.{name}_frame", f"frame not found: {relative}")
-        frames[name] = PetFrame.from_text(path.read_text(encoding="utf-8"), path)
-    sizes = {(frame.height, frame.width) for frame in frames.values()}
+    variants: dict[PetState, dict[str, PetFrame]] = {}
+    for raw_state, eyes in document.render.variants.items():
+        field = f"render.variants.{raw_state}"
+        try:
+            state = PetState(str(raw_state))
+        except ValueError:
+            known = ", ".join(s.value for s in PetState)
+            raise _error(manifest, field, f"unknown state (known: {known})") from None
+        loaded: dict[str, PetFrame] = {}
+        for eye, relative in eyes.items():
+            path = directory / relative
+            if not path.is_file():
+                raise _error(manifest, f"{field}.{eye}", f"frame not found: {relative}")
+            loaded[eye] = PetFrame.from_text(path.read_text(encoding="utf-8"), path)
+        variants[state] = loaded
+    asset = PetBehaviorAsset(document, variants)
+    sizes = {(frame.height, frame.width) for frame in asset.frames.values()}
     if len(sizes) > 1:
         rendered = ", ".join(f"{width}x{height}" for height, width in sorted(sizes))
         raise _error(manifest, "render", f"frames must share one size, found {rendered}")
-    return PetBehaviorAsset(document, frames)
+    return asset
 
 
 def load_pet(directory: Path) -> PetDefinition:

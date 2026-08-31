@@ -171,10 +171,12 @@ def test_blinking_swaps_the_drawing():
 
 def test_the_drawing_actually_rises_during_a_hop():
     config = BehaviorConfig(BlinkConfig(enabled=False), JumpConfig())
+    pet = load_pet_by_id("hello-kitty", ASSETS)
     renderer = MicroBehaviorRenderer(
-        PetAnimator(load_pet_by_id("hello-kitty", ASSETS), now=0.0),
-        load_pet_by_id("hello-kitty", ASSETS).behavior.frames,
+        PetAnimator(pet, now=0.0),
+        pet.behavior.variants,
         config=config,
+        render=pet.behavior.document.render,
         now=0.0,
         rng=random.Random(3),
     )
@@ -222,10 +224,16 @@ def test_changing_state_does_not_restart_the_micro_behavior():
     assert (renderer.behavior.next_blink_at, renderer.behavior.next_jump_at) == schedule
 
 
-def test_a_renderer_needs_an_open_frame():
-    animator = PetAnimator(load_pet_by_id("claw", ASSETS), now=0.0)
-    with pytest.raises(ValueError, match="open"):
-        MicroBehaviorRenderer(animator, {"closed": PetFrame(("x",))}, now=0.0)
+def test_a_pet_without_variants_still_draws_its_own_animation():
+    """No variants means no blink, but the animation and the hop still run."""
+    claw = load_pet_by_id("claw", ASSETS)
+    renderer = MicroBehaviorRenderer(
+        PetAnimator(claw, now=0.0), None, now=0.0, rng=random.Random(1)
+    )
+    assert renderer.blinks_in(PetState.IDLE) is False
+    drawn = [line.rstrip() for line in renderer.current_text(0.0).splitlines()]
+    expected = [line.rstrip() for line in claw.animation_for(PetState.IDLE).frames[0].lines]
+    assert drawn == expected
 
 
 # --- asset-driven selection ------------------------------------------------
@@ -248,9 +256,10 @@ def test_scaling_keeps_every_frame_aligned():
     scaled = scale_to_width(
         {name: frame.lines for name, frame in pet.behavior.frames.items()}, 20, crop=True
     )
-    assert {len(lines) for lines in scaled.values()} == {len(scaled["open"])}
-    assert {len(lines[0]) for lines in scaled.values()} == {len(scaled["open"][0])}
-    assert scaled["open"] != scaled["closed"]
+    reference = scaled["idle:open"]
+    assert {len(lines) for lines in scaled.values()} == {len(reference)}
+    assert {len(lines[0]) for lines in scaled.values()} == {len(reference[0])}
+    assert scaled["idle:open"] != scaled["idle:closed"]
 
 
 def test_scaling_survives_a_hop_without_changing_the_canvas():
@@ -364,10 +373,13 @@ def test_two_renderers_do_not_share_behavior_state():
     assert second.behavior.next_blink_at != first.behavior.next_blink_at
 
 
-def test_eye_frames_are_the_two_the_manifest_names():
+def test_eye_frames_are_declared_per_state():
     pet = load_pet_by_id("hello-kitty", ASSETS)
-    assert set(pet.behavior.frames) == {EyeState.OPEN.value, EyeState.CLOSED.value}
-    assert pet.behavior.frames["open"].lines != pet.behavior.frames["closed"].lines
+    assert set(pet.behavior.variants) == {PetState.IDLE}
+    eyes = pet.behavior.variants_for(PetState.IDLE)
+    assert set(eyes) == {EyeState.OPEN.value, EyeState.CLOSED.value}
+    assert eyes["open"].lines != eyes["closed"].lines
+    assert pet.behavior.variants_for(PetState.WORKING) is None
 
 
 def test_the_behavior_is_not_a_two_frame_loop():
@@ -384,8 +396,9 @@ def test_a_disabled_behavior_still_renders_a_still_character():
     pet = load_pet_by_id("hello-kitty", ASSETS)
     renderer = MicroBehaviorRenderer(
         PetAnimator(pet, now=0.0),
-        pet.behavior.frames,
+        pet.behavior.variants,
         config=BehaviorConfig(BlinkConfig(enabled=False), JumpConfig(enabled=False)),
+        render=pet.behavior.document.render,
         now=0.0,
         rng=random.Random(1),
     )
@@ -399,3 +412,208 @@ def test_micro_behavior_is_reusable_by_any_asset():
     canvases = normalize_canvas(frames)
     assert set(canvases) == {"open", "closed"}
     assert behavior.snapshot(0.0).eyes in set(EyeState)
+
+
+# --- semantic state drives the drawing -------------------------------------
+
+SYNTHETIC_MANIFEST = """schema_version: 1
+id: synthetic
+name: Synthetic
+animations:
+  idle:
+    fps: 1
+    loop: true
+  working:
+    fps: 1
+    loop: true
+"""
+
+SYNTHETIC_BEHAVIOR = """schema_version: 1
+id: synthetic
+
+micro_animations:
+  blink:
+    enabled: true
+    min_interval_ms: 1000
+    max_interval_ms: 1000
+    min_duration_ms: 400
+    max_duration_ms: 400
+    double_blink_chance: 0.0
+  jump:
+    enabled: false
+
+render:
+  anchor: bottom
+  preserve_canvas_height: true
+  variants:
+    idle:
+      open: base/idle-open.txt
+      closed: base/idle-shut.txt
+"""
+
+SYNTHETIC_FRAMES = {
+    "idle/01.txt": "        \n IDLE o \n ====== ",
+    # One line shorter than idle on purpose: the anchor decides where the
+    # padding that makes up the difference lands.
+    "working/01.txt": " WORK ! \n ###### ",
+    "base/idle-open.txt": "        \n IDLE o \n ====== ",
+    "base/idle-shut.txt": "        \n IDLE - \n ====== ",
+}
+
+
+def synthetic_pet(tmp_path: Path, *, behavior: str = SYNTHETIC_BEHAVIOR):
+    """A pet with two visibly different states and eye variants for one of them."""
+    directory = tmp_path / "synthetic"
+    for relative, text in SYNTHETIC_FRAMES.items():
+        target = directory / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text + "\n", encoding="utf-8")
+    (directory / "pet.yaml").write_text(SYNTHETIC_MANIFEST, encoding="utf-8")
+    (directory / "behavior.yaml").write_text(behavior, encoding="utf-8")
+    return load_pet_by_id("synthetic", tmp_path)
+
+
+def synthetic_renderer(tmp_path: Path, **kwargs) -> MicroBehaviorRenderer:
+    renderer = build_pet_renderer(synthetic_pet(tmp_path, **kwargs), now=0.0, rng=random.Random(1))
+    assert isinstance(renderer, MicroBehaviorRenderer)
+    return renderer
+
+
+def test_pet_state_still_chooses_the_drawing_under_a_micro_behavior(tmp_path):
+    renderer = synthetic_renderer(tmp_path)
+
+    renderer.set_state(PetState.IDLE, now=0.0)
+    idle = renderer.current_text(0.0)
+    renderer.set_state(PetState.WORKING, now=0.0)
+    working = renderer.current_text(0.0)
+
+    assert "IDLE" in idle and "WORK" not in idle
+    assert "WORK" in working and "IDLE" not in working
+    assert idle != working
+
+
+def test_blink_only_touches_the_states_the_asset_declares(tmp_path):
+    renderer = synthetic_renderer(tmp_path)
+    assert renderer.blinks_in(PetState.IDLE) is True
+    assert renderer.blinks_in(PetState.WORKING) is False
+
+    # The blink schedule is pinned: closed from 1.0s to 1.4s.
+    renderer.set_state(PetState.IDLE, now=0.0)
+    assert " IDLE o " in renderer.current_text(0.5)
+    assert " IDLE - " in renderer.current_text(1.1)
+    assert " IDLE o " in renderer.current_text(1.6)
+
+
+def test_a_state_without_variants_never_blinks(tmp_path):
+    renderer = synthetic_renderer(tmp_path)
+    renderer.set_state(PetState.WORKING, now=0.0)
+    drawn = {renderer.current_text(moment / 10) for moment in range(60)}
+    assert all("WORK" in text for text in drawn)
+    assert len(drawn) == 1, "no variant means the working frame is all there is"
+
+
+def test_blink_and_hop_both_still_run_in_the_state_that_has_them(tmp_path):
+    hopping = SYNTHETIC_BEHAVIOR.replace(
+        """  jump:
+    enabled: false""",
+        """  jump:
+    enabled: true
+    min_interval_ms: 2000
+    max_interval_ms: 2000
+    min_duration_ms: 1000
+    max_duration_ms: 1000
+    min_height_rows: 1
+    max_height_rows: 1
+    blink_convergence_chance: 0.0""",
+    )
+    renderer = synthetic_renderer(tmp_path, behavior=hopping)
+    renderer.set_state(PetState.IDLE, now=0.0)
+
+    frames = {}
+    moment = 0.0
+    while moment < 6.0:
+        frames[round(moment, 2)] = renderer.current_text(moment)
+        moment += 0.05
+
+    blinked = any(" IDLE - " in text for text in frames.values())
+    grounded = frames[0.0]
+    hopped = any(
+        text.splitlines()[-1].strip() == "" and text != grounded for text in frames.values()
+    )
+    assert blinked, "the declared state must still blink"
+    assert hopped, "the hop applies whatever the state"
+    assert {dimensions(text) for text in frames.values()} == {dimensions(grounded)}
+
+
+def test_the_hop_applies_to_a_state_without_variants_too(tmp_path):
+    hopping = SYNTHETIC_BEHAVIOR.replace(
+        """  blink:
+    enabled: true""",
+        """  blink:
+    enabled: false""",
+    ).replace(
+        """  jump:
+    enabled: false""",
+        """  jump:
+    enabled: true
+    min_interval_ms: 1000
+    max_interval_ms: 1000
+    min_duration_ms: 1000
+    max_duration_ms: 1000
+    min_height_rows: 1
+    max_height_rows: 1""",
+    )
+    renderer = synthetic_renderer(tmp_path, behavior=hopping)
+    renderer.set_state(PetState.WORKING, now=0.0)
+    grounded = renderer.current_text(0.0)
+    lifted = [renderer.current_text(m / 20) for m in range(60)]
+    assert any(text != grounded for text in lifted)
+    assert all("WORK" in text for text in lifted)
+    assert {dimensions(text) for text in lifted} == {dimensions(grounded)}
+
+
+def test_switching_state_keeps_the_canvas_and_the_behavior_schedule(tmp_path):
+    renderer = synthetic_renderer(tmp_path)
+    before = (renderer.behavior.next_blink_at, renderer.behavior.next_jump_at)
+    size = dimensions(renderer.current_text(0.0))
+    renderer.set_state(PetState.WORKING, now=0.5)
+    assert (renderer.behavior.next_blink_at, renderer.behavior.next_jump_at) == before
+    assert dimensions(renderer.current_text(0.5)) == size
+
+
+# --- anchor ----------------------------------------------------------------
+
+
+def test_anchor_decides_where_the_padding_goes():
+    frames = {"tall": PetFrame(("aaa", "bbb", "ccc")), "short": PetFrame(("xxx",))}
+    top = normalize_canvas(frames, anchor="top")
+    bottom = normalize_canvas(frames, anchor="bottom")
+    assert top["short"] == ("xxx", "   ", "   ")
+    assert bottom["short"] == ("   ", "   ", "xxx")
+    assert top["tall"] == bottom["tall"] == ("aaa", "bbb", "ccc")
+
+
+def test_top_and_bottom_anchors_place_the_drawing_differently(tmp_path):
+    """Same content, same canvas, different vertical placement."""
+    tall = SYNTHETIC_BEHAVIOR.replace("anchor: bottom", "anchor: top")
+    bottom = synthetic_renderer(tmp_path / "b")
+    top = synthetic_renderer(tmp_path / "t", behavior=tall)
+
+    # The working animation is one line shorter than the idle canvas, so where
+    # its padding lands is exactly what the anchor decides.
+    for renderer in (bottom, top):
+        renderer.set_state(PetState.WORKING, now=0.0)
+    bottom_lines = bottom.current_text(0.0).splitlines()
+    top_lines = top.current_text(0.0).splitlines()
+
+    assert dimensions(bottom.current_text(0.0)) == dimensions(top.current_text(0.0))
+    assert bottom_lines != top_lines
+    assert bottom_lines.index(" WORK ! ") > top_lines.index(" WORK ! ")
+
+
+def test_the_shipped_asset_anchors_to_the_bottom():
+    pet = load_pet_by_id("hello-kitty", ASSETS)
+    assert pet.behavior.document.render.anchor == "bottom"
+    lines = hello_kitty().current_text(0.0).splitlines()
+    assert is_blank_row(lines[0]), "headroom for the hop sits above the drawing"
+    assert not is_blank_row(lines[-1]), "and the character stands on the floor"

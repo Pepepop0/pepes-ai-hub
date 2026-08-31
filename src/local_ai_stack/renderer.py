@@ -216,8 +216,15 @@ def raise_drawing(lines: Sequence[str], rows: int) -> tuple[str, ...]:
     return tuple(lines[lift:]) + tuple(lines[:lift])
 
 
-def normalize_canvas(frames: Mapping[str, PetFrame]) -> dict[str, tuple[str, ...]]:
-    """One shared canvas for every frame, computed once and not per tick."""
+def normalize_canvas(
+    frames: Mapping[str, PetFrame], *, anchor: str = "top"
+) -> dict[str, tuple[str, ...]]:
+    """One shared canvas for every frame, computed once and not per tick.
+
+    ``anchor`` decides where the padding goes when a frame is shorter than the
+    canvas: ``top`` keeps the drawing against the ceiling and pads below,
+    ``bottom`` keeps it on the floor and pads above.
+    """
     if not frames:
         return {}
     width = max(frame.width for frame in frames.values())
@@ -225,22 +232,31 @@ def normalize_canvas(frames: Mapping[str, PetFrame]) -> dict[str, tuple[str, ...
     canvases: dict[str, tuple[str, ...]] = {}
     for name, frame in frames.items():
         lines = [line.ljust(width) for line in frame.lines]
-        lines.extend([" " * width] * (height - len(lines)))
-        canvases[name] = tuple(lines)
+        padding = [" " * width] * (height - len(lines))
+        canvases[name] = tuple(padding + lines) if anchor == "bottom" else tuple(lines + padding)
     return canvases
 
 
 class MicroBehaviorRenderer:
-    """A pet drawn by composing behavior channels over its base frames.
+    """A pet whose semantic animation is *decorated* by micro-behaviors.
 
-    Owns no clock and no state beyond the behavior itself; ``PetState`` still
-    lives in the wrapped animator, so blink and jump never leak into it.
+    The frame to draw always comes from the wrapped :class:`PetAnimator`, so
+    ``PetState`` keeps choosing what is shown. On top of that:
+
+    * blink swaps in an eyes-closed drawing, but only for the states the asset
+      declares a variant for. A state with no variant keeps its own frame and
+      simply does not blink;
+    * the hop lifts whatever frame is showing inside a fixed canvas, so it
+      applies to every state without the asset having to say anything.
+
+    Blink and jump therefore add to the semantic animation and never replace
+    it, and nothing here knows which pet or profile it is drawing.
     """
 
     def __init__(
         self,
         animator: PetAnimator,
-        frames: Mapping[str, PetFrame],
+        variants: Mapping[PetState, Mapping[str, PetFrame]] | None = None,
         *,
         config: BehaviorConfig | None = None,
         render: RenderConfig | None = None,
@@ -249,14 +265,29 @@ class MicroBehaviorRenderer:
     ) -> None:
         self._animator = animator
         self._render = render or RenderConfig()
-        self._frames = dict(frames)
+        self._variants = {state: dict(eyes) for state, eyes in (variants or {}).items()}
         self._fit_width: int | None = None
-        self._canvases = self._prepare(self._frames)
-        if EyeState.OPEN.value not in self._canvases:
-            raise ValueError("a micro-behavior renderer needs at least an 'open' frame")
+        self._canvases = self._prepare()
         self.behavior = MicroBehavior(
             config, now=animator.started_at if now is None else now, rng=rng
         )
+
+    # --- canvas ------------------------------------------------------------
+
+    def _source_frames(self) -> dict[str, PetFrame]:
+        """Every drawing this renderer might show, semantic frames included.
+
+        Animation frames and variant frames share one canvas, so switching
+        state or blinking can never change the size of the drawing.
+        """
+        frames: dict[str, PetFrame] = {}
+        for state, animation in self._animator.pet.animations.items():
+            for index, frame in enumerate(animation.frames):
+                frames[_animation_key(state, index)] = frame
+        for state, eyes in self._variants.items():
+            for eye, frame in eyes.items():
+                frames[_variant_key(state, eye)] = frame
+        return frames
 
     def _target_width(self) -> int | None:
         """The narrower of what the asset asks for and what the caller offers."""
@@ -265,17 +296,24 @@ class MicroBehaviorRenderer:
             return available
         return declared if available is None else min(declared, available)
 
-    def _prepare(self, frames: Mapping[str, PetFrame]) -> dict[str, tuple[str, ...]]:
+    def _prepare(self) -> dict[str, tuple[str, ...]]:
         """Fit the art to the canvas once, not on every tick."""
-        canvases = normalize_canvas(frames)
+        anchor = self._render.anchor
+        canvases = normalize_canvas(self._source_frames(), anchor=anchor)
+        if not canvases:
+            raise ValueError("a micro-behavior renderer needs at least one frame to draw")
         target = self._target_width()
         if target is not None:
             canvases = scale_to_width(canvases, target, crop=self._render.crop_to_ink)
-            canvases = normalize_canvas({name: PetFrame(lines) for name, lines in canvases.items()})
+            canvases = normalize_canvas(
+                {name: PetFrame(lines) for name, lines in canvases.items()}, anchor=anchor
+            )
         headroom = self._render.headroom_rows
         if headroom:
             width = max((len(lines[0]) for lines in canvases.values() if lines), default=0)
             blank = BRAILLE_BLANK * width
+            # Headroom is the room the hop borrows, so it always sits on top,
+            # whatever the anchor decided to do with the height padding.
             canvases = {name: (blank,) * headroom + lines for name, lines in canvases.items()}
         return canvases
 
@@ -289,7 +327,7 @@ class MicroBehaviorRenderer:
         if width == self._fit_width:
             return False
         self._fit_width = width
-        self._canvases = self._prepare(self._frames)
+        self._canvases = self._prepare()
         return True
 
     # --- the animator-shaped surface the rail already speaks ---------------
@@ -330,14 +368,33 @@ class MicroBehaviorRenderer:
 
     @property
     def canvas_size(self) -> tuple[int, int]:
-        lines = self._canvases[EyeState.OPEN.value]
+        lines = next(iter(self._canvases.values()))
         return len(lines[0]) if lines else 0, len(lines)
+
+    def blinks_in(self, state: PetState) -> bool:
+        """Whether the asset supplies an eyes-closed drawing for ``state``."""
+        animation = self._animator.pet.animation_for(state)
+        eyes = self._variants.get(animation.state)
+        return bool(eyes) and EyeState.CLOSED.value in eyes
+
+    def _semantic_key(self, now: float) -> str:
+        """The frame the animation itself would show right now."""
+        animation = self._animator.animation
+        return _animation_key(animation.state, self._animator.frame_index(now))
+
+    def _frame_key(self, now: float, blinking: bool) -> str:
+        animation = self._animator.animation
+        eyes = self._variants.get(animation.state)
+        if not eyes:
+            return self._semantic_key(now)
+        eye = EyeState.CLOSED.value if blinking else EyeState.OPEN.value
+        key = _variant_key(animation.state, eye)
+        return key if key in self._canvases else self._semantic_key(now)
 
     def current_lines(self, now: float | None = None) -> tuple[str, ...]:
         moment = time.monotonic() if now is None else now
         snapshot = self.behavior.snapshot(moment)
-        key = snapshot.eyes.value
-        lines = self._canvases.get(key, self._canvases[EyeState.OPEN.value])
+        lines = self._canvases[self._frame_key(moment, snapshot.blinking)]
         if not self._render.preserve_canvas_height:
             return lines
         return raise_drawing(lines, snapshot.vertical_offset_rows)
@@ -347,6 +404,14 @@ class MicroBehaviorRenderer:
 
     def current_text(self, now: float | None = None) -> str:
         return "\n".join(self.current_lines(now))
+
+
+def _animation_key(state: PetState, index: int) -> str:
+    return f"anim:{state.value}:{index}"
+
+
+def _variant_key(state: PetState, eye: str) -> str:
+    return f"var:{state.value}:{eye}"
 
 
 def build_pet_renderer(
@@ -364,7 +429,7 @@ def build_pet_renderer(
         return animator
     return MicroBehaviorRenderer(
         animator,
-        behavior.frames,
+        behavior.variants,
         config=behavior.document.config,
         render=behavior.document.render,
         now=moment,

@@ -78,12 +78,49 @@ explícito e, sem ele, falha com `PRECONDITION`. A instalação real fica
 bloqueada até existir um manifest pinado. A TUI não oferece controle de
 instalação real por esse motivo.
 
-**Árvore de processos.** `stop` encerra o processo que registramos, não seus
-filhos. `ollama serve` pode ter um `ollama runner` filho que sobrevive. Não foi
-resolvido nesta rodada de propósito: matar árvore inteira (`taskkill /T` ou
-equivalente) exige uma política de ownership por processo filho que ainda não
-existe, e sem ela o risco é encerrar algo que não é nosso. Fica documentado
-como limitação.
+**Árvore de processos.** Resolvido dentro de uma sessão, com fronteira
+explícita. Ver `src/local_ai_stack/jobs.py`.
+
+A regra continua: nunca matar um processo só porque ele descende de um PID que
+foi nosso. Descendência não é prova — no Windows o PPID vira um número obsoleto
+assim que o pai morre, e PIDs são reciclados. Por isso nada aqui usa
+`taskkill /T` nem `children(recursive=True)`.
+
+A prova real é um **Job Object**: um contêiner do kernel. Todo processo criado
+por um membro entra no job automaticamente, ninguém sai, e o kernel enumera a
+membresia sob demanda. "Esse processo faz parte da árvore que eu iniciei?" deixa
+de ser inferência e vira consulta. `TerminateJobObject` age exatamente sobre
+esse conjunto. Um processo que o usuário iniciou nunca aparece nele.
+
+Dois limites medidos nesta máquina antes de escrever o código:
+
+1. **A prova morre com a sessão.** O job é destruído quando o último *handle*
+   fecha, mesmo com membros vivos — os membros sobrevivem, mas o nome deixa de
+   resolver (`OpenJobObject` → erro 2). Um Hub reiniciado não consegue reabrir o
+   job e, portanto, não pode provar a árvore que iniciou antes. Nesse caso o
+   `stop` age só no processo registrado, cuja identidade ainda é verificável, e
+   diz isso no `detail`. Não usamos `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` porque
+   ele mataria todos os serviços quando o Hub fechasse.
+
+2. **Janela de adoção.** O filho já está executando quando `Popen` retorna, e a
+   atribuição ao job acontece logo depois. Um neto criado nesses primeiros
+   instantes nasce fora do job. A falha é segura por construção: esse neto não é
+   provável, então é **deixado vivo**, nunca morto por suposição.
+
+### NEEDS_DECISION
+
+Fechar a janela do item 2 exige criar o processo com `CREATE_SUSPENDED`,
+atribuir o job e só então `ResumeThread`. `subprocess.Popen` não expõe o handle
+da thread primária, então isso significa uma implementação própria de
+`CreateProcessW` via ctypes — incluindo herança de handles para os arquivos de
+log. É risco real em cima do caminho de spawn que hoje está estável e testado.
+
+Fazer a prova sobreviver a reinício do Hub (item 1) exige um processo
+supervisor que segure os handles, ou aceitar matar os serviços ao fechar o Hub.
+As duas são decisões de produto, não detalhes de implementação.
+
+Ambas ficam **BLOCKED até decisão**. O que está implementado é a parte segura:
+prova por job dentro da sessão, com fallback honesto fora dela.
 
 **Ids de serviço.** Os alvos do plano vêm das chaves do profile (`open_webui`),
 enquanto specs de serviço usam o id do serviço (`open-webui`). Enquanto só o

@@ -68,6 +68,11 @@ class ManagedProcess:
     started_at: float = 0.0
     create_time: float | None = None
     log_file: str | None = None
+    # The kernel job this process was launched into, when the host could make
+    # one. It names a container that only lives as long as the session that
+    # created it, so it is a record of how the process was started, never on
+    # its own a licence to act on anything.
+    job_name: str | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -97,6 +102,7 @@ class ManagedProcess:
             "started_at": self.started_at,
             "create_time": self.create_time,
             "log_file": self.log_file,
+            "job_name": self.job_name,
         }
 
     @classmethod
@@ -118,6 +124,7 @@ class ManagedProcess:
         started_at = data.get("started_at")
         create_time = data.get("create_time")
         log_file = data.get("log_file")
+        job_name = data.get("job_name")
         return cls(
             service_id,
             pid,
@@ -126,6 +133,7 @@ class ManagedProcess:
             float(started_at) if isinstance(started_at, (int, float)) else 0.0,
             float(create_time) if isinstance(create_time, (int, float)) else None,
             log_file if isinstance(log_file, str) else None,
+            job_name if isinstance(job_name, str) else None,
         )
 
 
@@ -322,6 +330,7 @@ def build_entry(
     *,
     started_at: float | None = None,
     log_file: str | Path | None = None,
+    job_name: str | None = None,
     clock=time.time,
 ) -> ManagedProcess:
     """Create an entry, capturing the live creation time when we can read it."""
@@ -335,6 +344,7 @@ def build_entry(
         clock() if started_at is None else started_at,
         create_time,
         None if log_file is None else str(log_file),
+        job_name,
     )
 
 

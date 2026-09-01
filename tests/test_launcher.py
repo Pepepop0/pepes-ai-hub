@@ -304,6 +304,9 @@ def test_stop_times_out_when_the_process_ignores_terminate(registry, tmp_path, r
     launcher = ProcessLauncher(registry)
     started = launcher.start(ProcessLaunchSpec("fixture", sleeper_argv(), cwd=tmp_path))
     reaper.append(started.pid)
+    # This is the single-process path: give up the job so the tree is not
+    # provable, which is what a restarted manager would face.
+    launcher.forget_job("fixture")
     monkeypatch.setattr(launcher_module, "_terminate", lambda pid: None)
 
     result = launcher.stop("fixture", timeout=0.2)
@@ -317,6 +320,7 @@ def test_force_kill_is_used_only_when_the_policy_allows_it(registry, tmp_path, r
     launcher = ProcessLauncher(registry)
     started = launcher.start(ProcessLaunchSpec("fixture", sleeper_argv(), cwd=tmp_path))
     reaper.append(started.pid)
+    launcher.forget_job("fixture")
     monkeypatch.setattr(launcher_module, "_terminate", lambda pid: None)
 
     result = launcher.stop("fixture", timeout=0.2, allow_force=True)

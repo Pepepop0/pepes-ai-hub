@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from local_ai_stack.installation import InstallLocation, resolve_installation
@@ -10,11 +12,13 @@ from local_ai_stack.provisioning import (
     Detection,
     EventLevel,
     FailureReason,
+    LaunchAvailability,
     Ownership,
     ProvisionContext,
     Provisioner,
     ProvisionOutcome,
     ProvisionStep,
+    RuntimeHandoff,
 )
 
 
@@ -118,6 +122,41 @@ def test_detection_state_and_ownership_are_independent_axes():
 def test_states_and_outcomes_cover_the_required_vocabulary():
     assert {str(s) for s in ComponentState} >= {"not-installed", "installed", "invalid", "unknown"}
     assert {str(o) for o in ProvisionOutcome} == {"installed", "skipped", "failed", "dry-run"}
+
+
+# --- handoff para runtime --------------------------------------------------
+
+
+def test_available_handoff_requires_managed_ownership_and_an_executable():
+    executable = Path("managed.exe")
+    handoff = RuntimeHandoff(
+        "toy", LaunchAvailability.AVAILABLE, Ownership.MANAGED, executable=executable
+    )
+    assert handoff.launchable
+    assert handoff.executable == executable
+
+    with pytest.raises(ValueError, match="owned by this manager"):
+        RuntimeHandoff("toy", LaunchAvailability.AVAILABLE, executable=executable)
+    with pytest.raises(ValueError, match="managed executable"):
+        RuntimeHandoff("toy", LaunchAvailability.AVAILABLE, Ownership.MANAGED)
+
+
+def test_external_handoff_requires_external_ownership_and_never_an_executable():
+    external = RuntimeHandoff("toy", LaunchAvailability.EXTERNAL, Ownership.EXTERNAL)
+    assert external.is_external
+    assert not external.launchable
+
+    with pytest.raises(ValueError, match="declared together"):
+        RuntimeHandoff("toy", LaunchAvailability.EXTERNAL)
+    with pytest.raises(ValueError, match="declared together"):
+        RuntimeHandoff("toy", LaunchAvailability.UNAVAILABLE, Ownership.EXTERNAL)
+    with pytest.raises(ValueError, match="must not carry an executable"):
+        RuntimeHandoff(
+            "toy",
+            LaunchAvailability.EXTERNAL,
+            Ownership.EXTERNAL,
+            executable=Path("external.exe"),
+        )
 
 
 # --- plano -----------------------------------------------------------------

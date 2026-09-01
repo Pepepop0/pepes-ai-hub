@@ -216,13 +216,20 @@ class RuntimeHandoff:
     detail: str = ""
 
     def __post_init__(self) -> None:
-        if self.availability is LaunchAvailability.AVAILABLE and self.executable is None:
-            raise ValueError("an available handoff must carry the managed executable")
-        if self.availability is not LaunchAvailability.AVAILABLE and self.executable is not None:
+        if self.availability is LaunchAvailability.AVAILABLE:
+            if self.ownership is not Ownership.MANAGED:
+                raise ValueError("an available handoff must be owned by this manager")
+            if self.executable is None:
+                raise ValueError("an available handoff must carry the managed executable")
+        elif self.executable is not None:
             raise ValueError(
                 f"{self.availability} handoff must not carry an executable; "
                 "only a managed install may be launched by this manager"
             )
+        if (self.availability is LaunchAvailability.EXTERNAL) is not (
+            self.ownership is Ownership.EXTERNAL
+        ):
+            raise ValueError("external availability and ownership must be declared together")
 
     @property
     def launchable(self) -> bool:

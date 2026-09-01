@@ -139,6 +139,10 @@ class ComfyUIProvisioner(Provisioner):
     def environment(self, context: ProvisionContext) -> PythonEnvironment:
         return PythonEnvironment.inside(self.managed_dir(context))
 
+    def managed_executable(self, context: ProvisionContext) -> Path:
+        """The managed interpreter that runs this checkout's entry point."""
+        return self.environment(context).python
+
     def entry_point(self, context: ProvisionContext) -> Path:
         return self.managed_dir(context) / ENTRY_POINT
 

@@ -224,6 +224,10 @@ def control_specs_for(
         options.setdefault(OLLAMA_SPEC.id, {}).setdefault("models_dir", models_dir)
     elif layout is not None:
         options.setdefault(OLLAMA_SPEC.id, {}).setdefault("models_dir", layout.models)
+    if layout is not None:
+        options.setdefault(COMFYUI_COMPONENT_ID, {}).setdefault(
+            "script", layout.comfyui_app / "main.py"
+        )
 
     specs: list[ServiceControlSpec] = []
     for service in DEFAULT_SERVICE_SPECS:

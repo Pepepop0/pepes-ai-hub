@@ -576,6 +576,46 @@ def test_default_comfyui_precondition_never_fakes_a_runtime_handoff(tmp_path):
     assert handoff.executable is None
 
 
+def test_preexisting_managed_comfyui_handoff_drives_its_runtime_spec(tmp_path):
+    """A valid managed checkout joins to Python + main.py without a second id."""
+    context = context_for(tmp_path)
+    provisioner = default_provisioners()["comfyui"]
+    environment = provisioner.environment(context)
+    environment.bin_dir.mkdir(parents=True)
+    environment.python.write_text("python", encoding="utf-8")
+    entry_point = provisioner.entry_point(context)
+    entry_point.write_text("# ComfyUI", encoding="utf-8")
+    write_marker(
+        provisioner.managed_dir(context),
+        component="comfyui",
+        source_id=provisioner.revision or "comfyui",
+        version=provisioner.revision,
+        checksum=provisioner.commit,
+    )
+
+    snapshot = detect_integration(context, {"comfyui": provisioner})
+    handoff = snapshot.by_component("comfyui")
+    assert handoff is not None
+    assert handoff.availability is LaunchAvailability.AVAILABLE
+    assert handoff.ownership is Ownership.MANAGED
+    assert handoff.executable == environment.python
+
+    spec = {item.service_id: item for item in control_specs_for(snapshot, layout=context.layout)}[
+        "comfyui"
+    ]
+    assert spec.controllable
+    assert spec.launch is not None
+    assert spec.launch.argv == (
+        str(environment.python),
+        str(entry_point),
+        "--listen",
+        "127.0.0.1",
+        "--port",
+        "8188",
+    )
+    assert spec.launch.cwd == context.layout.comfyui_app
+
+
 def test_an_external_web_app_is_never_given_a_launch_spec(tmp_path):
     from local_ai_stack.integration import ComponentIntegration, IntegrationSnapshot
     from local_ai_stack.provisioning import LaunchAvailability, Ownership, RuntimeHandoff

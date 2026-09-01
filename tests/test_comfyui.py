@@ -280,14 +280,16 @@ def test_unpinned_dependencies_refuse_before_cloning_anything(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_the_default_registry_ships_comfyui_pinned_but_refusing():
+def test_the_default_registry_ships_comfyui_fully_pinned():
     from local_ai_stack.integration import default_provisioners
 
     provisioner = default_provisioners()["comfyui"]
     assert provisioner.is_pinned
     assert provisioner.revision == REVISION
     assert provisioner.commit == COMMIT
-    assert provisioner.dependencies.is_empty
+    # The dependency decision now comes from the manifest, so apply() no longer
+    # refuses: this is the component's blocker being closed.
+    assert not provisioner.dependencies.is_empty
 
 
 def test_missing_git_refuses(tmp_path):

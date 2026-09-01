@@ -20,18 +20,22 @@ The clone is pinned twice. The manifest records the tag *and* the commit that
 tag pointed at when it was recorded, and the checkout is verified against that
 commit afterwards, so a tag moved upstream is reported rather than followed.
 
-Why apply() still refuses by default
-------------------------------------
+Dependencies
+------------
 ComfyUI's own requirements.txt leaves torch, torchvision and torchaudio
-unpinned, so installing it verbatim would resolve whatever those packages
+unversioned, so installing it verbatim would resolve whatever those packages
 happen to be today — and on an NVIDIA target, which build of torch to install
-is a real decision, not a default. Rather than resolve it silently, the
-dependency step needs an explicit pin: a requirement list and, where the wheels
-do not come from PyPI, an index to take them from.
+is a decision, not a default. Those three are pinned in the manifest instead,
+with the index that serves the CUDA wheels; everything else still comes from
+the repository's own file, which is itself fixed by the pinned commit.
 
-Without that pin, apply() refuses with PRECONDITION *before cloning anything*,
-so nothing is created and no half-installed checkout is left behind claiming to
-be usable. Detection, planning, verification and dry-run all work regardless.
+A component with no dependency pin is still refused with PRECONDITION *before
+cloning anything*, so nothing is created and no half-installed checkout is left
+behind claiming to be usable.
+
+verify() proves both halves independently: the checkout sits on the pinned
+commit, and the environment really holds the pinned distribution at the pinned
+version. Either can be true without the other.
 """
 
 from __future__ import annotations
@@ -61,6 +65,7 @@ from .pyenv import (
     PythonEnvironmentError,
     create_environment,
     describe_range,
+    distribution_version,
     find_interpreter,
     pip_install,
 )
@@ -91,10 +96,26 @@ class DependencyPin:
     index_url: str | None = None
     extra_index_url: str | None = None
     use_repository_requirements: bool = False
+    verify_distribution: str | None = None
+    verify_version: str | None = None
 
     @property
     def is_empty(self) -> bool:
         return not self.requirements and not self.use_repository_requirements
+
+    @classmethod
+    def from_pin(cls, pinned) -> DependencyPin:
+        """Adopt a catalog pin verbatim. The manifest already validated it."""
+        if pinned is None:
+            return cls()
+        return cls(
+            requirements=tuple(pinned.requirements),
+            index_url=pinned.index_url,
+            extra_index_url=pinned.extra_index_url,
+            use_repository_requirements=pinned.use_repository_requirements,
+            verify_distribution=pinned.verify_distribution,
+            verify_version=pinned.verify_version,
+        )
 
     def pip_arguments(self, checkout: Path) -> tuple[list[str], list[str]]:
         """(extra pip flags, requirement arguments)."""
@@ -117,6 +138,8 @@ class ComfyUIProvisioner(Provisioner):
     commit: str | None = None
     url: str | None = None
     dependencies: DependencyPin = field(default_factory=DependencyPin)
+    python_minimum: tuple[int, int] = PYTHON_MINIMUM
+    python_below: tuple[int, int] = PYTHON_BELOW
     install_alongside_external: bool = False
     git: GitClient | None = None
 
@@ -240,36 +263,67 @@ class ComfyUIProvisioner(Provisioner):
     # --- verificacao -------------------------------------------------------
 
     def verify(self, context: ProvisionContext) -> Detection:
-        """Confirm the checkout still sits on the pinned commit."""
+        """Confirm the checkout sits on the pinned commit and the environment
+        really holds the pinned dependency.
+
+        Two independent proofs, because either can be true without the other: a
+        correct checkout whose environment never finished installing, or a
+        complete environment on a checkout somebody moved.
+        """
         detection = self.detect(context)
         if not detection.is_usable or not detection.is_managed:
             return detection
-        if self.commit is None:
-            return detection
-        try:
-            head = self._git(context).head(self.managed_dir(context))
-        except GitError as exc:
-            return Detection(
-                component_id=self.component_id,
-                state=ComponentState.INVALID,
-                ownership=detection.ownership,
-                path=detection.path,
-                detail=f"Could not read the checkout revision: {exc}",
-                evidence=detection.evidence,
-            )
-        if head != self.commit:
-            return Detection(
-                component_id=self.component_id,
-                state=ComponentState.INVALID,
-                ownership=detection.ownership,
-                path=detection.path,
-                detail=(
+
+        if self.commit is not None:
+            try:
+                head = self._git(context).head(self.managed_dir(context))
+            except GitError as exc:
+                return self._invalid(detection, f"Could not read the checkout revision: {exc}")
+            if head != self.commit:
+                return self._invalid(
+                    detection,
                     f"The checkout is at {head[:12]} but the pin is {self.commit[:12]}. "
-                    "It was moved outside this hub."
-                ),
-                evidence=detection.evidence,
+                    "It was moved outside this hub.",
+                )
+
+        distribution = self.dependencies.verify_distribution
+        if distribution is None:
+            return detection
+
+        installed = distribution_version(context.runner, self.environment(context), distribution)
+        if installed is None:
+            return self._invalid(
+                detection,
+                f"{distribution} is not installed in the managed environment; "
+                "the dependency install did not complete.",
             )
-        return detection
+        expected = self.dependencies.verify_version
+        # A CUDA wheel reports its build as a local version (2.11.0+cu130), so
+        # the pin is compared against the release part, not the whole string.
+        if expected is not None and installed.split("+")[0] != expected:
+            return self._invalid(
+                detection,
+                f"{distribution} {installed} is installed but the pin is {expected}.",
+            )
+        return Detection(
+            component_id=detection.component_id,
+            state=ComponentState.INSTALLED,
+            ownership=detection.ownership,
+            version=detection.version,
+            path=detection.path,
+            detail=detection.detail,
+            evidence=(*detection.evidence, f"{distribution}=={installed}"),
+        )
+
+    def _invalid(self, detection: Detection, detail: str) -> Detection:
+        return Detection(
+            component_id=self.component_id,
+            state=ComponentState.INVALID,
+            ownership=detection.ownership,
+            path=detection.path,
+            detail=detail,
+            evidence=detection.evidence,
+        )
 
     # --- plano -------------------------------------------------------------
 
@@ -300,7 +354,7 @@ class ComfyUIProvisioner(Provisioner):
                 ProvisionStep(
                     action="create-venv",
                     target=str(self.environment(context).root),
-                    summary=f"Create a Python {describe_range(PYTHON_MINIMUM, PYTHON_BELOW)} environment.",
+                    summary=f"Create a Python {describe_range(self.python_minimum, self.python_below)} environment.",
                 ),
                 ProvisionStep(
                     action="install-requirements",
@@ -368,13 +422,15 @@ class ComfyUIProvisioner(Provisioner):
                 "Git is required to install ComfyUI and was not found on PATH.",
             )
 
-        interpreter = find_interpreter(context.runner, minimum=PYTHON_MINIMUM, below=PYTHON_BELOW)
+        interpreter = find_interpreter(
+            context.runner, minimum=self.python_minimum, below=self.python_below
+        )
         if interpreter is None:
             return self.failed(
                 detection,
                 FailureReason.PRECONDITION,
                 "No supported Python interpreter was found.",
-                f"ComfyUI requires Python {describe_range(PYTHON_MINIMUM, PYTHON_BELOW)}.",
+                f"ComfyUI requires Python {describe_range(self.python_minimum, self.python_below)}.",
             )
 
         if dry_run:
@@ -485,15 +541,27 @@ def provisioner_from_pin(
     dependencies: DependencyPin | None = None,
     requirements: Sequence[str] = (),
 ) -> ComfyUIProvisioner:
-    """Build a provisioner from a catalog pin, or an unpinned one from None."""
-    resolved = dependencies if dependencies is not None else DependencyPin(tuple(requirements))
+    """Build a provisioner from a catalog pin, or an unpinned one from None.
+
+    The manifest's dependency decision is adopted unless a caller overrides it,
+    which is what makes a pinned checkout installable without any code change.
+    """
     if pin is None:
+        resolved = dependencies if dependencies is not None else DependencyPin(tuple(requirements))
         return ComfyUIProvisioner(dependencies=resolved)
+    if dependencies is not None:
+        resolved = dependencies
+    elif requirements:
+        resolved = DependencyPin(tuple(requirements))
+    else:
+        resolved = DependencyPin.from_pin(pin.dependencies)
     return ComfyUIProvisioner(
         revision=pin.revision,
         commit=pin.commit,
         url=pin.url,
         dependencies=resolved,
+        python_minimum=pin.python_minimum,
+        python_below=pin.python_below,
     )
 
 

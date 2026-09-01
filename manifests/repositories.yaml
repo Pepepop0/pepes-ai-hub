@@ -16,3 +16,33 @@ repositories:
     revision: v0.34.0
     commit: 12d5279438bfefc058a269eae805ceab6047777f
     destination: apps/comfyui
+
+    # cp311 wheels exist for the whole torch triple below, and 3.11 is what the
+    # target host runs. Upstream also supports 3.13; widening this needs the
+    # triple validated there first.
+    python:
+      minimum: "3.11"
+      below: "3.13"
+
+    # ComfyUI's own requirements.txt leaves torch, torchvision and torchaudio
+    # unversioned, so they are pinned here instead. Everything else comes from
+    # that file, which is itself fixed by the commit above.
+    #
+    # cu130 because the README at this very commit states cu130 or above is
+    # required for Nvidia 20 series and newer, and the target is an RTX 5070.
+    # The host driver reports CUDA 13.3, which satisfies a CUDA 13.0 build.
+    #
+    # 2.11.0 rather than the newer 2.13.0 in the same index: torchaudio is in
+    # maintenance mode and its last cu130 build is 2.11.0, so 2.12 and 2.13
+    # have no matching torchaudio. This triple is internally consistent —
+    # torchvision 0.26.0 declares torch==2.11.0 — and ComfyUI needs torch 2.7
+    # at minimum, so 2.11.0 is comfortably above the floor.
+    dependencies:
+      extra_index_url: https://download.pytorch.org/whl/cu130
+      requirements:
+        - torch==2.11.0+cu130
+        - torchvision==0.26.0+cu130
+        - torchaudio==2.11.0+cu130
+      use_repository_requirements: true
+      verify_distribution: torch
+      verify_version: "2.11.0"

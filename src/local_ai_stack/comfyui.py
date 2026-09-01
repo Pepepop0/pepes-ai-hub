@@ -47,7 +47,7 @@ from pathlib import Path
 
 from .components import ComponentId
 from .git_ops import GitClient, GitError
-from .markers import ManagedMarker, marker_path, read_marker, write_marker
+from .markers import ManagedMarker, fingerprint_of, marker_path, read_marker, write_marker
 from .provisioning import (
     ComponentState,
     Detection,
@@ -153,6 +153,35 @@ class ComfyUIProvisioner(Provisioner):
 
     def _git(self, context: ProvisionContext) -> GitClient:
         return self.git if self.git is not None else GitClient(context.runner)
+
+    # --- identidade do pin -------------------------------------------------
+
+    def dependency_fingerprint(self) -> str:
+        """A stable hash of everything this install would be built from.
+
+        Recorded in the marker, so a later run can tell an install produced by
+        the current pin from one produced by an older one. Requirements are
+        sorted, so reordering the manifest is not mistaken for a new pin, while
+        adding, removing or re-versioning anything is.
+        """
+        return fingerprint_of(
+            {
+                "component": self.component_id,
+                "url": self.url or "",
+                "revision": self.revision or "",
+                "commit": self.commit or "",
+                "requirements": sorted(self.dependencies.requirements),
+                "index_url": self.dependencies.index_url or "",
+                "extra_index_url": self.dependencies.extra_index_url or "",
+                "use_repository_requirements": self.dependencies.use_repository_requirements,
+                "python": describe_range(self.python_minimum, self.python_below),
+            }
+        )
+
+    def matches_pin(self, context: ProvisionContext) -> bool:
+        """True when the marker on disk was written by the current pin."""
+        marker = self._read_marker(context)
+        return marker is not None and marker.matches(self.dependency_fingerprint())
 
     # --- paths -------------------------------------------------------------
 
@@ -329,7 +358,9 @@ class ComfyUIProvisioner(Provisioner):
 
     def plan(self, context: ProvisionContext) -> ProvisionPlan:
         detection = self.detect(context)
-        if detection.is_managed and detection.is_usable:
+        # A managed install is only nothing-to-do when it came from this pin.
+        # Under a changed pin it has work to do, and the plan must say so.
+        if detection.is_managed and detection.is_usable and self.matches_pin(context):
             return ProvisionPlan(self.component_id, (), detection)
         if detection.is_external and not self.install_alongside_external:
             return ProvisionPlan(self.component_id, (), detection)
@@ -389,8 +420,26 @@ class ComfyUIProvisioner(Provisioner):
         plan = self.plan(context)
         detection = plan.detection
 
+        reinstall_reason = ""
         if detection.is_managed and detection.is_usable:
-            return self.skipped(detection, "A managed ComfyUI is already installed.")
+            if self.matches_pin(context):
+                # Same pin: only a passing verification earns a skip. A managed
+                # install whose environment is broken is repaired, not accepted.
+                verified = self.verify(context)
+                if verified.is_usable:
+                    return self.skipped(
+                        verified, "A managed ComfyUI built from this pin is already installed."
+                    )
+                reinstall_reason = f"Reinstalling: {verified.detail}"
+            else:
+                # The pin changed. Skipping here would make a re-pin look like a
+                # no-op, which is exactly how a version bump gets lost.
+                marker = self._read_marker(context)
+                previous = marker.version if marker is not None else "an unknown revision"
+                reinstall_reason = (
+                    f"The installed ComfyUI was built from {previous}, "
+                    f"not from the current pin {self.revision}. Reinstalling."
+                )
 
         if detection.is_external and not self.install_alongside_external:
             return self.skipped(
@@ -434,12 +483,15 @@ class ComfyUIProvisioner(Provisioner):
             )
 
         if dry_run:
+            intent = f"Would install ComfyUI {self.revision} into {self.managed_dir(context)}."
             return self.dry_run_result(
                 detection,
                 plan.steps,
-                f"Would install ComfyUI {self.revision} into {self.managed_dir(context)}.",
+                f"{reinstall_reason} {intent}".strip(),
             )
 
+        if reinstall_reason:
+            context.emit(self.component_id, reinstall_reason)
         return self._install(context, detection, plan, git, interpreter)
 
     def _install(self, context, detection, plan, git, interpreter) -> ProvisionResult:
@@ -457,6 +509,9 @@ class ComfyUIProvisioner(Provisioner):
             if not git.is_repository(directory):
                 git.clone(self.url, directory, revision=self.revision)
             else:
+                # Re-pinning to a newer tag needs it fetched first. fetch()
+                # refuses a dirty tree, so local edits are never discarded.
+                git.fetch(directory)
                 git.checkout(directory, self.revision)
         except GitError as exc:
             return self.failed(
@@ -516,6 +571,7 @@ class ComfyUIProvisioner(Provisioner):
             source_id=self.url or self.component_id,
             version=self.revision,
             checksum=self.commit,
+            fingerprint=self.dependency_fingerprint(),
         )
         final = self.verify(context)
         if not final.is_usable:

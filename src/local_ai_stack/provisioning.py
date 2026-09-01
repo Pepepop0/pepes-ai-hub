@@ -299,14 +299,21 @@ class Provisioner:
         return None
 
     def runtime_handoff(self, context: ProvisionContext) -> RuntimeHandoff:
-        """Translate the current detection into what the runtime may do.
+        """Translate the current state into what the runtime may do.
 
         The mapping is deliberately narrow. Only a MANAGED install that is
         actually usable becomes AVAILABLE, and only then is an executable
         handed over. EXTERNAL is reported as EXTERNAL so a caller can show it
         and refuse to control it; nothing else can ever yield a path.
+
+        The question is put to `verify`, not to `detect`. Detection answers
+        "are the files there"; verification answers "does it actually work".
+        Handing the runtime an executable for an install whose dependencies
+        never finished installing turns a provisioning problem into a launch
+        failure, where it is far harder to diagnose. For a provisioner that
+        does not override `verify`, this is exactly the old behaviour.
         """
-        detection = self.detect(context)
+        detection = self.verify(context)
         name = self.display_name or self.component_id
         if detection.is_external:
             return RuntimeHandoff(

@@ -567,3 +567,124 @@ def test_restarting_a_service_replaces_its_job_instead_of_stacking_them(tmp_path
     assert len(ledger.closed_jobs) == 1, "the previous job was released on replacement"
     launcher.close_all()
     assert ledger.balanced
+
+
+# --- a failed tree termination must still let go ---------------------------
+
+
+def stop_scenario(monkeypatch, tmp_path, *, root: int, child: int, terminate_ok: bool):
+    """A root that exits, a proved descendant that does not, and a chosen
+    outcome for TerminateJobObject. No real process is involved: every kernel
+    answer is scripted, so the path under test is exact.
+    """
+    from local_ai_stack import jobs as job_module
+    from local_ai_stack import launcher as launcher_module
+    from local_ai_stack import registry as registry_module
+    from local_ai_stack.inventory import LookupOutcome, ProcessInfo, ProcessLookup
+    from local_ai_stack.launcher import ProcessLauncher
+    from local_ai_stack.registry import ManagedProcessRegistry
+
+    ledger = HandleLedger(monkeypatch)
+    monkeypatch.setattr(job_module, "member_pids", lambda job: (root, child))
+    monkeypatch.setattr(
+        job_module,
+        "membership",
+        lambda job, pid: Membership.MEMBER if job is not None else Membership.UNPROVABLE,
+    )
+    monkeypatch.setattr(job_module, "terminate", lambda job, exit_code=1: terminate_ok)
+
+    # The root is alive and ours until it is asked to stop; the child stays.
+    root_info = ProcessInfo(root, "python.exe", PYTHON, "root", 500.0)
+    state = {"root_alive": True}
+
+    def fake_lookup(pid: int) -> ProcessLookup:
+        if pid == root and not state["root_alive"]:
+            return ProcessLookup(LookupOutcome.NOT_FOUND, detail="gone")
+        info = root_info if pid == root else ProcessInfo(pid, "python.exe", PYTHON, "child", 600.0)
+        return ProcessLookup(LookupOutcome.FOUND, info)
+
+    monkeypatch.setattr(registry_module, "lookup_process", fake_lookup)
+    monkeypatch.setattr(launcher_module, "lookup_process", fake_lookup)
+
+    def fake_terminate_process(pid: int) -> None:
+        assert pid == root, "only the registered root is ever asked to stop"
+        state["root_alive"] = False
+
+    monkeypatch.setattr(launcher_module, "_terminate", fake_terminate_process)
+
+    def forbidden_kill(pid: int) -> None:
+        raise AssertionError("a failed tree termination must not fall back to killing pids")
+
+    monkeypatch.setattr(launcher_module, "_kill", forbidden_kill)
+
+    registry = ManagedProcessRegistry(tmp_path / "state" / "managed.json")
+    launcher = ProcessLauncher(
+        registry,
+        spawn=fake_spawn_returning(root),
+        clock=lambda: 500.0,
+        monotonic=lambda: 0.0,
+        sleep=lambda seconds: None,
+    )
+    launcher.start(launch_spec())
+    return launcher, registry, ledger
+
+
+def test_a_failed_tree_termination_still_releases_the_record_and_the_job(tmp_path, monkeypatch):
+    """The blocker: root gone, tree termination failed, state must be let go."""
+    from local_ai_stack.launcher import StopOutcome
+
+    launcher, registry, ledger = stop_scenario(
+        monkeypatch, tmp_path, root=7001, child=7002, terminate_ok=False
+    )
+
+    result = launcher.stop("fixture", timeout=5, allow_force=True)
+
+    # The blocker itself: nothing usable may be retained once the root is gone.
+    assert registry.load().entries == {}, "the record described a dead process"
+    assert launcher._jobs == {}, "the job handle was released"
+    assert ledger.balanced, "no handle was leaked"
+
+    # And the result stays honest about all three facts at once.
+    assert result.outcome is StopOutcome.STOPPED, "the root really did stop"
+    assert result.forced is False, "nothing was force terminated"
+    assert result.tree_pids == (), "no tree was claimed"
+    assert result.left_running == (7002,), "the descendant is reported as possibly alive"
+    assert "could not be terminated" in result.detail
+    assert "may still be running" in result.detail
+
+
+def test_a_successful_tree_termination_still_releases_everything(tmp_path, monkeypatch):
+    """The sibling path, so the fix cannot regress it."""
+    from local_ai_stack.launcher import StopOutcome
+
+    launcher, registry, ledger = stop_scenario(
+        monkeypatch, tmp_path, root=7101, child=7102, terminate_ok=True
+    )
+
+    result = launcher.stop("fixture", timeout=5, allow_force=True)
+
+    assert result.outcome is StopOutcome.STOPPED
+    assert result.forced is True
+    assert result.tree_pids == (7101, 7102)
+    assert registry.load().entries == {}
+    assert launcher._jobs == {}
+    assert ledger.balanced
+
+
+def test_a_root_that_exits_without_force_releases_everything_too(tmp_path, monkeypatch):
+    """And the conservative path keeps its own cleanup."""
+    from local_ai_stack.launcher import StopOutcome
+
+    launcher, registry, ledger = stop_scenario(
+        monkeypatch, tmp_path, root=7201, child=7202, terminate_ok=False
+    )
+
+    result = launcher.stop("fixture", timeout=5)
+
+    assert result.outcome is StopOutcome.STOPPED
+    assert result.tree_pids == ()
+    assert result.left_running == (7202,)
+    assert "force was not allowed" in result.detail
+    assert registry.load().entries == {}
+    assert launcher._jobs == {}
+    assert ledger.balanced

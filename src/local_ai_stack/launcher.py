@@ -499,15 +499,25 @@ class ProcessLauncher:
         """The registered process is gone. Decide what to do about its tree."""
         leftovers = self.surviving_members(proved, pid)
         if leftovers and allow_force:
-            result = self._terminate_tree(service_id, pid, proved or (), timeout)
-            if result.outcome is StopOutcome.STOPPED:
-                return result
-            # The tree could not be cleaned up, but the root really did exit.
+            attempt = self._terminate_tree(service_id, pid, proved or (), timeout)
+            if attempt.outcome is StopOutcome.STOPPED:
+                return attempt
+            # The tree could not be terminated, but the root is confirmed gone.
+            # The record describes a dead process and the job can no longer be
+            # reached through it, so both are released here rather than left
+            # behind. The surviving descendants are reported and nothing else
+            # is tried: a failed termination must not widen this manager's
+            # authority into guessing at them by another route.
+            self._release(service_id)
             return StopResult(
                 StopOutcome.STOPPED,
                 service_id,
                 pid,
-                f"terminated gracefully; {result.detail}",
+                (
+                    f"terminated gracefully, but the process tree could not be "
+                    f"terminated ({attempt.detail}); {len(leftovers)} proved child "
+                    "process(es) may still be running"
+                ),
                 left_running=leftovers,
             )
         detail = self._single_detail(self.registry.load().get(service_id), leftovers)

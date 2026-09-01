@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from .components import normalize_component_id
+
 PROFILE_SCHEMA_VERSION = 1
 MIB_PER_GIB = 1024
 
@@ -243,8 +245,13 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
     if not services_data:
         raise _error(source, "services", "must define at least one service")
     services: dict[str, ServiceConfig] = {}
-    for service_id, service_value in services_data.items():
-        _string(service_id, source, "services key")
+    for raw_service_id, service_value in services_data.items():
+        _string(raw_service_id, source, "services key")
+        # Canonicalize once, on the way in: everything downstream — plan steps,
+        # provisioners, runtime service ids — sees only canonical ids.
+        service_id = normalize_component_id(raw_service_id)
+        if service_id in services:
+            raise _error(source, "services", f"duplicate service id: {service_id}")
         service = _mapping(service_value, source, f"services.{service_id}")
         _reject_unknown(
             service,

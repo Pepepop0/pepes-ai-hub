@@ -30,17 +30,22 @@ Three cases, and their consequences, are decided here once:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from .adapters import observation_only_specs, ollama_control_spec
+from .catalog import artifact_for, package_for, repository_for
+from .comfyui import COMPONENT_ID as COMFYUI_COMPONENT_ID
+from .comfyui import provisioner_from_pin as comfyui_provisioner
 from .controller import ServiceController, ServiceControlSpec
 from .execution import PlanExecutor, ProvisionerRegistry
 from .installation import ResolvedInstallation
 from .launcher import ProcessLauncher
 from .ollama import COMPONENT_ID as OLLAMA_COMPONENT_ID
 from .ollama import OllamaProvisioner
+from .open_webui import COMPONENT_ID as OPEN_WEBUI_COMPONENT_ID
+from .open_webui import OpenWebUIProvisioner
 from .processes import OLLAMA_PROCESS
 from .provisioning import (
     LaunchAvailability,
@@ -68,11 +73,18 @@ __all__ = [
 def default_provisioners() -> dict[str, Provisioner]:
     """Every component with a real provisioner today.
 
-    Ollama is deliberately constructed without an artifact: no production
-    archive is pinned yet, so a real install refuses with PRECONDITION instead
-    of guessing a URL. Detection, planning and dry-run all work regardless.
+    Each one is handed whatever the shipped manifests pin for it. A component
+    with nothing pinned still detects, plans and dry-runs; only a real install
+    refuses, with PRECONDITION, rather than guessing a URL or a revision.
     """
-    return {OLLAMA_COMPONENT_ID: OllamaProvisioner()}
+    open_webui_pin = package_for(OPEN_WEBUI_COMPONENT_ID)
+    return {
+        OLLAMA_COMPONENT_ID: OllamaProvisioner(artifact=artifact_for(OLLAMA_COMPONENT_ID)),
+        OPEN_WEBUI_COMPONENT_ID: OpenWebUIProvisioner(
+            version=None if open_webui_pin is None else open_webui_pin.version,
+        ),
+        COMFYUI_COMPONENT_ID: comfyui_provisioner(repository_for(COMFYUI_COMPONENT_ID)),
+    }
 
 
 def provision_context(
@@ -161,21 +173,20 @@ class IntegrationSnapshot:
         return tuple(c.service_id for c in self.components if c.controllable)
 
 
-# Which service a provisioned component ends up serving. Ollama is the only
-# component with both a provisioner and a runtime service today.
-COMPONENT_SERVICE_IDS: Mapping[str, str] = {OLLAMA_COMPONENT_ID: OLLAMA_SPEC.id}
-
-
 def detect_integration(
     context: ProvisionContext,
     provisioners: ProvisionerRegistry | None = None,
 ) -> IntegrationSnapshot:
-    """Ask every provisioner what the runtime may do. Read-only, creates nothing."""
+    """Ask every provisioner what the runtime may do. Read-only, creates nothing.
+
+    A component id and a service id are the same canonical string (see
+    :mod:`components`), so there is no translation table here to drift.
+    """
     registry = default_provisioners() if provisioners is None else provisioners
     components = tuple(
         ComponentIntegration(
             handoff=provisioner.runtime_handoff(context),
-            service_id=COMPONENT_SERVICE_IDS.get(component_id, component_id),
+            service_id=component_id,
         )
         for component_id, provisioner in sorted(registry.items())
     )

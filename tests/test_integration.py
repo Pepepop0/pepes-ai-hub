@@ -118,11 +118,7 @@ def install_managed(context, *, executable: bool = True, marker: bool = True) ->
         (directory / MARKER_NAME).write_text(
             json.dumps(
                 ManagedMarker(
-                    schema_version=1,
-                    artifact_id="ollama-windows",
-                    version="0.5.4",
-                    sha256=None,
-                    installed_at=0.0,
+                    component="ollama", source_id="ollama-windows", version="0.5.4", checksum=None
                 ).to_dict()
             ),
             encoding="utf-8",
@@ -314,7 +310,7 @@ def plan_for(profile, tmp_path):
     )
 
 
-def test_prepare_layout_and_ollama_are_the_supported_steps(profile, tmp_path):
+def test_prepare_layout_and_every_provisioned_component_are_supported(profile, tmp_path):
     context = context_for(tmp_path)
     executor = plan_executor(context)
     plan = plan_for(profile, tmp_path)
@@ -322,10 +318,9 @@ def test_prepare_layout_and_ollama_are_the_supported_steps(profile, tmp_path):
 
     assert resolved[(PlanAction.PREPARE_LAYOUT, str(context.layout.root))] is True
     assert resolved[(PlanAction.INSTALL, "ollama")] is True
-    # Plan targets are profile service keys, which is why Open WebUI appears
-    # here as "open_webui" and not as the "open-webui" service id.
-    assert resolved[(PlanAction.INSTALL, "open_webui")] is False
-    assert resolved[(PlanAction.INSTALL, "comfyui")] is False
+    # Plan targets and runtime service ids are the same canonical string.
+    assert resolved[(PlanAction.INSTALL, "open-webui")] is True
+    assert resolved[(PlanAction.INSTALL, "comfyui")] is True
     assert resolved[(PlanAction.CHECK, "system")] is False
     assert resolved[(PlanAction.CONFIGURE, profile.id)] is False
 
@@ -341,7 +336,8 @@ def test_unsupported_steps_stay_explicit_and_cover_the_whole_plan(profile, tmp_p
         assert entry.reason
     unsupported_targets = {e.step.target for e in report.unsupported}
     # Models and workflows are named, not silently dropped as if they were done.
-    assert {"open_webui", "comfyui"} <= unsupported_targets
+    # Every stack component now has a provisioner; models and workflows do not.
+    assert not ({"ollama", "open-webui", "comfyui"} & unsupported_targets)
     assert any(e.action is PlanAction.ACQUIRE_MODEL for e in report.unsupported)
     assert any(e.action is PlanAction.APPLY_WORKFLOW for e in report.unsupported)
 
@@ -360,8 +356,19 @@ def test_dry_run_is_deterministic_and_creates_nothing(profile, tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_dry_run_without_a_pinned_artifact_refuses_with_a_precondition(profile, tmp_path):
+def test_dry_run_with_the_pinned_artifact_previews_the_install(profile, tmp_path):
     executor = plan_executor(context_for(tmp_path))
+    report = executor.execute(plan_for(profile, tmp_path), dry_run=True)
+    ollama = next(r for r in report.results if r.component_id == "ollama")
+    assert ollama.outcome is ProvisionOutcome.DRY_RUN
+    assert ollama.failure is None
+    assert [step.action for step in ollama.steps] == ["download", "extract", "mark-managed"]
+    assert not context_for(tmp_path).layout.root.exists()
+
+
+def test_a_component_with_nothing_pinned_still_refuses_with_a_precondition(profile, tmp_path):
+    """The refusal path stays reachable: no pin means no guessed URL."""
+    executor = plan_executor(context_for(tmp_path), {"ollama": OllamaProvisioner()})
     report = executor.execute(plan_for(profile, tmp_path), dry_run=True)
     ollama = next(r for r in report.results if r.component_id == "ollama")
     assert ollama.outcome is ProvisionOutcome.FAILED
@@ -381,10 +388,13 @@ def test_dry_run_leaves_an_external_ollama_untouched(profile, tmp_path):
     assert not context.layout.root.exists()
 
 
-def test_default_registry_ships_ollama_without_an_artifact():
+def test_default_registry_ships_every_component_with_its_pin():
     provisioners = default_provisioners()
-    assert set(provisioners) == {"ollama"}
-    assert provisioners["ollama"].artifact is None
+    assert set(provisioners) == {"ollama", "open-webui", "comfyui"}
+    artifact = provisioners["ollama"].artifact
+    assert artifact is not None
+    assert artifact.version == "0.33.2"
+    assert artifact.has_checksum
 
 
 # --- helpers ---------------------------------------------------------------

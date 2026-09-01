@@ -96,7 +96,6 @@ def integration_snapshot(
                     detected_path=detected_path,
                     detail=detail,
                 ),
-                service_id="ollama",
             ),
         )
     )

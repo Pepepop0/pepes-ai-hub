@@ -443,3 +443,79 @@ def test_layout_helper_is_not_reimplemented(tmp_path):
     assert OllamaProvisioner().managed_executable(context) == (
         context.layout.ollama_app / EXECUTABLE
     )
+
+
+# --- canonical component/service ids ----------------------------------------
+
+
+def test_stack_components_and_runtime_services_share_canonical_ids():
+    """Planning, provisioning and runtime join without an id translation."""
+    from local_ai_stack.components import CANONICAL_IDS
+    from local_ai_stack.services import DEFAULT_SERVICE_SPECS
+    from local_ai_stack.stacks import get_stack
+
+    assert get_stack().component_ids == CANONICAL_IDS
+    assert tuple(spec.id for spec in DEFAULT_SERVICE_SPECS) == CANONICAL_IDS
+
+
+def test_control_specs_cover_every_service_even_without_a_provisioner(tmp_path):
+    """Missing installs stay watch-only even when their provisioners exist."""
+    context = context_for(tmp_path)
+    install_managed(context)
+    specs = {spec.service_id: spec for spec in control_specs_for(detect_integration(context))}
+    assert set(specs) == {"ollama", "open-webui", "comfyui"}
+    assert specs["ollama"].controllable
+    assert not specs["open-webui"].controllable
+    assert not specs["comfyui"].controllable
+    assert specs["open-webui"].launch is None
+
+
+def test_a_managed_web_app_becomes_controllable_with_no_change_here(tmp_path):
+    """The rule is per-handoff, so a future provisioner needs no wiring."""
+    from local_ai_stack.integration import ComponentIntegration, IntegrationSnapshot
+    from local_ai_stack.provisioning import LaunchAvailability, Ownership, RuntimeHandoff
+
+    layout = StackLayout.from_root(tmp_path / "stack")
+    snapshot = IntegrationSnapshot(
+        (
+            ComponentIntegration(
+                handoff=RuntimeHandoff(
+                    component_id="open-webui",
+                    availability=LaunchAvailability.AVAILABLE,
+                    ownership=Ownership.MANAGED,
+                    executable=Path(sys.executable),
+                    detail="managed install",
+                ),
+            ),
+        )
+    )
+    specs = {spec.service_id: spec for spec in control_specs_for(snapshot, layout=layout)}
+    open_webui = specs["open-webui"]
+    assert open_webui.controllable
+    assert open_webui.launch.argv == (sys.executable, "serve")
+    assert open_webui.launch.env["DATA_DIR"] == str(layout.open_webui_data)
+    assert open_webui.launch.logs.stdout == layout.log_file("open-webui")
+    # The others are untouched by one component becoming available.
+    assert not specs["comfyui"].controllable
+
+
+def test_an_external_web_app_is_never_given_a_launch_spec(tmp_path):
+    from local_ai_stack.integration import ComponentIntegration, IntegrationSnapshot
+    from local_ai_stack.provisioning import LaunchAvailability, Ownership, RuntimeHandoff
+
+    snapshot = IntegrationSnapshot(
+        (
+            ComponentIntegration(
+                handoff=RuntimeHandoff(
+                    component_id="comfyui",
+                    availability=LaunchAvailability.EXTERNAL,
+                    ownership=Ownership.EXTERNAL,
+                    detected_path=Path(sys.executable).parent,
+                    detail="installed by someone else",
+                ),
+            ),
+        )
+    )
+    specs = {spec.service_id: spec for spec in control_specs_for(snapshot)}
+    assert not specs["comfyui"].controllable
+    assert specs["comfyui"].launch is None

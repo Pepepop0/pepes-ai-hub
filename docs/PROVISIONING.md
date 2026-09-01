@@ -140,23 +140,37 @@ PATH, nenhum site-packages do sistema é tocado, e apagar o diretório desinstal
 faixa que o upstream declara (`>=3.11,<3.13`), sem mexer no PATH; se não houver
 um compatível, recusa em vez de montar ambiente não suportado.
 
-## ComfyUI — estratégia e o que falta
+## ComfyUI — estratégia
 
 Distribuído como fonte: clone Git pinado por tag **e** commit, mais um
 virtualenv ao lado. Depois do checkout o commit é conferido contra o pin, então
 tag movida upstream é reportada em vez de seguida silenciosamente.
 
-**Limitação real, deliberada:** o `requirements.txt` do ComfyUI no revision
-pinado deixa `torch`, `torchvision` e `torchaudio` **sem versão**. Instalar
-aquilo verbatim resolveria versões flutuantes — e, num alvo NVIDIA, *qual* build
-de torch instalar é uma decisão, não um default.
+O `requirements.txt` do ComfyUI no revision pinado deixa `torch`,
+`torchvision` e `torchaudio` **sem versão**. Esses três são pinados no manifest;
+o resto continua vindo daquele arquivo, que já está congelado pelo commit.
 
-Por isso o passo de dependências exige um `DependencyPin` explícito
-(requirements + índice, quando as wheels não vêm do PyPI). Sem ele, `apply()`
-recusa com `PRECONDITION` **antes de clonar qualquer coisa** — nada é criado e
-não sobra checkout meio-instalado se dizendo utilizável.
+| pin | valor | por quê |
+|---|---|---|
+| índice | `download.pytorch.org/whl/cu130` | o README **deste commit** exige cu130+ para série 20 e mais novas |
+| torch | `2.11.0+cu130` | maior versão com torchaudio pareado |
+| torchvision | `0.26.0+cu130` | seu metadado declara `torch==2.11.0` |
+| torchaudio | `2.11.0+cu130` | em *maintenance mode*: 2.11.0 é o último build cu130 |
+| python | `>=3.11,<3.13` | wheels cp311 existem para os três; 3.11 é o que o host roda |
 
-Decisão pendente para destravar: qual versão de torch e de qual índice.
+Por que não o torch 2.13.0, que existe no mesmo índice: torchaudio parou no
+2.11.0, então 2.12/2.13 não têm par. Fixar torch mais novo obrigaria a
+descartar o torchaudio que o ComfyUI lista.
+
+Driver do host reporta CUDA 13.3, que satisfaz um build CUDA 13.0.
+
+`verify()` prova as duas metades de forma independente: o checkout está no
+commit pinado, **e** o ambiente tem `torch` na versão pinada (comparando a
+parte de release, já que a wheel reporta `2.11.0+cu130`). Uma pode ser
+verdadeira sem a outra.
+
+Componente sem pin de dependência continua recusando com `PRECONDITION`
+**antes de clonar** — nada é criado.
 
 ## O que ainda não existe
 
@@ -164,4 +178,4 @@ Decisão pendente para destravar: qual versão de torch e de qual índice.
 - update/repair/uninstall;
 - VRAM orchestration;
 - resume de download parcial (o `.part` é descartado, não retomado);
-- pin de dependências do ComfyUI (torch e índice).
+- validação em hardware real do stack ComfyUI (nada foi instalado no host).

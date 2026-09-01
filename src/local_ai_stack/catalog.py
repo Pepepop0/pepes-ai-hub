@@ -48,6 +48,32 @@ class CatalogError(ValueError):
 
 
 @dataclass(frozen=True)
+class PinnedDependencies:
+    """What to install into a checkout's environment, decided explicitly.
+
+    A repository's own requirements file may leave packages unversioned — as
+    ComfyUI does for torch — so the ones that matter are pinned here. Wheels
+    that do not come from PyPI, such as a CUDA build of torch, need the index
+    that serves them named alongside.
+
+    `verify_distribution` names a package whose presence and version prove the
+    environment really got what was pinned, which is what makes verify() more
+    than a file-existence check.
+    """
+
+    requirements: tuple[str, ...] = ()
+    index_url: str | None = None
+    extra_index_url: str | None = None
+    use_repository_requirements: bool = False
+    verify_distribution: str | None = None
+    verify_version: str | None = None
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.requirements and not self.use_repository_requirements
+
+
+@dataclass(frozen=True)
 class PinnedRepository:
     """A source checkout pinned to an exact revision.
 
@@ -61,6 +87,9 @@ class PinnedRepository:
     revision: str
     commit: str | None = None
     destination: str | None = None
+    dependencies: PinnedDependencies | None = None
+    python_minimum: tuple[int, int] = (3, 11)
+    python_below: tuple[int, int] = (3, 13)
 
     @property
     def is_pinned(self) -> bool:
@@ -112,7 +141,9 @@ def _repository_from(data: Any, component: str, source: Path | str) -> PinnedRep
     if not isinstance(data, dict):
         raise CatalogError(f"{source}: repositories.{component} must be a mapping")
     unknown = sorted(
-        str(key) for key in data if key not in {"url", "revision", "commit", "destination"}
+        str(key)
+        for key in data
+        if key not in {"url", "revision", "commit", "destination", "dependencies", "python"}
     )
     if unknown:
         raise CatalogError(
@@ -138,12 +169,99 @@ def _repository_from(data: Any, component: str, source: Path | str) -> PinnedRep
     destination = data.get("destination")
     if destination is not None and (not isinstance(destination, str) or not destination.strip()):
         raise CatalogError(f"{source}: repositories.{component}.destination must be a string")
+
+    python = data.get("python") or {}
+    if not isinstance(python, dict):
+        raise CatalogError(f"{source}: repositories.{component}.python must be a mapping")
+    minimum = _version_pair(
+        python.get("minimum", "3.11"), f"repositories.{component}.python.minimum", source
+    )
+    below = _version_pair(
+        python.get("below", "3.13"), f"repositories.{component}.python.below", source
+    )
+    if below <= minimum:
+        raise CatalogError(f"{source}: repositories.{component}.python.below must be above minimum")
+
     return PinnedRepository(
         component=component,
         url=url.strip(),
         revision=revision.strip(),
         commit=commit,
         destination=destination.strip() if isinstance(destination, str) else None,
+        dependencies=_dependencies_from(data.get("dependencies"), component, source),
+        python_minimum=minimum,
+        python_below=below,
+    )
+
+
+def _dependencies_from(data: Any, component: str, source: Path | str) -> PinnedDependencies | None:
+    """Parse the explicit dependency decision, rejecting floating versions."""
+    if data is None:
+        return None
+    field = f"repositories.{component}.dependencies"
+    if not isinstance(data, dict):
+        raise CatalogError(f"{source}: {field} must be a mapping")
+    allowed = {
+        "requirements",
+        "index_url",
+        "extra_index_url",
+        "use_repository_requirements",
+        "verify_distribution",
+        "verify_version",
+    }
+    unknown = sorted(str(key) for key in data if key not in allowed)
+    if unknown:
+        raise CatalogError(f"{source}: {field}: unknown fields: {', '.join(unknown)}")
+
+    raw_requirements = data.get("requirements", [])
+    if not isinstance(raw_requirements, list):
+        raise CatalogError(f"{source}: {field}.requirements must be a list")
+    requirements: list[str] = []
+    for index, entry in enumerate(raw_requirements):
+        if not isinstance(entry, str) or not entry.strip():
+            raise CatalogError(f"{source}: {field}.requirements[{index}] must be a string")
+        requirement = entry.strip()
+        if "==" not in requirement:
+            raise CatalogError(
+                f"{source}: {field}.requirements[{index}] must pin an exact version "
+                f"with '==', got {requirement!r}"
+            )
+        requirements.append(requirement)
+
+    urls: dict[str, str | None] = {}
+    for key in ("index_url", "extra_index_url"):
+        value = data.get(key)
+        if value is None:
+            urls[key] = None
+            continue
+        if not isinstance(value, str) or not value.lower().startswith("https://"):
+            raise CatalogError(f"{source}: {field}.{key} must be an https URL")
+        urls[key] = value.strip()
+
+    use_repository = data.get("use_repository_requirements", False)
+    if not isinstance(use_repository, bool):
+        raise CatalogError(f"{source}: {field}.use_repository_requirements must be a boolean")
+
+    verify_distribution = data.get("verify_distribution")
+    if verify_distribution is not None and (
+        not isinstance(verify_distribution, str) or not verify_distribution.strip()
+    ):
+        raise CatalogError(f"{source}: {field}.verify_distribution must be a string")
+    verify_version = data.get("verify_version")
+    if verify_version is not None and (
+        not isinstance(verify_version, str) or not verify_version.strip()
+    ):
+        raise CatalogError(f"{source}: {field}.verify_version must be a string")
+
+    return PinnedDependencies(
+        requirements=tuple(requirements),
+        index_url=urls["index_url"],
+        extra_index_url=urls["extra_index_url"],
+        use_repository_requirements=use_repository,
+        verify_distribution=(
+            verify_distribution.strip() if isinstance(verify_distribution, str) else None
+        ),
+        verify_version=verify_version.strip() if isinstance(verify_version, str) else None,
     )
 
 

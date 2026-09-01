@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from helpers import NOTHING_LISTENING, http_failing, running, tcp_answering
 
+from local_ai_stack.catalog import repository_for
 from local_ai_stack.execution import PlanExecutor
 from local_ai_stack.installation import InstallLocation, resolve_installation
 from local_ai_stack.integration import (
@@ -76,11 +77,19 @@ class FakeRunner(CommandRunner):
         on_path: str | None = None,
         path_command: str = "ollama",
         env: Mapping[str, str] | None = None,
+        head_commit: str | None = None,
+        torch_version: str | None = "2.11.0+cu130",
     ):
         super().__init__()
         self.on_path = on_path
         self.path_command = path_command
         self.fake_env = dict(env or {})
+        # A handoff now asks verify(), so a managed ComfyUI has to answer the
+        # two questions verify() puts to it: which commit is checked out, and
+        # which torch the environment holds. Defaults satisfy the shipped pin.
+        pin = repository_for("comfyui")
+        self.head_commit = head_commit or (pin.commit if pin else "")
+        self.torch_version = torch_version
         self.calls: list[tuple[str, ...]] = []
 
     def which(self, name: str, extra_env: Mapping[str, str] | None = None) -> str | None:
@@ -92,6 +101,11 @@ class FakeRunner(CommandRunner):
     def run(self, argv: Sequence[str], **kwargs: object) -> CommandResult:
         items = tuple(str(a) for a in argv)
         self.calls.append(items)
+        if "rev-parse" in items:
+            return CommandResult(argv=items, returncode=0, stdout=f"{self.head_commit}\n")
+        if "-c" in items and "importlib.metadata" in items[items.index("-c") + 1]:
+            body = "" if self.torch_version is None else f"{self.torch_version}\n"
+            return CommandResult(argv=items, returncode=0, stdout=body)
         return CommandResult(argv=items, returncode=0, stdout="ollama version is 0.5.4\n")
 
 

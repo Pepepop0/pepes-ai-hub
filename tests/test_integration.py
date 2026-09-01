@@ -322,9 +322,8 @@ def test_prepare_layout_and_ollama_are_the_supported_steps(profile, tmp_path):
 
     assert resolved[(PlanAction.PREPARE_LAYOUT, str(context.layout.root))] is True
     assert resolved[(PlanAction.INSTALL, "ollama")] is True
-    # Plan targets are profile service keys, which is why Open WebUI appears
-    # here as "open_webui" and not as the "open-webui" service id.
-    assert resolved[(PlanAction.INSTALL, "open_webui")] is False
+    # Plan targets and runtime service ids are the same canonical string.
+    assert resolved[(PlanAction.INSTALL, "open-webui")] is False
     assert resolved[(PlanAction.INSTALL, "comfyui")] is False
     assert resolved[(PlanAction.CHECK, "system")] is False
     assert resolved[(PlanAction.CONFIGURE, profile.id)] is False
@@ -341,7 +340,7 @@ def test_unsupported_steps_stay_explicit_and_cover_the_whole_plan(profile, tmp_p
         assert entry.reason
     unsupported_targets = {e.step.target for e in report.unsupported}
     # Models and workflows are named, not silently dropped as if they were done.
-    assert {"open_webui", "comfyui"} <= unsupported_targets
+    assert {"open-webui", "comfyui"} <= unsupported_targets
     assert any(e.action is PlanAction.ACQUIRE_MODEL for e in report.unsupported)
     assert any(e.action is PlanAction.APPLY_WORKFLOW for e in report.unsupported)
 

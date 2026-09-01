@@ -26,6 +26,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+from .components import ComponentId
 from .inventory import ListenerReport, list_listeners
 from .probes import DEFAULT_TIMEOUT, ProbeOutcome, ProbeResult, http_probe, tcp_probe
 
@@ -105,7 +106,7 @@ class StackHealth:
 # /api/version is the cheapest documented Ollama endpoint and always returns
 # {"version": "..."} — a 200 on "/" only proves the HTTP server is up.
 OLLAMA_SPEC = ServiceSpec(
-    id="ollama",
+    id=ComponentId.OLLAMA,
     name="Ollama",
     port=11434,
     health_path="/api/version",
@@ -114,7 +115,7 @@ OLLAMA_SPEC = ServiceSpec(
 
 # Open WebUI exposes /health, which answers {"status": true} without auth.
 OPEN_WEBUI_SPEC = ServiceSpec(
-    id="open-webui",
+    id=ComponentId.OPEN_WEBUI,
     name="Open WebUI",
     port=8080,
     health_path="/health",
@@ -124,7 +125,7 @@ OPEN_WEBUI_SPEC = ServiceSpec(
 # ComfyUI has no /health; /system_stats is the stable JSON probe and proves the
 # backend answers, not just the web server.
 COMFYUI_SPEC = ServiceSpec(
-    id="comfyui",
+    id=ComponentId.COMFYUI,
     name="ComfyUI",
     port=8188,
     health_path="/system_stats",

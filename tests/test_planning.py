@@ -30,7 +30,7 @@ def test_install_plan_reflects_enabled_services_models_and_workflows():
     plan = build_install_plan(profile)
     targets = {(step.action, step.target) for step in plan.steps}
     assert (PlanAction.INSTALL, "ollama") in targets
-    assert (PlanAction.INSTALL, "open_webui") in targets
+    assert (PlanAction.INSTALL, "open-webui") in targets
     assert (PlanAction.INSTALL, "comfyui") in targets
     assert (PlanAction.ACQUIRE_MODEL, "hermes3:8b") in targets
     assert (PlanAction.APPLY_WORKFLOW, "text_to_image") in targets

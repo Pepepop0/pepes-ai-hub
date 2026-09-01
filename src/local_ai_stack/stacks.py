@@ -9,10 +9,11 @@ This version ships one stack, Standard. Choosing between stacks is out of
 scope, so there is no selection logic here, only the definition and a lookup
 that currently has a single answer.
 
-Component ids match the service ids used by profiles, so a stack component and
-a profile service join on the same key. The directory names on disk belong to
-StackLayout and are referenced by attribute, which keeps the layout free of any
-stack knowledge.
+Component ids come from :mod:`components`, so a stack component, a profile
+service, a plan step target and a runtime service id are all the same string.
+The directory names on disk belong to StackLayout and are reached by attribute,
+derived from the canonical id, which keeps the layout free of any stack
+knowledge and keeps the two spellings from drifting apart.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .components import ComponentId
 from .layout import StackLayout
 
 STANDARD_STACK_ID = "standard"
@@ -81,18 +83,22 @@ STANDARD_STACK = StackDefinition(
     name="Standard",
     description="Ollama for chat, Open WebUI for the interface, ComfyUI for images.",
     components=(
-        StackComponent(id="ollama", name="Ollama", app_dir_attr="ollama_app"),
         StackComponent(
-            id="open_webui",
-            name="Open WebUI",
-            app_dir_attr="open_webui_app",
-            data_dir_attr="open_webui_data",
+            id=ComponentId.OLLAMA,
+            name="Ollama",
+            app_dir_attr=f"{ComponentId.OLLAMA.attr}_app",
         ),
         StackComponent(
-            id="comfyui",
+            id=ComponentId.OPEN_WEBUI,
+            name="Open WebUI",
+            app_dir_attr=f"{ComponentId.OPEN_WEBUI.attr}_app",
+            data_dir_attr=f"{ComponentId.OPEN_WEBUI.attr}_data",
+        ),
+        StackComponent(
+            id=ComponentId.COMFYUI,
             name="ComfyUI",
-            app_dir_attr="comfyui_app",
-            data_dir_attr="comfyui_data",
+            app_dir_attr=f"{ComponentId.COMFYUI.attr}_app",
+            data_dir_attr=f"{ComponentId.COMFYUI.attr}_data",
         ),
     ),
 )

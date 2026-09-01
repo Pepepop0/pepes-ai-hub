@@ -22,7 +22,7 @@ REPO = Path(__file__).resolve().parents[1]
 
 def test_standard_stack_holds_the_three_programs():
     assert STANDARD_STACK.id == "standard"
-    assert STANDARD_STACK.component_ids == ("ollama", "open_webui", "comfyui")
+    assert STANDARD_STACK.component_ids == ("ollama", "open-webui", "comfyui")
 
 
 def test_standard_is_the_default_and_only_stack():
@@ -45,9 +45,9 @@ def test_unknown_component_fails_clearly():
 def test_components_resolve_their_directories_from_a_layout(tmp_path):
     layout = StackLayout.from_root(tmp_path / "stack")
     assert STANDARD_STACK.component("ollama").app_dir(layout) == layout.ollama_app
-    assert STANDARD_STACK.component("open_webui").app_dir(layout) == layout.open_webui_app
+    assert STANDARD_STACK.component("open-webui").app_dir(layout) == layout.open_webui_app
     assert STANDARD_STACK.component("comfyui").app_dir(layout) == layout.comfyui_app
-    assert STANDARD_STACK.component("open_webui").data_dir(layout) == layout.open_webui_data
+    assert STANDARD_STACK.component("open-webui").data_dir(layout) == layout.open_webui_data
     assert STANDARD_STACK.component("comfyui").data_dir(layout) == layout.comfyui_data
 
 

@@ -17,6 +17,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 
+from .components import ComponentId
 from .inventory import ListenerReport, ProcessInfo, ProcessReport, list_listeners, list_processes
 
 
@@ -89,7 +90,7 @@ class RuntimeProcessStatus:
 
 
 OLLAMA_PROCESS = RuntimeProcessSpec(
-    service_id="ollama",
+    service_id=ComponentId.OLLAMA,
     name="Ollama",
     executables=("ollama.exe", "ollama app.exe", "ollama"),
     cmdline_markers=("ollama serve",),
@@ -99,7 +100,7 @@ OLLAMA_PROCESS = RuntimeProcessSpec(
 # Open WebUI runs inside python.exe (uvx/pip install), so the command line is
 # the only reliable marker.
 OPEN_WEBUI_PROCESS = RuntimeProcessSpec(
-    service_id="open-webui",
+    service_id=ComponentId.OPEN_WEBUI,
     name="Open WebUI",
     executables=("open-webui.exe", "open_webui.exe"),
     cmdline_markers=("open_webui", "open-webui"),
@@ -107,7 +108,7 @@ OPEN_WEBUI_PROCESS = RuntimeProcessSpec(
 )
 
 COMFYUI_PROCESS = RuntimeProcessSpec(
-    service_id="comfyui",
+    service_id=ComponentId.COMFYUI,
     name="ComfyUI",
     executables=("comfyui.exe", "comfyui desktop.exe"),
     cmdline_markers=("comfyui/main.py", "comfyui\\main.py", "comfy-desktop"),

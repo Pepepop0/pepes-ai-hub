@@ -16,7 +16,7 @@ hardware:
 
 services:
   ollama: {enabled: true, port: 11434}
-  open_webui: {enabled: true, port: 8080}
+  open-webui: {enabled: true, port: 8080}
   comfyui: {enabled: true, port: 8188}
 
 features:

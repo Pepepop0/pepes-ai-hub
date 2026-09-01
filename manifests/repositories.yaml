@@ -4,7 +4,7 @@ repositories:
     url: https://github.com/comfyanonymous/ComfyUI.git
     revision: TBD
     destination: apps/comfyui
-  open_webui:
+  open-webui:
     url: https://github.com/open-webui/open-webui.git
     revision: TBD
     destination: apps/open-webui

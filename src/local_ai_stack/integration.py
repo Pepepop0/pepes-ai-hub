@@ -30,7 +30,7 @@ Three cases, and their consequences, are decided here once:
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -161,21 +161,20 @@ class IntegrationSnapshot:
         return tuple(c.service_id for c in self.components if c.controllable)
 
 
-# Which service a provisioned component ends up serving. Ollama is the only
-# component with both a provisioner and a runtime service today.
-COMPONENT_SERVICE_IDS: Mapping[str, str] = {OLLAMA_COMPONENT_ID: OLLAMA_SPEC.id}
-
-
 def detect_integration(
     context: ProvisionContext,
     provisioners: ProvisionerRegistry | None = None,
 ) -> IntegrationSnapshot:
-    """Ask every provisioner what the runtime may do. Read-only, creates nothing."""
+    """Ask every provisioner what the runtime may do. Read-only, creates nothing.
+
+    A component id and a service id are the same canonical string (see
+    :mod:`components`), so there is no translation table here to drift.
+    """
     registry = default_provisioners() if provisioners is None else provisioners
     components = tuple(
         ComponentIntegration(
             handoff=provisioner.runtime_handoff(context),
-            service_id=COMPONENT_SERVICE_IDS.get(component_id, component_id),
+            service_id=component_id,
         )
         for component_id, provisioner in sorted(registry.items())
     )

@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .artifacts import Artifact
+from .components import ComponentId
 from .download import (
     ChecksumMismatchError,
     DownloadCancelledError,
@@ -67,7 +68,7 @@ from .provisioning import (
     ProvisionStep,
 )
 
-COMPONENT_ID = "ollama"
+COMPONENT_ID = str(ComponentId.OLLAMA)
 MARKER_NAME = ".pepito-managed.json"
 MARKER_SCHEMA_VERSION = 1
 EXECUTABLE = "ollama.exe" if os.name == "nt" else "ollama"

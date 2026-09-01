@@ -359,8 +359,19 @@ def test_dry_run_is_deterministic_and_creates_nothing(profile, tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_dry_run_without_a_pinned_artifact_refuses_with_a_precondition(profile, tmp_path):
+def test_dry_run_with_the_pinned_artifact_previews_the_install(profile, tmp_path):
     executor = plan_executor(context_for(tmp_path))
+    report = executor.execute(plan_for(profile, tmp_path), dry_run=True)
+    ollama = next(r for r in report.results if r.component_id == "ollama")
+    assert ollama.outcome is ProvisionOutcome.DRY_RUN
+    assert ollama.failure is None
+    assert [step.action for step in ollama.steps] == ["download", "extract", "mark-managed"]
+    assert not context_for(tmp_path).layout.root.exists()
+
+
+def test_a_component_with_nothing_pinned_still_refuses_with_a_precondition(profile, tmp_path):
+    """The refusal path stays reachable: no pin means no guessed URL."""
+    executor = plan_executor(context_for(tmp_path), {"ollama": OllamaProvisioner()})
     report = executor.execute(plan_for(profile, tmp_path), dry_run=True)
     ollama = next(r for r in report.results if r.component_id == "ollama")
     assert ollama.outcome is ProvisionOutcome.FAILED
@@ -380,10 +391,13 @@ def test_dry_run_leaves_an_external_ollama_untouched(profile, tmp_path):
     assert not context.layout.root.exists()
 
 
-def test_default_registry_ships_ollama_without_an_artifact():
+def test_default_registry_ships_ollama_with_the_pinned_artifact():
     provisioners = default_provisioners()
     assert set(provisioners) == {"ollama"}
-    assert provisioners["ollama"].artifact is None
+    artifact = provisioners["ollama"].artifact
+    assert artifact is not None
+    assert artifact.version == "0.33.2"
+    assert artifact.has_checksum
 
 
 # --- helpers ---------------------------------------------------------------

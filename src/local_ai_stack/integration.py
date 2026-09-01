@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .adapters import observation_only_specs, ollama_control_spec
+from .catalog import artifact_for
 from .controller import ServiceController, ServiceControlSpec
 from .execution import PlanExecutor, ProvisionerRegistry
 from .installation import ResolvedInstallation
@@ -68,11 +69,13 @@ __all__ = [
 def default_provisioners() -> dict[str, Provisioner]:
     """Every component with a real provisioner today.
 
-    Ollama is deliberately constructed without an artifact: no production
-    archive is pinned yet, so a real install refuses with PRECONDITION instead
-    of guessing a URL. Detection, planning and dry-run all work regardless.
+    Each one is handed whatever the shipped manifests pin for it. A component
+    with nothing pinned still detects, plans and dry-runs; only a real install
+    refuses, with PRECONDITION, rather than guessing a URL or a revision.
     """
-    return {OLLAMA_COMPONENT_ID: OllamaProvisioner()}
+    return {
+        OLLAMA_COMPONENT_ID: OllamaProvisioner(artifact=artifact_for(OLLAMA_COMPONENT_ID)),
+    }
 
 
 def provision_context(

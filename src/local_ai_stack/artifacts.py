@@ -19,6 +19,8 @@ from typing import Any
 
 import yaml
 
+from .components import normalize_component_id
+
 ARTIFACT_SCHEMA_VERSION = 1
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -62,6 +64,7 @@ class Artifact:
     sha256: str | None = None
     size_bytes: int | None = None
     version: str | None = None
+    component: str | None = None
 
     @property
     def has_checksum(self) -> bool:
@@ -79,12 +82,14 @@ class Artifact:
             data["size_bytes"] = self.size_bytes
         if self.version is not None:
             data["version"] = self.version
+        if self.component is not None:
+            data["component"] = self.component
         return data
 
     @classmethod
     def from_dict(cls, data: Any, source: Path | str = "<artifact>") -> Artifact:
         record = _mapping(data, source, "artifact")
-        allowed = {"id", "url", "filename", "sha256", "size_bytes", "version"}
+        allowed = {"id", "url", "filename", "sha256", "size_bytes", "version", "component"}
         unknown = sorted((str(key) for key in record if key not in allowed), key=str.casefold)
         if unknown:
             raise _error(source, "artifact", f"unknown fields: {', '.join(unknown)}")
@@ -124,6 +129,10 @@ class Artifact:
         if version is not None:
             version = _string(version, source, "version")
 
+        component = record.get("component")
+        if component is not None:
+            component = normalize_component_id(_string(component, source, "component"))
+
         return cls(
             id=artifact_id,
             url=url,
@@ -131,6 +140,7 @@ class Artifact:
             sha256=sha256,
             size_bytes=size_bytes,
             version=version,
+            component=component,
         )
 
 

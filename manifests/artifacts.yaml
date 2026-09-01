@@ -1,0 +1,25 @@
+# Pinned downloadable artifacts.
+#
+# Every entry names an exact upstream release. Nothing here resolves "latest":
+# a version bump is an edit to this file, reviewed like any other change.
+#
+# The sha256 values come from the GitHub release API `digest` field for each
+# asset, which is what the release publisher recorded. The downloader treats a
+# present checksum as mandatory and discards bytes that do not match.
+#
+# Windows/amd64 only, matching the v0.1 target. Other platforms get their own
+# entries when they are supported, not a substitution at runtime.
+
+schema_version: 1
+
+artifacts:
+  # Ollama v0.33.2, published 2026-08-27, stable (not a prerelease).
+  # Portable archive rather than OllamaSetup.exe: the installer writes to the
+  # registry and the user PATH, which this project does not do.
+  - id: ollama-windows-amd64
+    component: ollama
+    version: "0.33.2"
+    url: https://github.com/ollama/ollama/releases/download/v0.33.2/ollama-windows-amd64.zip
+    filename: ollama-windows-amd64.zip
+    sha256: 2439cbea65310b1aadf7d8fc41d7faf5d033f920d42e00a476c58bf9bff6950e
+    size_bytes: 1460134793

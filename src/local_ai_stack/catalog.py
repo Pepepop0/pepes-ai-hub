@@ -12,7 +12,9 @@ Two kinds of pin exist, because the components are distributed differently:
   pinned by version and SHA-256 (Ollama);
 - a :class:`PinnedRepository` for a source checkout, pinned by tag *and* the
   commit that tag pointed at when it was recorded (ComfyUI), so a moved tag is
-  detectable instead of silently followed.
+  detectable instead of silently followed;
+- a :class:`PinnedPackage` for a published Python package, pinned to an exact
+  version plus the interpreter range upstream supports (Open WebUI).
 
 Manifests live beside the source in the repository, so a wheel install without
 them simply has no pins. That is reported as an empty catalog, and a
@@ -35,6 +37,7 @@ from .installation import InstallLocationError, detect_repo_root
 
 ARTIFACT_MANIFEST = "artifacts.yaml"
 REPOSITORY_MANIFEST = "repositories.yaml"
+PACKAGE_MANIFEST = "packages.yaml"
 MANIFEST_DIR = "manifests"
 
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -174,7 +177,99 @@ def repository_for(component_id: str) -> PinnedRepository | None:
     return entry if entry is not None and entry.is_pinned else None
 
 
+@dataclass(frozen=True)
+class PinnedPackage:
+    """A published Python package pinned to an exact version."""
+
+    component: str
+    distribution: str
+    version: str
+    python_minimum: tuple[int, int] = (3, 11)
+    python_below: tuple[int, int] = (3, 13)
+
+    @property
+    def requirement(self) -> str:
+        """The exact requirement string handed to pip."""
+        return f"{self.distribution}=={self.version}"
+
+
+def _version_pair(raw: Any, field: str, source: Path | str) -> tuple[int, int]:
+    if not isinstance(raw, str):
+        raise CatalogError(f"{source}: {field} must be a string like '3.11'")
+    parts = raw.strip().split(".")
+    if len(parts) != 2:
+        raise CatalogError(f"{source}: {field} must look like '3.11'")
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError as exc:
+        raise CatalogError(f"{source}: {field} must be numeric, got {raw!r}") from exc
+
+
+def _package_from(data: Any, component: str, source: Path | str) -> PinnedPackage:
+    if not isinstance(data, dict):
+        raise CatalogError(f"{source}: packages.{component} must be a mapping")
+    unknown = sorted(str(key) for key in data if key not in {"distribution", "version", "python"})
+    if unknown:
+        raise CatalogError(f"{source}: packages.{component}: unknown fields: {', '.join(unknown)}")
+    distribution = data.get("distribution")
+    if not isinstance(distribution, str) or not distribution.strip():
+        raise CatalogError(
+            f"{source}: packages.{component}.distribution must be a non-empty string"
+        )
+    version = data.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise CatalogError(f"{source}: packages.{component}.version must be a non-empty string")
+    if version.strip().lower() in {"latest", "*"}:
+        raise CatalogError(f"{source}: packages.{component}.version must be exact, not {version!r}")
+    python = data.get("python") or {}
+    if not isinstance(python, dict):
+        raise CatalogError(f"{source}: packages.{component}.python must be a mapping")
+    minimum = _version_pair(
+        python.get("minimum", "3.11"), f"packages.{component}.python.minimum", source
+    )
+    below = _version_pair(python.get("below", "3.13"), f"packages.{component}.python.below", source)
+    if below <= minimum:
+        raise CatalogError(f"{source}: packages.{component}.python.below must be above minimum")
+    return PinnedPackage(
+        component=component,
+        distribution=distribution.strip(),
+        version=version.strip(),
+        python_minimum=minimum,
+        python_below=below,
+    )
+
+
+@lru_cache(maxsize=1)
+def package_catalog() -> dict[str, PinnedPackage]:
+    """Every pinned Python package, keyed by canonical component id."""
+    path = _manifest_path(PACKAGE_MANIFEST)
+    if path is None:
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise CatalogError(f"{path}: could not read package manifest: {exc}") from exc
+    if not isinstance(data, dict):
+        raise CatalogError(f"{path}: manifest root must be a mapping")
+    entries = data.get("packages")
+    if not isinstance(entries, dict) or not entries:
+        raise CatalogError(f"{path}: packages must be a non-empty mapping")
+    catalog: dict[str, PinnedPackage] = {}
+    for raw_component, record in entries.items():
+        component = normalize_component_id(str(raw_component))
+        if component in catalog:
+            raise CatalogError(f"{path}: duplicate package for {component}")
+        catalog[component] = _package_from(record, component, path)
+    return catalog
+
+
+def package_for(component_id: str) -> PinnedPackage | None:
+    """The pinned package for a component, or None when nothing is pinned."""
+    return package_catalog().get(normalize_component_id(component_id))
+
+
 def clear_cache() -> None:
     """Forget the parsed manifests. For tests that point at another checkout."""
     artifact_catalog.cache_clear()
     repository_catalog.cache_clear()
+    package_catalog.cache_clear()

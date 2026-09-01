@@ -37,12 +37,9 @@ marker, which reports as INVALID rather than pretending to be installed.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
-import time
 import zipfile
-from dataclasses import dataclass
 from pathlib import Path
 
 from .artifacts import Artifact
@@ -54,6 +51,7 @@ from .download import (
     DownloadError,
     DownloadSpec,
 )
+from .markers import MARKER_NAME, ManagedMarker, marker_path, read_marker, write_marker
 from .provisioning import (
     ComponentState,
     Detection,
@@ -69,8 +67,6 @@ from .provisioning import (
 )
 
 COMPONENT_ID = str(ComponentId.OLLAMA)
-MARKER_NAME = ".pepito-managed.json"
-MARKER_SCHEMA_VERSION = 1
 EXECUTABLE = "ollama.exe" if os.name == "nt" else "ollama"
 VERSION_TIMEOUT = 15.0
 
@@ -79,47 +75,6 @@ EXTERNAL_HINTS = (
     ("LOCALAPPDATA", Path("Programs") / "Ollama" / EXECUTABLE),
     ("PROGRAMFILES", Path("Ollama") / EXECUTABLE),
 )
-
-
-@dataclass(frozen=True)
-class ManagedMarker:
-    """Proof that this install is ours, and of what exactly."""
-
-    schema_version: int
-    artifact_id: str
-    version: str | None
-    sha256: str | None
-    installed_at: float
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "schema_version": self.schema_version,
-            "component": COMPONENT_ID,
-            "artifact_id": self.artifact_id,
-            "version": self.version,
-            "sha256": self.sha256,
-            "installed_at": self.installed_at,
-        }
-
-    @classmethod
-    def from_dict(cls, data: object) -> ManagedMarker | None:
-        if not isinstance(data, dict):
-            return None
-        if data.get("schema_version") != MARKER_SCHEMA_VERSION:
-            return None
-        artifact_id = data.get("artifact_id")
-        if not isinstance(artifact_id, str):
-            return None
-        version = data.get("version")
-        sha256 = data.get("sha256")
-        installed_at = data.get("installed_at")
-        return cls(
-            schema_version=MARKER_SCHEMA_VERSION,
-            artifact_id=artifact_id,
-            version=version if isinstance(version, str) else None,
-            sha256=sha256 if isinstance(sha256, str) else None,
-            installed_at=float(installed_at) if isinstance(installed_at, (int, float)) else 0.0,
-        )
 
 
 class OllamaProvisioner(Provisioner):
@@ -147,7 +102,7 @@ class OllamaProvisioner(Provisioner):
         return self.managed_dir(context) / EXECUTABLE
 
     def marker_path(self, context: ProvisionContext) -> Path:
-        return self.managed_dir(context) / MARKER_NAME
+        return marker_path(self.managed_dir(context))
 
     # --- deteccao ----------------------------------------------------------
 
@@ -235,12 +190,7 @@ class OllamaProvisioner(Provisioner):
         return [c for c in candidates if c != managed]
 
     def _read_marker(self, context: ProvisionContext) -> ManagedMarker | None:
-        path = self.marker_path(context)
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return None
-        return ManagedMarker.from_dict(data)
+        return read_marker(self.managed_dir(context), component=self.component_id)
 
     def _probe_version(self, context: ProvisionContext, executable: Path) -> str | None:
         result = context.runner.run(
@@ -435,17 +385,13 @@ class OllamaProvisioner(Provisioner):
 
     def _write_marker(self, context: ProvisionContext) -> None:
         assert self.artifact is not None
-        marker = ManagedMarker(
-            schema_version=MARKER_SCHEMA_VERSION,
-            artifact_id=self.artifact.id,
+        write_marker(
+            self.managed_dir(context),
+            component=self.component_id,
+            source_id=self.artifact.id,
             version=self.artifact.version,
-            sha256=self.artifact.sha256,
-            installed_at=time.time(),
+            checksum=self.artifact.sha256,
         )
-        path = self.marker_path(context)
-        temporary = path.with_name(path.name + ".tmp")
-        temporary.write_text(json.dumps(marker.to_dict(), indent=2), encoding="utf-8")
-        os.replace(temporary, path)
 
 
 def _reset_directory(path: Path) -> None:

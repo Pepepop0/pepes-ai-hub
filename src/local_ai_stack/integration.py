@@ -35,13 +35,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .adapters import observation_only_specs, ollama_control_spec
-from .catalog import artifact_for
+from .catalog import artifact_for, package_for
 from .controller import ServiceController, ServiceControlSpec
 from .execution import PlanExecutor, ProvisionerRegistry
 from .installation import ResolvedInstallation
 from .launcher import ProcessLauncher
 from .ollama import COMPONENT_ID as OLLAMA_COMPONENT_ID
 from .ollama import OllamaProvisioner
+from .open_webui import COMPONENT_ID as OPEN_WEBUI_COMPONENT_ID
+from .open_webui import OpenWebUIProvisioner
 from .processes import OLLAMA_PROCESS
 from .provisioning import (
     LaunchAvailability,
@@ -73,8 +75,12 @@ def default_provisioners() -> dict[str, Provisioner]:
     with nothing pinned still detects, plans and dry-runs; only a real install
     refuses, with PRECONDITION, rather than guessing a URL or a revision.
     """
+    open_webui_pin = package_for(OPEN_WEBUI_COMPONENT_ID)
     return {
         OLLAMA_COMPONENT_ID: OllamaProvisioner(artifact=artifact_for(OLLAMA_COMPONENT_ID)),
+        OPEN_WEBUI_COMPONENT_ID: OpenWebUIProvisioner(
+            version=None if open_webui_pin is None else open_webui_pin.version,
+        ),
     }
 
 

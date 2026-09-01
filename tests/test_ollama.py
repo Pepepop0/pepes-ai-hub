@@ -20,12 +20,8 @@ import httpx
 from local_ai_stack.artifacts import Artifact
 from local_ai_stack.download import Downloader
 from local_ai_stack.installation import InstallLocation, resolve_installation
-from local_ai_stack.ollama import (
-    EXECUTABLE,
-    MARKER_NAME,
-    ManagedMarker,
-    OllamaProvisioner,
-)
+from local_ai_stack.markers import MARKER_NAME, write_marker
+from local_ai_stack.ollama import EXECUTABLE, OllamaProvisioner
 from local_ai_stack.provisioning import (
     ComponentState,
     FailureReason,
@@ -104,17 +100,12 @@ def install_managed(context: ProvisionContext, *, marker: bool = True, executabl
     if executable:
         (directory / EXECUTABLE).write_text("binary", encoding="utf-8")
     if marker:
-        (directory / MARKER_NAME).write_text(
-            json.dumps(
-                ManagedMarker(
-                    schema_version=1,
-                    artifact_id="ollama-windows",
-                    version="0.5.4",
-                    sha256=ARCHIVE_SHA,
-                    installed_at=0.0,
-                ).to_dict()
-            ),
-            encoding="utf-8",
+        write_marker(
+            directory,
+            component="ollama",
+            source_id="ollama-windows",
+            version="0.5.4",
+            checksum=ARCHIVE_SHA,
         )
 
 
@@ -260,7 +251,8 @@ def test_marker_with_a_future_schema_is_rejected(tmp_path):
     context = context_for(tmp_path)
     install_managed(context)
     (context.layout.ollama_app / MARKER_NAME).write_text(
-        json.dumps({"schema_version": 99, "artifact_id": "x"}), encoding="utf-8"
+        json.dumps({"schema_version": 99, "component": "ollama", "source_id": "x"}),
+        encoding="utf-8",
     )
     assert OllamaProvisioner().detect(context).state is ComponentState.INVALID
 
@@ -342,8 +334,8 @@ def test_managed_install_extracts_and_marks(tmp_path):
     assert (context.layout.ollama_app / EXECUTABLE).is_file()
     assert (context.layout.ollama_app / "lib" / "runner.dll").is_file()
     marker = json.loads((context.layout.ollama_app / MARKER_NAME).read_text(encoding="utf-8"))
-    assert marker["artifact_id"] == "ollama-windows"
-    assert marker["sha256"] == ARCHIVE_SHA
+    assert marker["source_id"] == "ollama-windows"
+    assert marker["checksum"] == ARCHIVE_SHA
     assert marker["version"] == "0.5.4"
 
 

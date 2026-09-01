@@ -134,13 +134,20 @@ def test_both_spellings_in_one_profile_are_rejected():
 # --- guarda contra reintroducao do split -----------------------------------
 
 
-def test_no_module_hardcodes_the_legacy_service_id():
-    """The old spelling may survive only as an alias or a process marker."""
-    allowed = {"components.py", "processes.py", "layout.py", "stacks.py"}
+def test_no_module_uses_the_legacy_id_as_a_value():
+    """Identifiers may hold the underscored form; an id *value* may not.
+
+    Module names, attributes and constants cannot contain a hyphen, so
+    open_webui.py and layout.open_webui_app are expected. What must never come
+    back is the old spelling written as a string, because that is what would
+    split the two layers again.
+    """
+    allowed = {"components.py", "processes.py"}  # the alias table and a cmdline marker
     offenders = []
     for path in sorted((REPO / "src" / "local_ai_stack").rglob("*.py")):
         if path.name in allowed:
             continue
-        if "open_webui" in path.read_text(encoding="utf-8"):
+        source = path.read_text(encoding="utf-8")
+        if '"open_webui"' in source or "'open_webui'" in source:
             offenders.append(path.name)
     assert offenders == []

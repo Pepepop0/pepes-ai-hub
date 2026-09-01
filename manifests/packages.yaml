@@ -1,0 +1,22 @@
+# Pinned Python packages.
+#
+# Components distributed as published packages rather than as archives or
+# source checkouts. The version is exact: an install runs
+# `pip install <distribution>==<version>` and never resolves what PyPI happens
+# to serve today. A version bump is an edit to this file.
+#
+# `python` records the interpreter range upstream declares (requires-python),
+# so an install refuses rather than building an environment upstream does not
+# support.
+
+schema_version: 1
+
+packages:
+  # Open WebUI 0.11.3, the current stable release on PyPI.
+  # requires-python: >=3.11,<3.13.0a1
+  open-webui:
+    distribution: open-webui
+    version: "0.11.3"
+    python:
+      minimum: "3.11"
+      below: "3.13"

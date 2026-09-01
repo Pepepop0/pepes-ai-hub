@@ -35,6 +35,7 @@ from local_ai_stack.launcher import (
     StopOutcome,
 )
 from local_ai_stack.layout import StackLayout
+from local_ai_stack.markers import write_marker
 from local_ai_stack.ollama import EXECUTABLE, MARKER_NAME, ManagedMarker, OllamaProvisioner
 from local_ai_stack.planning import PlanAction, build_install_plan
 from local_ai_stack.probes import ProbeOutcome
@@ -69,14 +70,21 @@ EXTERNAL_PROC = ProcessInfo(
 class FakeRunner(CommandRunner):
     """Answers PATH lookups and `--version`. Never runs a real command."""
 
-    def __init__(self, *, on_path: str | None = None, env: Mapping[str, str] | None = None):
+    def __init__(
+        self,
+        *,
+        on_path: str | None = None,
+        path_command: str = "ollama",
+        env: Mapping[str, str] | None = None,
+    ):
         super().__init__()
         self.on_path = on_path
+        self.path_command = path_command
         self.fake_env = dict(env or {})
         self.calls: list[tuple[str, ...]] = []
 
     def which(self, name: str, extra_env: Mapping[str, str] | None = None) -> str | None:
-        return self.on_path if name == "ollama" else None
+        return self.on_path if name == self.path_command else None
 
     def child_env(self, extra: Mapping[str, str] | None = None) -> dict[str, str]:
         return dict(self.fake_env)
@@ -497,6 +505,75 @@ def test_a_managed_web_app_becomes_controllable_with_no_change_here(tmp_path):
     assert open_webui.launch.logs.stdout == layout.log_file("open-webui")
     # The others are untouched by one component becoming available.
     assert not specs["comfyui"].controllable
+
+
+def test_managed_open_webui_handoff_drives_its_runtime_spec(tmp_path):
+    """The real provisioner path and runtime builder agree on executable and id."""
+    context = context_for(tmp_path)
+    provisioner = default_provisioners()["open-webui"]
+    environment = provisioner.environment(context)
+    environment.bin_dir.mkdir(parents=True)
+    environment.python.write_text("python", encoding="utf-8")
+    executable = provisioner.managed_executable(context)
+    executable.write_text("console script", encoding="utf-8")
+    write_marker(
+        provisioner.managed_dir(context),
+        component="open-webui",
+        source_id="open-webui",
+        version=provisioner.version,
+    )
+
+    snapshot = detect_integration(context, {"open-webui": provisioner})
+    handoff = snapshot.by_component("open-webui")
+    assert handoff is not None
+    assert handoff.availability is LaunchAvailability.AVAILABLE
+    assert handoff.ownership is Ownership.MANAGED
+    assert handoff.executable == executable
+
+    spec = {item.service_id: item for item in control_specs_for(snapshot, layout=context.layout)}[
+        "open-webui"
+    ]
+    assert spec.controllable
+    assert spec.launch is not None
+    assert spec.launch.argv == (str(executable), "serve")
+    assert spec.launch.env["DATA_DIR"] == str(context.layout.open_webui_data)
+
+
+def test_external_open_webui_handoff_never_becomes_controllable(tmp_path):
+    external = tmp_path / "external" / "open-webui.exe"
+    external.parent.mkdir(parents=True)
+    external.write_text("external", encoding="utf-8")
+    context = context_for(
+        tmp_path,
+        FakeRunner(on_path=str(external), path_command="open-webui"),
+    )
+    provisioner = default_provisioners()["open-webui"]
+
+    snapshot = detect_integration(context, {"open-webui": provisioner})
+    handoff = snapshot.by_component("open-webui")
+    assert handoff is not None
+    assert handoff.availability is LaunchAvailability.EXTERNAL
+    assert handoff.ownership is Ownership.EXTERNAL
+    assert handoff.executable is None
+    spec = {item.service_id: item for item in control_specs_for(snapshot)}["open-webui"]
+    assert not spec.controllable
+    assert spec.launch is None
+
+
+def test_default_comfyui_precondition_never_fakes_a_runtime_handoff(tmp_path):
+    context = context_for(tmp_path)
+    provisioner = default_provisioners()["comfyui"]
+
+    result = provisioner.apply(context)
+    assert result.outcome is ProvisionOutcome.FAILED
+    assert result.failure is not None
+    assert result.failure.reason is FailureReason.PRECONDITION
+    assert not context.layout.root.exists()
+
+    handoff = provisioner.runtime_handoff(context)
+    assert handoff.availability is LaunchAvailability.NOT_INSTALLED
+    assert handoff.ownership is Ownership.NONE
+    assert handoff.executable is None
 
 
 def test_an_external_web_app_is_never_given_a_launch_spec(tmp_path):

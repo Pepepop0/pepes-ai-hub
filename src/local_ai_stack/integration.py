@@ -35,7 +35,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .adapters import observation_only_specs, ollama_control_spec
-from .catalog import artifact_for, package_for
+from .catalog import artifact_for, package_for, repository_for
+from .comfyui import COMPONENT_ID as COMFYUI_COMPONENT_ID
+from .comfyui import provisioner_from_pin as comfyui_provisioner
 from .controller import ServiceController, ServiceControlSpec
 from .execution import PlanExecutor, ProvisionerRegistry
 from .installation import ResolvedInstallation
@@ -81,6 +83,7 @@ def default_provisioners() -> dict[str, Provisioner]:
         OPEN_WEBUI_COMPONENT_ID: OpenWebUIProvisioner(
             version=None if open_webui_pin is None else open_webui_pin.version,
         ),
+        COMFYUI_COMPONENT_ID: comfyui_provisioner(repository_for(COMFYUI_COMPONENT_ID)),
     }
 
 

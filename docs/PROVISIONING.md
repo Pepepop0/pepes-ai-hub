@@ -71,6 +71,34 @@ log sanitizado). Limites deliberados:
 - pinning é explícito: `clone(..., revision=...)` e `checkout(path, revision)`
   usam `--detach`. Nada se auto-atualiza.
 
+## IDs canônicos
+
+Um id por componente, hifenizado, usado em **todas** as camadas: stack
+definition, chaves de `services` no profile, target de step do plano,
+provisioner, `ServiceSpec`, `RuntimeProcessSpec` e integração.
+
+    ollama   open-webui   comfyui
+
+Fonte única em `components.py`. Nomes de identificador Python não aceitam
+hífen, então `ComponentId.attr` deriva a forma com underscore
+(`open_webui_app`) — é o único ponto onde as duas grafias se encontram.
+Profiles escritos com a grafia antiga (`open_webui`) são canonicalizados no
+carregamento; declarar as duas no mesmo profile é erro.
+
+Não existe tabela de tradução entre component id e service id: são a mesma
+string.
+
+## Pinning por componente
+
+| componente | distribuição | pin |
+|---|---|---|
+| ollama | zip portable | `v0.33.2` + SHA-256 (`artifacts.yaml`) |
+| open-webui | pacote PyPI | `open-webui==0.11.3` (`packages.yaml`) |
+| comfyui | checkout Git | tag `v0.34.0` + commit `12d5279…` (`repositories.yaml`) |
+
+Nada resolve `latest`. Subir versão é editar manifest, revisado como qualquer
+mudança. `catalog.py` lê os manifests e não toca a rede.
+
 ## Ollama — estratégia e limitação
 
 A distribuição oficial do Ollama para Windows é um **instalador executável**,
@@ -81,12 +109,9 @@ O caminho gerenciado usa o **arquivo portable**: download → verificação
 SHA-256 → extração em `<layout.apps>/ollama` → marcador. PATH, registry e
 qualquer Ollama externo ficam intactos.
 
-**Limitação atual, deliberada:** este módulo não traz URL nem checksum
-embutidos, porque ambos mudam a cada release upstream e não podem ser
-verificados aqui. `apply()` exige um `Artifact` fornecido pelo chamador e, sem
-ele, falha com `PRECONDITION` e uma mensagem explicando o porquê — em vez de
-adivinhar uma URL. O pinning fica, portanto, explícito e auditável: quem
-fornece o artifact fornece a versão e o hash.
+O artifact vem de `manifests/artifacts.yaml`, pinado em `v0.33.2` com o
+SHA-256 publicado pelo release. Um componente sem pin ainda faz detect, plan e
+dry-run; só o install real recusa, com `PRECONDITION`, em vez de chutar URL.
 
 Extração tem guarda de path traversal: entrada de ZIP que escape do destino
 aborta a instalação.
@@ -103,11 +128,40 @@ detail)` com `FailureReason` tipado (`UNSUPPORTED`, `PRECONDITION`,
 Progresso sai por `ProvisionEvent` via callback opcional — o backend não sabe
 que existe terminal.
 
+## Open WebUI — estratégia
+
+Pacote publicado, então não há archive nem clone: o install gerenciado é um
+virtualenv em `<apps>/open-webui/.venv` com um requirement pinado.
+
+Virtualenv em vez de `uvx` ou user-site porque é autocontido: nada entra no
+PATH, nenhum site-packages do sistema é tocado, e apagar o diretório desinstala.
+
+`pip` recebe sempre `open-webui==<versão>`. Interpretador é escolhido dentro da
+faixa que o upstream declara (`>=3.11,<3.13`), sem mexer no PATH; se não houver
+um compatível, recusa em vez de montar ambiente não suportado.
+
+## ComfyUI — estratégia e o que falta
+
+Distribuído como fonte: clone Git pinado por tag **e** commit, mais um
+virtualenv ao lado. Depois do checkout o commit é conferido contra o pin, então
+tag movida upstream é reportada em vez de seguida silenciosamente.
+
+**Limitação real, deliberada:** o `requirements.txt` do ComfyUI no revision
+pinado deixa `torch`, `torchvision` e `torchaudio` **sem versão**. Instalar
+aquilo verbatim resolveria versões flutuantes — e, num alvo NVIDIA, *qual* build
+de torch instalar é uma decisão, não um default.
+
+Por isso o passo de dependências exige um `DependencyPin` explícito
+(requirements + índice, quando as wheels não vêm do PyPI). Sem ele, `apply()`
+recusa com `PRECONDITION` **antes de clonar qualquer coisa** — nada é criado e
+não sobra checkout meio-instalado se dizendo utilizável.
+
+Decisão pendente para destravar: qual versão de torch e de qual índice.
+
 ## O que ainda não existe
 
-- provisioners de Open WebUI e ComfyUI (só o contrato base);
 - aquisição de modelos;
 - update/repair/uninstall;
 - VRAM orchestration;
 - resume de download parcial (o `.part` é descartado, não retomado);
-- artifact manifest de produção com URLs e hashes reais.
+- pin de dependências do ComfyUI (torch e índice).

@@ -310,7 +310,7 @@ def plan_for(profile, tmp_path):
     )
 
 
-def test_prepare_layout_and_ollama_are_the_supported_steps(profile, tmp_path):
+def test_prepare_layout_and_every_provisioned_component_are_supported(profile, tmp_path):
     context = context_for(tmp_path)
     executor = plan_executor(context)
     plan = plan_for(profile, tmp_path)
@@ -320,7 +320,7 @@ def test_prepare_layout_and_ollama_are_the_supported_steps(profile, tmp_path):
     assert resolved[(PlanAction.INSTALL, "ollama")] is True
     # Plan targets and runtime service ids are the same canonical string.
     assert resolved[(PlanAction.INSTALL, "open-webui")] is True
-    assert resolved[(PlanAction.INSTALL, "comfyui")] is False
+    assert resolved[(PlanAction.INSTALL, "comfyui")] is True
     assert resolved[(PlanAction.CHECK, "system")] is False
     assert resolved[(PlanAction.CONFIGURE, profile.id)] is False
 
@@ -336,8 +336,8 @@ def test_unsupported_steps_stay_explicit_and_cover_the_whole_plan(profile, tmp_p
         assert entry.reason
     unsupported_targets = {e.step.target for e in report.unsupported}
     # Models and workflows are named, not silently dropped as if they were done.
-    assert {"comfyui"} <= unsupported_targets
-    assert "open-webui" not in unsupported_targets
+    # Every stack component now has a provisioner; models and workflows do not.
+    assert not ({"ollama", "open-webui", "comfyui"} & unsupported_targets)
     assert any(e.action is PlanAction.ACQUIRE_MODEL for e in report.unsupported)
     assert any(e.action is PlanAction.APPLY_WORKFLOW for e in report.unsupported)
 
@@ -388,9 +388,9 @@ def test_dry_run_leaves_an_external_ollama_untouched(profile, tmp_path):
     assert not context.layout.root.exists()
 
 
-def test_default_registry_ships_ollama_with_the_pinned_artifact():
+def test_default_registry_ships_every_component_with_its_pin():
     provisioners = default_provisioners()
-    assert set(provisioners) == {"ollama", "open-webui"}
+    assert set(provisioners) == {"ollama", "open-webui", "comfyui"}
     artifact = provisioners["ollama"].artifact
     assert artifact is not None
     assert artifact.version == "0.33.2"

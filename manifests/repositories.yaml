@@ -1,10 +1,18 @@
+# Pinned source checkouts.
+#
+# `revision` is what gets checked out. `commit` is what that revision resolved
+# to when it was recorded, so a tag that moves upstream is detected instead of
+# silently followed.
+#
+# Open WebUI is not here: it is a published package, pinned in packages.yaml.
+
 schema_version: 1
+
 repositories:
+  # ComfyUI v0.34.0, published 2026-08-26, stable (not a prerelease).
+  # The tag was a lightweight tag pointing directly at this commit.
   comfyui:
     url: https://github.com/comfyanonymous/ComfyUI.git
-    revision: TBD
+    revision: v0.34.0
+    commit: 12d5279438bfefc058a269eae805ceab6047777f
     destination: apps/comfyui
-  open-webui:
-    url: https://github.com/open-webui/open-webui.git
-    revision: TBD
-    destination: apps/open-webui

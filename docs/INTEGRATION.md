@@ -92,6 +92,18 @@ membresia sob demanda. "Esse processo faz parte da árvore que eu iniciei?" deix
 de ser inferência e vira consulta. `TerminateJobObject` age exatamente sobre
 esse conjunto. Um processo que o usuário iniciou nunca aparece nele.
 
+`TerminateJobObject` não é gracioso: é `TerminateProcess` em todos os membros
+de uma vez. Por isso ele é **escalonamento**, nunca o caminho normal:
+
+- `stop` normal pede terminate na **raiz** e espera. Descendentes provados
+  nossos são reportados em `left_running` e não são tocados;
+- `allow_force=True` é o que autoriza a escalada, exatamente como já
+  autorizava o kill de um processo só. Com ele, uma raiz que sobrevive ao
+  timeout — ou descendentes que sobrevivem a uma raiz que saiu limpa — são
+  encerrados pelo job;
+- sem prova, a escalada degrada para o processo único cuja identidade o
+  registry verifica, e o `detail` diz isso.
+
 Dois limites medidos nesta máquina antes de escrever o código:
 
 1. **A prova morre com a sessão.** O job é destruído quando o último *handle*
@@ -106,6 +118,12 @@ Dois limites medidos nesta máquina antes de escrever o código:
    atribuição ao job acontece logo depois. Um neto criado nesses primeiros
    instantes nasce fora do job. A falha é segura por construção: esse neto não é
    provável, então é **deixado vivo**, nunca morto por suposição.
+
+3. **Shim de venv.** Um `python.exe` de venv no Windows é um lançador que
+   inicia o interpretador real como outro processo e sai. Adotar o shim adota
+   algo que já está saindo, e o processo que faz o trabalho nasce fora do job.
+   Um `ProcessLaunchSpec` deve apontar para o executável real, não para um
+   shim. Vale para Open WebUI instalado em venv.
 
 ### NEEDS_DECISION
 

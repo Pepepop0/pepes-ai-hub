@@ -14,15 +14,25 @@ Whether the service actually serves is a health question, answered by
 
 Launching is generic: it knows argv, cwd, env and log files, not services.
 
-**A tree is stopped only where it can be proved.** A managed process is
-launched into a kernel job (see :mod:`local_ai_stack.jobs`), the only thing on
-Windows that can answer "did I start this process?" for a child we never saw
-being created. Where that proof exists, stopping asks the kernel for the
-membership and terminates exactly that set. Where it does not — another session
-created the job, or the host cannot make one — stopping falls back to the single
-process whose identity the registry can still verify, and says so. Descendants
-are never inferred from parent pids. See docs/INTEGRATION.md for the two
-boundaries and what closing them would cost.
+**A tree is stopped only where it can be proved, and only when force is
+allowed.** A managed process is launched into a kernel job (see
+:mod:`local_ai_stack.jobs`), the only thing on Windows that can answer "did I
+start this process?" for a child we never saw being created. Membership is a
+kernel lookup, never an inference from parent pids.
+
+Terminating that job is not graceful — it is ``TerminateProcess`` applied to
+every member at once — so it is an escalation, never the normal path:
+
+* a normal stop asks the *root* to terminate and waits. Descendants the job
+  proves are ours are reported as left running, and are not touched;
+* ``allow_force`` is what permits the escalation, exactly as it always did for
+  a single process. With it, a root that outlives its timeout, or descendants
+  that outlive a root which exited cleanly, are terminated through the job;
+* without proof — another session created the job, or the host cannot make one
+  — the escalation degrades to the single process whose identity the registry
+  verifies, and the result says so.
+
+See docs/INTEGRATION.md for the two boundaries and what closing them would cost.
 """
 
 from __future__ import annotations
@@ -139,6 +149,9 @@ class StopResult:
     # Every pid the kernel proved was in our tree and was terminated with it.
     # Empty when only the registered process itself was stopped.
     tree_pids: tuple[int, ...] = ()
+    # Descendants proved ours that were deliberately left running, because
+    # ending them would have been a force kill the caller did not allow.
+    left_running: tuple[int, ...] = ()
 
     @property
     def stopped_tree(self) -> bool:
@@ -320,20 +333,22 @@ class ProcessLauncher:
         process to be created suspended and resumed after assignment, which
         subprocess cannot express; see the module docstring.
         """
-        if job is None:
-            return None
-        previous = self._jobs.pop(service_id, None)
-        if previous is not None:
-            jobs.close(previous)
+        # The duplicated process handle belongs to this method and is closed
+        # on every path out of it, including the ones that give up the job.
         try:
+            if job is None:
+                return None
+            previous = self._jobs.pop(service_id, None)
+            if previous is not None:
+                jobs.close(previous)
             if not jobs.assign(job, spawned.handle or 0):
                 self.log.debug("could not assign %s to a job; tree stop unavailable", service_id)
                 jobs.close(job)
                 return None
+            self._jobs[service_id] = job
+            return job
         finally:
             jobs.close_handle(spawned.handle)
-        self._jobs[service_id] = job
-        return job
 
     # --- ownership proof ---------------------------------------------------
 
@@ -356,6 +371,27 @@ class ProcessLauncher:
     def forget_job(self, service_id: str) -> None:
         """Release a job handle. Members keep running; proof is given up."""
         jobs.close(self._jobs.pop(service_id, None))
+
+    def close_all(self) -> None:
+        """Release every job handle this launcher holds.
+
+        Members keep running: a job is not a leash, it is a proof of origin.
+        """
+        for service_id in list(self._jobs):
+            self.forget_job(service_id)
+
+    def surviving_members(self, proved: tuple[int, ...] | None, root_pid: int) -> tuple[int, ...]:
+        """Which of the proved members are still alive, root excluded.
+
+        Takes the membership snapshot rather than re-querying: once the root
+        exits it is no longer a job member, and the question would stop being
+        answerable exactly when it matters most.
+        """
+        return tuple(
+            pid
+            for pid in (proved or ())
+            if pid != root_pid and lookup_process(pid).outcome is not LookupOutcome.NOT_FOUND
+        )
 
     # --- stop --------------------------------------------------------------
 
@@ -381,13 +417,13 @@ class ProcessLauncher:
         pid = status.entry.pid
         if status.verdict is IdentityVerdict.STALE:
             if not is_dry:
-                self.registry.unregister(service_id)
+                self._release(service_id)
             return StopResult(
                 StopOutcome.NOT_RUNNING, service_id, pid, "process already gone, entry cleaned"
             )
         if status.verdict is IdentityVerdict.MISMATCH:
             if not is_dry:
-                self.registry.unregister(service_id)
+                self._release(service_id)
             return StopResult(
                 StopOutcome.IDENTITY_MISMATCH,
                 service_id,
@@ -407,9 +443,9 @@ class ProcessLauncher:
                 StopOutcome.DRY_RUN, service_id, pid, f"[dry-run] would stop pid {pid}"
             )
 
+        # Proof is read before anything is terminated, so a tree the kernel
+        # vouches for is known even when policy forbids acting on it.
         proved = self.tree_pids(service_id, pid)
-        if proved:
-            return self._stop_tree(service_id, pid, proved, timeout)
 
         try:
             _terminate(pid)
@@ -419,10 +455,7 @@ class ProcessLauncher:
             )
 
         if self._wait_for_exit(pid, timeout):
-            self.registry.unregister(service_id)
-            return StopResult(
-                StopOutcome.STOPPED, service_id, pid, self._single_detail(status.entry)
-            )
+            return self._root_exited(service_id, pid, proved, timeout, allow_force)
 
         if not allow_force:
             return StopResult(
@@ -430,7 +463,12 @@ class ProcessLauncher:
                 service_id,
                 pid,
                 f"pid {pid} still alive after {timeout:.1f}s; force kill not allowed",
+                left_running=self.surviving_members(proved, pid),
             )
+
+        # Force was allowed: escalate as widely as ownership can be proved.
+        if proved:
+            return self._terminate_tree(service_id, pid, proved, timeout)
 
         try:
             _kill(pid)
@@ -439,28 +477,70 @@ class ProcessLauncher:
                 StopOutcome.FAILED, service_id, pid, f"kill failed: {exc.__class__.__name__}"
             )
         if self._wait_for_exit(pid, timeout):
-            self.registry.unregister(service_id)
+            self._release(service_id)
             return StopResult(StopOutcome.STOPPED, service_id, pid, "force killed", forced=True)
         return StopResult(
             StopOutcome.FAILED, service_id, pid, f"pid {pid} survived force kill", forced=True
         )
 
-    def _single_detail(self, entry: ManagedProcess) -> str:
-        """Say plainly when only the registered process could be acted on."""
+    def _release(self, service_id: str) -> None:
+        """A service is no longer ours: drop the record and the proof together."""
+        self.registry.unregister(service_id)
+        self.forget_job(service_id)
+
+    def _root_exited(
+        self,
+        service_id: str,
+        pid: int,
+        proved: tuple[int, ...] | None,
+        timeout: float,
+        allow_force: bool,
+    ) -> StopResult:
+        """The registered process is gone. Decide what to do about its tree."""
+        leftovers = self.surviving_members(proved, pid)
+        if leftovers and allow_force:
+            result = self._terminate_tree(service_id, pid, proved or (), timeout)
+            if result.outcome is StopOutcome.STOPPED:
+                return result
+            # The tree could not be cleaned up, but the root really did exit.
+            return StopResult(
+                StopOutcome.STOPPED,
+                service_id,
+                pid,
+                f"terminated gracefully; {result.detail}",
+                left_running=leftovers,
+            )
+        detail = self._single_detail(self.registry.load().get(service_id), leftovers)
+        self._release(service_id)
+        return StopResult(StopOutcome.STOPPED, service_id, pid, detail, left_running=leftovers)
+
+    def _single_detail(self, entry: ManagedProcess | None, leftovers: tuple[int, ...] = ()) -> str:
+        """Say plainly what was stopped and what was deliberately not."""
         base = "terminated gracefully"
-        if entry.job_name is None:
+        if leftovers:
+            return (
+                f"{base}; {len(leftovers)} proved child process(es) left running, "
+                "because ending them is a force kill and force was not allowed"
+            )
+        if entry is None or entry.job_name is None:
             return base
         if not jobs.jobs_supported():
             return f"{base}; tree ownership is not provable on this host"
-        return (
-            f"{base}; the job that proved this tree belonged to another session, "
-            "so any child processes were left running"
-        )
+        if self._jobs.get(entry.service_id) is None:
+            return (
+                f"{base}; the job that proved this tree belonged to another session, "
+                "so any child processes were left running"
+            )
+        return base
 
-    def _stop_tree(
+    def _terminate_tree(
         self, service_id: str, pid: int, proved: tuple[int, ...], timeout: float
     ) -> StopResult:
-        """Terminate exactly the processes the kernel says are in our job."""
+        """Force-terminate exactly the processes the kernel says are in our job.
+
+        Only reachable once ``allow_force`` permitted an escalation: this ends
+        every member at once and is never part of a normal stop.
+        """
         job = self._jobs.get(service_id)
         if not jobs.terminate(job):
             return StopResult(
@@ -474,13 +554,14 @@ class ProcessLauncher:
                 f"pid {pid} still alive after {timeout:.1f}s despite terminating its tree",
                 tree_pids=proved,
             )
-        self.forget_job(service_id)
-        self.registry.unregister(service_id)
+        self._release(service_id)
         others = len(proved) - 1
-        detail = "terminated the process tree we started"
+        detail = "force terminated the process tree we started"
         if others > 0:
             detail = f"{detail} ({others} child process(es) proved ours and stopped with it)"
-        return StopResult(StopOutcome.STOPPED, service_id, pid, detail, tree_pids=proved)
+        return StopResult(
+            StopOutcome.STOPPED, service_id, pid, detail, forced=True, tree_pids=proved
+        )
 
     def _wait_for_exit(self, pid: int, timeout: float) -> bool:
         deadline = self._monotonic() + timeout

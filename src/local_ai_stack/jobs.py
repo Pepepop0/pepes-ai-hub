@@ -51,31 +51,67 @@ if WINDOWS:  # pragma: no cover - exercised on Windows, skipped elsewhere
     import ctypes
     from ctypes import wintypes
 
+    # Every signature is declared. ctypes defaults to int arguments and an int
+    # return, which silently truncates a 64-bit HANDLE on win64 and would make
+    # these calls fail in ways that look like "no permission" rather than like
+    # a bug. LPVOID is the handle type; ULONG_PTR is pointer-sized.
+    ULONG_PTR = ctypes.c_size_t
+
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    _kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
     _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-    _kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-    _kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+
     _kernel32.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    _kernel32.OpenJobObjectW.restype = wintypes.HANDLE
+
     _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-    _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    _kernel32.DuplicateHandle.argtypes = [
-        wintypes.HANDLE,
-        wintypes.HANDLE,
-        wintypes.HANDLE,
-        ctypes.POINTER(wintypes.HANDLE),
-        wintypes.DWORD,
-        wintypes.BOOL,
-        wintypes.DWORD,
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+
+    _kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE,  # hJob
+        ctypes.c_int,  # JOBOBJECTINFOCLASS
+        wintypes.LPVOID,  # lpJobObjectInformation
+        wintypes.DWORD,  # cbJobObjectInformationLength
+        wintypes.LPDWORD,  # lpReturnLength
     ]
+    _kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+
+    _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    _kernel32.TerminateJobObject.restype = wintypes.BOOL
+
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+    _kernel32.GetCurrentProcess.argtypes = []
+    _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    _kernel32.DuplicateHandle.argtypes = [
+        wintypes.HANDLE,  # hSourceProcessHandle
+        wintypes.HANDLE,  # hSourceHandle
+        wintypes.HANDLE,  # hTargetProcessHandle
+        ctypes.POINTER(wintypes.HANDLE),  # lpTargetHandle
+        wintypes.DWORD,  # dwDesiredAccess
+        wintypes.BOOL,  # bInheritHandle
+        wintypes.DWORD,  # dwOptions
+    ]
+    _kernel32.DuplicateHandle.restype = wintypes.BOOL
 
     class _ProcessIdList(ctypes.Structure):
+        """JOBOBJECT_BASIC_PROCESS_ID_LIST with room for a bounded membership.
+
+        ``ProcessIdList`` is declared ULONG_PTR by Windows, so it is 64-bit
+        wide on win64. A job with more members than fit returns what fits and
+        reports the count in ``NumberOfProcessIdsInList``; the caller compares
+        it against ``NumberOfAssignedProcesses`` to know the answer is partial.
+        """
+
         _fields_ = [
             ("NumberOfAssignedProcesses", wintypes.DWORD),
             ("NumberOfProcessIdsInList", wintypes.DWORD),
-            ("ProcessIdList", ctypes.c_void_p * MAX_TRACKED_MEMBERS),
+            ("ProcessIdList", ULONG_PTR * MAX_TRACKED_MEMBERS),
         ]
+
 else:  # pragma: no cover - only the import shape matters off Windows
     ctypes = None  # type: ignore[assignment]
     _kernel32 = None
@@ -180,17 +216,36 @@ def member_pids(job: ProcessJob | None) -> tuple[int, ...] | None:
     if job is None or not jobs_supported():
         return None
     info = _ProcessIdList()
+    returned = wintypes.DWORD(0)
     ok = _kernel32.QueryInformationJobObject(
         job.handle,
         JOB_OBJECT_BASIC_PROCESS_ID_LIST,
         ctypes.byref(info),
         ctypes.sizeof(info),
-        None,
+        ctypes.byref(returned),
     )
     if not ok:
         return None
-    count = min(info.NumberOfProcessIdsInList, MAX_TRACKED_MEMBERS)
+    count = min(int(info.NumberOfProcessIdsInList), MAX_TRACKED_MEMBERS)
     return tuple(int(info.ProcessIdList[index]) for index in range(count))
+
+
+def membership_is_partial(job: ProcessJob | None) -> bool:
+    """True when the job holds more processes than one query can return."""
+    if job is None or not jobs_supported():
+        return False
+    info = _ProcessIdList()
+    returned = wintypes.DWORD(0)
+    ok = _kernel32.QueryInformationJobObject(
+        job.handle,
+        JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+        ctypes.byref(info),
+        ctypes.sizeof(info),
+        ctypes.byref(returned),
+    )
+    if not ok:
+        return False
+    return int(info.NumberOfAssignedProcesses) > int(info.NumberOfProcessIdsInList)
 
 
 def membership(job: ProcessJob | None, pid: int) -> Membership:

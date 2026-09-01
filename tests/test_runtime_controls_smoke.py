@@ -29,7 +29,9 @@ from local_ai_stack.layout import StackLayout
 from local_ai_stack.logs import read_log_tail, service_log_files
 from local_ai_stack.probes import ProbeOutcome
 from local_ai_stack.processes import (
+    COMFYUI_PROCESS,
     OLLAMA_PROCESS,
+    OPEN_WEBUI_PROCESS,
     ProcessOrigin,
     RuntimeProcessSpec,
     RuntimeProcessState,
@@ -191,6 +193,66 @@ def test_stopping_a_service_we_never_started_is_refused(tmp_path):
     result = controller.stop("smoke")
     assert result.outcome is StopOutcome.NOT_MANAGED
     assert registry.load().entries == {}
+
+
+def test_open_webui_adapter_drives_a_real_child_through_its_lifecycle(tmp_path, reaper):
+    """The shipped Open WebUI spec, pointed at a child this test fully owns.
+
+    Only the executable and its arguments are replaced: the environment, the
+    log files, the registry and the ownership rules are the real ones.
+    """
+    from local_ai_stack.adapters import open_webui_control_spec
+
+    layout = StackLayout.from_root(tmp_path / "stack")
+    layout.ensure()
+    registry = ManagedProcessRegistry.from_layout(layout)
+    code = (
+        f"import sys, time; sys.stdout.write('{MARKER} open-webui\\n'); "
+        "sys.stdout.flush(); time.sleep(60)"
+    )
+    spec = open_webui_control_spec(
+        sys.executable,
+        layout=layout,
+        args=("-c", code),
+        startup_timeout=15.0,
+    )
+    controller = ServiceController(
+        (spec,),
+        registry,
+        http=http_answering(payload={"status": True}),
+        tcp=tcp_forbidden,
+        list_listeners_fn=lambda: NO_LISTENER_SCAN,
+        poll_interval=0.05,
+    )
+
+    started = controller.start("open-webui", wait=True)
+    reaper.append(started.pid)
+    assert started.outcome is LaunchOutcome.STARTED
+    assert started.ready
+
+    running_status = controller.status("open-webui")
+    assert running_status.origin is ProcessOrigin.MANAGED
+    assert running_status.stoppable
+
+    deadline = time.monotonic() + 10
+    log = layout.log_file("open-webui")
+    while time.monotonic() < deadline and not read_log_tail(log):
+        time.sleep(0.05)
+    assert read_log_tail(log) == (f"{MARKER} open-webui",)
+
+    assert controller.stop("open-webui").outcome is StopOutcome.STOPPED
+    assert wait_until_gone(started.pid)
+    assert registry.load().entries == {}
+
+
+def test_real_open_webui_and_comfyui_are_only_observed():
+    """Whatever is running on this machine, we must not claim to own it."""
+    processes = list_processes()
+    for spec in (OPEN_WEBUI_PROCESS, COMFYUI_PROCESS):
+        status = discover_process(spec, processes=processes)
+        assert status.state in set(RuntimeProcessState)
+        if status.state is RuntimeProcessState.RUNNING:
+            assert status.origin is ProcessOrigin.EXTERNAL
 
 
 def test_doctor_still_runs_against_the_real_machine():

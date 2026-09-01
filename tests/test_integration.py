@@ -433,3 +433,97 @@ def test_layout_helper_is_not_reimplemented(tmp_path):
     assert OllamaProvisioner().managed_executable(context) == (
         context.layout.ollama_app / EXECUTABLE
     )
+
+
+# --- the component/service id seam ------------------------------------------
+
+
+def test_every_stack_component_maps_to_a_known_service():
+    """The two id spaces meet in exactly one place, and nowhere else.
+
+    A stack component is named for the thing installed (``open_webui``); a
+    service is named for the thing that runs (``open-webui``). If a component
+    is ever added without extending that single mapping, this fails.
+    """
+    from local_ai_stack.integration import (
+        COMPONENT_SERVICE_IDS,
+        known_component_ids,
+        service_id_for_component,
+    )
+    from local_ai_stack.services import DEFAULT_SERVICE_SPECS
+
+    service_ids = {spec.id for spec in DEFAULT_SERVICE_SPECS}
+    for component_id in known_component_ids():
+        assert component_id in COMPONENT_SERVICE_IDS, component_id
+        assert service_id_for_component(component_id) in service_ids
+
+
+def test_an_unmapped_component_keeps_its_own_id():
+    from local_ai_stack.integration import service_id_for_component
+
+    assert service_id_for_component("something-new") == "something-new"
+
+
+def test_control_specs_cover_every_service_even_without_a_provisioner(tmp_path):
+    """Open WebUI and ComfyUI have no provisioner yet, so they stay watch-only."""
+    context = context_for(tmp_path)
+    install_managed(context)
+    specs = {spec.service_id: spec for spec in control_specs_for(detect_integration(context))}
+    assert set(specs) == {"ollama", "open-webui", "comfyui"}
+    assert specs["ollama"].controllable
+    assert not specs["open-webui"].controllable
+    assert not specs["comfyui"].controllable
+    assert specs["open-webui"].launch is None
+
+
+def test_a_managed_web_app_becomes_controllable_with_no_change_here(tmp_path):
+    """The rule is per-handoff, so a future provisioner needs no wiring."""
+    from local_ai_stack.integration import ComponentIntegration, IntegrationSnapshot
+    from local_ai_stack.provisioning import LaunchAvailability, Ownership, RuntimeHandoff
+
+    layout = StackLayout.from_root(tmp_path / "stack")
+    snapshot = IntegrationSnapshot(
+        (
+            ComponentIntegration(
+                handoff=RuntimeHandoff(
+                    component_id="open_webui",
+                    availability=LaunchAvailability.AVAILABLE,
+                    ownership=Ownership.MANAGED,
+                    executable=Path(sys.executable),
+                    detail="managed install",
+                ),
+                service_id="open-webui",
+            ),
+        )
+    )
+    specs = {spec.service_id: spec for spec in control_specs_for(snapshot, layout=layout)}
+    open_webui = specs["open-webui"]
+    assert open_webui.controllable
+    assert open_webui.launch.argv == (sys.executable, "serve")
+    assert open_webui.launch.env["DATA_DIR"] == str(layout.open_webui_data)
+    assert open_webui.launch.logs.stdout == layout.log_file("open-webui")
+    # The others are untouched by one component becoming available.
+    assert not specs["comfyui"].controllable
+
+
+def test_an_external_web_app_is_never_given_a_launch_spec(tmp_path):
+    from local_ai_stack.integration import ComponentIntegration, IntegrationSnapshot
+    from local_ai_stack.provisioning import LaunchAvailability, Ownership, RuntimeHandoff
+
+    snapshot = IntegrationSnapshot(
+        (
+            ComponentIntegration(
+                handoff=RuntimeHandoff(
+                    component_id="comfyui",
+                    availability=LaunchAvailability.EXTERNAL,
+                    ownership=Ownership.EXTERNAL,
+                    detected_path=Path(sys.executable).parent,
+                    detail="installed by someone else",
+                ),
+                service_id="comfyui",
+            ),
+        )
+    )
+    specs = {spec.service_id: spec for spec in control_specs_for(snapshot)}
+    assert not specs["comfyui"].controllable
+    assert specs["comfyui"].launch is None

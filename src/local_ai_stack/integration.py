@@ -19,13 +19,18 @@ an install root, and it never searches the machine for a binary.
 
 Three cases, and their consequences, are decided here once:
 
-* **EXTERNAL** — Ollama exists but somebody else installed it. It is watched,
-  never controlled. No launch spec is built, so start has nothing to spawn and
-  stop is refused by the registry, which never claimed the process.
+* **EXTERNAL** — the component exists but somebody else installed it. It is
+  watched, never controlled. No launch spec is built, so start has nothing to
+  spawn and stop is refused by the registry, which never claimed the process.
 * **MANAGED** — we installed it, the marker proves it, and the executable is
   present. Only then is a control spec with a launch spec built.
 * **NOT_INSTALLED / UNAVAILABLE** — no executable is invented. The service stays
   observation-only and the reason travels with it, so a UI can say why.
+
+The three services are handled by exactly the same rule. Ollama is simply the
+only component with a provisioner today, so it is the only one that can reach
+MANAGED; Open WebUI and ComfyUI fall out as NOT_INSTALLED until theirs exist,
+and become controllable with no change here the moment they do.
 """
 
 from __future__ import annotations
@@ -34,14 +39,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from .adapters import observation_only_specs, ollama_control_spec
+from .adapters import control_spec_for
 from .controller import ServiceController, ServiceControlSpec
 from .execution import PlanExecutor, ProvisionerRegistry
 from .installation import ResolvedInstallation
 from .launcher import ProcessLauncher
 from .ollama import COMPONENT_ID as OLLAMA_COMPONENT_ID
 from .ollama import OllamaProvisioner
-from .processes import OLLAMA_PROCESS
 from .provisioning import (
     LaunchAvailability,
     Ownership,
@@ -51,7 +55,8 @@ from .provisioning import (
 )
 from .registry import ManagedProcessRegistry
 from .runner import CommandRunner
-from .services import OLLAMA_SPEC
+from .services import COMFYUI_SPEC, DEFAULT_SERVICE_SPECS, OLLAMA_SPEC, OPEN_WEBUI_SPEC
+from .stacks import get_stack
 
 __all__ = [
     "ComponentIntegration",
@@ -60,8 +65,10 @@ __all__ = [
     "control_specs_for",
     "default_provisioners",
     "detect_integration",
+    "known_component_ids",
     "plan_executor",
     "provision_context",
+    "service_id_for_component",
 ]
 
 
@@ -161,9 +168,29 @@ class IntegrationSnapshot:
         return tuple(c.service_id for c in self.components if c.controllable)
 
 
-# Which service a provisioned component ends up serving. Ollama is the only
-# component with both a provisioner and a runtime service today.
-COMPONENT_SERVICE_IDS: Mapping[str, str] = {OLLAMA_COMPONENT_ID: OLLAMA_SPEC.id}
+# Which service a provisioned component ends up serving.
+#
+# The two id spaces are not the same and neither is wrong: a stack component is
+# named for the thing installed (``open_webui``, as it appears in stacks.py and
+# in profile YAML), while a service is named for the thing that runs and is
+# probed (``open-webui``, as it appears in services.py, processes.py and the
+# navigation). This mapping is the single, existing bridge between them; adding
+# another one anywhere else is how the two would silently drift apart.
+COMPONENT_SERVICE_IDS: Mapping[str, str] = {
+    OLLAMA_COMPONENT_ID: OLLAMA_SPEC.id,
+    "open_webui": OPEN_WEBUI_SPEC.id,
+    "comfyui": COMFYUI_SPEC.id,
+}
+
+
+def service_id_for_component(component_id: str) -> str:
+    """The service a component serves, falling back to the component's own id."""
+    return COMPONENT_SERVICE_IDS.get(component_id, component_id)
+
+
+def known_component_ids() -> tuple[str, ...]:
+    """Every component the default stack declares, in declaration order."""
+    return get_stack().component_ids
 
 
 def detect_integration(
@@ -175,7 +202,7 @@ def detect_integration(
     components = tuple(
         ComponentIntegration(
             handoff=provisioner.runtime_handoff(context),
-            service_id=COMPONENT_SERVICE_IDS.get(component_id, component_id),
+            service_id=service_id_for_component(component_id),
         )
         for component_id, provisioner in sorted(registry.items())
     )
@@ -187,30 +214,42 @@ def control_specs_for(
     *,
     layout=None,
     models_dir: str | Path | None = None,
+    service_options: Mapping[str, Mapping[str, object]] | None = None,
 ) -> tuple[ServiceControlSpec, ...]:
-    """Build control specs from what provisioning found.
+    """Build one control spec per service from what provisioning found.
 
-    A launch spec is built only for a MANAGED, usable install. An external or
-    missing Ollama yields the same spec the read-only layers already use, so it
-    keeps showing health and process state while start and stop have nothing to
-    act on.
+    A launch spec is built only where a handoff carried an executable, which
+    happens only for a MANAGED, usable install. External and missing components
+    get the same watch-only spec the read-only layers already use, so health and
+    process state keep working while start and stop have nothing to act on.
 
-    A managed Ollama keeps its models inside the stack layout unless a caller
-    says otherwise, so a managed install never writes into the model directory
-    an external install owns.
+    Defaults come from the stack layout, never from a guess: a managed install
+    keeps its models and its data inside the layout, so it can never write into
+    a directory an external install owns.
     """
-    ollama = snapshot.by_component(OLLAMA_COMPONENT_ID)
-    if ollama is not None and ollama.controllable and ollama.executable is not None:
-        if models_dir is None and layout is not None:
-            models_dir = layout.models
-        controlled = ollama_control_spec(
-            ollama.executable,
-            layout=layout,
-            models_dir=models_dir,
+    options: dict[str, dict[str, object]] = {
+        service_id: dict(values) for service_id, values in (service_options or {}).items()
+    }
+    if models_dir is not None:
+        options.setdefault(OLLAMA_SPEC.id, {}).setdefault("models_dir", models_dir)
+    elif layout is not None:
+        options.setdefault(OLLAMA_SPEC.id, {}).setdefault("models_dir", layout.models)
+
+    specs: list[ServiceControlSpec] = []
+    for service in DEFAULT_SERVICE_SPECS:
+        component = snapshot.by_service(service.id)
+        executable = (
+            component.executable if component is not None and component.controllable else None
         )
-    else:
-        controlled = ServiceControlSpec(OLLAMA_SPEC, OLLAMA_PROCESS)
-    return (controlled, *observation_only_specs())
+        specs.append(
+            control_spec_for(
+                service.id,
+                executable,
+                layout=layout,
+                **options.get(service.id, {}),
+            )
+        )
+    return tuple(specs)
 
 
 def build_service_controller(
@@ -221,6 +260,7 @@ def build_service_controller(
     launcher: ProcessLauncher | None = None,
     specs: Sequence[ServiceControlSpec] | None = None,
     models_dir: str | Path | None = None,
+    service_options: Mapping[str, Mapping[str, object]] | None = None,
     **controller_options,
 ) -> ServiceController:
     """A controller that can only ever control what provisioning owns.
@@ -229,7 +269,9 @@ def build_service_controller(
     how probes and scans are injected instead of reaching into the instance.
     """
     control_specs = (
-        control_specs_for(snapshot, layout=layout, models_dir=models_dir)
+        control_specs_for(
+            snapshot, layout=layout, models_dir=models_dir, service_options=service_options
+        )
         if specs is None
         else tuple(specs)
     )

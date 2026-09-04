@@ -1,38 +1,73 @@
+# Model catalog.
+#
+# One canonical id per model: <provider>/<stable-name>, the key below joined to
+# its provider section. Profiles reference these ids and nothing else — no URL,
+# no hash, no filename, no install path ever appears in a profile.
+#
+# Nothing here resolves "latest". An Ollama model is pinned by an explicit
+# name:tag, and a managed ComfyUI file is pinned by URL plus SHA-256; a file
+# entry without both is declared but not installable, and resolves as
+# not-installed rather than being fetched from somewhere unverified.
+#
+# `aliases` exist so an id written the old way still lands on the canonical
+# entry. They are normalized on the way in and never become a second namespace.
+
 schema_version: 1
 
 ollama:
+  # Digests are the short manifest digests published on ollama.com/library.
+  # They are recorded for traceability and checked as a prefix of the full
+  # digest the local Ollama reports, so a tag republished upstream is visible.
   hermes3_8b:
-    id: hermes3:8b
+    kind: chat
+    reference: hermes3:8b
+    digest: 4f6b83f30b62
+    aliases: [ollama/hermes3-8b]
     capabilities: {text: true, tools: true, vision: false}
     status: candidate
+
   qwen3_5_9b:
-    id: qwen3.5:9b
+    kind: chat
+    reference: qwen3.5:9b
+    digest: 6488c96fa5fa
+    aliases: [ollama/qwen3-5-9b]
     capabilities: {text: true, tools: true, vision: true}
     status: tested_chat_tool_calling_unreliable_for_image
+
   qwen3_8b:
-    id: qwen3:8b
+    kind: chat
+    reference: qwen3:8b
+    digest: 500a1f067a9f
+    aliases: [ollama/qwen3-8b]
     capabilities: {text: true, tools: true, vision: false}
     status: tested
 
 comfyui:
+  # These three were validated by hand on the reference machine, but no
+  # authoritative download URL and SHA-256 has been recorded for them yet.
+  # They stay declared and unpinned on purpose: the catalog refuses to build a
+  # managed file source without a checksum, so they resolve as not-installed
+  # instead of being fetched from an unverified location.
   flux2_klein_fp8:
+    kind: diffusion
+    placement: diffusion_models
     filename: flux-2-klein-4b-fp8.safetensors
-    type: diffusion_model
-    destination: diffusion_models
     url: TBD
     sha256: TBD
     status: manually_tested
+
   qwen_3_4b_encoder:
+    kind: text-encoder
+    placement: text_encoders
     filename: qwen_3_4b.safetensors
-    type: text_encoder
-    destination: text_encoders
     url: TBD
     sha256: TBD
     status: manually_tested
+
   flux2_vae:
+    kind: vae
+    placement: vae
     filename: flux2-vae.safetensors
-    type: vae
-    destination: vae
     url: TBD
     sha256: TBD
     status: manually_tested

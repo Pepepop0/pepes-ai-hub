@@ -12,9 +12,12 @@ absolute path is what the ComfyUI search-path configuration is built from. This
 module never sees a URL, a checksum, a catalog or a downloader, and never turns
 a filename back into a path.
 
-Fail closed: a workflow whose models are not all ``AVAILABLE`` is not a workflow
-that can be rendered. It reports why and refuses, rather than emitting a graph
-that names a file which is not there.
+Fail closed: a workflow declares *every* role it loads, and all of them must
+resolve to ``AVAILABLE`` before it can be rendered. A graph that needs a
+diffusion model, a text encoder and a VAE is not usable with two of the three,
+and nothing here quietly waits for fewer: the manifest lists them, and a role
+that is missing, invalid, external or undeclared blocks the workflow with that
+reason attached.
 """
 
 from __future__ import annotations
@@ -75,14 +78,30 @@ class NodeBinding:
 
 @dataclass(frozen=True)
 class WorkflowSpec:
-    """A workflow the manager can materialise, declared entirely by manifest."""
+    """A workflow the manager can materialise, declared entirely by manifest.
+
+    ``required_roles`` is the whole set of models the graph loads, and
+    ``parameter_role`` is the one of those that the ``model`` binding names.
+    Both come from the manifest; neither has a default, because a hidden
+    default is how a workflow ends up silently missing an encoder.
+    """
 
     id: str
     file: Path
     bindings: Mapping[WorkflowParameter, NodeBinding]
-    model_role: str = "image.diffusion"
+    required_roles: tuple[str, ...]
+    parameter_role: str
     status: str = ""
     unresolved: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.required_roles:
+            raise WorkflowError(f"workflow {self.id!r} must declare the models it requires")
+        if self.parameter_role not in self.required_roles:
+            raise WorkflowError(
+                f"workflow {self.id!r}: parameter role {self.parameter_role!r} is not one of "
+                f"the required roles ({', '.join(self.required_roles)})"
+            )
 
     @property
     def complete(self) -> bool:
@@ -133,13 +152,22 @@ class WorkflowState(StrEnum):
 
 @dataclass(frozen=True)
 class WorkflowResolution:
-    """A workflow checked against one profile and one resolver."""
+    """A workflow checked against one profile and one resolver.
+
+    ``models`` holds every role the workflow declared, so a caller can see
+    which one is missing rather than only that something is.
+    """
 
     spec: WorkflowSpec
     state: WorkflowState
-    model: ResolvedModel | None = None
+    models: Mapping[str, ResolvedModel] = field(default_factory=dict)
     template_path: Path | None = None
     problems: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def model(self) -> ResolvedModel | None:
+        """The model the ``model`` parameter names, when it resolved at all."""
+        return self.models.get(self.spec.parameter_role)
 
     @property
     def ready(self) -> bool:
@@ -157,11 +185,12 @@ class WorkflowResolution:
         return location.path
 
     def require_model_location(self) -> FileModelLocation:
-        if self.model is None:
+        model = self.model
+        if model is None:
             raise ModelUnavailableError(
                 f"workflow {self.spec.id!r} has no resolved model: {'; '.join(self.problems)}"
             )
-        location = self.model.require_location()
+        location = model.require_location()
         if not isinstance(location, FileModelLocation):
             raise WorkflowError(
                 f"workflow {self.spec.id!r} needs a file model, got {location.provider.value}"
@@ -170,6 +199,36 @@ class WorkflowResolution:
 
 
 # --- manifest loading -------------------------------------------------------
+
+
+def _model_roles(
+    entry: dict[str, Any], workflow_id: str, source: str
+) -> tuple[tuple[str, ...], str]:
+    """Read the explicit model contract of one workflow. No defaults."""
+    models = entry.get("models")
+    if not isinstance(models, dict):
+        raise WorkflowError(
+            f"{source}: workflow {workflow_id!r} must declare a models block naming every "
+            "role it loads"
+        )
+    unknown = sorted(str(key) for key in models if str(key) not in {"required", "parameter"})
+    if unknown:
+        raise WorkflowError(
+            f"{source}: workflow {workflow_id!r}: models has unknown fields: {', '.join(unknown)}"
+        )
+    required = models.get("required")
+    if not isinstance(required, list) or not required:
+        raise WorkflowError(
+            f"{source}: workflow {workflow_id!r}: models.required must be a non-empty list of roles"
+        )
+    roles = tuple(str(role) for role in required)
+    parameter = models.get("parameter")
+    if not isinstance(parameter, str) or not parameter:
+        raise WorkflowError(
+            f"{source}: workflow {workflow_id!r}: models.parameter must name the role the "
+            "model input uses"
+        )
+    return roles, parameter
 
 
 def _binding(value: Any, workflow_id: str, parameter: str) -> NodeBinding | None:
@@ -239,11 +298,13 @@ def parse_workflow_manifest(
             else:
                 bindings[parameter] = binding
 
+        required_roles, parameter_role = _model_roles(entry, str(workflow_id), source)
         specs[str(workflow_id)] = WorkflowSpec(
             id=str(workflow_id),
             file=Path(file_value),
             bindings=bindings,
-            model_role=roles.get(str(workflow_id), "image.diffusion"),
+            required_roles=required_roles,
+            parameter_role=roles.get(str(workflow_id), parameter_role),
             status=str(entry.get("status", "")),
             unresolved=tuple(sorted(unresolved)),
         )
@@ -281,43 +342,59 @@ def resolve_workflow(
 ) -> WorkflowResolution:
     """Check one workflow against the profile's models and the graph on disk.
 
-    Every failure is a refusal with a reason. Nothing is invented: an absent
-    model does not become a filename, and an incomplete mapping does not become
-    a guess at a node id.
+    Every declared role is resolved, not just the one the ``model`` input
+    names: a graph that loads a text encoder and a VAE is unusable without
+    them, whatever the diffusion model says. Every failure is a refusal with a
+    reason; nothing is invented.
     """
-    problems: list[str] = []
+    resolved: dict[str, ResolvedModel] = {}
+    undeclared: list[str] = []
+    unavailable: list[str] = []
 
-    model_id = _profile_model_id(profile, spec.model_role)
-    if model_id is None:
+    for role in spec.required_roles:
+        model_id = _profile_model_id(profile, role)
+        if model_id is None:
+            undeclared.append(role)
+            continue
+        model = resolver.resolve(model_id)
+        resolved[role] = model
+        if not model.available:
+            detail = f": {model.detail}" if model.detail else ""
+            unavailable.append(f"{role} ({model_id}) is {model.state.value}{detail}")
+
+    if undeclared:
         return WorkflowResolution(
             spec,
             WorkflowState.MODEL_NOT_DECLARED,
-            problems=(f"profile {profile.id!r} declares no model for role {spec.model_role!r}",),
+            resolved,
+            problems=tuple(
+                f"profile {profile.id!r} declares no model for role {role!r}" for role in undeclared
+            ),
         )
-
-    resolved = resolver.resolve(model_id)
-    if not resolved.available:
+    if unavailable:
         return WorkflowResolution(
             spec,
             WorkflowState.MODEL_UNAVAILABLE,
-            problems=(
-                f"model {model_id} is {resolved.state.value} and cannot be used"
-                + (f": {resolved.detail}" if resolved.detail else ""),
-            ),
+            resolved,
+            problems=tuple(f"model for {problem} and cannot be used" for problem in unavailable),
         )
 
     template = (repo_root / spec.file) if repo_root is not None else spec.file
     if not spec.complete:
-        problems.append(
-            f"workflow {spec.id!r} has no node binding for: {', '.join(spec.unresolved)}"
-        )
         return WorkflowResolution(
-            spec, WorkflowState.MAPPING_INCOMPLETE, resolved, template, tuple(problems)
+            spec,
+            WorkflowState.MAPPING_INCOMPLETE,
+            resolved,
+            template,
+            (f"workflow {spec.id!r} has no node binding for: {', '.join(spec.unresolved)}",),
         )
     if not template.is_file():
-        problems.append(f"workflow graph not present in the repository: {spec.file}")
         return WorkflowResolution(
-            spec, WorkflowState.TEMPLATE_MISSING, resolved, template, tuple(problems)
+            spec,
+            WorkflowState.TEMPLATE_MISSING,
+            resolved,
+            template,
+            (f"workflow graph not present in the repository: {spec.file}",),
         )
     return WorkflowResolution(spec, WorkflowState.READY, resolved, template)
 

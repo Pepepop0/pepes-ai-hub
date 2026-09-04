@@ -39,6 +39,20 @@ SRC = Path(local_ai_stack.__file__).resolve().parents[1]
 FIXTURE_GRAPH = Path(__file__).parent / "fixtures" / "flux2-klein-t2i-api.json"
 
 DIFFUSION_ID = ModelId("comfyui/flux2_klein_fp8")
+ENCODER_ID = ModelId("comfyui/qwen_3_4b_encoder")
+VAE_ID = ModelId("comfyui/flux2_vae")
+
+# Every role the shipped t2i workflow declares, and the file each one resolves
+# to. A workflow needs all of them; the tests below take one away at a time.
+IMAGE_MODELS: dict[ModelId, tuple[ModelPlacement, str, ModelKind]] = {
+    DIFFUSION_ID: (
+        ModelPlacement.DIFFUSION_MODELS,
+        "flux2-klein-fp8.safetensors",
+        ModelKind.DIFFUSION,
+    ),
+    ENCODER_ID: (ModelPlacement.TEXT_ENCODERS, "qwen_3_4b.safetensors", ModelKind.TEXT_ENCODER),
+    VAE_ID: (ModelPlacement.VAE, "flux2-vae.safetensors", ModelKind.VAE),
+}
 
 
 class FakeResolver:
@@ -56,15 +70,30 @@ class FakeResolver:
 
 
 def available_file_model(tmp_path, model_id: ModelId = DIFFUSION_ID) -> ResolvedModel:
-    path = tmp_path / "models" / "comfyui" / "diffusion_models" / "flux2-klein-fp8.safetensors"
+    placement, filename, kind = IMAGE_MODELS[model_id]
+    path = tmp_path / "models" / "comfyui" / placement.value / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"weights")
     return ResolvedModel(
         model_id,
-        ModelKind.DIFFUSION,
+        kind,
         ModelState.AVAILABLE,
-        FileModelLocation(path, path.name, ModelPlacement.DIFFUSION_MODELS),
+        FileModelLocation(path, path.name, placement),
     )
+
+
+def image_resolver(tmp_path, *, missing: ModelId | None = None, state=None) -> FakeResolver:
+    """Every image role available, except one the caller wants to break."""
+    models = {}
+    for model_id in IMAGE_MODELS:
+        if model_id == missing:
+            if state is not None:
+                models[model_id] = ResolvedModel(
+                    model_id, IMAGE_MODELS[model_id][2], state, detail="broken on purpose"
+                )
+            continue
+        models[model_id] = available_file_model(tmp_path, model_id)
+    return FakeResolver(models)
 
 
 @pytest.fixture
@@ -144,28 +173,80 @@ def test_a_binding_missing_its_node_is_refused():
 # --- fail closed on models --------------------------------------------------
 
 
-def test_a_workflow_needs_an_available_model(specs, profile, tmp_path):
-    resolver = FakeResolver({DIFFUSION_ID: available_file_model(tmp_path)})
+def test_a_workflow_resolves_every_role_it_declares(specs, profile, tmp_path):
+    resolver = image_resolver(tmp_path)
     resolution = resolve_workflow(
         specs["flux2_klein_t2i"], profile, resolver, repo_root=FIXTURE_GRAPH.parent.parent
     )
-    assert resolver.asked == [DIFFUSION_ID], "only the role the workflow needs is asked for"
+    assert resolver.asked == [DIFFUSION_ID, ENCODER_ID, VAE_ID], "all three, not just the model"
+    assert set(resolution.models) == {"image.diffusion", "image.text_encoder", "image.vae"}
     assert resolution.state is WorkflowState.TEMPLATE_MISSING, "the graph is not in the repo yet"
     assert resolution.model.available
 
 
+def test_the_manifest_declares_the_roles_with_no_hidden_default(specs):
+    spec = specs["flux2_klein_t2i"]
+    assert spec.required_roles == ("image.diffusion", "image.text_encoder", "image.vae")
+    assert spec.parameter_role == "image.diffusion"
+
+
+def test_a_workflow_without_a_models_block_is_refused():
+    data = {
+        "schema_version": 1,
+        "workflows": {"w": {"file": "w.json", "mapping": {"prompt": {"node_id": "1", "key": "v"}}}},
+    }
+    with pytest.raises(WorkflowError, match="must declare a models block"):
+        parse_workflow_manifest(data)
+
+
+def test_a_parameter_role_outside_the_required_set_is_refused():
+    data = {
+        "schema_version": 1,
+        "workflows": {
+            "w": {
+                "file": "w.json",
+                "models": {"required": ["image.vae"], "parameter": "image.diffusion"},
+                "mapping": {"prompt": {"node_id": "1", "key": "v"}},
+            }
+        },
+    }
+    with pytest.raises(WorkflowError, match="is not one of the required roles"):
+        parse_workflow_manifest(data)
+
+
+@pytest.mark.parametrize(
+    ("missing", "role"),
+    [
+        (DIFFUSION_ID, "image.diffusion"),
+        (ENCODER_ID, "image.text_encoder"),
+        (VAE_ID, "image.vae"),
+    ],
+)
 @pytest.mark.parametrize(
     "state", [ModelState.NOT_INSTALLED, ModelState.INVALID, ModelState.EXTERNAL]
 )
-def test_a_model_that_is_not_available_blocks_the_workflow(specs, profile, state):
-    resolver = FakeResolver(
-        {DIFFUSION_ID: ResolvedModel(DIFFUSION_ID, ModelKind.DIFFUSION, state, detail="nope")}
-    )
+def test_any_missing_role_blocks_the_workflow(specs, profile, tmp_path, missing, role, state):
+    """One broken role out of three is enough; there is no partial readiness."""
+    resolver = image_resolver(tmp_path, missing=missing, state=state)
+    template = tmp_path / "workflows" / "flux2-klein-t2i-api.json"
+    template.parent.mkdir(parents=True, exist_ok=True)
+    template.write_text(FIXTURE_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
+
+    resolution = resolve_workflow(specs["flux2_klein_t2i"], profile, resolver, repo_root=tmp_path)
+
+    assert resolution.state is WorkflowState.MODEL_UNAVAILABLE
+    assert not resolution.ready
+    assert any(role in problem and state.value in problem for problem in resolution.problems)
+    with pytest.raises(ModelUnavailableError):
+        render_workflow(resolution, WorkflowParameters(prompt="x"))
+
+
+def test_a_model_that_is_not_available_never_exposes_a_location(specs, profile):
+    resolver = FakeResolver()
     resolution = resolve_workflow(specs["flux2_klein_t2i"], profile, resolver)
 
     assert resolution.state is WorkflowState.MODEL_UNAVAILABLE
     assert not resolution.ready
-    assert state.value in resolution.problems[0]
     with pytest.raises(ModelUnavailableError):
         resolution.require_model_location()
 
@@ -178,7 +259,7 @@ def test_an_unavailable_model_can_never_be_rendered(specs, profile, graph):
 
 
 def test_an_incomplete_mapping_blocks_the_workflow(specs, profile, tmp_path):
-    resolver = FakeResolver({DIFFUSION_ID: available_file_model(tmp_path)})
+    resolver = image_resolver(tmp_path)
     edit = specs["flux2_klein_edit"]
     resolution = resolve_workflow(edit, profile, resolver, repo_root=tmp_path)
     assert resolution.state is WorkflowState.MAPPING_INCOMPLETE
@@ -188,10 +269,14 @@ def test_an_incomplete_mapping_blocks_the_workflow(specs, profile, tmp_path):
 def test_a_role_the_profile_does_not_declare_blocks_the_workflow(specs, profile, tmp_path):
     from dataclasses import replace
 
-    spec = replace(specs["flux2_klein_t2i"], model_role="image.upscaler")
-    resolution = resolve_workflow(spec, profile, FakeResolver())
+    spec = replace(
+        specs["flux2_klein_t2i"],
+        required_roles=("image.diffusion", "image.upscaler"),
+        parameter_role="image.diffusion",
+    )
+    resolution = resolve_workflow(spec, profile, image_resolver(tmp_path))
     assert resolution.state is WorkflowState.MODEL_NOT_DECLARED
-    assert "declares no model for role" in resolution.problems[0]
+    assert "image.upscaler" in resolution.problems[0]
 
 
 def test_a_comfyui_model_cannot_carry_an_ollama_location():
@@ -207,14 +292,17 @@ def test_a_comfyui_model_cannot_carry_an_ollama_location():
         )
 
 
-def test_a_workflow_refuses_a_model_that_is_not_a_file(specs, profile):
+def test_a_workflow_refuses_a_model_that_is_not_a_file(specs, profile, tmp_path):
     """An Ollama model is a reference, and a node needs a name on disk."""
     chat_id = ModelId("ollama/hermes3_8b")
     resolution_input = ResolvedModel(
         chat_id, ModelKind.CHAT, ModelState.AVAILABLE, OllamaModelLocation("hermes3:8b")
     )
-    resolver = FakeResolver({DIFFUSION_ID: resolution_input})
-    resolution = resolve_workflow(specs["flux2_klein_t2i"], profile, resolver)
+    models = {model_id: available_file_model(tmp_path, model_id) for model_id in IMAGE_MODELS}
+    models[DIFFUSION_ID] = resolution_input
+    resolution = resolve_workflow(
+        specs["flux2_klein_t2i"], profile, FakeResolver(models), repo_root=tmp_path
+    )
     with pytest.raises(WorkflowError, match="needs a file model"):
         resolution.require_model_location()
 
@@ -223,7 +311,7 @@ def test_a_workflow_refuses_a_model_that_is_not_a_file(specs, profile):
 
 
 def ready_resolution(specs, profile, tmp_path):
-    resolver = FakeResolver({DIFFUSION_ID: available_file_model(tmp_path)})
+    resolver = image_resolver(tmp_path)
     template = tmp_path / "workflows" / "flux2-klein-t2i-api.json"
     template.parent.mkdir(parents=True, exist_ok=True)
     template.write_text(FIXTURE_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")

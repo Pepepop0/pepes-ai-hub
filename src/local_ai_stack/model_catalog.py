@@ -148,6 +148,26 @@ def _placement(value: Any, source: Path | str, field_name: str) -> ModelPlacemen
         ) from exc
 
 
+def _alias_list(value: Any, source: Path | str, field_name: str) -> list[Any]:
+    """The alias declaration, as a list or not at all.
+
+    A bare string is the trap this guards: it is iterable, so accepting one
+    would silently register every character as its own alias. A mapping is
+    iterable too, over its keys. Only a real list is a list of aliases, and an
+    absent or null declaration means none.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise _error(
+            source,
+            f"{field_name}.aliases",
+            f"must be a list of strings, got {type(value).__name__}"
+            + (f"; write '- {value}' to declare a single alias" if isinstance(value, str) else ""),
+        )
+    return value
+
+
 def _reject_unknown(
     record: dict[str, Any], allowed: set[str], source: Path | str, field_name: str
 ) -> None:
@@ -280,7 +300,7 @@ def validate_model_manifest(data: Any, source: Path | str = "<models>") -> Model
             else:
                 unpinned[model_id] = reason or "not installable"
 
-            for index, alias in enumerate(record.get("aliases", []) or []):
+            for index, alias in enumerate(_alias_list(record.get("aliases"), source, field_name)):
                 label = f"{field_name}.aliases[{index}]"
                 text = _string(alias, source, label)
                 if text in aliases and aliases[text] != model_id:

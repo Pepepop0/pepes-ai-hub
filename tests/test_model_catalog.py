@@ -93,6 +93,60 @@ def test_an_alias_normalizes_to_the_canonical_id():
     assert catalog.normalize("ollama/demo_8b") == ModelId("ollama/demo_8b")
 
 
+def test_a_list_of_aliases_is_the_declared_shape():
+    catalog = validate_model_manifest(
+        manifest(ollama={"demo_8b": ollama_entry(aliases=["ollama/legacy-a", "ollama/legacy-b"])})
+    )
+    assert set(catalog.aliases) == {"ollama/legacy-a", "ollama/legacy-b"}
+    assert all(target == ModelId("ollama/demo_8b") for target in catalog.aliases.values())
+    # Both spellings land on the one canonical id; neither becomes a spec.
+    assert set(catalog.specs) == {ModelId("ollama/demo_8b")}
+
+
+@pytest.mark.parametrize(
+    "value, described",
+    [
+        ("legacy", "str"),
+        (123, "int"),
+        ({}, "dict"),
+        ({"ollama/legacy": 1}, "dict"),
+        (("ollama/legacy",), "tuple"),
+        (True, "bool"),
+    ],
+)
+def test_a_non_list_aliases_declaration_is_rejected(value, described):
+    """A bare string is iterable, so accepting one would register a character
+    per alias. Only a real list is a list of aliases."""
+    with pytest.raises(ModelCatalogError, match="must be a list of strings") as exc:
+        validate_model_manifest(manifest(ollama={"demo_8b": ollama_entry(aliases=value)}))
+    assert described in str(exc.value)
+    assert "aliases" in str(exc.value)
+
+
+def test_a_scalar_string_alias_is_never_iterated_into_characters():
+    with pytest.raises(ModelCatalogError) as exc:
+        validate_model_manifest(manifest(ollama={"demo_8b": ollama_entry(aliases="legacy")}))
+    message = str(exc.value)
+    # The corrective hint names the whole word, never its letters.
+    assert "- legacy" in message
+    assert "'l'" not in message
+
+
+@pytest.mark.parametrize("value", [[], None])
+def test_no_aliases_stays_valid(value):
+    """An absent or empty declaration is simply no alias, as it always was."""
+    catalog = validate_model_manifest(manifest(ollama={"demo_8b": ollama_entry(aliases=value)}))
+    assert catalog.aliases == {}
+    assert catalog.get(ModelId("ollama/demo_8b")) is not None
+
+
+def test_a_non_string_inside_the_alias_list_is_rejected():
+    with pytest.raises(ModelCatalogError, match="aliases\\[1\\]"):
+        validate_model_manifest(
+            manifest(ollama={"demo_8b": ollama_entry(aliases=["ollama/ok", 7])})
+        )
+
+
 def test_an_alias_is_not_a_second_namespace():
     """Only the canonical id exists as a spec; the alias is an input spelling."""
     catalog = validate_model_manifest(

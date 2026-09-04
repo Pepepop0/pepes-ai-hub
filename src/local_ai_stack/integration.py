@@ -34,7 +34,7 @@ install stays observation-only with no executable in its handoff.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,13 +43,21 @@ from .catalog import artifact_for, package_for, repository_for
 from .comfyui import COMPONENT_ID as COMFYUI_COMPONENT_ID
 from .comfyui import provisioner_from_pin as comfyui_provisioner
 from .controller import ServiceController, ServiceControlSpec
+from .endpoints import StackEndpoints
 from .execution import PlanExecutor, ProvisionerRegistry
-from .installation import ResolvedInstallation
+from .install_actions import InstallActionHandlers
+from .installation import ResolvedInstallation, detect_repo_root
 from .launcher import ProcessLauncher
+from .managed_config import ManagedConfigWriter
+from .model_catalog import ModelCatalog, model_catalog
+from .model_installer import ModelInstaller
+from .models import ManagedModelPaths
 from .ollama import COMPONENT_ID as OLLAMA_COMPONENT_ID
 from .ollama import OllamaProvisioner
+from .ollama_models import HttpOllamaClient
 from .open_webui import COMPONENT_ID as OPEN_WEBUI_COMPONENT_ID
 from .open_webui import OpenWebUIProvisioner
+from .profiles import Profile, load_profiles
 from .provisioning import (
     LaunchAvailability,
     Ownership,
@@ -59,13 +67,20 @@ from .provisioning import (
 )
 from .registry import ManagedProcessRegistry
 from .runner import CommandRunner
+from .service_config import (
+    COMFYUI_SEARCH_PATHS_FILE,
+    ServiceConfiguration,
+    StackConfiguration,
+)
 from .services import DEFAULT_SERVICE_SPECS, OLLAMA_SPEC
+from .workflows import WorkflowSpec, load_workflow_manifest
 
 __all__ = [
     "ComponentIntegration",
     "IntegrationSnapshot",
     "build_service_controller",
     "control_specs_for",
+    "default_install_actions",
     "default_provisioners",
     "detect_integration",
     "plan_executor",
@@ -107,11 +122,55 @@ def provision_context(
 def plan_executor(
     context: ProvisionContext,
     provisioners: ProvisionerRegistry | None = None,
+    *,
+    actions: InstallActionHandlers | None = None,
 ) -> PlanExecutor:
     """The executor the application uses. Nothing runs until it is asked to."""
+    bound_actions = actions if actions is not None else default_install_actions(context)
     return PlanExecutor(
         context=context,
         provisioners=dict(default_provisioners() if provisioners is None else provisioners),
+        action_handlers=bound_actions.handlers(),
+    )
+
+
+def default_install_actions(
+    context: ProvisionContext,
+    *,
+    repo_root: Path | None = None,
+    profiles: Sequence[Profile] | None = None,
+    catalog: ModelCatalog | None = None,
+    workflow_specs: Mapping[str, WorkflowSpec] | None = None,
+    installer_factory: Callable[[Profile], ModelInstaller] | None = None,
+    config_writer: ManagedConfigWriter | None = None,
+) -> InstallActionHandlers:
+    """Bind the shipped profiles/manifests to the three executable domains."""
+    root = Path(repo_root) if repo_root is not None else detect_repo_root()
+    known_profiles = tuple(profiles) if profiles is not None else load_profiles(root / "profiles")
+    known_catalog = catalog if catalog is not None else model_catalog()
+    known_workflows = (
+        workflow_specs
+        if workflow_specs is not None
+        else load_workflow_manifest(root / "manifests" / "workflows.yaml")
+    )
+
+    def build_installer(profile: Profile) -> ModelInstaller:
+        if installer_factory is not None:
+            return installer_factory(profile)
+        endpoint = StackEndpoints.from_profile(profile).ollama
+        return ModelInstaller(
+            ManagedModelPaths.from_layout(context.layout),
+            ollama=HttpOllamaClient(endpoint),
+        )
+
+    return InstallActionHandlers(
+        profiles={profile.id: profile for profile in known_profiles},
+        catalog=known_catalog,
+        installer_factory=build_installer,
+        workflow_specs=known_workflows,
+        repo_root=root,
+        layout=context.layout,
+        config_writer=config_writer or ManagedConfigWriter(),
     )
 
 
@@ -205,6 +264,8 @@ def control_specs_for(
     layout=None,
     models_dir: str | Path | None = None,
     service_options: Mapping[str, Mapping[str, object]] | None = None,
+    configuration: StackConfiguration | None = None,
+    config_writer: ManagedConfigWriter | None = None,
 ) -> tuple[ServiceControlSpec, ...]:
     """Build one control spec per service from what provisioning found.
 
@@ -235,6 +296,27 @@ def control_specs_for(
         executable = (
             component.executable if component is not None and component.controllable else None
         )
+        if executable is not None and configuration is not None and service.id != OLLAMA_SPEC.id:
+            configured = configuration.services.get(service.id)
+            if not _verified_configuration(configured, config_writer):
+                executable = None
+            elif service.id == OPEN_WEBUI_COMPONENT_ID:
+                existing = options.setdefault(service.id, {}).get("env")
+                base_env = existing if isinstance(existing, Mapping) else None
+                options[service.id]["env"] = configured.merged_env(base_env)
+            elif service.id == COMFYUI_COMPONENT_ID:
+                document = next(
+                    (
+                        item
+                        for item in configured.documents
+                        if item.path.name == COMFYUI_SEARCH_PATHS_FILE
+                    ),
+                    None,
+                )
+                if document is None:
+                    executable = None
+                else:
+                    options.setdefault(service.id, {})["extra_model_paths_config"] = document.path
         specs.append(
             control_spec_for(
                 service.id,
@@ -246,6 +328,17 @@ def control_specs_for(
     return tuple(specs)
 
 
+def _verified_configuration(
+    configuration: ServiceConfiguration | None,
+    writer: ManagedConfigWriter | None,
+) -> bool:
+    """Only generated bytes verified on disk are eligible for a managed launch."""
+    if configuration is None or not configuration.ok or not configuration.documents:
+        return False
+    verifier = writer if writer is not None else ManagedConfigWriter()
+    return verifier.verify(configuration.documents).ok
+
+
 def build_service_controller(
     snapshot: IntegrationSnapshot,
     registry: ManagedProcessRegistry,
@@ -255,6 +348,8 @@ def build_service_controller(
     specs: Sequence[ServiceControlSpec] | None = None,
     models_dir: str | Path | None = None,
     service_options: Mapping[str, Mapping[str, object]] | None = None,
+    configuration: StackConfiguration | None = None,
+    config_writer: ManagedConfigWriter | None = None,
     **controller_options,
 ) -> ServiceController:
     """A controller that can only ever control what provisioning owns.
@@ -264,7 +359,12 @@ def build_service_controller(
     """
     control_specs = (
         control_specs_for(
-            snapshot, layout=layout, models_dir=models_dir, service_options=service_options
+            snapshot,
+            layout=layout,
+            models_dir=models_dir,
+            service_options=service_options,
+            configuration=configuration,
+            config_writer=config_writer,
         )
         if specs is None
         else tuple(specs)

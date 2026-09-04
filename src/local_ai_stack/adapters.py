@@ -214,6 +214,7 @@ def comfyui_launch_spec(
     executable: str | Path,
     *,
     script: str | Path | None = None,
+    extra_model_paths_config: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 8188,
     args: Sequence[str] | None = None,
@@ -234,9 +235,14 @@ def comfyui_launch_spec(
     """
     entry = () if script is None else (str(script),)
     address = ("--listen", host, "--port", str(port)) if args is None else tuple(args)
+    model_paths = (
+        ()
+        if extra_model_paths_config is None
+        else ("--extra-model-paths-config", str(extra_model_paths_config))
+    )
     return ProcessLaunchSpec(
         service_id=COMFYUI_SPEC.id,
-        argv=(str(executable), *entry, *address),
+        argv=(str(executable), *entry, *address, *model_paths),
         cwd=cwd,
         env=dict(env) if env else {},
         logs=logs,
@@ -251,6 +257,7 @@ def comfyui_control_spec(
     *,
     layout=None,
     script: str | Path | None = None,
+    extra_model_paths_config: str | Path | None = None,
     host: str = "127.0.0.1",
     port: int = 8188,
     args: Sequence[str] | None = None,
@@ -271,6 +278,7 @@ def comfyui_control_spec(
     launch = comfyui_launch_spec(
         executable,
         script=script,
+        extra_model_paths_config=extra_model_paths_config,
         host=host,
         port=port,
         args=args,

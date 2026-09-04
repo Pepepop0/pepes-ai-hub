@@ -344,7 +344,9 @@ def test_prepare_layout_and_every_provisioned_component_are_supported(profile, t
     assert resolved[(PlanAction.INSTALL, "open-webui")] is True
     assert resolved[(PlanAction.INSTALL, "comfyui")] is True
     assert resolved[(PlanAction.CHECK, "system")] is False
-    assert resolved[(PlanAction.CONFIGURE, profile.id)] is False
+    assert resolved[(PlanAction.ACQUIRE_MODEL, "ollama/hermes3_8b")] is True
+    assert resolved[(PlanAction.APPLY_WORKFLOW, "text_to_image")] is True
+    assert resolved[(PlanAction.CONFIGURE, profile.id)] is True
 
 
 def test_unsupported_steps_stay_explicit_and_cover_the_whole_plan(profile, tmp_path):
@@ -357,11 +359,15 @@ def test_unsupported_steps_stay_explicit_and_cover_the_whole_plan(profile, tmp_p
     for entry in report.unsupported:
         assert entry.reason
     unsupported_targets = {e.step.target for e in report.unsupported}
-    # Models and workflows are named, not silently dropped as if they were done.
-    # Every stack component now has a provisioner; models and workflows do not.
+    # Every implemented component and post-install domain is executable. The
+    # system compatibility check remains an explicit read-only prerequisite.
     assert not ({"ollama", "open-webui", "comfyui"} & unsupported_targets)
-    assert any(e.action is PlanAction.ACQUIRE_MODEL for e in report.unsupported)
-    assert any(e.action is PlanAction.APPLY_WORKFLOW for e in report.unsupported)
+    assert {entry.action for entry in report.unsupported} == {PlanAction.CHECK}
+    assert {result.action for result in report.action_results} == {
+        PlanAction.ACQUIRE_MODEL,
+        PlanAction.APPLY_WORKFLOW,
+        PlanAction.CONFIGURE,
+    }
 
 
 def test_dry_run_is_deterministic_and_creates_nothing(profile, tmp_path):

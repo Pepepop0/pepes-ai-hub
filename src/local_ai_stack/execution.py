@@ -5,12 +5,15 @@ module is the only place that turns a described step into a call, and it does
 so through a registry, so a plan step for a component nobody implements yet is
 reported as unsupported rather than silently dropped.
 
-Two step kinds are executable today:
+Five step kinds are executable today:
 
     PREPARE_LAYOUT   -> StackLayout.ensure()
     INSTALL <id>     -> the registered provisioner for that component
+    ACQUIRE_MODEL    -> an injected IC5 handler
+    APPLY_WORKFLOW   -> an injected IC6 workflow handler
+    CONFIGURE        -> an injected managed-configuration handler
 
-Everything else is carried through as UNSUPPORTED with its reason attached, so
+Other steps are carried through as UNSUPPORTED with their reason attached, so
 the sequence a caller sees always covers the whole plan.
 
 Dry-run is deterministic and touches no disk: `ensure(dry_run=True)` only reads,
@@ -19,7 +22,7 @@ and every provisioner receives `dry_run=True`.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,7 +42,33 @@ from .provisioning import (
 
 ProvisionerRegistry = Mapping[str, Provisioner]
 
-EXECUTABLE_ACTIONS = (PlanAction.PREPARE_LAYOUT, PlanAction.INSTALL)
+
+@dataclass(frozen=True)
+class ActionExecutionResult:
+    """Result of one non-provisioning plan action.
+
+    The integration layer adapts each domain's native result into this small
+    shape.  PlanExecutor therefore sequences domain calls without learning how
+    models, workflows or managed configuration work.
+    """
+
+    action: PlanAction
+    target: str
+    ok: bool
+    detail: str = ""
+    changed: bool = False
+    payload: object | None = field(default=None, compare=False, repr=False)
+
+
+PlanActionHandler = Callable[[InstallPlan, PlanStep, bool], ActionExecutionResult]
+
+EXECUTABLE_ACTIONS = (
+    PlanAction.PREPARE_LAYOUT,
+    PlanAction.INSTALL,
+    PlanAction.ACQUIRE_MODEL,
+    PlanAction.APPLY_WORKFLOW,
+    PlanAction.CONFIGURE,
+)
 
 
 @dataclass(frozen=True)
@@ -61,12 +90,15 @@ class ExecutionReport:
     plan_profile_id: str
     dry_run: bool
     results: tuple[ProvisionResult, ...] = ()
+    action_results: tuple[ActionExecutionResult, ...] = ()
     created_directories: tuple[Path, ...] = ()
     unsupported: tuple[ExecutionStep, ...] = ()
 
     @property
     def ok(self) -> bool:
-        return all(result.ok for result in self.results)
+        return all(result.ok for result in self.results) and all(
+            result.ok for result in self.action_results
+        )
 
     @property
     def failures(self) -> tuple[ProvisionResult, ...]:
@@ -79,6 +111,7 @@ class PlanExecutor:
 
     context: ProvisionContext
     provisioners: ProvisionerRegistry = field(default_factory=dict)
+    action_handlers: Mapping[PlanAction, PlanActionHandler] = field(default_factory=dict)
 
     # --- resolucao ---------------------------------------------------------
 
@@ -102,6 +135,8 @@ class PlanExecutor:
                         ),
                     )
                 )
+            elif step.action in self.action_handlers:
+                resolved.append(ExecutionStep(step=step, supported=True))
             else:
                 resolved.append(
                     ExecutionStep(
@@ -121,6 +156,7 @@ class PlanExecutor:
         anything, so the report is a faithful preview of the same sequence.
         """
         results: list[ProvisionResult] = []
+        action_results: list[ActionExecutionResult] = []
         created: list[Path] = []
         unsupported: list[ExecutionStep] = []
 
@@ -131,13 +167,18 @@ class PlanExecutor:
             if entry.action is PlanAction.PREPARE_LAYOUT:
                 created.extend(self._prepare_layout(dry_run=dry_run, results=results))
                 continue
-            provisioner = self.provisioners[entry.step.target]
-            results.append(provisioner.apply(self.context, dry_run=dry_run))
+            if entry.action is PlanAction.INSTALL:
+                provisioner = self.provisioners[entry.step.target]
+                results.append(provisioner.apply(self.context, dry_run=dry_run))
+                continue
+            handler = self.action_handlers[entry.action]
+            action_results.append(handler(plan, entry.step, dry_run))
 
         return ExecutionReport(
             plan_profile_id=plan.profile_id,
             dry_run=dry_run,
             results=tuple(results),
+            action_results=tuple(action_results),
             created_directories=tuple(created),
             unsupported=tuple(unsupported),
         )

@@ -449,7 +449,7 @@ def render_workflow(
             f"workflow {resolution.spec.id!r} is {resolution.state.value}: "
             + "; ".join(resolution.problems)
         )
-    source = graph if graph is not None else _load_graph(resolution)
+    source = graph if graph is not None else load_workflow_graph(resolution)
     rendered = deepcopy(dict(source))
     spec = resolution.spec
 
@@ -461,7 +461,8 @@ def render_workflow(
     return rendered
 
 
-def _load_graph(resolution: WorkflowResolution) -> dict[str, Any]:
+def load_workflow_graph(resolution: WorkflowResolution) -> dict[str, Any]:
+    """Load the declared API graph for a ready workflow without mutating it."""
     import json
 
     path = resolution.template_path
@@ -500,6 +501,7 @@ __all__: Sequence[str] = (
     "WorkflowResolution",
     "WorkflowSpec",
     "WorkflowState",
+    "load_workflow_graph",
     "load_workflow_manifest",
     "parse_workflow_manifest",
     "render_workflow",

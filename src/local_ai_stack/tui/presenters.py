@@ -182,6 +182,13 @@ def render_plan_execution(report: ExecutionReport | None) -> str:
             f"- {escape(result.component_id)}: [cyan]{outcome}[/cyan] - "
             f"{escape(terminal_text(detail or 'no detail'))}"
         )
+    for result in report.action_results:
+        outcome = "OK" if result.ok else "BLOCKED"
+        colour = "cyan" if result.ok else "yellow"
+        lines.append(
+            f"- {escape(result.action.value)} {escape(terminal_text(result.target))}: "
+            f"[{colour}]{outcome}[/{colour}] - {escape(terminal_text(result.detail))}"
+        )
     if report.unsupported:
         lines.extend(["", f"[yellow]Unsupported steps: {len(report.unsupported)}[/yellow]"])
         lines.extend(

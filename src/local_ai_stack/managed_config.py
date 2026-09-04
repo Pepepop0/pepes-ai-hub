@@ -21,6 +21,11 @@ identical content is ``UNCHANGED`` rather than a write, which makes apply
 idempotent. A dry run produces the same plan and touches nothing. Writes go
 through a temporary file and a rename, so a crash cannot leave a half-written
 config where a whole one used to be.
+
+The marker is a claim, not evidence. Verification therefore recomputes the
+digest from the body actually on disk and compares it with the one the header
+claims, so editing a generated file without touching its header is detected
+rather than trusted.
 """
 
 from __future__ import annotations
@@ -173,34 +178,83 @@ class ConfigVerifyReport:
         return not (self.drifted or self.missing or self.foreign)
 
 
-def read_marker(path: Path) -> tuple[Ownership, str | None]:
-    """Who owns the file on disk, and which content it claims to hold."""
-    if not path.is_file():
-        return Ownership.ABSENT, None
+@dataclass(frozen=True)
+class ManagedFile:
+    """What is on disk: who owns it, what it claims, and what it actually is."""
+
+    ownership: Ownership
+    claimed_digest: str | None = None
+    body: str | None = None
+
+    @property
+    def actual_digest(self) -> str | None:
+        """Recomputed from the body, so an edited file cannot claim otherwise."""
+        return None if self.body is None else content_digest(self.body)
+
+    @property
+    def intact(self) -> bool:
+        """Whether the content still matches the digest the header claims."""
+        return (
+            self.ownership is Ownership.MANAGED
+            and self.claimed_digest is not None
+            and self.claimed_digest == self.actual_digest
+        )
+
+
+def _recover_json_body(text: str) -> tuple[bool, str | None, str | None]:
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return Ownership.EXTERNAL, None
-    stripped = text.lstrip()
-    if stripped.startswith("{"):
-        try:
-            payload = json.loads(text)
-        except ValueError:
-            return Ownership.EXTERNAL, None
-        if isinstance(payload, dict) and payload.get(MARKER_KEY) == MANAGED_BY:
-            digest = payload.get(DIGEST_KEY)
-            return Ownership.MANAGED, digest if isinstance(digest, str) else None
-        return Ownership.EXTERNAL, None
-    digest: str | None = None
+        payload = json.loads(text)
+    except ValueError:
+        return False, None, None
+    if not isinstance(payload, dict) or payload.get(MARKER_KEY) != MANAGED_BY:
+        return False, None, None
+    claimed = payload.get(DIGEST_KEY)
+    body = {key: value for key, value in payload.items() if key not in {MARKER_KEY, DIGEST_KEY}}
+    return (
+        True,
+        claimed if isinstance(claimed, str) else None,
+        json.dumps(body, indent=2, sort_keys=True),
+    )
+
+
+def _recover_text_body(text: str) -> tuple[bool, str | None, str | None]:
+    claimed: str | None = None
     owned = False
-    for line in text.splitlines():
+    lines = text.splitlines()
+    index = 0
+    for index, line in enumerate(lines):
         if not line.startswith(MARKER_COMMENT_PREFIX):
             break
         if f"{MARKER_KEY}: {MANAGED_BY}" in line:
             owned = True
         if DIGEST_KEY in line:
-            digest = line.split(":", 2)[-1].strip()
-    return (Ownership.MANAGED, digest) if owned else (Ownership.EXTERNAL, None)
+            claimed = line.split(":", 2)[-1].strip()
+    else:
+        index = len(lines)
+    if not owned:
+        return False, None, None
+    return True, claimed, "\n".join(lines[index:])
+
+
+def read_managed(path: Path) -> ManagedFile:
+    """Read a file and separate what it claims from what it contains."""
+    if not path.is_file():
+        return ManagedFile(Ownership.ABSENT)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ManagedFile(Ownership.EXTERNAL)
+    recover = _recover_json_body if text.lstrip().startswith("{") else _recover_text_body
+    owned, claimed, body = recover(text)
+    if not owned:
+        return ManagedFile(Ownership.EXTERNAL)
+    return ManagedFile(Ownership.MANAGED, claimed, body)
+
+
+def read_marker(path: Path) -> tuple[Ownership, str | None]:
+    """Who owns the file on disk, and which content it claims to hold."""
+    managed = read_managed(path)
+    return managed.ownership, managed.claimed_digest
 
 
 class ManagedConfigWriter:
@@ -216,21 +270,33 @@ class ManagedConfigWriter:
         return ConfigPlan(tuple(self._change_for(document) for document in documents))
 
     def _change_for(self, document: ConfigDocument) -> ConfigChange:
-        ownership, digest = read_marker(document.path)
-        if ownership is Ownership.ABSENT:
-            return ConfigChange(document, ConfigAction.CREATE, ownership, "no file yet")
-        if ownership is Ownership.EXTERNAL:
+        managed = read_managed(document.path)
+        if managed.ownership is Ownership.ABSENT:
+            return ConfigChange(document, ConfigAction.CREATE, managed.ownership, "no file yet")
+        if managed.ownership is Ownership.EXTERNAL:
             return ConfigChange(
                 document,
                 ConfigAction.CONFLICT,
-                ownership,
+                managed.ownership,
                 "a file exists that this manager did not generate; it is left untouched",
             )
-        if digest == document.digest:
+        if not managed.intact:
             return ConfigChange(
-                document, ConfigAction.UNCHANGED, ownership, "already the generated content"
+                document,
+                ConfigAction.UPDATE,
+                managed.ownership,
+                "the generated file was edited by hand and will be regenerated",
             )
-        return ConfigChange(document, ConfigAction.UPDATE, ownership, "generated content changed")
+        if managed.actual_digest == document.digest:
+            return ConfigChange(
+                document,
+                ConfigAction.UNCHANGED,
+                managed.ownership,
+                "already the generated content",
+            )
+        return ConfigChange(
+            document, ConfigAction.UPDATE, managed.ownership, "generated content changed"
+        )
 
     # --- apply -------------------------------------------------------------
 
@@ -267,14 +333,19 @@ class ManagedConfigWriter:
         foreign: list[Path] = []
         problems: list[str] = []
         for document in documents:
-            ownership, digest = read_marker(document.path)
-            if ownership is Ownership.ABSENT:
+            managed = read_managed(document.path)
+            if managed.ownership is Ownership.ABSENT:
                 missing.append(document.path)
                 problems.append(f"{document.path.name}: not generated yet")
-            elif ownership is Ownership.EXTERNAL:
+            elif managed.ownership is Ownership.EXTERNAL:
                 foreign.append(document.path)
                 problems.append(f"{document.path.name}: exists but is not ours")
-            elif digest != document.digest:
+            elif not managed.intact:
+                # The header still claims our digest, but the body no longer
+                # hashes to it. A marker is a claim; this is the check.
+                drifted.append(document.path)
+                problems.append(f"{document.path.name}: content was edited after it was generated")
+            elif managed.actual_digest != document.digest:
                 drifted.append(document.path)
                 problems.append(f"{document.path.name}: on disk differs from what we generate")
             else:
@@ -333,11 +404,13 @@ __all__: Sequence[str] = (
     "ConfigPlan",
     "ConfigVerifyReport",
     "ManagedConfigWriter",
+    "ManagedFile",
     "Ownership",
     "content_digest",
     "describe_plan",
     "env_document",
     "json_document",
+    "read_managed",
     "read_marker",
     "yaml_document",
 )

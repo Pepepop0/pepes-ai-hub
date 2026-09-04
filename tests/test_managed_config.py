@@ -17,6 +17,7 @@ from local_ai_stack.managed_config import (
     describe_plan,
     env_document,
     json_document,
+    read_managed,
     read_marker,
     yaml_document,
 )
@@ -205,3 +206,68 @@ def test_a_failed_write_leaves_the_previous_file_intact(tmp_path, writer, monkey
     assert document.path.read_text(encoding="utf-8") == original
     leftovers = [p for p in tmp_path.iterdir() if p != document.path]
     assert leftovers == [], "no temporary file was left behind"
+
+
+# --- the marker is a claim, not evidence ------------------------------------
+
+
+def test_editing_a_generated_file_is_detected_even_with_the_header_intact(tmp_path, writer):
+    """The blocker: trusting the header would let an edited body pass."""
+    document = env_document(tmp_path / "service.env", {"A": "1", "B": "2"})
+    writer.apply([document])
+    assert writer.verify([document]).ok
+
+    text = document.path.read_text(encoding="utf-8")
+    document.path.write_text(text.replace("A=1", "A=tampered"), encoding="utf-8")
+
+    managed = read_managed(document.path)
+    assert managed.ownership is Ownership.MANAGED, "it is still our file"
+    assert managed.claimed_digest is not None
+    assert managed.actual_digest != managed.claimed_digest
+    assert not managed.intact
+
+    report = writer.verify([document])
+    assert not report.ok
+    assert report.drifted == (document.path,)
+    assert "edited after it was generated" in report.problems[0]
+
+
+def test_an_edited_generated_file_is_regenerated_rather_than_left_alone(tmp_path, writer):
+    document = env_document(tmp_path / "service.env", {"A": "1"})
+    writer.apply([document])
+    text = document.path.read_text(encoding="utf-8")
+    document.path.write_text(text.replace("A=1", "A=edited"), encoding="utf-8")
+
+    plan = writer.plan([document])
+    assert plan.changes[0].action is ConfigAction.UPDATE
+    assert "edited by hand" in plan.changes[0].detail
+
+    writer.apply([document])
+    assert writer.verify([document]).ok
+    assert "A=1" in document.path.read_text(encoding="utf-8")
+
+
+def test_a_tampered_json_body_is_detected_too(tmp_path, writer):
+    document = json_document(tmp_path / "nodes.json", {"nodes": [{"type": "prompt"}]})
+    writer.apply([document])
+
+    payload = json.loads(document.path.read_text(encoding="utf-8"))
+    payload["nodes"] = [{"type": "somebody-elses"}]
+    document.path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    managed = read_managed(document.path)
+    assert managed.ownership is Ownership.MANAGED
+    assert not managed.intact
+    assert not writer.verify([document]).ok
+
+
+def test_an_external_file_is_still_external_not_tampered(tmp_path, writer):
+    """Ownership detection is unchanged by the integrity check."""
+    path = tmp_path / "service.env"
+    path.write_text("A=theirs\n", encoding="utf-8")
+    managed = read_managed(path)
+    assert managed.ownership is Ownership.EXTERNAL
+    assert managed.intact is False
+    report = writer.verify([env_document(path, {"A": "1"})])
+    assert report.foreign == (path,)
+    assert report.drifted == ()

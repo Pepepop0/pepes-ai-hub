@@ -31,7 +31,13 @@ from .components import ComponentId
 from .endpoints import StackEndpoints
 from .layout import StackLayout
 from .managed_config import ConfigDocument, env_document, json_document, yaml_document
-from .models import FileModelLocation, ModelResolver, ModelState, ResolvedModel
+from .models import (
+    FileModelLocation,
+    ModelResolver,
+    ModelState,
+    OllamaModelLocation,
+    ResolvedModel,
+)
 from .profiles import Profile
 from .workflows import (
     WorkflowParameter,
@@ -57,10 +63,13 @@ ENV_COMFYUI_WORKFLOW_NODES = "COMFYUI_WORKFLOW_NODES"
 ENV_IMAGE_GENERATION_MODEL = "IMAGE_GENERATION_MODEL"
 ENV_IMAGE_SIZE = "IMAGE_SIZE"
 ENV_IMAGE_STEPS = "IMAGE_STEPS"
+ENV_DEFAULT_MODELS = "DEFAULT_MODELS"
+
+CHAT_ROLE = "chat.primary"
 
 # How Open WebUI names the workflow inputs it can drive. The node ids stay in
 # the workflow manifest; this only translates our vocabulary into theirs.
-OPEN_WEBUI_NODE_KEYS: Mapping[WorkflowParameter, str] = {
+OPEN_WEBUI_NODE_TYPES: Mapping[WorkflowParameter, str] = {
     WorkflowParameter.PROMPT: "prompt",
     WorkflowParameter.MODEL: "model",
     WorkflowParameter.WIDTH: "width",
@@ -128,12 +137,50 @@ class StackConfiguration:
 # --- Open WebUI -> Ollama ---------------------------------------------------
 
 
-def open_webui_ollama_env(endpoints: StackEndpoints) -> dict[str, str]:
-    """Point Open WebUI's chat backend at the Ollama this stack runs."""
-    return {
+def open_webui_ollama_env(
+    endpoints: StackEndpoints, chat: ResolvedModel | None = None
+) -> dict[str, str]:
+    """Point Open WebUI's chat backend at the Ollama this stack runs.
+
+    The default model is the provider reference IC5 verified, never a name this
+    layer assembled. Passing no model configures the connection only, which is
+    why :func:`open_webui_chat_configuration` is what callers use.
+    """
+    env = {
         ENV_OLLAMA_BASE_URL: endpoints.ollama,
         ENV_ENABLE_OLLAMA_API: "true",
     }
+    if chat is not None:
+        location = chat.require_location()
+        if not isinstance(location, OllamaModelLocation):
+            raise TypeError("the chat model must resolve to an Ollama provider reference")
+        env[ENV_DEFAULT_MODELS] = location.reference
+    return env
+
+
+def open_webui_chat_configuration(
+    endpoints: StackEndpoints, chat: ResolvedModel | None
+) -> ServiceConfiguration:
+    """Chat, or the reason there is none.
+
+    Fail closed: a stack whose primary model is missing, invalid or external is
+    a stack with no chat model to select, so nothing is emitted and the reason
+    travels with the result. No reference is invented and no path is used.
+    """
+    if chat is None:
+        return ServiceConfiguration(
+            ComponentId.OPEN_WEBUI,
+            problems=("this profile declares no primary chat model, so chat cannot be configured",),
+        )
+    if not chat.available:
+        return ServiceConfiguration(
+            ComponentId.OPEN_WEBUI,
+            problems=(
+                f"chat is not configurable: model {chat.id} is {chat.state.value}"
+                + (f" ({chat.detail})" if chat.detail else ""),
+            ),
+        )
+    return ServiceConfiguration(ComponentId.OPEN_WEBUI, open_webui_ollama_env(endpoints, chat))
 
 
 # --- ComfyUI model visibility ----------------------------------------------
@@ -178,19 +225,24 @@ def comfyui_search_paths_document(
 # --- Open WebUI -> ComfyUI --------------------------------------------------
 
 
-def open_webui_workflow_nodes(resolution: WorkflowResolution) -> dict[str, dict[str, str]]:
+def open_webui_workflow_nodes(resolution: WorkflowResolution) -> list[dict[str, object]]:
     """Translate our parameter bindings into Open WebUI's node mapping.
+
+    Open WebUI 0.11.3 reads a *list* of entries, each naming an input type, the
+    field on the node, and the node ids that input drives::
+
+        [{"type": "prompt", "key": "value", "node_ids": ["76"]}, ...]
 
     This is the only translation between the two vocabularies, and it reads the
     workflow manifest rather than repeating any node id.
     """
-    nodes: dict[str, dict[str, str]] = {}
+    nodes: list[dict[str, object]] = []
     for parameter in resolution.spec.parameters:
-        key = OPEN_WEBUI_NODE_KEYS.get(parameter)
-        if key is None:
+        node_type = OPEN_WEBUI_NODE_TYPES.get(parameter)
+        if node_type is None:
             continue
         binding = resolution.spec.binding(parameter)
-        nodes[key] = {"node_id": binding.node_id, "key": binding.key}
+        nodes.append({"type": node_type, "key": binding.key, "node_ids": [binding.node_id]})
     return nodes
 
 
@@ -200,7 +252,13 @@ def open_webui_image_configuration(
     resolution: WorkflowResolution,
     graph: Mapping[str, object] | None = None,
 ) -> ServiceConfiguration:
-    """Everything Open WebUI needs to drive ComfyUI, or the reason it cannot."""
+    """Everything Open WebUI needs to drive ComfyUI, or the reason it cannot.
+
+    Fail closed on the graph as well as on the models: without the workflow to
+    submit there is nothing to enable, and enabling image generation anyway
+    would let Open WebUI fall back to a default workflow that knows nothing
+    about this stack's models.
+    """
     if not resolution.ready:
         return ServiceConfiguration(
             ComponentId.OPEN_WEBUI,
@@ -212,38 +270,40 @@ def open_webui_image_configuration(
                 *resolution.problems,
             ),
         )
+    if graph is None:
+        return ServiceConfiguration(
+            ComponentId.OPEN_WEBUI,
+            problems=(
+                (
+                    "image generation is not configurable: no workflow graph is available "
+                    f"for {resolution.spec.id!r}, and enabling it without one would let "
+                    "Open WebUI submit a default workflow this stack does not control"
+                ),
+            ),
+            manual_steps=(
+                (
+                    "Export the ComfyUI graph in API format to "
+                    f"{resolution.spec.file} and re-run configuration."
+                ),
+            ),
+        )
 
     workflow_path = layout.open_webui_data / COMFYUI_WORKFLOW_FILE
     nodes_path = layout.open_webui_data / COMFYUI_WORKFLOW_NODES_FILE
     nodes = open_webui_workflow_nodes(resolution)
-    documents: list[ConfigDocument] = [
-        json_document(nodes_path, nodes, "which workflow node each input drives")
-    ]
-    if graph is not None:
-        documents.append(
-            json_document(workflow_path, dict(graph), "the workflow graph Open WebUI submits")
-        )
-
+    documents = (
+        json_document(nodes_path, {"nodes": nodes}, "which workflow node each input drives"),
+        json_document(workflow_path, dict(graph), "the workflow graph Open WebUI submits"),
+    )
     env = {
         ENV_ENABLE_IMAGE_GENERATION: "true",
         ENV_IMAGE_GENERATION_ENGINE: "comfyui",
         ENV_COMFYUI_BASE_URL: endpoints.comfyui,
-        ENV_COMFYUI_WORKFLOW_NODES: json.dumps(nodes, sort_keys=True),
+        ENV_COMFYUI_WORKFLOW: json.dumps(dict(graph), sort_keys=True),
+        ENV_COMFYUI_WORKFLOW_NODES: json.dumps(nodes),
         ENV_IMAGE_GENERATION_MODEL: resolution.runtime_name,
     }
-    if graph is not None:
-        env[ENV_COMFYUI_WORKFLOW] = json.dumps(dict(graph), sort_keys=True)
-
-    manual: tuple[str, ...] = ()
-    if graph is None:
-        manual = (
-            (
-                "Export the ComfyUI graph in API format into the repository and re-run "
-                "configuration; until then Open WebUI is pointed at ComfyUI but has no "
-                "workflow to submit."
-            ),
-        )
-    return ServiceConfiguration(ComponentId.OPEN_WEBUI, env, tuple(documents), manual_steps=manual)
+    return ServiceConfiguration(ComponentId.OPEN_WEBUI, env, documents)
 
 
 # --- the whole stack --------------------------------------------------------
@@ -267,7 +327,10 @@ def build_stack_configuration(
     configured around.
     """
     endpoints = StackEndpoints.from_profile(profile)
-    resolved_models = [resolver.resolve(req.model_id) for req in profile.model_requirements]
+    resolved_models = {
+        requirement.role: resolver.resolve(requirement.model_id)
+        for requirement in profile.model_requirements
+    }
 
     env: dict[str, str] = {}
     problems: list[str] = []
@@ -275,26 +338,22 @@ def build_stack_configuration(
     open_webui_documents: list[ConfigDocument] = []
 
     if endpoints.enabled(profile, ComponentId.OLLAMA):
-        env.update(open_webui_ollama_env(endpoints))
+        chat = open_webui_chat_configuration(endpoints, resolved_models.get(CHAT_ROLE))
+        env.update(chat.env)
+        problems.extend(chat.problems)
     else:
         problems.append("this profile does not enable Ollama, so chat cannot be configured")
 
     workflows: dict[str, WorkflowResolution] = {}
     if workflow_specs:
-        wanted = {
-            workflow_id: config.manifest_id for workflow_id, config in profile.workflows.items()
-        }
+        wanted = {config.manifest_id for config in profile.workflows.values()}
         workflows = resolve_workflows(
-            workflow_specs,
-            profile,
-            resolver,
-            repo_root=repo_root,
-            only=set(wanted.values()),
+            workflow_specs, profile, resolver, repo_root=repo_root, only=wanted
         )
 
     if profile.features.get("image_generation") and endpoints.enabled(profile, ComponentId.COMFYUI):
-        manifest_id = profile.workflows.get(image_workflow)
-        resolution = workflows.get(manifest_id.manifest_id) if manifest_id else None
+        declared = profile.workflows.get(image_workflow)
+        resolution = workflows.get(declared.manifest_id) if declared else None
         if resolution is None:
             problems.append(
                 f"profile {profile.id!r} enables image generation but declares no usable "
@@ -328,12 +387,13 @@ def build_stack_configuration(
         )
     }
 
-    comfyui_document = comfyui_search_paths_document(layout, resolved_models)
+    models = list(resolved_models.values())
+    comfyui_document = comfyui_search_paths_document(layout, models)
     comfyui_problems: tuple[str, ...] = ()
     if comfyui_document is None and endpoints.enabled(profile, ComponentId.COMFYUI):
         unavailable = [
             f"{model.id} is {model.state.value}"
-            for model in resolved_models
+            for model in models
             if model.provider.value == ComponentId.COMFYUI
             and model.state is not ModelState.AVAILABLE
         ]
@@ -360,6 +420,7 @@ __all__: Sequence[str] = (
     "build_stack_configuration",
     "comfyui_search_paths",
     "comfyui_search_paths_document",
+    "open_webui_chat_configuration",
     "open_webui_image_configuration",
     "open_webui_ollama_env",
     "open_webui_workflow_nodes",

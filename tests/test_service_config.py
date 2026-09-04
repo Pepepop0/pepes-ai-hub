@@ -5,7 +5,13 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_workflows import DIFFUSION_ID, FIXTURE_GRAPH, FakeResolver, available_file_model
+from test_workflows import (
+    DIFFUSION_ID,
+    FIXTURE_GRAPH,
+    IMAGE_MODELS,
+    FakeResolver,
+    available_file_model,
+)
 
 from local_ai_stack.components import ComponentId
 from local_ai_stack.endpoints import EndpointError, StackEndpoints, base_url
@@ -23,12 +29,15 @@ from local_ai_stack.models import (
 from local_ai_stack.profiles import load_profile
 from local_ai_stack.service_config import (
     ENV_COMFYUI_BASE_URL,
+    ENV_COMFYUI_WORKFLOW_NODES,
+    ENV_DEFAULT_MODELS,
     ENV_ENABLE_IMAGE_GENERATION,
     ENV_IMAGE_GENERATION_MODEL,
     ENV_OLLAMA_BASE_URL,
     build_stack_configuration,
     comfyui_search_paths,
     comfyui_search_paths_document,
+    open_webui_chat_configuration,
     open_webui_image_configuration,
     open_webui_ollama_env,
     open_webui_workflow_nodes,
@@ -59,24 +68,45 @@ def available_chat() -> ResolvedModel:
     )
 
 
-def full_resolver(tmp_path) -> FakeResolver:
-    models = {CHAT_ID: available_chat(), DIFFUSION_ID: available_file_model(tmp_path)}
-    for model_id, placement, name in (
-        (
-            ModelId("comfyui/qwen_3_4b_encoder"),
-            ModelPlacement.TEXT_ENCODERS,
-            "qwen_3_4b.safetensors",
-        ),
-        (ModelId("comfyui/flux2_vae"), ModelPlacement.VAE, "flux2-vae.safetensors"),
-    ):
-        path = tmp_path / "models" / "comfyui" / placement.value / name
+def full_resolver(tmp_path, *, chat: ResolvedModel | None = None) -> FakeResolver:
+    """Every role the Pepe profile needs. ``chat`` overrides the primary model."""
+    models: dict[ModelId, ResolvedModel] = {
+        model_id: available_file_model(tmp_path, model_id) for model_id in IMAGE_MODELS
+    }
+    models[CHAT_ID] = available_chat() if chat is None else chat
+    return FakeResolver(models)
+
+
+def resolver_for(profile, tmp_path) -> FakeResolver:
+    """Resolve whatever *this* profile asks for, whichever ids those are.
+
+    Stands in for IC5: an Ollama role becomes a provider reference, a ComfyUI
+    role becomes a managed file. Nothing here knows which profile it is.
+    """
+    models: dict[ModelId, ResolvedModel] = {}
+    for requirement in profile.model_requirements:
+        model_id = requirement.model_id
+        if model_id.provider.value == ComponentId.OLLAMA:
+            models[model_id] = ResolvedModel(
+                model_id,
+                ModelKind.CHAT,
+                ModelState.AVAILABLE,
+                OllamaModelLocation(model_id.name.replace("_", "-")),
+            )
+            continue
+        placement = {
+            "image.diffusion": ModelPlacement.DIFFUSION_MODELS,
+            "image.text_encoder": ModelPlacement.TEXT_ENCODERS,
+            "image.vae": ModelPlacement.VAE,
+        }[requirement.role]
+        path = tmp_path / "models" / "comfyui" / placement.value / f"{model_id.name}.safetensors"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x")
         models[model_id] = ResolvedModel(
             model_id,
             ModelKind.AUXILIARY,
             ModelState.AVAILABLE,
-            FileModelLocation(path, name, placement),
+            FileModelLocation(path, path.name, placement),
         )
     return FakeResolver(models)
 
@@ -135,6 +165,45 @@ def test_open_webui_is_pointed_at_the_stack_ollama():
     assert env["ENABLE_OLLAMA_API"] == "true"
 
 
+def test_an_available_primary_model_becomes_the_default_model():
+    """The provider reference IC5 verified, used verbatim."""
+    endpoints = StackEndpoints.from_profile(profile_named("pepe"))
+    configuration = open_webui_chat_configuration(endpoints, available_chat())
+
+    assert configuration.ok
+    assert configuration.env[ENV_DEFAULT_MODELS] == "hermes3:8b"
+    assert configuration.env[ENV_OLLAMA_BASE_URL] == endpoints.ollama
+
+
+@pytest.mark.parametrize(
+    "state", [ModelState.NOT_INSTALLED, ModelState.INVALID, ModelState.EXTERNAL]
+)
+def test_a_primary_model_that_is_not_available_blocks_chat(state):
+    endpoints = StackEndpoints.from_profile(profile_named("pepe"))
+    unusable = ResolvedModel(CHAT_ID, ModelKind.CHAT, state, detail="not ready")
+
+    configuration = open_webui_chat_configuration(endpoints, unusable)
+
+    assert not configuration.ok
+    assert configuration.env == {}, "nothing is configured on a model we cannot use"
+    assert state.value in configuration.problems[0]
+
+
+def test_a_profile_without_a_primary_model_blocks_chat():
+    endpoints = StackEndpoints.from_profile(profile_named("pepe"))
+    configuration = open_webui_chat_configuration(endpoints, None)
+    assert not configuration.ok
+    assert configuration.env == {}
+    assert "no primary chat model" in configuration.problems[0]
+
+
+def test_the_chat_configuration_never_carries_a_path(tmp_path):
+    endpoints = StackEndpoints.from_profile(profile_named("pepe"))
+    configuration = open_webui_chat_configuration(endpoints, available_chat())
+    for value in configuration.env.values():
+        assert "\\" not in value and "/models/" not in value
+
+
 def test_the_ollama_model_is_used_as_a_provider_reference(tmp_path, layout, specs):
     """An Ollama model is a reference; it never becomes a path."""
     resolver = full_resolver(tmp_path)
@@ -177,12 +246,38 @@ def test_the_search_path_document_lands_in_the_comfyui_data_directory(tmp_path, 
 # --- Open WebUI -> ComfyUI ---------------------------------------------------
 
 
-def test_the_node_mapping_is_translated_from_the_manifest(specs, tmp_path):
+def test_the_node_mapping_matches_the_shape_open_webui_reads(specs, tmp_path):
+    """Open WebUI 0.11.3 reads a list of {type, key, node_ids} entries."""
     resolution = ready_t2i(specs, profile_named("pepe"), tmp_path)
     nodes = open_webui_workflow_nodes(resolution)
-    assert nodes["prompt"] == {"node_id": "76", "key": "value"}
-    assert nodes["model"] == {"node_id": "75:70", "key": "unet_name"}
-    assert set(nodes) == {"prompt", "model", "width", "height", "steps", "seed"}
+
+    assert isinstance(nodes, list)
+    assert all(set(entry) == {"type", "key", "node_ids"} for entry in nodes)
+    assert all(isinstance(entry["node_ids"], list) for entry in nodes)
+    assert all(isinstance(node_id, str) for entry in nodes for node_id in entry["node_ids"])
+    assert {entry["type"] for entry in nodes} == {
+        "prompt",
+        "model",
+        "width",
+        "height",
+        "steps",
+        "seed",
+    }
+    by_type = {entry["type"]: entry for entry in nodes}
+    assert by_type["prompt"] == {"type": "prompt", "key": "value", "node_ids": ["76"]}
+    assert by_type["model"] == {"type": "model", "key": "unet_name", "node_ids": ["75:70"]}
+
+
+def test_the_node_mapping_env_value_is_a_json_list(specs, layout, tmp_path):
+    endpoints = StackEndpoints.from_profile(profile_named("pepe"))
+    resolution = ready_t2i(specs, profile_named("pepe"), tmp_path)
+    graph = json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))
+
+    configuration = open_webui_image_configuration(layout, endpoints, resolution, graph)
+
+    payload = json.loads(configuration.env[ENV_COMFYUI_WORKFLOW_NODES])
+    assert isinstance(payload, list)
+    assert payload == open_webui_workflow_nodes(resolution)
 
 
 def test_image_configuration_uses_the_runtime_name_and_the_comfyui_url(specs, layout, tmp_path):
@@ -212,15 +307,33 @@ def test_image_configuration_refuses_an_unusable_workflow(specs, layout):
     assert "not configurable" in configuration.problems[0]
 
 
-def test_a_missing_graph_is_reported_as_a_manual_step(specs, layout, tmp_path):
+def test_a_missing_graph_never_enables_image_generation(specs, layout, tmp_path):
+    """Fail closed: without our graph, Open WebUI would submit its own."""
     endpoints = StackEndpoints.from_profile(profile_named("pepe"))
     resolution = ready_t2i(specs, profile_named("pepe"), tmp_path)
 
     configuration = open_webui_image_configuration(layout, endpoints, resolution, None)
 
-    assert configuration.ok
-    assert configuration.manual_steps
+    assert not configuration.ok
+    assert ENV_ENABLE_IMAGE_GENERATION not in configuration.env
+    assert configuration.env == {}
+    assert configuration.documents == ()
+    assert "default workflow" in configuration.problems[0]
     assert "API format" in configuration.manual_steps[0]
+
+
+def test_a_stack_without_the_graph_does_not_enable_image_generation(specs, layout, tmp_path):
+    configuration = build_stack_configuration(
+        profile_named("pepe"),
+        full_resolver(tmp_path),
+        layout,
+        workflow_specs=specs,
+        repo_root=tmp_path,
+    )
+    open_webui = configuration.service(ComponentId.OPEN_WEBUI)
+    assert not configuration.ok
+    assert ENV_ENABLE_IMAGE_GENERATION not in open_webui.env
+    assert ENV_DEFAULT_MODELS in open_webui.env, "chat is configured independently"
 
 
 # --- the whole stack ---------------------------------------------------------
@@ -249,27 +362,65 @@ def test_a_profile_produces_a_complete_configuration(specs, layout, tmp_path):
     assert configuration.ok, configuration.problems
     open_webui = configuration.service(ComponentId.OPEN_WEBUI)
     assert open_webui.env[ENV_OLLAMA_BASE_URL] == "http://127.0.0.1:11434"
+    assert open_webui.env[ENV_DEFAULT_MODELS] == "hermes3:8b"
     assert open_webui.env[ENV_COMFYUI_BASE_URL] == "http://127.0.0.1:8188"
     assert any(doc.path.name == "open-webui.env" for doc in open_webui.documents)
     assert any(doc.path.name == "extra_model_paths.yaml" for doc in configuration.documents)
 
 
 def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_path):
-    """Nothing branches on a profile id; the values simply come from the file."""
-    pepe = build_stack_configuration(
-        profile_named("pepe"), full_resolver(tmp_path), layout, workflow_specs=specs
-    )
-    capella = build_stack_configuration(
-        profile_named("capella"), full_resolver(tmp_path), layout, workflow_specs=specs
-    )
-    test = build_stack_configuration(
-        profile_named("test"), full_resolver(tmp_path), layout, workflow_specs=specs
-    )
+    """Nothing branches on a profile id; the differences come from the files.
 
-    assert pepe.profile_id != capella.profile_id
-    for configuration in (pepe, capella, test):
-        env = configuration.env_for(ComponentId.OPEN_WEBUI)
-        assert env[ENV_OLLAMA_BASE_URL].startswith("http://127.0.0.1:")
+    Pepe has chosen a chat model, Capella has not yet (``primary: TBD``), and
+    Test has chosen nothing at all. Each configuration says exactly that.
+    """
+    stage_graph(tmp_path)
+    built = {}
+    for name in ("pepe", "capella", "test"):
+        profile = profile_named(name)
+        built[name] = build_stack_configuration(
+            profile,
+            resolver_for(profile, tmp_path),
+            layout,
+            workflow_specs=specs,
+            repo_root=tmp_path,
+            graphs={"flux2_klein_t2i": json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))},
+        )
+
+    pepe = built["pepe"].service(ComponentId.OPEN_WEBUI)
+    assert pepe.env[ENV_OLLAMA_BASE_URL] == "http://127.0.0.1:11434"
+    assert pepe.env[ENV_DEFAULT_MODELS] == "hermes3-8b"
+    assert pepe.env[ENV_ENABLE_IMAGE_GENERATION] == "true"
+
+    capella = built["capella"].service(ComponentId.OPEN_WEBUI)
+    assert ENV_DEFAULT_MODELS not in capella.env, "no chat model has been chosen yet"
+    assert any("no primary chat model" in problem for problem in capella.problems)
+    assert capella.env[ENV_ENABLE_IMAGE_GENERATION] == "true", "images still work"
+
+    test = built["test"].service(ComponentId.OPEN_WEBUI)
+    assert test.env == {}, "a profile that has chosen nothing configures nothing"
+    assert built["test"].service(ComponentId.COMFYUI).documents == ()
+
+
+def test_a_port_moved_in_a_profile_moves_the_generated_configuration(specs, layout, tmp_path):
+    stage_graph(tmp_path)
+    profile = profile_named("pepe")
+    moved = replace(
+        profile,
+        services={**profile.services, "comfyui": replace(profile.services["comfyui"], port=9188)},
+    )
+    configuration = build_stack_configuration(
+        moved,
+        resolver_for(moved, tmp_path),
+        layout,
+        workflow_specs=specs,
+        repo_root=tmp_path,
+        graphs={"flux2_klein_t2i": json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))},
+    )
+    assert (
+        configuration.env_for(ComponentId.OPEN_WEBUI)[ENV_COMFYUI_BASE_URL]
+        == "http://127.0.0.1:9188"
+    )
 
 
 def test_no_profile_id_is_branched_on_in_the_configuration_layer():
@@ -288,10 +439,31 @@ def test_an_unavailable_model_removes_the_capability_it_supported(specs, layout,
     assert not configuration.ok
     open_webui = configuration.service(ComponentId.OPEN_WEBUI)
     assert ENV_ENABLE_IMAGE_GENERATION not in open_webui.env
-    assert ENV_OLLAMA_BASE_URL in open_webui.env, "chat is unaffected by an image model"
+    assert ENV_DEFAULT_MODELS not in open_webui.env
+    assert open_webui.env == {}, "no chat model means no chat configuration"
     comfyui = configuration.service(ComponentId.COMFYUI)
     assert comfyui.documents == ()
     assert any("no managed model is available" in problem for problem in comfyui.problems)
+
+
+def test_an_unavailable_chat_model_leaves_image_generation_alone(specs, layout, tmp_path):
+    """The two capabilities fail independently, each for its own reason."""
+    stage_graph(tmp_path)
+    unusable_chat = ResolvedModel(CHAT_ID, ModelKind.CHAT, ModelState.NOT_INSTALLED)
+    configuration = build_stack_configuration(
+        profile_named("pepe"),
+        full_resolver(tmp_path, chat=unusable_chat),
+        layout,
+        workflow_specs=specs,
+        repo_root=tmp_path,
+        graphs={"flux2_klein_t2i": json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))},
+    )
+
+    open_webui = configuration.service(ComponentId.OPEN_WEBUI)
+    assert not configuration.ok
+    assert ENV_DEFAULT_MODELS not in open_webui.env
+    assert open_webui.env[ENV_ENABLE_IMAGE_GENERATION] == "true"
+    assert any("chat is not configurable" in problem for problem in open_webui.problems)
 
 
 def test_generated_configuration_is_deterministic(specs, layout, tmp_path):

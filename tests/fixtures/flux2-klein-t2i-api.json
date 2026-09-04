@@ -1,0 +1,46 @@
+{
+  "_comment": "Representative FLUX.2 Klein API-format graph. Node ids match the mapping already recorded in manifests/workflows.yaml, but the graph itself is a stand-in: the real export is not versioned in this repository yet. It exists so the workflow domain can be exercised end to end without inventing a mapping.",
+  "75:62": {
+    "class_type": "KSamplerSelect",
+    "inputs": {
+      "steps": 20
+    }
+  },
+  "75:68": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": 1024
+    }
+  },
+  "75:69": {
+    "class_type": "PrimitiveInt",
+    "inputs": {
+      "value": 1024
+    }
+  },
+  "75:70": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "placeholder.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "75:73": {
+    "class_type": "RandomNoise",
+    "inputs": {
+      "noise_seed": 0
+    }
+  },
+  "76": {
+    "class_type": "PrimitiveString",
+    "inputs": {
+      "value": ""
+    }
+  },
+  "90": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "PepitosAIHub"
+    }
+  }
+}

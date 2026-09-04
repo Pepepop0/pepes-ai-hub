@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 
 from .components import normalize_component_id
+from .models import ModelContractError, ModelId, ModelRequirement
 
 PROFILE_SCHEMA_VERSION = 1
 MIB_PER_GIB = 1024
@@ -58,6 +59,7 @@ class Profile:
     services: dict[str, ServiceConfig]
     features: dict[str, bool]
     models: dict[str, dict[str, Any]]
+    model_requirements: tuple[ModelRequirement, ...]
     workflows: dict[str, WorkflowConfig]
     runtime: dict[str, bool]
     raw: dict[str, Any]
@@ -121,6 +123,42 @@ def _boolean(value: Any, source: Path | str, field: str) -> bool:
     if not isinstance(value, bool):
         raise _error(source, field, "must be a boolean")
     return value
+
+
+def _model_id(value: Any, source: Path | str, field: str) -> ModelId | None:
+    raw = _string(value, source, field)
+    if raw.upper() == "TBD":
+        return None
+    try:
+        return ModelId(raw)
+    except ModelContractError as exc:
+        raise _error(source, field, str(exc)) from exc
+
+
+def _model_contract(
+    models: dict[str, dict[str, Any]], source: Path | str
+) -> tuple[ModelRequirement, ...]:
+    """Validate current profile roles without changing their public YAML shape."""
+    requirements: list[ModelRequirement] = []
+    active_roles = {
+        "chat": ("primary",),
+        "image": ("diffusion", "text_encoder", "vae"),
+    }
+    for group, fields in active_roles.items():
+        values = models.get(group, {})
+        for field in fields:
+            if field not in values:
+                continue
+            model_id = _model_id(values[field], source, f"models.{group}.{field}")
+            if model_id is not None:
+                requirements.append(ModelRequirement(f"{group}.{field}", model_id))
+
+    chat_alternatives = models.get("chat", {}).get("alternatives", [])
+    if not isinstance(chat_alternatives, list):
+        raise _error(source, "models.chat.alternatives", "must be a list")
+    for index, value in enumerate(chat_alternatives):
+        _model_id(value, source, f"models.chat.alternatives[{index}]")
+    return tuple(requirements)
 
 
 def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profile:
@@ -279,6 +317,7 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
         _string(key, source, "models key"): _mapping(value, source, f"models.{key}")
         for key, value in models_data.items()
     }
+    model_requirements = _model_contract(models, source)
 
     workflows_data = _mapping(root.get("workflows", {}), source, "workflows")
     workflows: dict[str, WorkflowConfig] = {}
@@ -330,6 +369,7 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
         services=services,
         features=features,
         models=models,
+        model_requirements=model_requirements,
         workflows=workflows,
         runtime=runtime,
         raw=root,

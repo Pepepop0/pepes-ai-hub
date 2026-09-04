@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
 
 from .installation import ResolvedInstallation
 from .profiles import Profile
@@ -35,20 +34,6 @@ class InstallPlan:
     stack_id: str | None = None
     install_mode: str | None = None
     install_root: Path | None = None
-
-
-def _model_references(models: dict[str, dict[str, Any]]) -> list[str]:
-    references: set[str] = set()
-    for group in models.values():
-        for key, value in group.items():
-            if (
-                key in {"primary", "diffusion", "text_encoder", "vae"}
-                and isinstance(value, str)
-                and value
-                and value.upper() != "TBD"
-            ):
-                references.add(value)
-    return sorted(references, key=str.casefold)
 
 
 def build_install_plan(
@@ -93,7 +78,11 @@ def build_install_plan(
                 )
             )
 
-    for model in _model_references(profile.models):
+    for model_id in sorted(
+        {requirement.model_id for requirement in profile.model_requirements},
+        key=lambda item: item.value,
+    ):
+        model = str(model_id)
         pending.append(
             (
                 PlanAction.ACQUIRE_MODEL,

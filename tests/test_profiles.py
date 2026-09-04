@@ -53,6 +53,30 @@ def test_profile_vram_is_normalized_to_mib():
     assert profile.hardware.vram_tolerance_mib == 128
 
 
+def test_profiles_expose_only_active_canonical_model_requirements():
+    profiles = {profile.id: profile for profile in load_profiles(ROOT / "profiles")}
+
+    assert {(item.role, str(item.model_id)) for item in profiles["pepe"].model_requirements} == {
+        ("chat.primary", "ollama/hermes3_8b"),
+        ("image.diffusion", "comfyui/flux2_klein_fp8"),
+        ("image.text_encoder", "comfyui/qwen_3_4b_encoder"),
+        ("image.vae", "comfyui/flux2_vae"),
+    }
+    assert {str(item.model_id) for item in profiles["capella"].model_requirements} == {
+        "comfyui/flux2_klein_fp8",
+        "comfyui/qwen_3_4b_encoder",
+        "comfyui/flux2_vae",
+    }
+    assert profiles["test"].model_requirements == ()
+
+
+def test_legacy_model_references_are_rejected_at_profile_ingress():
+    data = copy.deepcopy(load_profile(ROOT / "profiles" / "pepe.yaml").raw)
+    data["models"]["chat"]["primary"] = "hermes3:8b"
+    with pytest.raises(ProfileError, match="canonical"):
+        validate_profile_data(data)
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected_field"),
     [

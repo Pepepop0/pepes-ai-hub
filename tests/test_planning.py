@@ -32,7 +32,7 @@ def test_install_plan_reflects_enabled_services_models_and_workflows():
     assert (PlanAction.INSTALL, "ollama") in targets
     assert (PlanAction.INSTALL, "open-webui") in targets
     assert (PlanAction.INSTALL, "comfyui") in targets
-    assert (PlanAction.ACQUIRE_MODEL, "hermes3:8b") in targets
+    assert (PlanAction.ACQUIRE_MODEL, "ollama/hermes3_8b") in targets
     assert (PlanAction.APPLY_WORKFLOW, "text_to_image") in targets
 
 

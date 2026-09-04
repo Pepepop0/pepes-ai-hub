@@ -28,13 +28,13 @@ features:
 
 models:
   chat:
-    primary: hermes3:8b
+    primary: ollama/hermes3_8b
     status: candidate
-    alternatives: [qwen3.5:9b, qwen3:8b]
+    alternatives: [ollama/qwen3_5_9b, ollama/qwen3_8b]
   image:
-    diffusion: flux-2-klein-4b-fp8.safetensors
-    text_encoder: qwen_3_4b.safetensors
-    vae: flux2-vae.safetensors
+    diffusion: comfyui/flux2_klein_fp8
+    text_encoder: comfyui/qwen_3_4b_encoder
+    vae: comfyui/flux2_vae
 
 workflows:
   text_to_image: {manifest_id: flux2_klein_t2i}

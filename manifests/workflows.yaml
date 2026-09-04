@@ -3,6 +3,12 @@ workflows:
   flux2_klein_t2i:
     file: workflows/flux2-klein-t2i-api.json
     status: mapping_known_json_not_embedded_yet
+    # Every model this graph loads, by profile role. Nothing is implied: a role
+    # missing here is a role the workflow will not wait for, and a role listed
+    # here must resolve to an AVAILABLE model before the workflow is usable.
+    models:
+      required: [image.diffusion, image.text_encoder, image.vae]
+      parameter: image.diffusion
     mapping:
       prompt: {node_id: "76", key: value}
       model: {node_id: "75:70", key: unet_name}
@@ -13,6 +19,9 @@ workflows:
   flux2_klein_edit:
     file: workflows/flux2-klein-edit-api.json
     status: TODO_export_and_map
+    models:
+      required: [image.diffusion, image.text_encoder, image.vae]
+      parameter: image.diffusion
     mapping:
       image: TBD
       prompt: TBD

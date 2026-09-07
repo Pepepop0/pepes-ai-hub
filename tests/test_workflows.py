@@ -36,7 +36,10 @@ from local_ai_stack.workflows import (
 
 REPO = Path(__file__).resolve().parents[1]
 SRC = Path(local_ai_stack.__file__).resolve().parents[1]
-FIXTURE_GRAPH = Path(__file__).parent / "fixtures" / "flux2-klein-t2i-api.json"
+# The graph this stack actually submits: exported from ComfyUI in API format
+# and versioned in the repository. Tests read it rather than a stand-in, so a
+# mapping that drifts from the real export fails here.
+SHIPPED_GRAPH = REPO / "workflows" / "flux2-klein-t2i-api.json"
 
 DIFFUSION_ID = ModelId("comfyui/flux2_klein_fp8")
 ENCODER_ID = ModelId("comfyui/qwen_3_4b_encoder")
@@ -108,7 +111,7 @@ def specs():
 
 @pytest.fixture
 def graph():
-    return json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))
+    return json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))
 
 
 # --- the manifest is the only place node ids live ---------------------------
@@ -175,12 +178,9 @@ def test_a_binding_missing_its_node_is_refused():
 
 def test_a_workflow_resolves_every_role_it_declares(specs, profile, tmp_path):
     resolver = image_resolver(tmp_path)
-    resolution = resolve_workflow(
-        specs["flux2_klein_t2i"], profile, resolver, repo_root=FIXTURE_GRAPH.parent.parent
-    )
+    resolution = resolve_workflow(specs["flux2_klein_t2i"], profile, resolver, repo_root=REPO)
     assert resolver.asked == [DIFFUSION_ID, ENCODER_ID, VAE_ID], "all three, not just the model"
     assert set(resolution.models) == {"image.diffusion", "image.text_encoder", "image.vae"}
-    assert resolution.state is WorkflowState.TEMPLATE_MISSING, "the graph is not in the repo yet"
     assert resolution.model.available
 
 
@@ -230,7 +230,7 @@ def test_any_missing_role_blocks_the_workflow(specs, profile, tmp_path, missing,
     resolver = image_resolver(tmp_path, missing=missing, state=state)
     template = tmp_path / "workflows" / "flux2-klein-t2i-api.json"
     template.parent.mkdir(parents=True, exist_ok=True)
-    template.write_text(FIXTURE_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
+    template.write_text(SHIPPED_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
 
     resolution = resolve_workflow(specs["flux2_klein_t2i"], profile, resolver, repo_root=tmp_path)
 
@@ -314,7 +314,7 @@ def ready_resolution(specs, profile, tmp_path):
     resolver = image_resolver(tmp_path)
     template = tmp_path / "workflows" / "flux2-klein-t2i-api.json"
     template.parent.mkdir(parents=True, exist_ok=True)
-    template.write_text(FIXTURE_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
+    template.write_text(SHIPPED_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
     return resolve_workflow(specs["flux2_klein_t2i"], profile, resolver, repo_root=tmp_path)
 
 
@@ -456,3 +456,77 @@ def test_no_ic6_module_names_a_url_or_a_checksum_in_code():
         for text in literals:
             assert "https://" not in text, f"{name} carries a URL literal"
             assert "sha256" not in text, f"{name} carries a checksum literal"
+
+
+# --- the graph exported from ComfyUI ----------------------------------------
+
+
+def test_the_shipped_graph_is_api_format_not_the_ui_export(graph):
+    """The UI export nests nodes under "nodes" with numeric ids and link arrays."""
+    assert graph, "the export is versioned in the repository"
+    assert "nodes" not in graph, "a UI export would be rejected by ComfyUI's /prompt"
+    assert all(isinstance(node, dict) and "class_type" in node for node in graph.values())
+
+
+def test_the_graph_loads_a_model_for_every_role_the_manifest_requires(specs, graph):
+    """Three loaders in the graph, three roles in the manifest, no coincidence."""
+    loaders = {node["class_type"] for node in graph.values()} & {
+        "UNETLoader",
+        "CLIPLoader",
+        "VAELoader",
+    }
+    assert loaders == {"UNETLoader", "CLIPLoader", "VAELoader"}
+    assert specs["flux2_klein_t2i"].required_roles == (
+        "image.diffusion",
+        "image.text_encoder",
+        "image.vae",
+    )
+
+
+def test_the_model_binding_addresses_the_diffusion_loader(specs, graph):
+    """The node id comes from the manifest; only the class is asserted here."""
+    binding = specs["flux2_klein_t2i"].binding(WorkflowParameter.MODEL)
+    assert graph[binding.node_id]["class_type"] == "UNETLoader"
+    assert binding.key in graph[binding.node_id]["inputs"]
+
+
+def test_every_binding_the_manifest_declares_exists_in_the_real_graph(
+    specs, profile, tmp_path, graph
+):
+    resolution = resolve_workflow(
+        specs["flux2_klein_t2i"], profile, image_resolver(tmp_path), repo_root=REPO
+    )
+    assert verify_workflow_references(resolution, graph) == ()
+
+
+def test_rendering_the_real_graph_replaces_everything_it_was_exported_with(
+    specs, profile, tmp_path
+):
+    """Whatever the export happened to carry is a value, never a default."""
+    resolution = resolve_workflow(
+        specs["flux2_klein_t2i"], profile, image_resolver(tmp_path), repo_root=REPO
+    )
+    before = SHIPPED_GRAPH.read_text(encoding="utf-8")
+    exported = json.loads(before)
+
+    rendered = render_workflow(
+        resolution,
+        WorkflowParameters(prompt="a small crab", width=768, height=512, steps=28, seed=99),
+    )
+
+    spec = resolution.spec
+    for parameter, expected in (
+        (WorkflowParameter.PROMPT, "a small crab"),
+        (WorkflowParameter.WIDTH, 768),
+        (WorkflowParameter.HEIGHT, 512),
+        (WorkflowParameter.STEPS, 28),
+        (WorkflowParameter.SEED, 99),
+        (WorkflowParameter.MODEL, resolution.runtime_name),
+    ):
+        binding = spec.binding(parameter)
+        assert rendered[binding.node_id]["inputs"][binding.key] == expected
+        assert exported[binding.node_id]["inputs"][binding.key] != expected, (
+            f"{parameter.value} would pass even without being written"
+        )
+
+    assert SHIPPED_GRAPH.read_text(encoding="utf-8") == before, "the export on disk is read-only"

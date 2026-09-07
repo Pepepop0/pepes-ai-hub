@@ -287,12 +287,94 @@ def test_an_unknown_placement_is_rejected():
         validate_model_manifest(manifest(comfyui={"demo": file_entry(placement="loras")}))
 
 
-def test_the_shipped_comfyui_models_are_declared_but_unpinned():
-    """No URL or checksum has been recorded for them, so none is installable."""
+SHIPPED_COMFYUI = {
+    "comfyui/flux2_klein_fp8": (
+        "black-forest-labs/FLUX.2-klein-4b-fp8",
+        "5b4408e59397a4a37ccb46afe426d8ed86379441",
+        "flux-2-klein-4b-fp8.safetensors",
+        "97ed34fe0567e436200f2faee3939b88f2b5d99f8af2a4dc16532c4245c0ccb6",
+        4070624520,
+    ),
+    "comfyui/qwen_3_4b_encoder": (
+        "Comfy-Org/flux2-klein-4B",
+        "5f526678002e43af5551dadb73ce2e8c91b43afe",
+        "qwen_3_4b.safetensors",
+        "6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a",
+        8044982048,
+    ),
+    "comfyui/flux2_vae": (
+        "Comfy-Org/flux2-dev",
+        "ab9055628ea245000e610f2aa2c96f4746093546",
+        "flux2-vae.safetensors",
+        "d64f3a68e1cc4f9f4e29b6e0da38a0204fe9a49f2d4053f0ec1fa1ca02f9c4b5",
+        336213556,
+    ),
+}
+
+
+def test_nothing_shipped_is_left_unpinned():
+    """Every declared model is installable; no TBD survives."""
+    assert model_catalog().unpinned == {}
+
+
+@pytest.mark.parametrize("model_id, expected", SHIPPED_COMFYUI.items())
+def test_each_comfyui_model_is_pinned_to_its_verified_artifact(model_id, expected):
+    repository, commit, filename, sha256, size = expected
+    spec = model_catalog().require(ModelId(model_id))
+    artifact = spec.source.artifact
+
+    assert artifact.filename == filename
+    assert artifact.sha256 == sha256
+    assert artifact.size_bytes == size
+    # The source repository is named, so a same-named file elsewhere cannot
+    # quietly take its place.
+    assert f"huggingface.co/{repository}/" in artifact.url
+    assert commit in artifact.url
+    assert spec.revision == commit
+
+
+@pytest.mark.parametrize("model_id", SHIPPED_COMFYUI)
+def test_every_comfyui_url_is_pinned_to_a_commit_not_a_branch(model_id):
+    """An immutable /resolve/<commit>/ URL, never a moving branch."""
+    url = model_catalog().require(ModelId(model_id)).source.artifact.url
+    assert "/resolve/" in url
+    revision = url.split("/resolve/", 1)[1].split("/", 1)[0]
+    assert len(revision) == 40
+    assert all(character in "0123456789abcdef" for character in revision)
+    assert "/resolve/main/" not in url
+    assert "/blob/" not in url
+
+
+def test_the_vae_comes_from_the_repository_the_tutorial_names():
+    """A file with this exact name also exists in flux2-klein-4B with other
+    bytes, so the source is part of the pin, not an implementation detail."""
+    artifact = model_catalog().require(ModelId("comfyui/flux2_vae")).source.artifact
+    assert "Comfy-Org/flux2-dev" in artifact.url
+    assert "flux2-klein" not in artifact.url
+    assert artifact.sha256 != "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3"
+
+
+def test_the_diffusion_model_is_the_distilled_variant_not_the_base():
+    artifact = model_catalog().require(ModelId("comfyui/flux2_klein_fp8")).source.artifact
+    assert artifact.filename == "flux-2-klein-4b-fp8.safetensors"
+    assert "klein-base" not in artifact.url
+
+
+def test_placements_are_unchanged():
     catalog = model_catalog()
-    comfy = {m for m in catalog.declared_ids if m.provider is ModelProvider.COMFYUI}
-    assert comfy
-    assert all(model_id in catalog.unpinned for model_id in comfy)
+    assert catalog.require(ModelId("comfyui/flux2_klein_fp8")).source.placement is (
+        ModelPlacement.DIFFUSION_MODELS
+    )
+    assert catalog.require(ModelId("comfyui/qwen_3_4b_encoder")).source.placement is (
+        ModelPlacement.TEXT_ENCODERS
+    )
+    assert catalog.require(ModelId("comfyui/flux2_vae")).source.placement is ModelPlacement.VAE
+
+
+def test_the_shipped_model_ids_are_unchanged():
+    catalog = model_catalog()
+    comfy = {str(m) for m in catalog.declared_ids if m.provider is ModelProvider.COMFYUI}
+    assert comfy == set(SHIPPED_COMFYUI)
 
 
 def test_every_pinned_file_model_has_a_checksum():

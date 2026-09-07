@@ -596,6 +596,7 @@ def provisioner_from_pin(
     *,
     dependencies: DependencyPin | None = None,
     requirements: Sequence[str] = (),
+    install_alongside_external: bool = False,
 ) -> ComfyUIProvisioner:
     """Build a provisioner from a catalog pin, or an unpinned one from None.
 
@@ -604,7 +605,10 @@ def provisioner_from_pin(
     """
     if pin is None:
         resolved = dependencies if dependencies is not None else DependencyPin(tuple(requirements))
-        return ComfyUIProvisioner(dependencies=resolved)
+        return ComfyUIProvisioner(
+            dependencies=resolved,
+            install_alongside_external=install_alongside_external,
+        )
     if dependencies is not None:
         resolved = dependencies
     elif requirements:
@@ -618,6 +622,7 @@ def provisioner_from_pin(
         dependencies=resolved,
         python_minimum=pin.python_minimum,
         python_below=pin.python_below,
+        install_alongside_external=install_alongside_external,
     )
 
 

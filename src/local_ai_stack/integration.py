@@ -34,31 +34,39 @@ install stays observation-only with no executable in its handoff.
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 
 from .adapters import control_spec_for
 from .catalog import artifact_for, package_for, repository_for
 from .comfyui import COMPONENT_ID as COMFYUI_COMPONENT_ID
 from .comfyui import provisioner_from_pin as comfyui_provisioner
+from .compatibility import CompatibilityReport, evaluate_compatibility
+from .components import CANONICAL_IDS
 from .controller import ServiceController, ServiceControlSpec
-from .endpoints import StackEndpoints
+from .endpoints import DEFAULT_HOST, StackEndpoints
 from .execution import PlanExecutor, ProvisionerRegistry
 from .install_actions import InstallActionHandlers
 from .installation import ResolvedInstallation, detect_repo_root
+from .inventory import ListenerReport, ScanOutcome, list_listeners
 from .launcher import ProcessLauncher
 from .managed_config import ManagedConfigWriter
 from .model_catalog import ModelCatalog, model_catalog
 from .model_installer import ModelInstaller
-from .models import ManagedModelPaths
+from .models import ManagedModelPaths, ModelProvider
 from .ollama import COMPONENT_ID as OLLAMA_COMPONENT_ID
 from .ollama import OllamaProvisioner
 from .ollama_models import HttpOllamaClient
 from .open_webui import COMPONENT_ID as OPEN_WEBUI_COMPONENT_ID
 from .open_webui import OpenWebUIProvisioner
+from .planning import InstallPlan, PlanAction
 from .profiles import Profile, load_profiles
 from .provisioning import (
+    FailureReason,
     LaunchAvailability,
     Ownership,
     ProvisionContext,
@@ -73,36 +81,289 @@ from .service_config import (
     StackConfiguration,
 )
 from .services import DEFAULT_SERVICE_SPECS, OLLAMA_SPEC
+from .system import SystemFacts, detect_system
 from .workflows import WorkflowSpec, load_workflow_manifest
 
 __all__ = [
     "ComponentIntegration",
+    "IntegrationOptions",
     "IntegrationSnapshot",
+    "ManagedPlanPhases",
+    "ManagedPreflightCode",
+    "ManagedPreflightIssue",
+    "ManagedPreflightReport",
     "build_service_controller",
     "control_specs_for",
     "default_install_actions",
     "default_provisioners",
     "detect_integration",
     "plan_executor",
+    "preflight_managed_stack",
     "provision_context",
+    "stage_managed_plan",
 ]
 
 
-def default_provisioners() -> dict[str, Provisioner]:
+@dataclass(frozen=True)
+class IntegrationOptions:
+    """Explicit opt-ins shared by provisioning, models, config and runtime.
+
+    Defaults preserve the conservative policy: an external installation causes
+    provisioning to skip it, and profile endpoints are used unchanged.  An
+    isolated managed stack must opt into coexistence per component and name
+    deterministic endpoint overrides here, once.
+    """
+
+    host: str = DEFAULT_HOST
+    port_overrides: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
+    alongside_external: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.host, str) or not self.host.strip():
+            raise ValueError("managed endpoint host must be a non-empty string")
+        unknown = sorted(set(self.alongside_external) - set(CANONICAL_IDS))
+        if unknown:
+            raise ValueError(f"alongside_external names unknown components: {', '.join(unknown)}")
+        object.__setattr__(self, "host", self.host.strip())
+        object.__setattr__(self, "port_overrides", MappingProxyType(dict(self.port_overrides)))
+        object.__setattr__(self, "alongside_external", frozenset(self.alongside_external))
+
+    def endpoints_for(self, profile: Profile) -> StackEndpoints:
+        return StackEndpoints.from_profile(
+            profile,
+            host=self.host,
+            port_overrides=self.port_overrides,
+        )
+
+    def allows_alongside(self, component_id: str) -> bool:
+        return component_id in self.alongside_external
+
+
+class ManagedPreflightCode(StrEnum):
+    INCOMPATIBLE = "incompatible"
+    DISK_SPACE = "disk-space"
+    LISTENER_SCAN = "listener-scan"
+    ENDPOINT_COLLISION = "endpoint-collision"
+    DUPLICATE_ENDPOINT = "duplicate-endpoint"
+    ALONGSIDE_REQUIRED = "alongside-required"
+    PATH_OVERLAP = "path-overlap"
+
+
+@dataclass(frozen=True)
+class ManagedPreflightIssue:
+    code: ManagedPreflightCode
+    detail: str
+    reason: FailureReason = FailureReason.PRECONDITION
+
+
+@dataclass(frozen=True)
+class ManagedPreflightReport:
+    """Read-only proof that an isolated managed plan may mutate its root."""
+
+    endpoints: StackEndpoints
+    model_endpoint: str
+    model_store: Path
+    free_bytes: int
+    compatibility: CompatibilityReport
+    external_components: tuple[str, ...] = ()
+    issues: tuple[ManagedPreflightIssue, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.issues
+
+
+@dataclass(frozen=True)
+class ManagedPlanPhases:
+    """The runtime boundary inside a full managed install plan.
+
+    Provisioning runs first. The caller then starts the verified managed
+    Ollama through ``ServiceController`` and waits for readiness before handing
+    ``after_ollama_ready`` to ``PlanExecutor``. The executor never starts a
+    service and therefore cannot accidentally fall back to another endpoint.
+    """
+
+    provisioning: InstallPlan
+    after_ollama_ready: InstallPlan
+
+
+def _plan_steps(plan: InstallPlan, actions: frozenset[PlanAction]) -> InstallPlan:
+    return InstallPlan(
+        profile_id=plan.profile_id,
+        steps=tuple(step for step in plan.steps if step.action in actions),
+        stack_id=plan.stack_id,
+        install_mode=plan.install_mode,
+        install_root=plan.install_root,
+    )
+
+
+def stage_managed_plan(plan: InstallPlan) -> ManagedPlanPhases:
+    """Split work around managed Ollama startup without duplicating runtime."""
+    provisioning_actions = frozenset(
+        {PlanAction.CHECK, PlanAction.PREPARE_LAYOUT, PlanAction.INSTALL}
+    )
+    post_start_actions = frozenset(
+        {PlanAction.ACQUIRE_MODEL, PlanAction.APPLY_WORKFLOW, PlanAction.CONFIGURE}
+    )
+    return ManagedPlanPhases(
+        provisioning=_plan_steps(plan, provisioning_actions),
+        after_ollama_ready=_plan_steps(plan, post_start_actions),
+    )
+
+
+def default_provisioners(options: IntegrationOptions | None = None) -> dict[str, Provisioner]:
     """Every component with a real provisioner today.
 
     Each one is handed whatever the shipped manifests pin for it. A component
     with nothing pinned still detects, plans and dry-runs; only a real install
     refuses, with PRECONDITION, rather than guessing a URL or a revision.
     """
+    resolved_options = options or IntegrationOptions()
     open_webui_pin = package_for(OPEN_WEBUI_COMPONENT_ID)
     return {
-        OLLAMA_COMPONENT_ID: OllamaProvisioner(artifact=artifact_for(OLLAMA_COMPONENT_ID)),
+        OLLAMA_COMPONENT_ID: OllamaProvisioner(
+            artifact=artifact_for(OLLAMA_COMPONENT_ID),
+            install_alongside_external=resolved_options.allows_alongside(OLLAMA_COMPONENT_ID),
+        ),
         OPEN_WEBUI_COMPONENT_ID: OpenWebUIProvisioner(
             version=None if open_webui_pin is None else open_webui_pin.version,
+            install_alongside_external=resolved_options.allows_alongside(OPEN_WEBUI_COMPONENT_ID),
         ),
-        COMFYUI_COMPONENT_ID: comfyui_provisioner(repository_for(COMFYUI_COMPONENT_ID)),
+        COMFYUI_COMPONENT_ID: comfyui_provisioner(
+            repository_for(COMFYUI_COMPONENT_ID),
+            install_alongside_external=resolved_options.allows_alongside(COMFYUI_COMPONENT_ID),
+        ),
     }
+
+
+def _disk_root(path: Path) -> Path:
+    candidate = path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    return candidate
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    left = left.resolve(strict=False)
+    right = right.resolve(strict=False)
+    return left == right or left in right.parents or right in left.parents
+
+
+def preflight_managed_stack(
+    context: ProvisionContext,
+    profile: Profile,
+    options: IntegrationOptions,
+    *,
+    provisioners: ProvisionerRegistry | None = None,
+    facts: SystemFacts | None = None,
+    listener_report: ListenerReport | None = None,
+    minimum_free_bytes: int = 0,
+) -> ManagedPreflightReport:
+    """Prove isolation before an opt-in managed plan mutates anything.
+
+    This function is deliberately read-only.  Callers must require ``ok``
+    before layout preparation or any provisioner ``apply``.  An unavailable
+    listener scan fails closed because it cannot prove that the selected ports
+    are free.
+    """
+    endpoints = options.endpoints_for(profile)
+    compatibility = evaluate_compatibility(facts or detect_system(), profile)
+    model_paths = ManagedModelPaths.from_layout(context.layout)
+    model_store = model_paths.provider_root(ModelProvider.OLLAMA)
+    free_bytes = shutil.disk_usage(_disk_root(context.layout.root)).free
+    issues: list[ManagedPreflightIssue] = [
+        ManagedPreflightIssue(ManagedPreflightCode.INCOMPATIBLE, blocker.message)
+        for blocker in compatibility.blockers
+    ]
+    if minimum_free_bytes < 0:
+        raise ValueError("minimum_free_bytes cannot be negative")
+    if free_bytes < minimum_free_bytes:
+        issues.append(
+            ManagedPreflightIssue(
+                ManagedPreflightCode.DISK_SPACE,
+                f"managed root has {free_bytes} free bytes; {minimum_free_bytes} required",
+            )
+        )
+
+    registry = dict(default_provisioners(options) if provisioners is None else provisioners)
+    external: list[str] = []
+    for component_id, provisioner in registry.items():
+        detection = provisioner.detect(context)
+        if not detection.is_external:
+            continue
+        external.append(component_id)
+        configured = profile.services.get(component_id)
+        option_enabled = options.allows_alongside(component_id)
+        provisioner_enabled = bool(getattr(provisioner, "install_alongside_external", False))
+        if (
+            configured is not None
+            and configured.enabled
+            and not (option_enabled and provisioner_enabled)
+        ):
+            issues.append(
+                ManagedPreflightIssue(
+                    ManagedPreflightCode.ALONGSIDE_REQUIRED,
+                    f"{component_id} is external and alongside provisioning is not active "
+                    "in both the integration request and provisioner",
+                )
+            )
+        if detection.path is not None and _paths_overlap(context.layout.root, detection.path):
+            issues.append(
+                ManagedPreflightIssue(
+                    ManagedPreflightCode.PATH_OVERLAP,
+                    f"managed root overlaps the external {component_id} path",
+                )
+            )
+
+    enabled_specs = [
+        endpoints.spec(component_id)
+        for component_id, service in profile.services.items()
+        if service.enabled
+    ]
+    occupied: dict[tuple[str, int], str] = {}
+    for spec in enabled_specs:
+        key = (spec.host, spec.port)
+        previous = occupied.get(key)
+        if previous is not None:
+            issues.append(
+                ManagedPreflightIssue(
+                    ManagedPreflightCode.DUPLICATE_ENDPOINT,
+                    f"{previous} and {spec.id} both resolve to {spec.host}:{spec.port}",
+                )
+            )
+        occupied[key] = spec.id
+
+    listeners = listener_report or list_listeners()
+    if listeners.outcome is ScanOutcome.UNAVAILABLE:
+        issues.append(
+            ManagedPreflightIssue(
+                ManagedPreflightCode.LISTENER_SCAN,
+                f"could not prove managed ports are free: {listeners.detail}",
+            )
+        )
+    else:
+        for spec in enabled_specs:
+            collisions = listeners.on_port(spec.port, spec.host)
+            if not collisions:
+                continue
+            pids = sorted({listener.pid for listener in collisions if listener.pid is not None})
+            suffix = f" (pids: {', '.join(map(str, pids))})" if pids else ""
+            issues.append(
+                ManagedPreflightIssue(
+                    ManagedPreflightCode.ENDPOINT_COLLISION,
+                    f"managed endpoint {spec.host}:{spec.port} for {spec.id} is occupied{suffix}",
+                )
+            )
+
+    return ManagedPreflightReport(
+        endpoints=endpoints,
+        model_endpoint=endpoints.ollama,
+        model_store=model_store,
+        free_bytes=free_bytes,
+        compatibility=compatibility,
+        external_components=tuple(sorted(external)),
+        issues=tuple(issues),
+    )
 
 
 def provision_context(
@@ -124,12 +385,15 @@ def plan_executor(
     provisioners: ProvisionerRegistry | None = None,
     *,
     actions: InstallActionHandlers | None = None,
+    options: IntegrationOptions | None = None,
 ) -> PlanExecutor:
     """The executor the application uses. Nothing runs until it is asked to."""
-    bound_actions = actions if actions is not None else default_install_actions(context)
+    bound_actions = (
+        actions if actions is not None else default_install_actions(context, options=options)
+    )
     return PlanExecutor(
         context=context,
-        provisioners=dict(default_provisioners() if provisioners is None else provisioners),
+        provisioners=dict(default_provisioners(options) if provisioners is None else provisioners),
         action_handlers=bound_actions.handlers(),
     )
 
@@ -143,6 +407,7 @@ def default_install_actions(
     workflow_specs: Mapping[str, WorkflowSpec] | None = None,
     installer_factory: Callable[[Profile], ModelInstaller] | None = None,
     config_writer: ManagedConfigWriter | None = None,
+    options: IntegrationOptions | None = None,
 ) -> InstallActionHandlers:
     """Bind the shipped profiles/manifests to the three executable domains."""
     root = Path(repo_root) if repo_root is not None else detect_repo_root()
@@ -154,10 +419,12 @@ def default_install_actions(
         else load_workflow_manifest(root / "manifests" / "workflows.yaml")
     )
 
+    resolved_options = options or IntegrationOptions()
+
     def build_installer(profile: Profile) -> ModelInstaller:
         if installer_factory is not None:
             return installer_factory(profile)
-        endpoint = StackEndpoints.from_profile(profile).ollama
+        endpoint = resolved_options.endpoints_for(profile).ollama
         return ModelInstaller(
             ManagedModelPaths.from_layout(context.layout),
             ollama=HttpOllamaClient(endpoint),
@@ -171,6 +438,7 @@ def default_install_actions(
         repo_root=root,
         layout=context.layout,
         config_writer=config_writer or ManagedConfigWriter(),
+        endpoints_for=resolved_options.endpoints_for,
     )
 
 
@@ -242,13 +510,15 @@ class IntegrationSnapshot:
 def detect_integration(
     context: ProvisionContext,
     provisioners: ProvisionerRegistry | None = None,
+    *,
+    options: IntegrationOptions | None = None,
 ) -> IntegrationSnapshot:
     """Ask every provisioner what the runtime may do. Read-only, creates nothing.
 
     A component id and a service id are the same canonical string (see
     :mod:`components`), so there is no translation table here to drift.
     """
-    registry = default_provisioners() if provisioners is None else provisioners
+    registry = default_provisioners(options) if provisioners is None else provisioners
     components = tuple(
         ComponentIntegration(
             handoff=provisioner.runtime_handoff(context),
@@ -266,6 +536,7 @@ def control_specs_for(
     service_options: Mapping[str, Mapping[str, object]] | None = None,
     configuration: StackConfiguration | None = None,
     config_writer: ManagedConfigWriter | None = None,
+    endpoints: StackEndpoints | None = None,
 ) -> tuple[ServiceControlSpec, ...]:
     """Build one control spec per service from what provisioning found.
 
@@ -284,7 +555,22 @@ def control_specs_for(
     if models_dir is not None:
         options.setdefault(OLLAMA_SPEC.id, {}).setdefault("models_dir", models_dir)
     elif layout is not None:
-        options.setdefault(OLLAMA_SPEC.id, {}).setdefault("models_dir", layout.models)
+        managed_paths = ManagedModelPaths.from_layout(layout)
+        options.setdefault(OLLAMA_SPEC.id, {}).setdefault(
+            "models_dir", managed_paths.provider_root(ModelProvider.OLLAMA)
+        )
+    if endpoints is not None:
+        for service in DEFAULT_SERVICE_SPECS:
+            endpoint = endpoints.spec(service.id)
+            service_values = options.setdefault(service.id, {})
+            for field_name, expected in (("host", endpoint.host), ("port", endpoint.port)):
+                supplied = service_values.get(field_name, expected)
+                if supplied != expected:
+                    raise ValueError(
+                        f"{service.id} {field_name} {supplied!r} conflicts with the "
+                        f"managed endpoint authority {expected!r}"
+                    )
+                service_values[field_name] = expected
     if layout is not None:
         options.setdefault(COMFYUI_COMPONENT_ID, {}).setdefault(
             "script", layout.comfyui_app / "main.py"
@@ -350,6 +636,7 @@ def build_service_controller(
     service_options: Mapping[str, Mapping[str, object]] | None = None,
     configuration: StackConfiguration | None = None,
     config_writer: ManagedConfigWriter | None = None,
+    endpoints: StackEndpoints | None = None,
     **controller_options,
 ) -> ServiceController:
     """A controller that can only ever control what provisioning owns.
@@ -365,6 +652,7 @@ def build_service_controller(
             service_options=service_options,
             configuration=configuration,
             config_writer=config_writer,
+            endpoints=endpoints,
         )
         if specs is None
         else tuple(specs)

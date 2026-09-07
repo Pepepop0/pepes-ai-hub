@@ -26,6 +26,10 @@ class EndpointError(KeyError):
     """A service was asked about that this stack does not describe."""
 
 
+class EndpointConfigurationError(ValueError):
+    """An explicit endpoint override is malformed or names no known service."""
+
+
 def aligned_service_spec(spec: ServiceSpec, *, host: str = DEFAULT_HOST, port: int) -> ServiceSpec:
     """The same service, moved to where the caller says it listens."""
     if port != spec.port:
@@ -53,16 +57,31 @@ class StackEndpoints:
         *,
         specs: Sequence[ServiceSpec] = DEFAULT_SERVICE_SPECS,
         host: str = DEFAULT_HOST,
+        port_overrides: Mapping[str, int] | None = None,
     ) -> StackEndpoints:
         """Read the ports the profile declares; keep every other detail.
 
         A service the profile does not mention keeps its declared default, so
         adding a service to a profile is what moves it, and nothing else.
         """
+        known = {spec.id for spec in specs}
+        overrides = dict(port_overrides or {})
+        unknown = sorted(str(service_id) for service_id in overrides if service_id not in known)
+        if unknown:
+            raise EndpointConfigurationError(
+                f"endpoint overrides name unknown services: {', '.join(unknown)}"
+            )
+        for service_id, port in overrides.items():
+            if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+                raise EndpointConfigurationError(
+                    f"endpoint override for {service_id!r} must be an integer from 1 to 65535"
+                )
+
         resolved: dict[str, ServiceSpec] = {}
         for spec in specs:
             configured = profile.services.get(spec.id)
-            port = configured.port if configured is not None else spec.port
+            profile_port = configured.port if configured is not None else spec.port
+            port = overrides.get(spec.id, profile_port)
             resolved[spec.id] = aligned_service_spec(spec, host=host, port=port)
         return cls(resolved)
 

@@ -14,7 +14,12 @@ from test_workflows import (
 )
 
 from local_ai_stack.components import ComponentId
-from local_ai_stack.endpoints import EndpointError, StackEndpoints, base_url
+from local_ai_stack.endpoints import (
+    EndpointConfigurationError,
+    EndpointError,
+    StackEndpoints,
+    base_url,
+)
 from local_ai_stack.layout import StackLayout
 from local_ai_stack.managed_config import ManagedConfigWriter
 from local_ai_stack.models import (
@@ -140,6 +145,38 @@ def test_moving_a_port_in_the_profile_moves_every_url():
     endpoints = StackEndpoints.from_profile(moved)
     assert endpoints.ollama == "http://127.0.0.1:21434"
     assert open_webui_ollama_env(endpoints)[ENV_OLLAMA_BASE_URL] == "http://127.0.0.1:21434"
+
+
+def test_explicit_port_overrides_move_config_from_one_endpoint_authority(tmp_path, layout, specs):
+    profile = profile_named("pepe")
+    endpoints = StackEndpoints.from_profile(
+        profile,
+        port_overrides={"ollama": 12434, "open-webui": 18080, "comfyui": 18188},
+    )
+    configuration = build_stack_configuration(
+        profile,
+        full_resolver(tmp_path),
+        layout,
+        workflow_specs=specs,
+        repo_root=REPO,
+        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
+        endpoints=endpoints,
+    )
+
+    env = configuration.service("open-webui").env
+    assert env[ENV_OLLAMA_BASE_URL] == "http://127.0.0.1:12434"
+    assert env[ENV_COMFYUI_BASE_URL] == "http://127.0.0.1:18188"
+
+
+@pytest.mark.parametrize("port", [0, 65536, True, "12434"])
+def test_invalid_endpoint_override_is_rejected(port):
+    with pytest.raises(EndpointConfigurationError):
+        StackEndpoints.from_profile(profile_named("pepe"), port_overrides={"ollama": port})
+
+
+def test_unknown_endpoint_override_is_rejected():
+    with pytest.raises(EndpointConfigurationError, match="unknown services"):
+        StackEndpoints.from_profile(profile_named("pepe"), port_overrides={"other": 12345})
 
 
 def test_a_health_path_never_leaks_into_a_base_url():

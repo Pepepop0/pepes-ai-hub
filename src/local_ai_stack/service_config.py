@@ -318,6 +318,7 @@ def build_stack_configuration(
     repo_root: Path | None = None,
     graphs: Mapping[str, Mapping[str, object]] | None = None,
     image_workflow: str = "text_to_image",
+    endpoints: StackEndpoints | None = None,
 ) -> StackConfiguration:
     """Generate every service configuration this profile implies.
 
@@ -326,7 +327,7 @@ def build_stack_configuration(
     removes the capability that needed it and says so, instead of being
     configured around.
     """
-    endpoints = StackEndpoints.from_profile(profile)
+    endpoints = endpoints or StackEndpoints.from_profile(profile)
     resolved_models = {
         requirement.role: resolver.resolve(requirement.model_id)
         for requirement in profile.model_requirements

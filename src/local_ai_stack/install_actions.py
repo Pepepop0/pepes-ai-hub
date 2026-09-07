@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .endpoints import StackEndpoints
 from .execution import ActionExecutionResult, PlanActionHandler
 from .layout import StackLayout
 from .managed_config import ManagedConfigWriter
@@ -33,6 +34,7 @@ from .workflows import (
 )
 
 ModelInstallerFactory = Callable[[Profile], ModelInstaller]
+EndpointFactory = Callable[[Profile], StackEndpoints]
 
 
 @dataclass
@@ -46,6 +48,7 @@ class InstallActionHandlers:
     repo_root: Path
     layout: StackLayout
     config_writer: ManagedConfigWriter = field(default_factory=ManagedConfigWriter)
+    endpoints_for: EndpointFactory = StackEndpoints.from_profile
     _installers: dict[str, ModelInstaller] = field(default_factory=dict, init=False, repr=False)
 
     def handlers(self) -> Mapping[PlanAction, PlanActionHandler]:
@@ -170,6 +173,7 @@ class InstallActionHandlers:
                 workflow_specs=self.workflow_specs,
                 repo_root=self.repo_root,
                 graphs=graphs,
+                endpoints=self.endpoints_for(profile),
             )
         except (OSError, ValueError, WorkflowError) as exc:
             return self._failure(step, f"configuration could not be generated: {exc}")

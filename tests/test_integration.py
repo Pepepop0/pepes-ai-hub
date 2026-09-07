@@ -255,7 +255,7 @@ def test_managed_install_hands_its_executable_to_the_runtime(tmp_path):
     assert ollama_spec.launch.argv == (str(executable), "serve")
     assert ollama_spec.launch.env["OLLAMA_HOST"] == "127.0.0.1:11434"
     # A managed install keeps its models inside the managed layout.
-    assert ollama_spec.launch.env["OLLAMA_MODELS"] == str(context.layout.models)
+    assert ollama_spec.launch.env["OLLAMA_MODELS"] == str(context.layout.models / "ollama")
     assert snapshot.controllable_ids == (OLLAMA_SPEC.id,)
 
 

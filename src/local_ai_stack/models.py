@@ -280,12 +280,15 @@ class ManagedModelPaths:
     def from_layout(cls, layout: StackLayout) -> ManagedModelPaths:
         return cls(layout.models)
 
+    def provider_root(self, provider: ModelProvider) -> Path:
+        """The isolated root owned by one model provider."""
+        return self.root / provider.value
+
     def destination_for(self, spec: ModelSpec) -> Path:
         if not isinstance(spec.source, FileModelSource):
             raise ModelContractError("Ollama models have no managed file destination")
         return (
-            self.root
-            / spec.provider.value
+            self.provider_root(spec.provider)
             / spec.source.placement.value
             / spec.source.artifact.filename
         )

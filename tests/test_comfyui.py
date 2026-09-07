@@ -201,6 +201,25 @@ def test_apply_never_takes_ownership_of_an_external_install(tmp_path):
     assert not context.layout.comfyui_app.exists()
 
 
+def test_managed_install_can_coexist_when_explicitly_requested(tmp_path):
+    local_appdata = tmp_path / "AppData" / "Local"
+    desktop = local_appdata / "Comfy-Desktop"
+    desktop.mkdir(parents=True)
+    sentinel = desktop / "keep.txt"
+    sentinel.write_text("mine", encoding="utf-8")
+    runner = FakeRunner(env={"LOCALAPPDATA": str(local_appdata)})
+    context = context_for(tmp_path, runner)
+
+    result = pinned(
+        git=FakeGit(),
+        install_alongside_external=True,
+    ).apply(context)
+
+    assert result.outcome is ProvisionOutcome.INSTALLED
+    assert sentinel.read_text(encoding="utf-8") == "mine"
+    assert context.layout.comfyui_app.is_dir()
+
+
 def test_managed_install_is_detected(tmp_path):
     context = context_for(tmp_path)
     install_managed(context)

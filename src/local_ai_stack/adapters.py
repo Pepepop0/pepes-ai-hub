@@ -312,14 +312,24 @@ _OBSERVATION_ONLY: Mapping[str, tuple[ServiceSpec, RuntimeProcessSpec]] = {
 }
 
 
-def observation_only_spec(service_id: str) -> ServiceControlSpec:
+def observation_only_spec(
+    service_id: str,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+) -> ServiceControlSpec:
     """A service we can watch but not start: health and discovery, no launch."""
     try:
         service, process = _OBSERVATION_ONLY[service_id]
     except KeyError:
         known = ", ".join(sorted(_OBSERVATION_ONLY))
         raise KeyError(f"unknown service {service_id!r} (known: {known})") from None
-    return ServiceControlSpec(service, process)
+    resolved_host = service.host if host is None else host
+    resolved_port = service.port if port is None else port
+    return ServiceControlSpec(
+        _aligned(service, resolved_host, resolved_port),
+        _aligned_process(process, resolved_port),
+    )
 
 
 def observation_only_specs(
@@ -342,7 +352,11 @@ def control_spec_for(
     provisioning already answered it by supplying, or withholding, a path.
     """
     if executable is None:
-        return observation_only_spec(service_id)
+        return observation_only_spec(
+            service_id,
+            host=options.get("host"),
+            port=options.get("port"),
+        )
     try:
         builder = CONTROL_SPEC_BUILDERS[service_id]
     except KeyError:

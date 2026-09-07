@@ -62,21 +62,49 @@ TUI pode chamá-lo ao montar a view.
 Executáveis hoje:
 
 - `PREPARE_LAYOUT` -> `StackLayout.ensure()`
-- `INSTALL ollama` -> `OllamaProvisioner`
+- `INSTALL` -> provisioner registrado para Ollama, Open WebUI ou ComfyUI
+- `ACQUIRE_MODEL` -> `ModelInstaller`
+- `APPLY_WORKFLOW` -> resolução/materialização declarativa do workflow
+- `CONFIGURE` -> geração, escrita e verificação da configuração managed
 
-Todo o resto (modelos, workflows, Open WebUI, ComfyUI) sai como UNSUPPORTED
-**com motivo**, nunca omitido e nunca exibido como concluído.
+`CHECK system` continua explícito como UNSUPPORTED **com motivo**; a
+compatibilidade é validada pelo preflight antes da execução.
 
 Dry-run é determinístico e não muta nada: `ensure(dry_run=True)` só lê e todo
 provisioner recebe `dry_run=True`.
 
-## Pendências conhecidas
+## Coexistência managed + external
 
-**Artifact de produção do Ollama.** Não há URL nem SHA-256 embutidos, de
-propósito: ambos mudam a cada release upstream. `apply()` exige um `Artifact`
-explícito e, sem ele, falha com `PRECONDITION`. A instalação real fica
-bloqueada até existir um manifest pinado. A TUI não oferece controle de
-instalação real por esse motivo.
+O default continua conservador: se uma instalação externa for detectada, o
+provisioner retorna `SKIPPED`. Coexistência só existe quando o caller cria um
+`IntegrationOptions` que habilita `alongside_external` por component id. O
+mesmo objeto carrega overrides determinísticos de porta e é propagado pelo
+composition root para provisioners, model client, configuração e runtime.
+
+Antes de qualquer mutação, `preflight_managed_stack()` verifica hardware,
+espaço, separação de paths, opt-in efetivo dos provisioners e disponibilidade
+dos endpoints managed. Falha no inventário de listeners ou porta ocupada é
+`PRECONDITION`; o layout ainda não foi criado. A instalação externa permanece
+apenas evidência observacional e nunca fornece executable ao runtime.
+
+O store do Ollama managed é `ManagedModelPaths.provider_root(OLLAMA)`, sob
+`<root>/models/ollama`. O launch spec recebe esse path em `OLLAMA_MODELS`, e o
+`HttpOllamaClient` recebe o endpoint managed vindo do mesmo
+`IntegrationOptions`. Assim, um modelo presente apenas em um Ollama externo
+não pode satisfazer o resolver managed.
+
+Pull via API exige servidor pronto. `stage_managed_plan()` divide o plano sem
+ensinar start/stop ao `PlanExecutor`:
+
+```text
+preflight -> provisioning -> ServiceController.start(ollama) -> readiness
+          -> ACQUIRE_MODEL -> APPLY_WORKFLOW -> CONFIGURE -> restante da stack
+```
+
+O caller continua usando `ServiceController` para iniciar o Ollama; o executor
+não ganhou uma segunda implementação de runtime.
+
+## Pendências conhecidas
 
 **Árvore de processos.** Resolvido dentro de uma sessão, com fronteira
 explícita. Ver `src/local_ai_stack/jobs.py`.
@@ -140,10 +168,4 @@ As duas são decisões de produto, não detalhes de implementação.
 Ambas ficam **BLOCKED até decisão**. O que está implementado é a parte segura:
 prova por job dentro da sessão, com fallback honesto fora dela.
 
-**Ids de serviço.** Os alvos do plano vêm das chaves do profile (`open_webui`),
-enquanto specs de serviço usam o id do serviço (`open-webui`). Enquanto só o
-Ollama tem provisioner, os dois coincidem. Um provisioner de Open WebUI precisa
-resolver isso antes de ser registrado.
-
-**Ainda não existe:** Open WebUI e ComfyUI provisioners, aquisição de modelos,
-VRAM orchestration, repair/update/uninstall.
+**Ainda não existe:** VRAM orchestration e repair/update/uninstall.

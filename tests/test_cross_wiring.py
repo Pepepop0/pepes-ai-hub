@@ -45,7 +45,7 @@ from local_ai_stack.service_config import (
 from local_ai_stack.workflows import WorkflowState, load_workflow_manifest, resolve_workflow
 
 REPO = Path(__file__).resolve().parents[1]
-FIXTURE_GRAPH = REPO / "tests" / "fixtures" / "flux2-klein-t2i-api.json"
+SHIPPED_GRAPH = REPO / "workflows" / "flux2-klein-t2i-api.json"
 
 OLLAMA_ID = ModelId("ollama/hermes3_8b")
 DIFFUSION_ID = ModelId("comfyui/flux2_klein_fp8")
@@ -114,7 +114,7 @@ def prepared_domains(tmp_path: Path, *, ollama_available: bool = True):
     repo_root = tmp_path / "repo"
     graph_path = repo_root / "workflows" / "flux2-klein-t2i-api.json"
     graph_path.parent.mkdir(parents=True)
-    graph_path.write_text(FIXTURE_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
+    graph_path.write_text(SHIPPED_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
     specs = load_workflow_manifest(REPO / "manifests" / "workflows.yaml")
     actions = InstallActionHandlers(
         profiles={"pepe": profile()},
@@ -132,7 +132,7 @@ def configuration_for(tmp_path: Path, *, ollama_available: bool = True):
         tmp_path, ollama_available=ollama_available
     )
     resolver = StackModelResolver(installer, catalog)
-    graph = json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))
+    graph = json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))
     configuration = build_stack_configuration(
         profile(),
         resolver,

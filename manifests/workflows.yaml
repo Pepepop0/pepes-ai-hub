@@ -2,7 +2,7 @@ schema_version: 1
 workflows:
   flux2_klein_t2i:
     file: workflows/flux2-klein-t2i-api.json
-    status: mapping_known_json_not_embedded_yet
+    status: mapped_and_embedded
     # Every model this graph loads, by profile role. Nothing is implied: a role
     # missing here is a role the workflow will not wait for, and a role listed
     # here must resolve to an AVAILABLE model before the workflow is usable.

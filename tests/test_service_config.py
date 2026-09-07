@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 from test_workflows import (
     DIFFUSION_ID,
-    FIXTURE_GRAPH,
     IMAGE_MODELS,
+    SHIPPED_GRAPH,
     FakeResolver,
     available_file_model,
 )
@@ -114,7 +114,7 @@ def resolver_for(profile, tmp_path) -> FakeResolver:
 def ready_t2i(specs, profile, tmp_path):
     template = tmp_path / "workflows" / "flux2-klein-t2i-api.json"
     template.parent.mkdir(parents=True, exist_ok=True)
-    template.write_text(FIXTURE_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
+    template.write_text(SHIPPED_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
     return resolve_workflow(
         specs["flux2_klein_t2i"], profile, full_resolver(tmp_path), repo_root=tmp_path
     )
@@ -271,7 +271,7 @@ def test_the_node_mapping_matches_the_shape_open_webui_reads(specs, tmp_path):
 def test_the_node_mapping_env_value_is_a_json_list(specs, layout, tmp_path):
     endpoints = StackEndpoints.from_profile(profile_named("pepe"))
     resolution = ready_t2i(specs, profile_named("pepe"), tmp_path)
-    graph = json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))
+    graph = json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))
 
     configuration = open_webui_image_configuration(layout, endpoints, resolution, graph)
 
@@ -283,7 +283,7 @@ def test_the_node_mapping_env_value_is_a_json_list(specs, layout, tmp_path):
 def test_image_configuration_uses_the_runtime_name_and_the_comfyui_url(specs, layout, tmp_path):
     endpoints = StackEndpoints.from_profile(profile_named("pepe"))
     resolution = ready_t2i(specs, profile_named("pepe"), tmp_path)
-    graph = json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))
+    graph = json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))
 
     configuration = open_webui_image_configuration(layout, endpoints, resolution, graph)
 
@@ -343,7 +343,7 @@ def stage_graph(tmp_path) -> None:
     """Put the workflow graph where a repository checkout would have it."""
     template = tmp_path / "workflows" / "flux2-klein-t2i-api.json"
     template.parent.mkdir(parents=True, exist_ok=True)
-    template.write_text(FIXTURE_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
+    template.write_text(SHIPPED_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
 
 
 def test_a_profile_produces_a_complete_configuration(specs, layout, tmp_path):
@@ -355,7 +355,7 @@ def test_a_profile_produces_a_complete_configuration(specs, layout, tmp_path):
         layout,
         workflow_specs=specs,
         repo_root=tmp_path,
-        graphs={"flux2_klein_t2i": json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))},
+        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
     )
 
     assert configuration.profile_id == "pepe"
@@ -384,7 +384,7 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
             layout,
             workflow_specs=specs,
             repo_root=tmp_path,
-            graphs={"flux2_klein_t2i": json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))},
+            graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
         )
 
     pepe = built["pepe"].service(ComponentId.OPEN_WEBUI)
@@ -415,7 +415,7 @@ def test_a_port_moved_in_a_profile_moves_the_generated_configuration(specs, layo
         layout,
         workflow_specs=specs,
         repo_root=tmp_path,
-        graphs={"flux2_klein_t2i": json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))},
+        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
     )
     assert (
         configuration.env_for(ComponentId.OPEN_WEBUI)[ENV_COMFYUI_BASE_URL]
@@ -456,7 +456,7 @@ def test_an_unavailable_chat_model_leaves_image_generation_alone(specs, layout, 
         layout,
         workflow_specs=specs,
         repo_root=tmp_path,
-        graphs={"flux2_klein_t2i": json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))},
+        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
     )
 
     open_webui = configuration.service(ComponentId.OPEN_WEBUI)
@@ -488,7 +488,7 @@ def test_the_generated_configuration_applies_verifies_and_is_idempotent(specs, l
         layout,
         workflow_specs=specs,
         repo_root=tmp_path,
-        graphs={"flux2_klein_t2i": json.loads(FIXTURE_GRAPH.read_text(encoding="utf-8"))},
+        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
     )
     documents = configuration.documents
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+from .endpoints import StackEndpoints
 from .installation import ResolvedInstallation
 from .profiles import Profile
 from .stacks import StackDefinition
@@ -41,14 +42,17 @@ def build_install_plan(
     *,
     installation: ResolvedInstallation | None = None,
     stack: StackDefinition | None = None,
+    endpoints: StackEndpoints | None = None,
 ) -> InstallPlan:
     """Build a deterministic description of future work without executing any step.
 
-    `installation` and `stack` are optional context. When an installation is
-    given the plan states where the work would land and adds a step for
-    preparing the directory layout; it still stats nothing and creates nothing.
-    Computing which directories are missing belongs to whoever runs the plan,
-    via StackLayout.ensure(dry_run=True).
+    `installation`, `stack`, and `endpoints` are optional context. When an
+    installation is given the plan states where the work would land and adds a
+    step for preparing the directory layout. Explicit managed endpoint choices
+    must be supplied so the plan describes the same ports execution will use.
+    Planning still stats nothing and creates nothing. Computing which
+    directories are missing belongs to whoever runs the plan, via
+    StackLayout.ensure(dry_run=True).
     """
     pending: list[tuple[PlanAction, str, str]] = [
         (
@@ -70,11 +74,12 @@ def build_install_plan(
     for service_id in sorted(profile.services):
         service = profile.services[service_id]
         if service.enabled:
+            port = service.port if endpoints is None else endpoints.port(service_id)
             pending.append(
                 (
                     PlanAction.INSTALL,
                     service_id,
-                    f"Install {service_id} and reserve local port {service.port}.",
+                    f"Install {service_id} and reserve local port {port}.",
                 )
             )
 

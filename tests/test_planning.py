@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from local_ai_stack.endpoints import StackEndpoints
 from local_ai_stack.installation import InstallLocation, resolve_installation
 from local_ai_stack.planning import PlanAction, build_install_plan
 from local_ai_stack.profiles import load_profile
@@ -55,6 +56,24 @@ def test_plan_records_the_resolved_installation(pepe, tmp_path):
     assert plan.install_mode == "custom"
     assert plan.stack_id == "standard"
     assert plan.profile_id == "pepe"
+
+
+def test_plan_describes_the_explicit_managed_endpoints(pepe):
+    endpoints = StackEndpoints.from_profile(
+        pepe,
+        port_overrides={"ollama": 12434, "open-webui": 18080, "comfyui": 18188},
+    )
+
+    plan = build_install_plan(pepe, endpoints=endpoints)
+
+    install_summaries = {
+        step.target: step.summary for step in plan.steps if step.action is PlanAction.INSTALL
+    }
+    assert install_summaries == {
+        "comfyui": "Install comfyui and reserve local port 18188.",
+        "ollama": "Install ollama and reserve local port 12434.",
+        "open-webui": "Install open-webui and reserve local port 18080.",
+    }
 
 
 def test_plan_adds_a_layout_step_for_the_resolved_root(pepe, tmp_path):

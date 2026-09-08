@@ -190,6 +190,11 @@ def open_webui_control_spec(
         logs = service_log_files(layout, OPEN_WEBUI_SPEC.id)
     if data_dir is None and layout is not None:
         data_dir = layout.open_webui_data
+    if cwd is None and layout is not None:
+        # Open WebUI 0.11.3 stores .webui_secret_key under Path.cwd(), not
+        # DATA_DIR. Keep that runtime state inside the managed data tree so a
+        # launch from a checkout cannot write into or depend on the repo.
+        cwd = layout.open_webui_data
     launch = open_webui_launch_spec(
         executable,
         host=host,

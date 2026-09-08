@@ -57,6 +57,7 @@ def test_open_webui_control_spec_wires_health_process_and_logs(layout):
     assert spec.service.endpoint == "http://127.0.0.1:8080/health"
     assert spec.launch.logs.stdout == layout.log_file("open-webui")
     assert spec.launch.env["DATA_DIR"] == str(layout.open_webui_data)
+    assert spec.launch.cwd == layout.open_webui_data
     assert spec.launch.startup_timeout == OPEN_WEBUI_STARTUP_TIMEOUT
 
 

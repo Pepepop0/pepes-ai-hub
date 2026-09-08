@@ -15,7 +15,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
-from helpers import NOTHING_LISTENING, http_failing, running, tcp_answering
+from helpers import NOTHING_LISTENING, http_failing, listening, running, tcp_answering
 
 from local_ai_stack.catalog import repository_for
 from local_ai_stack.execution import PlanExecutor
@@ -167,7 +167,12 @@ def test_external_ollama_is_external_on_both_sides(tmp_path):
     assert handoff.executable is None
 
     # And the runtime's own discovery agrees, with no managed pid claimed.
-    controller = make_controller(tmp_path, context, processes=running(EXTERNAL_PROC))
+    controller = make_controller(
+        tmp_path,
+        context,
+        processes=running(EXTERNAL_PROC),
+        listeners=listening(11434, pid=EXTERNAL_PROC.pid),
+    )
     status = controller.status(OLLAMA_SPEC.id)
     assert status.runtime.state is RuntimeProcessState.RUNNING
     assert status.origin is ProcessOrigin.EXTERNAL
@@ -206,7 +211,11 @@ def test_managed_start_conflicts_with_an_already_running_external_ollama(tmp_pat
     install_managed(context)
     registry = ManagedProcessRegistry(tmp_path / "state" / "managed-processes.json")
     controller = make_controller(
-        tmp_path, context, registry=registry, processes=running(EXTERNAL_PROC)
+        tmp_path,
+        context,
+        registry=registry,
+        processes=running(EXTERNAL_PROC),
+        listeners=listening(11434, pid=EXTERNAL_PROC.pid),
     )
 
     report = controller.start(OLLAMA_SPEC.id)
@@ -219,7 +228,12 @@ def test_managed_start_conflicts_with_an_already_running_external_ollama(tmp_pat
 
 def test_stopping_external_ollama_is_refused(tmp_path):
     context, _ = external_context(tmp_path)
-    controller = make_controller(tmp_path, context, processes=running(EXTERNAL_PROC))
+    controller = make_controller(
+        tmp_path,
+        context,
+        processes=running(EXTERNAL_PROC),
+        listeners=listening(11434, pid=EXTERNAL_PROC.pid),
+    )
     result = controller.stop(OLLAMA_SPEC.id)
     assert result.outcome is StopOutcome.NOT_MANAGED
     assert result.pid == EXTERNAL_PROC.pid

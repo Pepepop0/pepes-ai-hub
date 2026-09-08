@@ -161,6 +161,18 @@ def discover_process(
             listener.pid for listener in listener_report.on_port(spec.port) if listener.pid
         }
 
+        # A process name identifies the product, not one particular service
+        # instance.  When two Ollama/ComfyUI instances coexist on different
+        # ports, every matching executable on the machine must not make both
+        # endpoints look occupied.  A trustworthy listener scan scopes
+        # external candidates to this endpoint; registered roots remain
+        # visible while they are still starting and have not opened the port.
+        matched = [
+            process
+            for process in matched
+            if process.pid in listener_pids or process.pid in managed_pids
+        ]
+
     # Whatever holds the service port is the service, even under a name we do
     # not recognise (custom launcher, renamed binary, wrapper script).
     known_pids = {p.pid for p in matched}

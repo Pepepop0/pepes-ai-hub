@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from helpers import NO_LISTENER_SCAN, NO_PROCESS_SCAN, NOTHING_LISTENING, listening, running
 
-from local_ai_stack.inventory import ProcessInfo
+from local_ai_stack.inventory import Listener, ListenerReport, ProcessInfo, ScanOutcome
 from local_ai_stack.processes import (
     COMFYUI_PROCESS,
     DEFAULT_PROCESS_SPECS,
@@ -97,14 +97,53 @@ def test_no_process_found_is_stopped():
     assert status.pid is None
 
 
-def test_multiple_candidate_processes_are_all_reported():
+def test_port_scoped_discovery_reports_only_the_process_serving_that_endpoint():
     status = discover_process(
         OLLAMA_PROCESS,
         processes=running(OLLAMA_TRAY, OLLAMA_SERVE, UNRELATED),
         listeners=listening(11434, pid=OLLAMA_SERVE.pid),
     )
     assert status.state is RuntimeProcessState.RUNNING
-    assert status.pids == (OLLAMA_SERVE.pid, OLLAMA_TRAY.pid)
+    assert status.pids == (OLLAMA_SERVE.pid,)
+
+
+def test_same_executable_on_another_port_does_not_occupy_managed_endpoint():
+    managed = RuntimeProcessSpec(
+        service_id=OLLAMA_PROCESS.service_id,
+        name=OLLAMA_PROCESS.name,
+        executables=OLLAMA_PROCESS.executables,
+        cmdline_markers=OLLAMA_PROCESS.cmdline_markers,
+        port=12434,
+    )
+
+    status = discover_process(
+        managed,
+        processes=running(OLLAMA_TRAY, OLLAMA_SERVE),
+        listeners=listening(11434, pid=OLLAMA_SERVE.pid),
+    )
+
+    assert status.state is RuntimeProcessState.STOPPED
+    assert status.processes == ()
+
+
+def test_managed_root_remains_visible_before_its_listener_opens():
+    managed = RuntimeProcessSpec(
+        service_id=OLLAMA_PROCESS.service_id,
+        name=OLLAMA_PROCESS.name,
+        executables=OLLAMA_PROCESS.executables,
+        cmdline_markers=OLLAMA_PROCESS.cmdline_markers,
+        port=12434,
+    )
+
+    status = discover_process(
+        managed,
+        processes=running(OLLAMA_SERVE),
+        listeners=NOTHING_LISTENING,
+        managed_pids=frozenset({OLLAMA_SERVE.pid}),
+    )
+
+    assert status.state is RuntimeProcessState.RUNNING
+    assert status.origin is ProcessOrigin.MANAGED
 
 
 def test_process_holding_the_port_counts_even_under_an_unknown_name():
@@ -157,7 +196,13 @@ def test_spec_without_port_falls_back_to_process_matching_only():
 def test_discover_processes_returns_one_status_per_spec():
     statuses = discover_processes(
         processes=running(OLLAMA_SERVE, COMFY_DESKTOP),
-        listeners=listening(11434, 8188),
+        listeners=ListenerReport(
+            ScanOutcome.OK,
+            (
+                Listener("127.0.0.1", 11434, OLLAMA_SERVE.pid),
+                Listener("127.0.0.1", 8188, COMFY_DESKTOP.pid),
+            ),
+        ),
     )
     by_id = {s.service_id: s for s in statuses}
     assert by_id["ollama"].state is RuntimeProcessState.RUNNING

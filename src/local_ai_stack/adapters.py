@@ -146,12 +146,12 @@ def open_webui_launch_spec(
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
     allow_force_kill: bool = False,
 ) -> ProcessLaunchSpec:
-    """``open-webui serve``, configured the way upstream documents.
+    """``open-webui serve`` bound to an explicit endpoint and data directory.
 
-    HOST, PORT and DATA_DIR are environment variables Open WebUI reads on every
-    supported install path, including the ``uvx`` one, so the same spec works
-    whether the executable is a console script or a launcher. ``args`` exists
-    for the uvx form, where the executable takes arguments of its own.
+    Open WebUI 0.11.3's Typer command accepts host and port as CLI options; it
+    does not read the same-named environment variables for those parameters.
+    Keep the variables for compatible launchers, but make the supported CLI
+    contract authoritative. ``args`` also covers the uvx prefix form.
     """
     child_env: dict[str, str] = {"HOST": host, "PORT": str(port)}
     if data_dir is not None:
@@ -160,7 +160,7 @@ def open_webui_launch_spec(
         child_env.update(env)
     return ProcessLaunchSpec(
         service_id=OPEN_WEBUI_SPEC.id,
-        argv=(str(executable), *args),
+        argv=(str(executable), *args, "--host", host, "--port", str(port)),
         cwd=cwd,
         env=child_env,
         logs=logs,

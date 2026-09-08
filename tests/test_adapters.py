@@ -33,9 +33,9 @@ def layout(tmp_path) -> StackLayout:
 # --- Open WebUI ------------------------------------------------------------
 
 
-def test_open_webui_is_configured_through_its_documented_environment(layout):
+def test_open_webui_is_bound_through_supported_cli_and_managed_environment(layout):
     spec = open_webui_launch_spec(EXECUTABLE, port=8081, data_dir=layout.open_webui_data)
-    assert spec.argv == (EXECUTABLE, "serve")
+    assert spec.argv == (EXECUTABLE, "serve", "--host", "127.0.0.1", "--port", "8081")
     assert spec.env["HOST"] == "127.0.0.1"
     assert spec.env["PORT"] == "8081"
     assert spec.env["DATA_DIR"] == str(layout.open_webui_data)
@@ -47,7 +47,17 @@ def test_open_webui_accepts_a_different_invocation(layout):
     spec = open_webui_launch_spec(
         EXECUTABLE, args=("--python", "3.11", "open-webui@latest", "serve")
     )
-    assert spec.argv == (EXECUTABLE, "--python", "3.11", "open-webui@latest", "serve")
+    assert spec.argv == (
+        EXECUTABLE,
+        "--python",
+        "3.11",
+        "open-webui@latest",
+        "serve",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8080",
+    )
 
 
 def test_open_webui_control_spec_wires_health_process_and_logs(layout):

@@ -534,7 +534,14 @@ def test_a_managed_web_app_becomes_controllable_with_no_change_here(tmp_path):
     specs = {spec.service_id: spec for spec in control_specs_for(snapshot, layout=layout)}
     open_webui = specs["open-webui"]
     assert open_webui.controllable
-    assert open_webui.launch.argv == (sys.executable, "serve")
+    assert open_webui.launch.argv == (
+        sys.executable,
+        "serve",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8080",
+    )
     assert open_webui.launch.env["DATA_DIR"] == str(layout.open_webui_data)
     assert open_webui.launch.logs.stdout == layout.log_file("open-webui")
     # The others are untouched by one component becoming available.
@@ -569,7 +576,14 @@ def test_managed_open_webui_handoff_drives_its_runtime_spec(tmp_path):
     ]
     assert spec.controllable
     assert spec.launch is not None
-    assert spec.launch.argv == (str(executable), "serve")
+    assert spec.launch.argv == (
+        str(executable),
+        "serve",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8080",
+    )
     assert spec.launch.env["DATA_DIR"] == str(context.layout.open_webui_data)
 
 

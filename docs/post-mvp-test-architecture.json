@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Arquitetura da fase de testes pós-MVP",
+    "output": "post-mvp-test-architecture.html",
+    "quality_profile": "showcase",
+    "viewBox": [1240, 760],
+    "views": [
+      {
+        "id": "harness",
+        "label": "Harness E2E",
+        "focus": ["scenario", "harness", "application", "domains", "managed-root", "report"],
+        "note": "Fases isoladas reutilizam os domínios existentes e produzem um relatório estruturado."
+      },
+      {
+        "id": "control-api",
+        "label": "Test Control API",
+        "focus": ["test-client", "control-api", "application", "events", "report"],
+        "note": "Interface local autenticada, opt-in e sem autoridade adicional sobre o runtime."
+      },
+      {
+        "id": "security",
+        "label": "Limite de segurança",
+        "focus": ["control-api", "application", "domains", "managed-root", "external"],
+        "note": "Paths, executáveis e ownership continuam validados pelos contratos do produto."
+      }
+    ]
+  },
+  "components": [
+    {"id": "scenario", "type": "external", "label": "Scenario runner", "sublabel": "Claude 1", "pos": [40, 150], "size": [150, 68]},
+    {"id": "harness", "type": "backend", "label": "E2E Test Harness", "sublabel": "fases + failure injection", "pos": [250, 150], "size": [180, 68]},
+    {"id": "test-client", "type": "external", "label": "Cliente de teste", "sublabel": "Claude 2 / túnel futuro", "pos": [40, 500], "size": [150, 68]},
+    {"id": "control-api", "type": "security", "label": "Test Control API", "sublabel": "127.0.0.1 + token + opt-in", "pos": [250, 500], "size": [180, 68]},
+    {"id": "application", "type": "backend", "label": "Application services", "sublabel": "mesma composição da TUI", "pos": [460, 310], "size": [180, 74]},
+    {"id": "domains", "type": "backend", "label": "Domínios existentes", "sublabel": "plan · provision · models · config · runtime", "pos": [700, 170], "size": [220, 78]},
+    {"id": "smokes", "type": "backend", "label": "Smoke adapters", "sublabel": "chat · image", "pos": [700, 450], "size": [220, 70]},
+    {"id": "events", "type": "messagebus", "label": "Event stream", "sublabel": "SSE: lifecycle · progress · run", "pos": [460, 560], "size": [180, 70]},
+    {"id": "managed-root", "type": "database", "label": "Managed test root", "sublabel": "apps · models · data · logs · state", "pos": [990, 170], "size": [210, 78]},
+    {"id": "external", "type": "external", "label": "Providers externos", "sublabel": "observation-only", "pos": [990, 330], "size": [210, 64]},
+    {"id": "report", "type": "database", "label": "Structured report", "sublabel": "resultados + referências de logs", "pos": [990, 500], "size": [210, 70]}
+  ],
+  "boundaries": [
+    {"kind": "security-group", "label": "Somente dev/test local", "wraps": ["control-api", "events"], "pad": 24},
+    {"kind": "region", "label": "Autoridade managed do Hub", "wraps": ["application", "domains", "smokes", "managed-root", "report"], "pad": 28}
+  ],
+  "connections": [
+    {"id": "scenario-harness", "from": "scenario", "to": "harness", "label": "executa cenário", "variant": "emphasis", "labelAt": [220, 232]},
+    {"id": "harness-app", "from": "harness", "to": "application", "label": "chama fases", "variant": "emphasis"},
+    {"id": "client-api", "from": "test-client", "to": "control-api", "label": "HTTP + bearer token", "variant": "security", "labelAt": [220, 582]},
+    {"id": "api-app", "from": "control-api", "to": "application", "label": "comandos tipados", "variant": "security"},
+    {"id": "app-domains", "from": "application", "to": "domains", "label": "contratos existentes", "variant": "emphasis"},
+    {"id": "app-smokes", "from": "application", "to": "smokes", "label": "operações funcionais"},
+    {"id": "domains-root", "from": "domains", "to": "managed-root", "label": "somente paths managed", "labelAt": [955, 150]},
+    {"id": "application-events", "from": "application", "to": "events", "label": "publica progresso", "labelAt": [550, 398]},
+    {"id": "events-api", "from": "events", "to": "control-api", "label": "SSE", "variant": "dashed"},
+    {"id": "domains-report", "from": "domains", "to": "report", "label": "resultados por fase", "fromSide": "bottom", "toSide": "left", "via": [[810, 420], [950, 420], [950, 535]], "labelAt": [880, 410]},
+    {"id": "smokes-report", "from": "smokes", "to": "report", "label": "latência + artefatos", "labelAt": [955, 584]},
+    {"id": "root-external", "from": "managed-root", "to": "external", "label": "observa; nunca adota", "variant": "dashed", "labelAt": [1095, 300]}
+  ]
+}

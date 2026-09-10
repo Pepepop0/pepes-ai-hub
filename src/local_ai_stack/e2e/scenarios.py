@@ -29,7 +29,6 @@ from ..test_contracts import (
     TestRunState,
 )
 from .fixtures import (
-    BROKEN_WORKFLOW_PROFILE,
     CHAT_DIGEST,
     CHAT_ONLY_PROFILE,
     CHAT_REFERENCE,
@@ -456,7 +455,9 @@ def _verify_external(component: str) -> Verifier:
 
 
 def _port_collision() -> ScenarioSetup:
-    world = controlled_world(injections=InjectionPlan.of(Injection.PORT_OCCUPIED))
+    # A port somebody else already owns is what the world *is*, not a
+    # dependency misbehaving, so it is built rather than injected.
+    world = controlled_world()
     world.inventory.occupy(MANAGED_OLLAMA_PORT)
     return ScenarioSetup(
         world, _spec(*INSTALL_PHASES), "an unrelated listener owns the managed port"
@@ -680,10 +681,10 @@ def _verify_missing_model(report: TestRunReport, world: ControlledWorld) -> list
 
 
 def _cuda_unavailable() -> ScenarioSetup:
+    # Likewise: a machine without a usable device is a world, not an injection.
     world = controlled_world(
         ready_ports=[MANAGED_OLLAMA_PORT, MANAGED_COMFYUI_PORT],
         cuda=False,
-        injections=InjectionPlan.of(Injection.CUDA_UNAVAILABLE),
     )
     return ScenarioSetup(
         world,
@@ -819,41 +820,78 @@ def _verify_corrupted_config(report: TestRunReport, world: ControlledWorld) -> l
     return problems
 
 
-def _invalid_workflow() -> ScenarioSetup:
-    world, fixture = _configurable_world(
-        BROKEN_WORKFLOW_PROFILE, InjectionPlan.of(Injection.INVALID_WORKFLOW)
+WORKFLOW_PHASES = (
+    TestPhase.PREFLIGHT,
+    TestPhase.PLAN,
+    TestPhase.PROVISION,
+    TestPhase.ACQUIRE_MODELS,
+    TestPhase.CONFIGURE,
+    TestPhase.IMAGE_SMOKE,
+)
+
+
+def _workflow_world(injections: InjectionPlan):
+    """The image stack, with the workflow-source seam under the given plan.
+
+    Every model this profile declares is installed and verified for real, so a
+    failure here can only be about the workflow. The identical world with the
+    injection off runs green, which is the control this row needs.
+    """
+    fixture = repo_fixture(STACK_PROFILE, injections=injections)
+    world = controlled_world(
+        ready_ports=[MANAGED_OLLAMA_PORT, MANAGED_COMFYUI_PORT],
+        repo_root=fixture.path,
+        injections=injections,
+        fixture_models=True,
+        ollama_models=[_ollama_entry()],
     )
+    world.external = fixture  # the seam's own record, read back by the verifier
+    return world, fixture
+
+
+def _invalid_workflow() -> ScenarioSetup:
+    world, fixture = _workflow_world(InjectionPlan.of(Injection.INVALID_WORKFLOW))
     return ScenarioSetup(
         world,
-        _spec(*CONFIG_PHASES, profile=BROKEN_WORKFLOW_PROFILE),
-        "the declared image workflow requires model roles nothing declares",
+        _spec(*WORKFLOW_PHASES, profile=STACK_PROFILE, gpu=True),
+        "the declared graph no longer contains the node its model binding names",
         fixture.release,
     )
 
 
 def _verify_invalid_workflow(report: TestRunReport, world: ControlledWorld) -> list[str]:
-    """Not ready, so not configured, so never offered to a runtime."""
+    """A structural defect in the graph, with every model available."""
     problems = _cleanup_problems(report) + _no_residual(world)
+
+    fixture = world.external
+    if not getattr(fixture, "broken_nodes", ()):
+        problems.append("the workflow-source seam never corrupted the graph")
+
+    # Not a missing model in disguise: acquisition succeeded.
+    acquire = _phase(report, TestPhase.ACQUIRE_MODELS)
+    if acquire is None or acquire.outcome is not TestPhaseOutcome.PASSED:
+        problems.append("the models were never installed, so this could be a missing-model row")
+
     configure = _phase(report, TestPhase.CONFIGURE)
     if configure is None:
         return problems + ["configure never ran"]
     if configure.outcome is not TestPhaseOutcome.FAILED:
-        problems.append(f"an unusable workflow did not fail configuration: {configure.outcome}")
-
-    actions = {item["target"]: item for item in configure.data.get("actions", [])}
-    workflow = actions.get("text_to_image")
-    if workflow is None:
-        problems.append("the workflow action never ran")
-    elif workflow["ok"]:
-        problems.append(f"the workflow reported itself usable: {workflow['detail']}")
-    elif "model-not-declared" not in workflow["detail"]:
-        problems.append(f"the workflow state was not the reported reason: {workflow['detail']}")
+        problems.append(f"an invalid workflow did not fail configuration: {configure.outcome}")
+    if "does not match its template" not in configure.detail:
+        problems.append(f"the template mismatch was not the reported reason: {configure.detail}")
+    for role, value in configure.data.get("roles", {}).items():
+        if role.startswith("image.") and value.get("state") != "available":
+            problems.append(f"{role} was {value.get('state')}, so the models are the real reason")
 
     if getattr(world.config_writer, "tampered", None):
-        problems.append("configuration was written for a run with an unusable workflow")
-    smoke = _phase(report, TestPhase.CHAT_SMOKE)
-    if smoke is not None and smoke.outcome is not TestPhaseOutcome.SKIPPED:
-        problems.append(f"runtime ran after an unusable workflow: {smoke.outcome}")
+        problems.append("configuration was written for a run with an invalid workflow")
+    image = _phase(report, TestPhase.IMAGE_SMOKE)
+    if image is None:
+        problems.append("image_smoke is not present in the report")
+    elif image.outcome is not TestPhaseOutcome.SKIPPED:
+        problems.append(f"the runtime was offered an image capability: {image.outcome}")
+    if world.comfyui.submissions:
+        problems.append("a workflow was submitted despite being invalid")
     return problems
 
 
@@ -966,7 +1004,7 @@ P0_SCENARIOS: tuple[Scenario, ...] = (
     ),
     Scenario(
         "invalid-workflow",
-        "Invalid workflow",
+        "Invalid workflow template",
         _invalid_workflow,
         _verify_invalid_workflow,
         phase=TestPhase.CONFIGURE,

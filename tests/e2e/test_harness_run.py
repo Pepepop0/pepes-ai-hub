@@ -360,7 +360,7 @@ def test_a_failing_run_never_deletes_a_configured_root(tmp_path):
 
 def test_the_harness_cannot_be_given_injections_of_its_own():
     """A second plan could name an injection no seam ever received."""
-    world = controlled_world(injections=InjectionPlan.of(Injection.PORT_OCCUPIED))
+    world = controlled_world(injections=InjectionPlan.of(Injection.READINESS_TIMEOUT))
     harness = StackTestHarness(world)
     assert harness.injections is world.injections
     with pytest.raises(TypeError):
@@ -389,7 +389,7 @@ def test_a_declared_injection_really_reached_its_seam():
 
 
 def test_a_blocked_precondition_stops_every_mutating_phase():
-    world = controlled_world(injections=InjectionPlan.of(Injection.PORT_OCCUPIED))
+    world = controlled_world()
     world.inventory.occupy(OLLAMA_PORT)
     report = run(world, Phase.PREFLIGHT, Phase.PLAN, Phase.PROVISION)
 
@@ -401,7 +401,7 @@ def test_a_blocked_precondition_stops_every_mutating_phase():
 
 
 def test_a_blocked_phase_keeps_its_diagnostics():
-    world = controlled_world(injections=InjectionPlan.of(Injection.PORT_OCCUPIED))
+    world = controlled_world()
     world.inventory.occupy(OLLAMA_PORT)
     report = run(world, Phase.PREFLIGHT, Phase.PLAN)
     preflight = next(item for item in report.phases if item.phase is Phase.PREFLIGHT)
@@ -549,7 +549,12 @@ def test_an_unusable_workflow_never_reports_itself_ready():
     assert configure.outcome is Outcome.FAILED
     workflow = next(item for item in configure.data["actions"] if item["target"] == "text_to_image")
     assert not workflow["ok"]
-    assert "model-not-declared" in workflow["detail"]
+    # A structural defect in the graph, not an absent model.
+    assert "75:70" in workflow["detail"]
+    roles = configure.data["roles"]
+    assert all(
+        value["state"] == "available" for role, value in roles.items() if role.startswith("image.")
+    )
 
 
 def test_an_unusable_workflow_leaves_no_configuration_behind():
@@ -911,3 +916,31 @@ def test_a_launcher_that_started_something_is_released_without_a_context(monkeyp
     assert report.state is RunState.FAILED
     assert launcher.closed, "the launcher was never released"
     assert not world.root.exists()
+
+
+def test_a_workflow_whose_model_roles_are_undeclared_also_fails_closed():
+    """The other way a workflow can be unusable. Not the P0 row, still true."""
+    from local_ai_stack.e2e.fixtures import BROKEN_WORKFLOW_PROFILE, repo_fixture
+
+    fixture = repo_fixture(BROKEN_WORKFLOW_PROFILE)
+    world = controlled_world(
+        ready_ports=[OLLAMA_PORT],
+        repo_root=fixture.path,
+        ollama_models=[
+            OllamaModelEntry(name="hermes3:8b", digest="4f6b83f30b62aaaa", size_bytes=1)
+        ],
+    )
+    try:
+        report = StackTestHarness(world).run(
+            new_run_id(),
+            RunSpec(
+                profile_id=BROKEN_WORKFLOW_PROFILE,
+                phases=(Phase.PREFLIGHT, Phase.PLAN, Phase.PROVISION, Phase.CONFIGURE),
+            ),
+        )
+        configure = phase_of(report, Phase.CONFIGURE)
+        assert configure.outcome is Outcome.FAILED
+        assert "model-not-declared" in configure.detail
+    finally:
+        world.root.release()
+        fixture.release()

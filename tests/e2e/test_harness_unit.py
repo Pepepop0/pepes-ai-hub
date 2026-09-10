@@ -123,9 +123,9 @@ def test_every_injection_declares_the_seam_it_acts_through():
 
 
 def test_an_injection_plan_names_itself_deterministically():
-    plan = InjectionPlan.of(Injection.SERVICE_CRASH, Injection.PORT_OCCUPIED)
-    assert plan.names == ("port-occupied", "service-crash")
-    assert plan.names == InjectionPlan.of(Injection.PORT_OCCUPIED, Injection.SERVICE_CRASH).names
+    plan = InjectionPlan.of(Injection.SERVICE_CRASH, Injection.MODEL_MISSING)
+    assert plan.names == ("model-missing", "service-crash")
+    assert plan.names == InjectionPlan.of(Injection.MODEL_MISSING, Injection.SERVICE_CRASH).names
 
 
 def test_an_empty_plan_is_falsy_and_names_nothing():
@@ -429,3 +429,136 @@ def test_the_whole_p0_matrix_leaves_nothing_outstanding():
     before = set(tracking.outstanding())
     ScenarioRunner().run_all()
     assert set(tracking.outstanding()) - before == set()
+
+
+# --- nenhuma injection decorativa -------------------------------------------
+
+MODEL_URL = "https://controlled.invalid/models/probe.bin"
+
+
+def _observe(injection, plan):
+    """Exercise the seam this injection acts through and return what it did.
+
+    One probe per injection, hitting the same seam the production path hits.
+    Comparing the observation with and without the plan is what proves the
+    injection is not decorative: if both are equal, running with it changes
+    nothing and it must not be declared.
+    """
+    import httpx
+
+    from local_ai_stack.download import Downloader
+    from local_ai_stack.e2e import tracking
+    from local_ai_stack.e2e.fixtures import STACK_PROFILE, fixture_model_catalog, repo_fixture
+    from local_ai_stack.e2e.providers import (
+        ControlledArtifacts,
+        ControlledConfigWriter,
+        ControlledEndpoints,
+        ControlledInventory,
+        ControlledLauncher,
+        ControlledModelInstaller,
+        ControlledOllama,
+        ControlledViolation,
+    )
+    from local_ai_stack.managed_config import env_document
+    from local_ai_stack.models import ManagedModelPaths
+    from local_ai_stack.ollama_models import OllamaModelEntry
+
+    if injection in (Injection.DOWNLOAD_INTERRUPTED, Injection.CHECKSUM_MISMATCH):
+        artifacts = ControlledArtifacts()
+        artifacts.register_model(MODEL_URL, b"payload-for-the-probe")
+        with httpx.Client(transport=artifacts.transport(plan)) as client:
+            try:
+                return ("body", client.get(MODEL_URL).content)
+            except httpx.HTTPError as exc:
+                return ("raised", type(exc).__name__)
+
+    if injection is Injection.CONFIG_TAMPERED:
+        root = tracking.make("pepito-e2e-probe-")
+        try:
+            writer = ControlledConfigWriter(plan)
+            document = env_document(root / "probe.env", {"A": "1"})
+            writer.apply([document])
+            return ("verified", writer.verify([document]).ok)
+        finally:
+            tracking.release([root])
+
+    if injection is Injection.INVALID_WORKFLOW:
+        fixture = repo_fixture(STACK_PROFILE, injections=plan)
+        try:
+            return ("broken_nodes", fixture.broken_nodes)
+        finally:
+            fixture.release()
+
+    if injection is Injection.READINESS_TIMEOUT:
+        endpoints = ControlledEndpoints(ready={21434}, plan=plan)
+        return ("probe", str(endpoints.http("http://127.0.0.1:21434/x", 1.0).outcome))
+
+    if injection is Injection.SERVICE_CRASH:
+        inventory = ControlledInventory()
+        endpoints = ControlledEndpoints(ready={21434})
+        registry = type("R", (), {"register": lambda *a: None, "unregister": lambda *a: None})()
+        launcher = ControlledLauncher(
+            registry, inventory, plan=plan, ready_port=21434, endpoints=endpoints
+        )
+        launcher.start(type("S", (), {"service_id": "ollama", "executable": "ollama.exe"})())
+        endpoints.tcp("127.0.0.1", 21434, 1.0)
+        endpoints.tcp("127.0.0.1", 21434, 1.0)
+        return ("alive", launcher.pid in inventory.pids())
+
+    if injection is Injection.MODEL_MISSING:
+        store = ControlledOllama(
+            installed=[OllamaModelEntry(name="hermes3:8b", digest="d", size_bytes=1)], plan=plan
+        )
+        return ("store", tuple(entry.name for entry in store.list_models()))
+
+    if injection is Injection.MODEL_TAMPERED:
+        root = tracking.make("pepito-e2e-probe-")
+        try:
+            artifacts = ControlledArtifacts()
+            catalog = fixture_model_catalog(artifacts.register_model)
+            spec = catalog.require(catalog.normalize("comfyui/e2e_diffusion"))
+            installer = ControlledModelInstaller(
+                ManagedModelPaths(root),
+                downloader=Downloader(client_factory=artifacts.client_factory(), max_attempts=1),
+                injections=plan,
+            )
+            installer.apply(spec)
+            return ("state", str(installer.detect(spec).state))
+        finally:
+            tracking.release([root])
+
+    if injection in (Injection.STOP_FAILURE, Injection.CLEANUP_FAILURE):
+        inventory = ControlledInventory()
+        registry = type("R", (), {"register": lambda *a: None, "unregister": lambda *a: None})()
+        launcher = ControlledLauncher(registry, inventory, plan=plan)
+        if injection is Injection.STOP_FAILURE:
+            return ("stop", str(launcher.stop("ollama").outcome))
+        try:
+            launcher.close_all()
+            return ("closed", True)
+        except ControlledViolation:
+            return ("closed", "raised")
+
+    raise AssertionError(f"{injection} has no seam probe, so it cannot be proved effective")
+
+
+@pytest.mark.parametrize("injection", list(Injection), ids=lambda item: item.value)
+def test_every_declared_injection_is_observable_at_its_seam(injection):
+    """Declared and not consumed is worse than not declared at all."""
+    without = _observe(injection, InjectionPlan.none())
+    with_it = _observe(injection, InjectionPlan.of(injection))
+    assert without != with_it, (
+        f"{injection} produced {without!r} either way, so the report would name "
+        "an injection that changed nothing"
+    )
+
+
+def test_every_injection_still_declares_the_seam_it_acts_through():
+    assert set(SEAM_FOR) == set(Injection)
+
+
+def test_no_injection_exists_for_something_that_is_just_a_world():
+    """A busy port and a machine without CUDA are worlds, not injections."""
+    names = {item.value for item in Injection}
+    assert "port-occupied" not in names
+    assert "cuda-unavailable" not in names

@@ -19,6 +19,7 @@ something the run installed.
 
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,8 @@ from ..models import (
     ModelProvider,
     ModelSpec,
 )
+from ..workflows import WorkflowParameter, load_workflow_manifest
+from .seams import Injection, InjectionPlan
 from .tracking import EXTERNAL_PREFIX, REPO_PREFIX, forget, make
 
 FIXTURE_PREFIX = REPO_PREFIX
@@ -72,6 +75,10 @@ FIXTURE_MODELS = (
 )
 
 MODEL_URL = "https://controlled.invalid/models/{filename}"
+
+# The workflow the image profile declares, and therefore the graph the
+# workflow-source seam corrupts.
+IMAGE_WORKFLOW_ID = "flux2_klein_t2i"
 
 # Where each provisioner looks for an installation it does not own. These
 # are the provisioner's own hints, so an external fixture is found by the
@@ -321,20 +328,34 @@ class RepoFixture:
 
     path: Path
     profile_id: str
+    # Node ids the workflow-source seam removed, empty when nothing was injected.
+    broken_nodes: tuple[str, ...] = ()
 
     def release(self) -> None:
         shutil.rmtree(self.path, ignore_errors=True)
         forget(self.path)
 
 
-def repo_fixture(profile_id: str, *, source: Path | None = None) -> RepoFixture:
-    """Copy the real manifests and graphs, then declare one fixture profile."""
+def repo_fixture(
+    profile_id: str,
+    *,
+    source: Path | None = None,
+    injections: InjectionPlan | None = None,
+) -> RepoFixture:
+    """Copy the real manifests and graphs, then declare one fixture profile.
+
+    This is the ``workflow-source`` seam: what a run reads its profiles,
+    manifests and workflow graphs from. Under ``INVALID_WORKFLOW`` the graph it
+    copies is corrupted on the way in, so the workflow domain is handed a real
+    template that no longer matches its own manifest.
+    """
     try:
         body = PROFILE_YAML[profile_id]
     except KeyError:
         known = ", ".join(sorted(PROFILE_YAML))
         raise KeyError(f"unknown fixture profile {profile_id!r}; known: {known}") from None
 
+    plan = injections or InjectionPlan.none()
     origin = Path(source) if source is not None else detect_repo_root()
     root = make(FIXTURE_PREFIX)
     for name in COPIED:
@@ -342,7 +363,36 @@ def repo_fixture(profile_id: str, *, source: Path | None = None) -> RepoFixture:
     profiles = root / "profiles"
     profiles.mkdir()
     (profiles / f"{profile_id}.yaml").write_text(body, encoding="utf-8")
-    return RepoFixture(path=root, profile_id=profile_id)
+
+    broken = ()
+    if plan.active(Injection.INVALID_WORKFLOW):
+        broken = break_workflow_template(root)
+    return RepoFixture(path=root, profile_id=profile_id, broken_nodes=broken)
+
+
+def break_workflow_template(root: Path, *, workflow: str = IMAGE_WORKFLOW_ID) -> tuple[str, ...]:
+    """Remove the node the manifest's model binding addresses.
+
+    A structural defect, not a missing model: the manifest still declares
+    ``model -> node 75:70, unet_name`` and the graph no longer has that node, so
+    the binding addresses nothing. ``verify_workflow_references`` is what says
+    that, here as everywhere else -- this only edits the file.
+
+    Returns the node ids it removed, so a scenario can prove the corruption
+    happened rather than assume it.
+    """
+    specs = load_workflow_manifest(root / "manifests" / "workflows.yaml")
+    spec = specs[workflow]
+    template = root / spec.file
+    graph = json.loads(template.read_text(encoding="utf-8"))
+
+    removed = []
+    node_id = spec.binding(WorkflowParameter.MODEL).node_id
+    if node_id in graph:
+        del graph[node_id]
+        removed.append(node_id)
+    template.write_text(json.dumps(graph, indent=2) + "\n", encoding="utf-8")
+    return tuple(removed)
 
 
 __all__ = [
@@ -353,10 +403,12 @@ __all__ = [
     "EXTERNAL_LAYOUT",
     "FIXTURE_MODELS",
     "FIXTURE_PREFIX",
+    "IMAGE_WORKFLOW_ID",
     "PROFILE_YAML",
     "STACK_PROFILE",
     "ExternalInstall",
     "RepoFixture",
+    "break_workflow_template",
     "external_install",
     "fixture_model_catalog",
     "fixture_model_payload",

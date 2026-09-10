@@ -17,6 +17,15 @@ Every injection obeys four rules from the contract:
 
 The last rule is the important one. An injection makes a dependency misbehave;
 it never makes the hub lie about who owns a process.
+
+There is a fifth rule, learned the hard way: **an injection that nothing
+consumes must not exist.** A port already owned by somebody else, or a machine
+without CUDA, is not a dependency misbehaving -- it is what the world *is*, and
+a scenario says so by building that world (``controlled_world(cuda=False)``, an
+occupied listener in the inventory). Declaring an injection for it put a name
+in the report that no seam ever read, so running with and without it produced
+identical behaviour. Every member below is consumed by a seam, and a
+parametrised test proves each one is observable there.
 """
 
 from __future__ import annotations
@@ -40,21 +49,17 @@ class Seam(StrEnum):
     MODEL_STORE = "model-store"
     CLOCK = "clock"
     EVENT_SINK = "event-sink"
-    SYSTEM_FACTS = "system-facts"
-    LISTENER_SCAN = "listener-scan"
 
 
 class Injection(StrEnum):
     """The failures the P0 matrix requires us to be able to cause."""
 
-    PORT_OCCUPIED = "port-occupied"
     DOWNLOAD_INTERRUPTED = "download-interrupted"
     CHECKSUM_MISMATCH = "checksum-mismatch"
     CONFIG_TAMPERED = "config-tampered"
     INVALID_WORKFLOW = "invalid-workflow"
     READINESS_TIMEOUT = "readiness-timeout"
     SERVICE_CRASH = "service-crash"
-    CUDA_UNAVAILABLE = "cuda-unavailable"
     MODEL_MISSING = "model-missing"
     MODEL_TAMPERED = "model-tampered"
     STOP_FAILURE = "stop-failure"
@@ -66,14 +71,12 @@ class Injection(StrEnum):
 # explicit rather than implied by the implementation.
 SEAM_FOR: Mapping[Injection, Seam] = MappingProxyType(
     {
-        Injection.PORT_OCCUPIED: Seam.LISTENER_SCAN,
         Injection.DOWNLOAD_INTERRUPTED: Seam.HTTP_TRANSPORT,
         Injection.CHECKSUM_MISMATCH: Seam.HTTP_TRANSPORT,
         Injection.CONFIG_TAMPERED: Seam.CONFIG_WRITE,
         Injection.INVALID_WORKFLOW: Seam.WORKFLOW_SOURCE,
         Injection.READINESS_TIMEOUT: Seam.RUNTIME_PROBE,
         Injection.SERVICE_CRASH: Seam.PROCESS_LAUNCH,
-        Injection.CUDA_UNAVAILABLE: Seam.SYSTEM_FACTS,
         Injection.MODEL_MISSING: Seam.OLLAMA_CLIENT,
         Injection.MODEL_TAMPERED: Seam.MODEL_STORE,
         Injection.STOP_FAILURE: Seam.PROCESS_LAUNCH,

@@ -41,9 +41,13 @@ mantinha inventário, probes e launcher controlados — um scan de processos
 controlado seria reportado como evidência sobre a máquina real.
 
 Existe **um** `InjectionPlan` por run, o do world; o harness não aceita outro.
-Uma injection declarada no relatório é uma injection que uma seam recebeu de
-fato: o transporte controlado registra quais URLs interrompeu ou corrompeu, e
-há teste que confere o relatório contra a seam.
+
+E **nenhuma injection decorativa**: cada membro de `Injection` é consumido por
+uma seam, e um teste parametrizado exercita essa seam com e sem o plano e
+exige observações diferentes. Porta ocupada e máquina sem CUDA deixaram de ser
+injections — são o que o mundo *é*, e o cenário passa a construir esse mundo
+(`controlled_world(cuda=False)`, listener no inventário) em vez de declarar um
+nome que nenhuma seam lia.
 
 ## Cleanup cobre o run inteiro
 
@@ -93,6 +97,10 @@ fase que nunca rodou nunca é prova.
   bytes em disco inalterados, processo vivo depois.
 - **corrupted-model** instala e verifica pesos de verdade e só então muda os
   bytes; quem pega é o installer re-hasheando um arquivo que já tinha aceito.
+- **invalid-workflow** roda com os três modelos genuinamente AVAILABLE. A seam
+  `workflow-source` remove do grafo o nó que o binding de modelo endereça, então
+  o defeito é estrutural, não ausência de modelo. O mesmo mundo com a injection
+  desligada passa até o image smoke — esse é o controle da linha.
 - **interrupted-download** age no URL de *modelo*, não no binário do componente.
 
 ## Pesos de fixture

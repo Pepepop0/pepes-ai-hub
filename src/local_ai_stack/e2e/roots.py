@@ -16,14 +16,12 @@ real install.
 from __future__ import annotations
 
 import shutil
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..installation import InstallLocation, ResolvedInstallation, resolve_installation
 from ..test_contracts import TestRootMode
-
-EPHEMERAL_PREFIX = "pepito-e2e-"
+from .tracking import EPHEMERAL_PREFIX, forget, make
 
 
 class RootError(RuntimeError):
@@ -65,6 +63,7 @@ class TestRoot:
             return self.cleanup_detail
         if not self.path.exists():
             self.removed = True
+            forget(self.path)
             self.cleanup_detail = "ephemeral root was already gone"
             return self.cleanup_detail
         try:
@@ -73,6 +72,7 @@ class TestRoot:
             self.cleanup_detail = f"could not remove the ephemeral root {self.path}: {exc}"
             raise RootError(self.cleanup_detail) from exc
         self.removed = True
+        forget(self.path)
         self.cleanup_detail = f"ephemeral root removed: {self.path}"
         return self.cleanup_detail
 
@@ -103,8 +103,7 @@ def allocate_root(
     if mode is TestRootMode.EPHEMERAL:
         if configured is not None:
             raise RootError("an ephemeral root cannot also name a configured path")
-        path = Path(tempfile.mkdtemp(prefix=EPHEMERAL_PREFIX))
-        return TestRoot(mode=mode, path=path, owned=True, created=True)
+        return TestRoot(mode=mode, path=make(EPHEMERAL_PREFIX), owned=True, created=True)
 
     if configured is None:
         raise RootError("a configured root mode requires an explicit path")

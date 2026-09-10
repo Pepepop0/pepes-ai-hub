@@ -31,29 +31,43 @@ from local_ai_stack.e2e.world import CapabilityRefused, controlled_world, real_w
 from local_ai_stack.managed_config import Ownership
 from local_ai_stack.ollama_models import OllamaModelEntry
 from local_ai_stack.test_contracts import (
-    TestEventKind,
-    TestHarness,
-    TestPhase,
-    TestPhaseOutcome,
-    TestProviderMode,
-    TestRootMode,
-    TestRunSpec,
-    TestRunState,
+    TestEventKind as EventKind,
+)
+from local_ai_stack.test_contracts import (
+    TestHarness as HarnessProtocol,
+)
+from local_ai_stack.test_contracts import (
+    TestPhase as Phase,
+)
+from local_ai_stack.test_contracts import (
+    TestPhaseOutcome as Outcome,
+)
+from local_ai_stack.test_contracts import (
+    TestProviderMode as ProviderMode,
+)
+from local_ai_stack.test_contracts import (
+    TestRootMode as RootMode,
+)
+from local_ai_stack.test_contracts import (
+    TestRunSpec as RunSpec,
+)
+from local_ai_stack.test_contracts import (
+    TestRunState as RunState,
 )
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "local_ai_stack"
 OLLAMA_PORT = 21434
 
 
-def phase_of(report, phase: TestPhase):
+def phase_of(report, phase: Phase):
     return next(item for item in report.phases if item.phase is phase)
 
 
-def spec(*phases: TestPhase, **kwargs) -> TestRunSpec:
-    return TestRunSpec(profile_id="pepe", phases=tuple(phases), **kwargs)
+def spec(*phases: Phase, **kwargs) -> RunSpec:
+    return RunSpec(profile_id="pepe", phases=tuple(phases), **kwargs)
 
 
-def run(world, *phases: TestPhase, **kwargs):
+def run(world, *phases: Phase, **kwargs):
     return StackTestHarness(world).run(new_run_id(), spec(*phases, **kwargs))
 
 
@@ -63,7 +77,7 @@ def run(world, *phases: TestPhase, **kwargs):
 def test_the_harness_satisfies_the_shared_protocol():
     world = controlled_world()
     try:
-        assert isinstance(StackTestHarness(world), TestHarness)
+        assert isinstance(StackTestHarness(world), HarnessProtocol)
     finally:
         world.root.release()
 
@@ -76,23 +90,21 @@ def test_a_run_id_is_opaque():
 
 def test_the_report_carries_the_contract_shape():
     world = controlled_world(ready_ports=[OLLAMA_PORT])
-    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN)
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN)
     assert report.schema_version == 1
     assert report.started_at and report.finished_at
-    assert report.state is TestRunState.PASSED
-    assert {item.phase for item in report.phases} >= {TestPhase.PREFLIGHT, TestPhase.PLAN}
+    assert report.state is RunState.PASSED
+    assert {item.phase for item in report.phases} >= {Phase.PREFLIGHT, Phase.PLAN}
     assert all(item.duration_seconds is not None for item in report.phases)
 
 
 def test_events_are_monotonic_and_end_with_exactly_one_result():
     world = controlled_world(ready_ports=[OLLAMA_PORT])
     events = []
-    StackTestHarness(world).run(
-        new_run_id(), spec(TestPhase.PREFLIGHT, TestPhase.PLAN), emit=events.append
-    )
+    StackTestHarness(world).run(new_run_id(), spec(Phase.PREFLIGHT, Phase.PLAN), emit=events.append)
     assert [event.sequence for event in events] == list(range(1, len(events) + 1))
-    assert sum(1 for event in events if event.kind is TestEventKind.RESULT) == 1
-    assert events[-1].kind is TestEventKind.RESULT
+    assert sum(1 for event in events if event.kind is EventKind.RESULT) == 1
+    assert events[-1].kind is EventKind.RESULT
 
 
 # --- orquestração, não reimplementação ------------------------------------
@@ -119,23 +131,23 @@ def test_a_full_controlled_run_passes_every_phase():
     world = controlled_world(ready_ports=[OLLAMA_PORT])
     report = run(
         world,
-        TestPhase.PREFLIGHT,
-        TestPhase.PLAN,
-        TestPhase.PROVISION,
-        TestPhase.START,
-        TestPhase.STOP,
-        TestPhase.SECOND_PLAN,
+        Phase.PREFLIGHT,
+        Phase.PLAN,
+        Phase.PROVISION,
+        Phase.START,
+        Phase.STOP,
+        Phase.SECOND_PLAN,
     )
     outcomes = {item.phase: item.outcome for item in report.phases}
-    assert report.state is TestRunState.PASSED, report.detail
-    assert outcomes[TestPhase.PROVISION] is TestPhaseOutcome.PASSED
-    assert outcomes[TestPhase.START] is TestPhaseOutcome.PASSED
-    assert outcomes[TestPhase.SECOND_PLAN] is TestPhaseOutcome.PASSED
+    assert report.state is RunState.PASSED, report.detail
+    assert outcomes[Phase.PROVISION] is Outcome.PASSED
+    assert outcomes[Phase.START] is Outcome.PASSED
+    assert outcomes[Phase.SECOND_PLAN] is Outcome.PASSED
 
 
 def test_a_controlled_run_never_reaches_the_real_network():
     world = controlled_world(ready_ports=[OLLAMA_PORT])
-    run(world, TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.PROVISION)
+    run(world, Phase.PREFLIGHT, Phase.PLAN, Phase.PROVISION)
     assert world.artifacts.requests
     assert all(url.startswith("https://controlled.invalid/") for url in world.artifacts.requests)
 
@@ -150,11 +162,11 @@ def test_cleanup_runs_even_when_a_phase_raises(monkeypatch):
         raise RuntimeError("controlled explosion inside a phase")
 
     monkeypatch.setattr(StackTestHarness, "_phase_plan", explode, raising=True)
-    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN)
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN)
 
-    assert report.state is TestRunState.FAILED
-    cleanup = next(item for item in report.phases if item.phase is TestPhase.CLEANUP)
-    assert cleanup.outcome is TestPhaseOutcome.PASSED
+    assert report.state is RunState.FAILED
+    cleanup = next(item for item in report.phases if item.phase is Phase.CLEANUP)
+    assert cleanup.outcome is Outcome.PASSED
     assert not world.root.exists()
 
 
@@ -165,17 +177,17 @@ def test_cleanup_cannot_turn_an_earlier_failure_into_a_pass(monkeypatch):
         "_phase_plan",
         lambda self, context: (_ for _ in ()).throw(RuntimeError("phase failed")),
     )
-    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN)
-    assert report.state is TestRunState.FAILED
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN)
+    assert report.state is RunState.FAILED
 
 
 def test_a_cleanup_failure_is_reported_on_its_own():
     world = controlled_world(
         ready_ports=[OLLAMA_PORT], injections=InjectionPlan.of(Injection.STOP_FAILURE)
     )
-    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.PROVISION, TestPhase.START)
-    cleanup = next(item for item in report.phases if item.phase is TestPhase.CLEANUP)
-    assert cleanup.outcome is TestPhaseOutcome.FAILED
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN, Phase.PROVISION, Phase.START)
+    cleanup = next(item for item in report.phases if item.phase is Phase.CLEANUP)
+    assert cleanup.outcome is Outcome.FAILED
     assert "did not stop" in cleanup.detail
     # The root is still released despite the failure.
     assert not world.root.exists()
@@ -184,7 +196,7 @@ def test_a_cleanup_failure_is_reported_on_its_own():
 def test_the_ephemeral_root_never_survives_a_run():
     world = controlled_world(ready_ports=[OLLAMA_PORT])
     path = world.root.path
-    run(world, TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.PROVISION)
+    run(world, Phase.PREFLIGHT, Phase.PLAN, Phase.PROVISION)
     assert not path.exists()
 
 
@@ -194,10 +206,10 @@ def test_a_configured_root_survives_the_run(tmp_path):
     persistent = tmp_path / "persistent"
     persistent.mkdir()
     world = controlled_world(
-        root=allocate_root(TestRootMode.CONFIGURED, configured=persistent),
+        root=allocate_root(RootMode.CONFIGURED, configured=persistent),
         ready_ports=[OLLAMA_PORT],
     )
-    run(world, TestPhase.PREFLIGHT, TestPhase.PLAN)
+    run(world, Phase.PREFLIGHT, Phase.PLAN)
     assert persistent.exists()
 
 
@@ -205,14 +217,14 @@ def test_a_configured_root_survives_the_run(tmp_path):
 
 
 def test_a_real_world_refuses_without_the_network_capability(tmp_path):
-    root = allocate_root(TestRootMode.CONFIGURED, configured=tmp_path / "real")
+    root = allocate_root(RootMode.CONFIGURED, configured=tmp_path / "real")
     with pytest.raises(CapabilityRefused, match="explicit network capability"):
         real_world(root=root, allow_network=False)
 
 
 def test_a_real_world_refuses_even_with_the_capability(tmp_path):
     """Until real seams exist, nothing may call controlled providers real."""
-    root = allocate_root(TestRootMode.CONFIGURED, configured=tmp_path / "real")
+    root = allocate_root(RootMode.CONFIGURED, configured=tmp_path / "real")
     with pytest.raises(CapabilityRefused, match="not implemented"):
         real_world(root=root, allow_network=True)
 
@@ -229,9 +241,9 @@ def test_no_default_test_path_builds_a_real_world():
 
 def test_the_gpu_phase_needs_its_capability():
     world = controlled_world(ready_ports=[OLLAMA_PORT, 28188])
-    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.IMAGE_SMOKE)
-    image = next(item for item in report.phases if item.phase is TestPhase.IMAGE_SMOKE)
-    assert image.outcome is TestPhaseOutcome.BLOCKED
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN, Phase.IMAGE_SMOKE)
+    image = next(item for item in report.phases if item.phase is Phase.IMAGE_SMOKE)
+    assert image.outcome is Outcome.BLOCKED
     assert "GPU capability" in image.detail
 
 
@@ -240,19 +252,17 @@ def test_a_local_real_spec_is_refused_rather_than_run_on_controlled_seams():
     world = controlled_world(ready_ports=[OLLAMA_PORT])
     report = StackTestHarness(world).run(
         new_run_id(),
-        TestRunSpec(
+        RunSpec(
             profile_id="pepe",
-            phases=(TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.ACQUIRE_MODELS),
-            provider_mode=TestProviderMode.LOCAL_REAL,
+            phases=(Phase.PREFLIGHT, Phase.PLAN, Phase.ACQUIRE_MODELS),
+            provider_mode=ProviderMode.LOCAL_REAL,
             allow_network=True,
         ),
     )
-    assert report.state is TestRunState.FAILED
+    assert report.state is RunState.FAILED
     assert "run refused" in report.detail
     assert all(
-        item.outcome is TestPhaseOutcome.BLOCKED
-        for item in report.phases
-        if item.phase is not TestPhase.CLEANUP
+        item.outcome is Outcome.BLOCKED for item in report.phases if item.phase is not Phase.CLEANUP
     )
 
 
@@ -260,9 +270,9 @@ def test_a_configured_spec_is_refused_against_an_ephemeral_world():
     world = controlled_world(ready_ports=[OLLAMA_PORT])
     report = StackTestHarness(world).run(
         new_run_id(),
-        spec(TestPhase.PREFLIGHT, TestPhase.PLAN, root_mode=TestRootMode.CONFIGURED),
+        spec(Phase.PREFLIGHT, Phase.PLAN, root_mode=RootMode.CONFIGURED),
     )
-    assert report.state is TestRunState.FAILED
+    assert report.state is RunState.FAILED
     assert "configured root" in report.detail
     assert "ephemeral" in report.detail
 
@@ -271,11 +281,11 @@ def test_an_ephemeral_spec_is_refused_against_a_configured_world(tmp_path):
     persistent = tmp_path / "stack"
     persistent.mkdir()
     world = controlled_world(
-        root=allocate_root(TestRootMode.CONFIGURED, configured=persistent),
+        root=allocate_root(RootMode.CONFIGURED, configured=persistent),
         ready_ports=[OLLAMA_PORT],
     )
-    report = StackTestHarness(world).run(new_run_id(), spec(TestPhase.PREFLIGHT))
-    assert report.state is TestRunState.FAILED
+    report = StackTestHarness(world).run(new_run_id(), spec(Phase.PREFLIGHT))
+    assert report.state is RunState.FAILED
     assert "run refused" in report.detail
     assert persistent.exists()
 
@@ -285,7 +295,7 @@ def test_a_refused_run_still_releases_its_root():
     root = world.root
     StackTestHarness(world).run(
         new_run_id(),
-        spec(TestPhase.PREFLIGHT, root_mode=TestRootMode.CONFIGURED),
+        spec(Phase.PREFLIGHT, root_mode=RootMode.CONFIGURED),
     )
     assert not root.exists()
 
@@ -297,22 +307,22 @@ def test_an_unknown_profile_fails_the_run_and_still_cleans_up():
     """The profile is loaded inside the try whose finally releases the root."""
     world = controlled_world(ready_ports=[OLLAMA_PORT])
     root = world.root
-    report = StackTestHarness(world).run(new_run_id(), spec(TestPhase.PREFLIGHT, TestPhase.PLAN))
-    assert report.state is TestRunState.PASSED  # sanity: the profile normally loads
+    report = StackTestHarness(world).run(new_run_id(), spec(Phase.PREFLIGHT, Phase.PLAN))
+    assert report.state is RunState.PASSED  # sanity: the profile normally loads
 
     world = controlled_world(ready_ports=[OLLAMA_PORT])
     root = world.root
     report = StackTestHarness(world).run(
         new_run_id(),
-        TestRunSpec(profile_id="no-such-profile", phases=(TestPhase.PREFLIGHT, TestPhase.PLAN)),
+        RunSpec(profile_id="no-such-profile", phases=(Phase.PREFLIGHT, Phase.PLAN)),
     )
 
-    assert report.state is TestRunState.FAILED
+    assert report.state is RunState.FAILED
     assert "unknown profile" in report.detail
     assert not root.exists()
     assert world.managed_residual() == ()
-    cleanup = phase_of(report, TestPhase.CLEANUP)
-    assert cleanup.outcome is TestPhaseOutcome.PASSED
+    cleanup = phase_of(report, Phase.CLEANUP)
+    assert cleanup.outcome is Outcome.PASSED
 
 
 def test_a_repository_without_profiles_fails_the_run_and_still_cleans_up(tmp_path):
@@ -320,8 +330,8 @@ def test_a_repository_without_profiles_fails_the_run_and_still_cleans_up(tmp_pat
     (tmp_path / "profiles").mkdir()
     world = controlled_world(ready_ports=[OLLAMA_PORT], repo_root=tmp_path)
     root = world.root
-    report = StackTestHarness(world).run(new_run_id(), spec(TestPhase.PREFLIGHT))
-    assert report.state is TestRunState.FAILED
+    report = StackTestHarness(world).run(new_run_id(), spec(Phase.PREFLIGHT))
+    assert report.state is RunState.FAILED
     assert not root.exists()
 
 
@@ -330,18 +340,18 @@ def test_a_failing_run_never_deletes_a_configured_root(tmp_path):
     persistent.mkdir()
     (persistent / "keep.txt").write_text("mine", encoding="utf-8")
     world = controlled_world(
-        root=allocate_root(TestRootMode.CONFIGURED, configured=persistent),
+        root=allocate_root(RootMode.CONFIGURED, configured=persistent),
         ready_ports=[OLLAMA_PORT],
     )
     report = StackTestHarness(world).run(
         new_run_id(),
-        TestRunSpec(
+        RunSpec(
             profile_id="no-such-profile",
-            phases=(TestPhase.PREFLIGHT,),
-            root_mode=TestRootMode.CONFIGURED,
+            phases=(Phase.PREFLIGHT,),
+            root_mode=RootMode.CONFIGURED,
         ),
     )
-    assert report.state is TestRunState.FAILED
+    assert report.state is RunState.FAILED
     assert (persistent / "keep.txt").read_text(encoding="utf-8") == "mine"
 
 
@@ -381,28 +391,28 @@ def test_a_declared_injection_really_reached_its_seam():
 def test_a_blocked_precondition_stops_every_mutating_phase():
     world = controlled_world(injections=InjectionPlan.of(Injection.PORT_OCCUPIED))
     world.inventory.occupy(OLLAMA_PORT)
-    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.PROVISION)
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN, Phase.PROVISION)
 
     outcomes = {item.phase: item.outcome for item in report.phases}
-    assert outcomes[TestPhase.PREFLIGHT] is TestPhaseOutcome.BLOCKED
-    assert outcomes[TestPhase.PROVISION] is TestPhaseOutcome.SKIPPED
+    assert outcomes[Phase.PREFLIGHT] is Outcome.BLOCKED
+    assert outcomes[Phase.PROVISION] is Outcome.SKIPPED
     # A read-only phase stays available.
-    assert outcomes[TestPhase.PLAN] is TestPhaseOutcome.PASSED
+    assert outcomes[Phase.PLAN] is Outcome.PASSED
 
 
 def test_a_blocked_phase_keeps_its_diagnostics():
     world = controlled_world(injections=InjectionPlan.of(Injection.PORT_OCCUPIED))
     world.inventory.occupy(OLLAMA_PORT)
-    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN)
-    preflight = next(item for item in report.phases if item.phase is TestPhase.PREFLIGHT)
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN)
+    preflight = next(item for item in report.phases if item.phase is Phase.PREFLIGHT)
     codes = {issue["code"] for issue in preflight.data["issues"]}
     assert "endpoint-collision" in codes
 
 
 def test_mutating_phases_are_named_explicitly():
-    assert TestPhase.PROVISION in MUTATING_PHASES
-    assert TestPhase.PLAN not in MUTATING_PHASES
-    assert TestPhase.PREFLIGHT not in MUTATING_PHASES
+    assert Phase.PROVISION in MUTATING_PHASES
+    assert Phase.PLAN not in MUTATING_PHASES
+    assert Phase.PREFLIGHT not in MUTATING_PHASES
 
 
 def test_phase_blocked_carries_a_payload():
@@ -415,7 +425,7 @@ def test_phase_blocked_carries_a_payload():
 
 def test_the_report_records_measurements():
     world = controlled_world(ready_ports=[OLLAMA_PORT])
-    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN)
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN)
     metrics = report.context["metrics"]
     recorded = {sample["metric"] for sample in metrics["samples"]}
     assert {"doctor", "plan", "cleanup"} <= recorded
@@ -426,14 +436,14 @@ def test_the_report_names_the_injection():
     world = controlled_world(
         ready_ports=[OLLAMA_PORT], injections=InjectionPlan.of(Injection.READINESS_TIMEOUT)
     )
-    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN)
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN)
     assert report.context["injection"]["injections"] == ["readiness-timeout"]
     assert report.context["injection"]["seams"] == ["runtime-probe"]
 
 
 def test_the_report_records_the_root_and_capabilities():
     world = controlled_world(ready_ports=[OLLAMA_PORT])
-    report = run(world, TestPhase.PREFLIGHT, allow_gpu=False)
+    report = run(world, Phase.PREFLIGHT, allow_gpu=False)
     assert report.context["root"]["mode"] == "ephemeral"
     assert report.context["capabilities"] == {"network": False, "gpu": False}
     assert report.context["provider_mode"] == "controlled"
@@ -498,10 +508,10 @@ def test_tampered_configuration_is_written_first_then_caught_by_the_domain():
     result = ScenarioRunner().run(scenario_by_id("corrupted-config"))
     assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
 
-    configure = phase_of(result.report, TestPhase.CONFIGURE)
-    assert configure.outcome is TestPhaseOutcome.FAILED
+    configure = phase_of(result.report, Phase.CONFIGURE)
+    assert configure.outcome is Outcome.FAILED
     assert "edited after it was generated" in configure.detail
-    assert result.report.state is TestRunState.FAILED
+    assert result.report.state is RunState.FAILED
 
 
 def test_a_tampered_config_keeps_its_marker_and_still_fails():
@@ -523,8 +533,8 @@ def test_a_tampered_config_keeps_its_marker_and_still_fails():
 
 def test_no_phase_runs_on_tampered_configuration():
     result = ScenarioRunner().run(scenario_by_id("corrupted-config"))
-    smoke = phase_of(result.report, TestPhase.CHAT_SMOKE)
-    assert smoke.outcome is TestPhaseOutcome.SKIPPED
+    smoke = phase_of(result.report, Phase.CHAT_SMOKE)
+    assert smoke.outcome is Outcome.SKIPPED
     assert "configure" in smoke.detail
 
 
@@ -535,8 +545,8 @@ def test_an_unusable_workflow_never_reports_itself_ready():
     result = ScenarioRunner().run(scenario_by_id("invalid-workflow"))
     assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
 
-    configure = phase_of(result.report, TestPhase.CONFIGURE)
-    assert configure.outcome is TestPhaseOutcome.FAILED
+    configure = phase_of(result.report, Phase.CONFIGURE)
+    assert configure.outcome is Outcome.FAILED
     workflow = next(item for item in configure.data["actions"] if item["target"] == "text_to_image")
     assert not workflow["ok"]
     assert "model-not-declared" in workflow["detail"]
@@ -579,19 +589,19 @@ def test_chat_smoke_sends_a_generation_to_the_resolved_model():
     try:
         report = StackTestHarness(world).run(
             new_run_id(),
-            TestRunSpec(
+            RunSpec(
                 profile_id=STACK_PROFILE,
                 phases=(
-                    TestPhase.PREFLIGHT,
-                    TestPhase.PLAN,
-                    TestPhase.PROVISION,
-                    TestPhase.ACQUIRE_MODELS,
-                    TestPhase.CHAT_SMOKE,
+                    Phase.PREFLIGHT,
+                    Phase.PLAN,
+                    Phase.PROVISION,
+                    Phase.ACQUIRE_MODELS,
+                    Phase.CHAT_SMOKE,
                 ),
             ),
         )
-        chat = phase_of(report, TestPhase.CHAT_SMOKE)
-        assert chat.outcome is TestPhaseOutcome.PASSED, chat.detail
+        chat = phase_of(report, Phase.CHAT_SMOKE)
+        assert chat.outcome is Outcome.PASSED, chat.detail
         assert chat.data["model"] == CHAT_REFERENCE
         assert chat.data["answered"]
 
@@ -631,20 +641,20 @@ def test_image_smoke_submits_the_rendered_workflow():
     try:
         report = StackTestHarness(world).run(
             new_run_id(),
-            TestRunSpec(
+            RunSpec(
                 profile_id=STACK_PROFILE,
                 phases=(
-                    TestPhase.PREFLIGHT,
-                    TestPhase.PLAN,
-                    TestPhase.PROVISION,
-                    TestPhase.ACQUIRE_MODELS,
-                    TestPhase.IMAGE_SMOKE,
+                    Phase.PREFLIGHT,
+                    Phase.PLAN,
+                    Phase.PROVISION,
+                    Phase.ACQUIRE_MODELS,
+                    Phase.IMAGE_SMOKE,
                 ),
                 allow_gpu=True,
             ),
         )
-        image = phase_of(report, TestPhase.IMAGE_SMOKE)
-        assert image.outcome is TestPhaseOutcome.PASSED, image.detail
+        image = phase_of(report, Phase.IMAGE_SMOKE)
+        assert image.outcome is Outcome.PASSED, image.detail
 
         # One submission, carrying the whole graph.
         assert len(world.comfyui.submissions) == 1
@@ -687,12 +697,12 @@ def test_a_crash_happens_after_readiness_not_instead_of_it():
     result = ScenarioRunner().run(scenario_by_id("crash-after-start"))
     assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
 
-    start = phase_of(result.report, TestPhase.START)
-    assert start.outcome is TestPhaseOutcome.PASSED
+    start = phase_of(result.report, Phase.START)
+    assert start.outcome is Outcome.PASSED
     assert start.data["ready"] is True
 
     observed = {
-        item["service"]: item for item in phase_of(result.report, TestPhase.STOP).data["observed"]
+        item["service"]: item for item in phase_of(result.report, Phase.STOP).data["observed"]
     }
     assert observed["ollama"]["state"] != "UP"
 
@@ -711,13 +721,11 @@ def test_an_external_installation_is_classified_and_left_alone(component):
     before = setup.world.external.snapshot()
     try:
         report = StackTestHarness(setup.world).run(new_run_id(), setup.spec)
-        preflight = phase_of(report, TestPhase.PREFLIGHT)
+        preflight = phase_of(report, Phase.PREFLIGHT)
         assert component in preflight.data["external_components"]
-        assert preflight.outcome is TestPhaseOutcome.PASSED
+        assert preflight.outcome is Outcome.PASSED
 
-        observed = {
-            item["service"]: item for item in phase_of(report, TestPhase.STOP).data["observed"]
-        }
+        observed = {item["service"]: item for item in phase_of(report, Phase.STOP).data["observed"]}
         assert observed[component]["stoppable"] is False
         assert observed[component]["origin"] != "managed"
 
@@ -732,18 +740,19 @@ def test_an_external_installation_is_classified_and_left_alone(component):
 # --- veredito declarado, não inferido ---------------------------------------
 
 
-def test_every_scenario_declares_the_phase_it_is_about():
+def test_every_scenario_declares_the_phase_it_is_about(scenario_run):
     for scenario in P0_SCENARIOS:
-        assert scenario.phase in scenario.setup().spec.phases or (
-            scenario.phase is TestPhase.CLEANUP
-        ), f"{scenario.id} names a phase it never runs"
+        phases = scenario_run(scenario).spec.phases
+        assert scenario.phase in phases or scenario.phase is Phase.CLEANUP, (
+            f"{scenario.id} names a phase it never runs"
+        )
 
 
 def test_a_failing_run_is_not_a_passing_scenario():
     """The defect this contract exists to prevent: a silent false pass."""
     from dataclasses import replace
 
-    row = replace(scenario_by_id("readiness-failure"), state=TestRunState.PASSED)
+    row = replace(scenario_by_id("readiness-failure"), state=RunState.PASSED)
     result = ScenarioRunner().run(row)
     assert result.outcome is ScenarioOutcome.FAILED
     assert any("expects passed" in item for item in result.diagnostics)
@@ -752,7 +761,7 @@ def test_a_failing_run_is_not_a_passing_scenario():
 def test_a_phase_that_never_ran_is_not_a_passing_scenario():
     from dataclasses import replace
 
-    row = replace(scenario_by_id("clean-root"), phase=TestPhase.IMAGE_SMOKE)
+    row = replace(scenario_by_id("clean-root"), phase=Phase.IMAGE_SMOKE)
     result = ScenarioRunner().run(row)
     assert result.outcome is ScenarioOutcome.FAILED
     assert any("never ran" in item for item in result.diagnostics)
@@ -760,7 +769,7 @@ def test_a_phase_that_never_ran_is_not_a_passing_scenario():
 
 def test_a_row_that_expects_a_failure_says_so():
     """Rows about failures are declared, not inferred from a silent verifier."""
-    expected_failures = {row.id for row in P0_SCENARIOS if row.state is TestRunState.FAILED}
+    expected_failures = {row.id for row in P0_SCENARIOS if row.state is RunState.FAILED}
     assert expected_failures == {
         "interrupted-download",
         "readiness-failure",
@@ -771,7 +780,7 @@ def test_a_row_that_expects_a_failure_says_so():
 
 
 def test_only_the_cleanup_row_tolerates_a_failing_cleanup():
-    tolerant = [row.id for row in P0_SCENARIOS if row.cleanup is not TestPhaseOutcome.PASSED]
+    tolerant = [row.id for row in P0_SCENARIOS if row.cleanup is not Outcome.PASSED]
     assert tolerant == ["cleanup-after-failure"]
 
 
@@ -782,8 +791,8 @@ def test_the_second_run_row_measures_a_first_pass_that_really_did_work():
     result = ScenarioRunner().run(scenario_by_id("second-run"))
     assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
 
-    acquire = phase_of(result.report, TestPhase.ACQUIRE_MODELS)
-    second = phase_of(result.report, TestPhase.SECOND_PLAN)
+    acquire = phase_of(result.report, Phase.ACQUIRE_MODELS)
+    second = phase_of(result.report, Phase.SECOND_PLAN)
     assert acquire.data["pulls"], "nothing was pulled, so nothing can be idempotent"
     assert acquire.data["downloads"] >= 3
 
@@ -797,7 +806,7 @@ def test_the_second_plan_looks_for_an_outcome_a_dry_run_can_produce():
     """`installed` never appears in a dry run, so it could never fail."""
     result = ScenarioRunner().run(scenario_by_id("second-run"))
     outcomes = {
-        item["outcome"] for item in phase_of(result.report, TestPhase.SECOND_PLAN).data["results"]
+        item["outcome"] for item in phase_of(result.report, Phase.SECOND_PLAN).data["results"]
     }
     assert "installed" not in outcomes
     assert outcomes <= {"skipped", "dry-run", "failed"}
@@ -808,7 +817,7 @@ def test_the_second_plan_looks_for_an_outcome_a_dry_run_can_produce():
 
 def test_a_partial_provisioning_run_names_what_it_did_not_attempt():
     result = ScenarioRunner().run(scenario_by_id("clean-root"))
-    components = phase_of(result.report, TestPhase.PROVISION).data["components"]
+    components = phase_of(result.report, Phase.PROVISION).data["components"]
     assert components["installed"] == ["ollama"]
     assert set(components["not_attempted"]) == {"comfyui", "open-webui"}
     assert set(components["declared"]) == {"ollama", "comfyui", "open-webui"}

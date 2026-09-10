@@ -23,10 +23,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# The shared contracts are named TestPhase, TestRunSpec and so on because that
-# is what they are; pytest's default class pattern tries to collect them and
-# warns on every import. Nothing in this suite is class-based.
-python_classes = ["*TestCase"]
 
 [tool.ruff]
 line-length = 100

@@ -20,7 +20,6 @@ something the run installed.
 from __future__ import annotations
 
 import shutil
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,8 +34,9 @@ from ..models import (
     ModelProvider,
     ModelSpec,
 )
+from .tracking import EXTERNAL_PREFIX, REPO_PREFIX, forget, make
 
-FIXTURE_PREFIX = "pepito-e2e-repo-"
+FIXTURE_PREFIX = REPO_PREFIX
 
 # What a repository has to hold for the install actions to bind to it: the
 # profiles, the workflow manifest, and the graphs the manifest points at.
@@ -286,6 +286,7 @@ class ExternalInstall:
 
     def release(self) -> None:
         shutil.rmtree(self.base, ignore_errors=True)
+        forget(self.base)
 
 
 def external_install(component: str) -> ExternalInstall:
@@ -296,7 +297,7 @@ def external_install(component: str) -> ExternalInstall:
         known = ", ".join(sorted(EXTERNAL_LAYOUT))
         raise KeyError(f"no external layout for {component!r}; known: {known}") from None
 
-    base = Path(tempfile.mkdtemp(prefix=f"pepito-e2e-external-{component}-"))
+    base = make(f"{EXTERNAL_PREFIX}{component}-")
     directory = base / relative
     directory.mkdir(parents=True)
     path = directory
@@ -323,6 +324,7 @@ class RepoFixture:
 
     def release(self) -> None:
         shutil.rmtree(self.path, ignore_errors=True)
+        forget(self.path)
 
 
 def repo_fixture(profile_id: str, *, source: Path | None = None) -> RepoFixture:
@@ -334,7 +336,7 @@ def repo_fixture(profile_id: str, *, source: Path | None = None) -> RepoFixture:
         raise KeyError(f"unknown fixture profile {profile_id!r}; known: {known}") from None
 
     origin = Path(source) if source is not None else detect_repo_root()
-    root = Path(tempfile.mkdtemp(prefix=FIXTURE_PREFIX))
+    root = make(FIXTURE_PREFIX)
     for name in COPIED:
         shutil.copytree(origin / name, root / name)
     profiles = root / "profiles"

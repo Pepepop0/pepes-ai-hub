@@ -26,9 +26,10 @@ from local_ai_stack.e2e.providers import (
     controlled_component_archive,
     controlled_facts,
 )
-from local_ai_stack.e2e.roots import RootError, TestRoot, allocate_root
+from local_ai_stack.e2e.roots import RootError, allocate_root
+from local_ai_stack.e2e.roots import TestRoot as StackRoot
 from local_ai_stack.e2e.seams import SEAM_FOR, Injection, InjectionPlan
-from local_ai_stack.test_contracts import TestRootMode
+from local_ai_stack.test_contracts import TestRootMode as RootMode
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "local_ai_stack"
 
@@ -170,7 +171,7 @@ def test_a_configured_root_is_never_deleted(tmp_path):
     persistent = tmp_path / "persistent"
     persistent.mkdir()
     (persistent / "keep.txt").write_text("mine", encoding="utf-8")
-    root = allocate_root(TestRootMode.CONFIGURED, configured=persistent)
+    root = allocate_root(RootMode.CONFIGURED, configured=persistent)
 
     assert not root.removable
     root.release()
@@ -182,14 +183,14 @@ def test_a_configured_root_is_never_deleted(tmp_path):
 
 def test_a_configured_root_must_be_named_and_absolute():
     with pytest.raises(RootError, match="explicit path"):
-        allocate_root(TestRootMode.CONFIGURED)
+        allocate_root(RootMode.CONFIGURED)
     with pytest.raises(RootError, match="absolute"):
-        allocate_root(TestRootMode.CONFIGURED, configured="relative/root")
+        allocate_root(RootMode.CONFIGURED, configured="relative/root")
 
 
 def test_an_ephemeral_root_cannot_also_name_a_path(tmp_path):
     with pytest.raises(RootError):
-        allocate_root(TestRootMode.EPHEMERAL, configured=tmp_path)
+        allocate_root(RootMode.EPHEMERAL, configured=tmp_path)
 
 
 def test_releasing_a_missing_ephemeral_root_is_not_an_error():
@@ -200,7 +201,7 @@ def test_releasing_a_missing_ephemeral_root_is_not_an_error():
 
 
 def test_the_installation_resolves_to_the_root(tmp_path):
-    root = TestRoot(mode=TestRootMode.CONFIGURED, path=tmp_path / "stack", owned=False)
+    root = StackRoot(mode=RootMode.CONFIGURED, path=tmp_path / "stack", owned=False)
     assert root.installation.root == tmp_path / "stack"
     assert not (tmp_path / "stack").exists()
 
@@ -369,3 +370,62 @@ def test_the_config_seam_computes_no_digest_of_its_own():
     names = {node.attr for node in ast.walk(writer) if isinstance(node, ast.Attribute)}
     names |= {node.id for node in ast.walk(writer) if isinstance(node, ast.Name)}
     assert not {"sha256", "content_digest", "hashlib", "md5"} & names
+
+
+# --- temp dir ledger --------------------------------------------------------
+
+
+def test_the_harness_tracks_every_temporary_directory_it_makes():
+    from local_ai_stack.e2e import tracking
+
+    path = tracking.make("pepito-e2e-ledger-")
+    try:
+        assert path in tracking.outstanding()
+    finally:
+        assert tracking.release([path]) == (path,)
+    assert not path.exists()
+    assert path not in tracking.outstanding()
+
+
+def test_the_ledger_refuses_a_path_it_did_not_create(tmp_path):
+    from local_ai_stack.e2e import tracking
+
+    outsider = tmp_path / "not-ours"
+    outsider.mkdir()
+    with pytest.raises(ValueError, match="not created by this harness"):
+        tracking.release([outsider])
+    assert outsider.exists()
+
+
+def test_releasing_a_root_stops_tracking_it():
+    from local_ai_stack.e2e import tracking
+
+    root = allocate_root()
+    assert root.path in tracking.outstanding()
+    root.release()
+    assert root.path not in tracking.outstanding()
+
+
+def test_a_repo_fixture_and_an_external_install_are_tracked_and_forgotten():
+    from local_ai_stack.e2e import tracking
+    from local_ai_stack.e2e.fixtures import CHAT_ONLY_PROFILE, external_install, repo_fixture
+
+    fixture = repo_fixture(CHAT_ONLY_PROFILE)
+    install = external_install("ollama")
+    assert fixture.path in tracking.outstanding()
+    assert install.base in tracking.outstanding()
+
+    fixture.release()
+    install.release()
+    assert fixture.path not in tracking.outstanding()
+    assert install.base not in tracking.outstanding()
+
+
+def test_the_whole_p0_matrix_leaves_nothing_outstanding():
+    """The delta a leak would show up in, measured over every row at once."""
+    from local_ai_stack.e2e import tracking
+    from local_ai_stack.e2e.scenarios import ScenarioRunner
+
+    before = set(tracking.outstanding())
+    ScenarioRunner().run_all()
+    assert set(tracking.outstanding()) - before == set()

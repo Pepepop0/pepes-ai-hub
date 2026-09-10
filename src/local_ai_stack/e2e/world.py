@@ -25,6 +25,7 @@ from ..integration import (
     default_install_actions,
     default_provisioners,
 )
+from ..managed_config import ManagedConfigWriter
 from ..ollama_models import HttpOllamaClient, OllamaModelEntry
 from ..profiles import Profile
 from ..runner import CommandRunner
@@ -32,6 +33,7 @@ from ..system import SystemFacts, detect_system
 from ..test_contracts import TestProviderMode
 from .providers import (
     ControlledArtifacts,
+    ControlledConfigWriter,
     ControlledEndpoints,
     ControlledInventory,
     ControlledLauncher,
@@ -62,6 +64,9 @@ class ControlledWorld:
     inventory: ControlledInventory
     artifacts: ControlledArtifacts
     options: IntegrationOptions
+    # The CONFIG_WRITE seam. A real ``ManagedConfigWriter`` unless a scenario
+    # supplies the controlled subclass; ``None`` means the domain default.
+    config_writer: ManagedConfigWriter | None = None
     injections: InjectionPlan = field(default_factory=InjectionPlan.none)
     provider_mode: TestProviderMode = TestProviderMode.CONTROLLED
     repo_root: Path = field(default_factory=detect_repo_root)
@@ -187,6 +192,7 @@ class ControlledWorld:
             context,
             repo_root=self.repo_root,
             installer_factory=build_installer,
+            config_writer=self.config_writer,
             options=self.options,
         )
 
@@ -258,6 +264,7 @@ def controlled_world(
         inventory=inventory,
         artifacts=ControlledArtifacts(),
         options=resolved_options,
+        config_writer=ControlledConfigWriter(plan),
         injections=plan,
         provider_mode=TestProviderMode.CONTROLLED,
         repo_root=repo_root if repo_root is not None else detect_repo_root(),

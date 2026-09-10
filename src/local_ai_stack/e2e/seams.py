@@ -10,7 +10,8 @@ Every injection obeys four rules from the contract:
 - it is **deterministic** — same plan, same behaviour, no randomness;
 - it acts only at a replaceable dependency seam: command execution, HTTP
   transport, the Ollama client, runtime probes and launching, managed config
-  writes, clocks and event sinks;
+  writes, the repository a run reads its profiles and workflow manifests from,
+  clocks and event sinks;
 - it cannot patch an ownership check, substitute an arbitrary executable,
   redirect a managed path, or touch an external provider.
 
@@ -35,6 +36,7 @@ class Seam(StrEnum):
     RUNTIME_PROBE = "runtime-probe"
     PROCESS_LAUNCH = "process-launch"
     CONFIG_WRITE = "config-write"
+    WORKFLOW_SOURCE = "workflow-source"
     CLOCK = "clock"
     EVENT_SINK = "event-sink"
     SYSTEM_FACTS = "system-facts"
@@ -66,7 +68,7 @@ SEAM_FOR: Mapping[Injection, Seam] = MappingProxyType(
         Injection.DOWNLOAD_INTERRUPTED: Seam.HTTP_TRANSPORT,
         Injection.CHECKSUM_MISMATCH: Seam.HTTP_TRANSPORT,
         Injection.CONFIG_TAMPERED: Seam.CONFIG_WRITE,
-        Injection.INVALID_WORKFLOW: Seam.CONFIG_WRITE,
+        Injection.INVALID_WORKFLOW: Seam.WORKFLOW_SOURCE,
         Injection.READINESS_TIMEOUT: Seam.RUNTIME_PROBE,
         Injection.SERVICE_CRASH: Seam.PROCESS_LAUNCH,
         Injection.CUDA_UNAVAILABLE: Seam.SYSTEM_FACTS,

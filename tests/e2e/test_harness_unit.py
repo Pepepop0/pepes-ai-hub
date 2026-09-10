@@ -270,3 +270,102 @@ def test_the_controlled_runner_answers_a_version_probe():
     result = ControlledRunner().run(["ollama.exe", "--version"])
     assert result.ok
     assert "0.33.2" in result.stdout
+
+
+# --- repository fixture ----------------------------------------------------
+
+
+def test_a_repo_fixture_carries_the_real_manifests_and_one_profile():
+    from local_ai_stack.e2e.fixtures import CHAT_ONLY_PROFILE, repo_fixture
+    from local_ai_stack.profiles import load_profiles
+    from local_ai_stack.workflows import load_workflow_manifest
+
+    fixture = repo_fixture(CHAT_ONLY_PROFILE)
+    try:
+        profiles = load_profiles(fixture.path / "profiles")
+        assert [profile.id for profile in profiles] == [CHAT_ONLY_PROFILE]
+        shipped = load_workflow_manifest(SRC.parents[1] / "manifests" / "workflows.yaml")
+        copied = load_workflow_manifest(fixture.path / "manifests" / "workflows.yaml")
+        assert sorted(copied) == sorted(shipped)
+    finally:
+        fixture.release()
+    assert not fixture.path.exists()
+
+
+def test_an_unknown_fixture_profile_fails_loudly():
+    from local_ai_stack.e2e.fixtures import repo_fixture
+
+    with pytest.raises(KeyError, match="unknown fixture profile"):
+        repo_fixture("nobody-declared-this")
+
+
+# --- the managed-config seam -----------------------------------------------
+
+
+def _document(tmp_path):
+    from local_ai_stack.managed_config import env_document
+
+    return env_document(tmp_path / "open-webui.env", {"OLLAMA_BASE_URL": "http://127.0.0.1:21434"})
+
+
+def test_the_config_seam_is_the_real_writer_when_nothing_is_injected(tmp_path):
+    from local_ai_stack.e2e.providers import ControlledConfigWriter
+
+    writer = ControlledConfigWriter()
+    document = _document(tmp_path)
+    writer.apply([document])
+    assert writer.verify([document]).ok
+    assert writer.tampered == []
+
+
+def test_tampering_keeps_the_marker_and_breaks_the_digest(tmp_path):
+    from local_ai_stack.e2e.providers import ControlledConfigWriter
+    from local_ai_stack.managed_config import Ownership, read_managed
+
+    writer = ControlledConfigWriter(InjectionPlan.of(Injection.CONFIG_TAMPERED))
+    document = _document(tmp_path)
+    applied = writer.apply([document])
+
+    assert applied.ok and applied.written
+    managed = read_managed(document.path)
+    assert managed.ownership is Ownership.MANAGED
+    assert managed.claimed_digest is not None
+    assert not managed.intact
+
+    report = writer.verify([document])
+    assert not report.ok
+    assert report.drifted == (document.path,)
+    assert "edited after it was generated" in " ".join(report.problems)
+
+
+def test_a_dry_run_tampers_with_nothing(tmp_path):
+    from local_ai_stack.e2e.providers import ControlledConfigWriter
+
+    writer = ControlledConfigWriter(InjectionPlan.of(Injection.CONFIG_TAMPERED))
+    document = _document(tmp_path)
+    writer.apply([document], dry_run=True)
+    assert not document.path.exists()
+    assert writer.tampered == []
+
+
+def test_the_config_seam_does_not_shadow_the_domain_plan(tmp_path):
+    """``plan`` belongs to the writer; the injections live under another name."""
+    from local_ai_stack.e2e.providers import ControlledConfigWriter
+
+    writer = ControlledConfigWriter(InjectionPlan.of(Injection.CONFIG_TAMPERED))
+    assert callable(writer.plan)
+    assert writer.plan([_document(tmp_path)]).changes
+    assert writer.injections.active(Injection.CONFIG_TAMPERED)
+
+
+def test_the_config_seam_computes_no_digest_of_its_own():
+    """Detecting drift is the domain's job; this only changes bytes."""
+    tree = ast.parse((SRC / "e2e" / "providers.py").read_text(encoding="utf-8"))
+    writer = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "ControlledConfigWriter"
+    )
+    names = {node.attr for node in ast.walk(writer) if isinstance(node, ast.Attribute)}
+    names |= {node.id for node in ast.walk(writer) if isinstance(node, ast.Name)}
+    assert not {"sha256", "content_digest", "hashlib", "md5"} & names

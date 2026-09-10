@@ -418,14 +418,11 @@ class StackTestHarness:
         with context.metrics.measure(Metric.MODEL_VERIFY, steps=len(acquire.steps)):
             report = executor.execute(acquire, dry_run=False)
         data = {
-            "actions": [
-                {"target": item.step.target, "outcome": str(item.outcome)}
-                for item in report.action_results
-            ],
+            "actions": _actions(report),
             "pulls": list(getattr(self.world.ollama, "pulls", [])),
         }
         if not report.ok:
-            raise PhaseFailed("model acquisition reported a failure")
+            raise PhaseFailed(f"model acquisition failed: {_why(report)}", data)
         return f"executed {len(report.action_results)} model actions", data
 
     def _phase_configure(self, context: RunContext) -> tuple[str, dict[str, Any]]:
@@ -459,16 +456,10 @@ class StackTestHarness:
         )
         configure = _only(phases.after_ollama_ready, "apply-workflow", "configure")
         report = executor.execute(configure, dry_run=False)
-        data = {
-            "roles": roles,
-            "actions": [
-                {"target": item.step.target, "outcome": str(item.outcome)}
-                for item in report.action_results
-            ],
-        }
+        data = {"roles": roles, "actions": _actions(report)}
         if not report.ok:
-            raise PhaseFailed("managed configuration reported a failure")
-        return "managed configuration applied", data
+            raise PhaseFailed(f"managed configuration failed: {_why(report)}", data)
+        return "managed configuration applied and verified", data
 
     def _phase_chat_smoke(self, context: RunContext) -> tuple[str, dict[str, Any]]:
         endpoints = context.data.get("endpoints", {})
@@ -637,6 +628,35 @@ class StackTestHarness:
             ollama=self.world.ollama,
         )
         return StackModelResolver(installer=installer, catalog=model_catalog())
+
+
+def _actions(report) -> list[dict[str, Any]]:
+    """Each executed action as the executor reported it, verbatim."""
+    return [
+        {
+            "action": str(item.action),
+            "target": item.target,
+            "ok": item.ok,
+            "detail": item.detail,
+        }
+        for item in report.action_results
+    ]
+
+
+def _why(report) -> str:
+    """The domain's own reason for a failed execution, not a paraphrase.
+
+    An execution is ``ok`` only when the provisioning results and the action
+    results all are, so both are read here; a phase must never fail with a
+    reason nobody gave.
+    """
+    reasons = [f"{item.component_id}: {item.detail}" for item in report.results if not item.ok]
+    reasons += [
+        f"{item.action}/{item.target}: {item.detail}"
+        for item in report.action_results
+        if not item.ok
+    ]
+    return "; ".join(reasons) if reasons else "the executor reported no reason"
 
 
 def _only(plan, *actions: str):

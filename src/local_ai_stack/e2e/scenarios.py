@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from ..managed_config import Ownership
 from ..models import ManagedModelPaths
 from ..ollama_models import OllamaModelEntry
 from ..test_contracts import (
@@ -27,6 +28,7 @@ from ..test_contracts import (
     TestRunSpec,
     TestRunState,
 )
+from .fixtures import BROKEN_WORKFLOW_PROFILE, CHAT_ONLY_PROFILE, repo_fixture
 from .harness import StackTestHarness, new_run_id
 from .seams import Injection, InjectionPlan
 from .world import ControlledWorld, controlled_world
@@ -57,11 +59,17 @@ class ScenarioOutcome(StrEnum):
 
 @dataclass
 class ScenarioSetup:
-    """What a scenario needs before the harness runs."""
+    """What a scenario needs before the harness runs, and how to undo it.
+
+    ``teardown`` covers fixtures that live outside the managed root — a
+    repository fixture, for instance. The root has its own release path and
+    is not this hook's business.
+    """
 
     world: ControlledWorld
     spec: TestRunSpec
     note: str = ""
+    teardown: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -146,9 +154,11 @@ def _ollama_entry(reference: str = "hermes3:8b") -> OllamaModelEntry:
     return OllamaModelEntry(name=reference, digest="4f6b83f30b62aaaa", size_bytes=1)
 
 
-def _spec(*phases: TestPhase, gpu: bool = False, network: bool = False) -> TestRunSpec:
+def _spec(
+    *phases: TestPhase, gpu: bool = False, network: bool = False, profile: str = "pepe"
+) -> TestRunSpec:
     return TestRunSpec(
-        profile_id="pepe",
+        profile_id=profile,
         phases=tuple(phases),
         root_mode=TestRootMode.EPHEMERAL,
         allow_network=network,
@@ -450,6 +460,119 @@ def _verify_cleanup_after_failure(report: TestRunReport, world: ControlledWorld)
     return problems
 
 
+CONFIG_PHASES = (
+    TestPhase.PREFLIGHT,
+    TestPhase.PLAN,
+    TestPhase.PROVISION,
+    TestPhase.CONFIGURE,
+    TestPhase.CHAT_SMOKE,
+)
+
+
+def _configurable_world(profile: str, injections: InjectionPlan):
+    """A run that genuinely reaches managed configuration, plus its teardown.
+
+    The shipped profile needs 12.45 GB of weights, so a controlled run is
+    blocked long before configuration exists. These two rows are about what
+    happens *at* configuration, so they point the run at a fixture repository
+    whose manifests and workflow graphs are the real ones.
+    """
+    fixture = repo_fixture(profile)
+    world = controlled_world(
+        ready_ports=[MANAGED_OLLAMA_PORT],
+        repo_root=fixture.path,
+        injections=injections,
+        ollama_models=[_ollama_entry()],
+    )
+    return world, fixture
+
+
+def _corrupted_config() -> ScenarioSetup:
+    world, fixture = _configurable_world(
+        CHAT_ONLY_PROFILE, InjectionPlan.of(Injection.CONFIG_TAMPERED)
+    )
+    return ScenarioSetup(
+        world,
+        _spec(*CONFIG_PHASES, profile=CHAT_ONLY_PROFILE),
+        "managed config is written, then edited behind its own marker",
+        fixture.release,
+    )
+
+
+def _verify_corrupted_config(report: TestRunReport, world: ControlledWorld) -> list[str]:
+    """Written valid, edited behind the marker, detected, refused."""
+    problems = _cleanup_problems(report) + _no_residual(world)
+    configure = _phase(report, TestPhase.CONFIGURE)
+    if configure is None:
+        return problems + ["configure never ran"]
+
+    tampered = list(getattr(world.config_writer, "tampered", ()))
+    if not tampered:
+        # Without a real write first, the rest of this would pass vacuously.
+        problems.append("no managed configuration was written, so nothing was tampered with")
+    if configure.outcome is not TestPhaseOutcome.FAILED:
+        problems.append(f"tampered configuration did not fail the phase: {configure.outcome}")
+    if "edited after it was generated" not in configure.detail:
+        problems.append(f"drift was not the reported reason: {configure.detail}")
+
+    for path in tampered:
+        # Read back through the domain at the moment of the edit: ownership
+        # survived and the header still claims our digest, so only
+        # recomputing it from the bytes on disk shows the drift.
+        managed = world.config_writer.after_tampering[path]
+        if managed.ownership is not Ownership.MANAGED:
+            problems.append(f"tampering changed ownership of {path.name}: {managed.ownership}")
+        if managed.claimed_digest is None:
+            problems.append(f"tampering removed the marker from {path.name}")
+        if managed.intact:
+            problems.append(f"{path.name} still reports itself intact after being edited")
+
+    smoke = _phase(report, TestPhase.CHAT_SMOKE)
+    if smoke is None:
+        problems.append("chat_smoke is not present in the report")
+    elif smoke.outcome is not TestPhaseOutcome.SKIPPED:
+        problems.append(f"runtime ran on tampered configuration: {smoke.outcome}")
+    return problems
+
+
+def _invalid_workflow() -> ScenarioSetup:
+    world, fixture = _configurable_world(
+        BROKEN_WORKFLOW_PROFILE, InjectionPlan.of(Injection.INVALID_WORKFLOW)
+    )
+    return ScenarioSetup(
+        world,
+        _spec(*CONFIG_PHASES, profile=BROKEN_WORKFLOW_PROFILE),
+        "the declared image workflow requires model roles nothing declares",
+        fixture.release,
+    )
+
+
+def _verify_invalid_workflow(report: TestRunReport, world: ControlledWorld) -> list[str]:
+    """Not ready, so not configured, so never offered to a runtime."""
+    problems = _cleanup_problems(report) + _no_residual(world)
+    configure = _phase(report, TestPhase.CONFIGURE)
+    if configure is None:
+        return problems + ["configure never ran"]
+    if configure.outcome is not TestPhaseOutcome.FAILED:
+        problems.append(f"an unusable workflow did not fail configuration: {configure.outcome}")
+
+    actions = {item["target"]: item for item in configure.data.get("actions", [])}
+    workflow = actions.get("text_to_image")
+    if workflow is None:
+        problems.append("the workflow action never ran")
+    elif workflow["ok"]:
+        problems.append(f"the workflow reported itself usable: {workflow['detail']}")
+    elif "model-not-declared" not in workflow["detail"]:
+        problems.append(f"the workflow state was not the reported reason: {workflow['detail']}")
+
+    if getattr(world.config_writer, "tampered", None):
+        problems.append("configuration was written for a run with an unusable workflow")
+    smoke = _phase(report, TestPhase.CHAT_SMOKE)
+    if smoke is not None and smoke.outcome is not TestPhaseOutcome.SKIPPED:
+        problems.append(f"runtime ran after an unusable workflow: {smoke.outcome}")
+    return problems
+
+
 P0_SCENARIOS: tuple[Scenario, ...] = (
     Scenario("clean-root", "Clean-root install", _clean_root, _verify_clean_root),
     Scenario("second-run", "Second run proposes nothing", _second_run, _verify_second_run),
@@ -480,6 +603,13 @@ P0_SCENARIOS: tuple[Scenario, ...] = (
     Scenario("stop-cleanup", "Stop and cleanup", _stop_and_cleanup, _verify_stop),
     Scenario("missing-model", "Missing required model", _missing_model, _verify_missing_model),
     Scenario("cuda-unavailable", "CUDA unavailable", _cuda_unavailable, _verify_cuda),
+    Scenario(
+        "corrupted-config",
+        "Corrupted managed configuration",
+        _corrupted_config,
+        _verify_corrupted_config,
+    ),
+    Scenario("invalid-workflow", "Invalid workflow", _invalid_workflow, _verify_invalid_workflow),
     Scenario(
         "cleanup-after-failure",
         "Cleanup after a failing phase",
@@ -512,6 +642,11 @@ class ScenarioRunner:
                     setup.world.root.release()
                 except Exception as exc:  # noqa: BLE001
                     diagnostics.append(f"root release failed: {exc}")
+            if setup.teardown is not None:
+                try:
+                    setup.teardown()
+                except Exception as exc:  # noqa: BLE001
+                    diagnostics.append(f"fixture teardown failed: {exc}")
 
         cleanup = _phase(report, TestPhase.CLEANUP) if report else None
         outcome = ScenarioOutcome.PASSED if not diagnostics else ScenarioOutcome.FAILED
@@ -539,6 +674,7 @@ def scenario_by_id(scenario_id: str) -> Scenario:
 
 
 __all__ = [
+    "CONFIG_PHASES",
     "FULL_PHASES",
     "INSTALL_PHASES",
     "P0_SCENARIOS",

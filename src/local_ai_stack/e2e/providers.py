@@ -17,6 +17,7 @@ outside the test root raises rather than silently succeeding.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,7 @@ from ..inventory import (
     ScanOutcome,
 )
 from ..launcher import LaunchOutcome, LaunchResult, StopOutcome, StopResult
+from ..managed_config import ManagedConfigWriter, ManagedFile, read_managed
 from ..ollama_models import OllamaClientError, OllamaModelEntry
 from ..probes import ProbeOutcome, ProbeResult
 from ..runner import CommandResult, CommandRunner
@@ -482,11 +484,71 @@ class ControlledLauncher:
         return ()
 
 
+# --- managed configuration -------------------------------------------------
+
+TAMPER_LINE = "PEPITO_E2E_TAMPERED=1"
+TAMPER_KEY = "pepito-e2e-tampered"
+
+
+class ControlledConfigWriter(ManagedConfigWriter):
+    """The CONFIG_WRITE seam. Writes for real; corrupts only when injected.
+
+    Generation, ownership, the marker, the atomic write and the verification
+    are all the inherited implementation — this class adds one thing, and only
+    under ``CONFIG_TAMPERED``: after a real apply it edits the *body* of a file
+    that was just written and leaves the header exactly as it is.
+
+    That is deliberately the hardest case. The file still names this manager and
+    still claims the digest we generated, so ownership alone cannot tell that
+    anything happened; only recomputing the digest from the bytes on disk can.
+    Nothing here computes a digest, and nothing here decides what the answer
+    should be: it changes bytes, and the domain says what that means.
+    """
+
+    def __init__(self, injections: InjectionPlan | None = None) -> None:
+        super().__init__()
+        # Not ``plan``: the base class already uses that name for the method
+        # that decides what an apply would do, and shadowing it would replace a
+        # domain decision with a fixture, which is exactly what must not happen.
+        self.injections = injections or InjectionPlan.none()
+        self.tampered: list[Path] = []
+        # What the file looked like the instant after it was edited, read
+        # back through the domain. Kept here because an ephemeral root is
+        # gone by the time a scenario checks its invariants.
+        self.after_tampering: dict[Path, ManagedFile] = {}
+
+    def apply(self, documents, *, dry_run: bool = False):
+        rendered = tuple(documents)
+        report = super().apply(rendered, dry_run=dry_run)
+        if dry_run or not self.injections.active(Injection.CONFIG_TAMPERED):
+            return report
+        for path in report.written:
+            self._tamper(path)
+        return report
+
+    def _tamper(self, path: Path) -> None:
+        """Edit the content, keep the header. A marker is a claim, not evidence."""
+        text = path.read_text(encoding="utf-8")
+        if text.lstrip().startswith("{"):
+            payload = json.loads(text)
+            payload[TAMPER_KEY] = True
+            edited = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        else:
+            edited = text if text.endswith("\n") else text + "\n"
+            edited += f"{TAMPER_LINE}\n"
+        path.write_text(edited, encoding="utf-8", newline="\n")
+        self.tampered.append(path)
+        self.after_tampering[path] = read_managed(path)
+
+
 __all__ = [
     "CONTROLLED_PID",
     "EXTERNAL_PID",
+    "TAMPER_KEY",
+    "TAMPER_LINE",
     "UNRELATED_PID",
     "ControlledArtifacts",
+    "ControlledConfigWriter",
     "ControlledEndpoints",
     "ControlledInventory",
     "ControlledLauncher",

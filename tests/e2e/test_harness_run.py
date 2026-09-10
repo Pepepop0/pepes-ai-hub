@@ -27,6 +27,7 @@ from local_ai_stack.e2e.scenarios import (
 )
 from local_ai_stack.e2e.seams import Injection, InjectionPlan
 from local_ai_stack.e2e.world import CapabilityRefused, controlled_world, real_world
+from local_ai_stack.managed_config import Ownership
 from local_ai_stack.test_contracts import (
     TestEventKind,
     TestHarness,
@@ -39,6 +40,10 @@ from local_ai_stack.test_contracts import (
 
 SRC = Path(__file__).resolve().parents[2] / "src" / "local_ai_stack"
 OLLAMA_PORT = 21434
+
+
+def phase_of(report, phase: TestPhase):
+    return next(item for item in report.phases if item.phase is phase)
 
 
 def spec(*phases: TestPhase, **kwargs) -> TestRunSpec:
@@ -340,4 +345,86 @@ def test_every_scenario_leaves_no_ephemeral_root_behind():
         setup = scenario.setup()
         roots.append(setup.world.root)
         setup.world.root.release()
+        if setup.teardown is not None:
+            setup.teardown()
     assert not any(root.exists() for root in roots)
+
+
+def test_a_scenario_fixture_is_released_with_its_root():
+    """A repository fixture lives outside the root, so it needs its own hook."""
+    setup = scenario_by_id("corrupted-config").setup()
+    repo = setup.world.repo_root
+    assert (repo / "profiles").is_dir()
+    setup.world.root.release()
+    setup.teardown()
+    assert not repo.exists()
+
+
+# --- configuração gerada e depois adulterada --------------------------------
+
+
+def test_tampered_configuration_is_written_first_then_caught_by_the_domain():
+    """Valid first, edited behind the marker, refused for the right reason."""
+    result = ScenarioRunner().run(scenario_by_id("corrupted-config"))
+    assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
+
+    configure = phase_of(result.report, TestPhase.CONFIGURE)
+    assert configure.outcome is TestPhaseOutcome.FAILED
+    assert "edited after it was generated" in configure.detail
+    assert result.report.state is TestRunState.FAILED
+
+
+def test_a_tampered_config_keeps_its_marker_and_still_fails():
+    """Ownership is intact; only recomputing the digest finds the edit."""
+    setup = scenario_by_id("corrupted-config").setup()
+    try:
+        StackTestHarness(setup.world).run(new_run_id(), setup.spec)
+        written = setup.world.config_writer.tampered
+        assert written, "the scenario must write real configuration before editing it"
+        for path in written:
+            managed = setup.world.config_writer.after_tampering[path]
+            assert managed.ownership is Ownership.MANAGED
+            assert managed.claimed_digest
+            assert not managed.intact
+    finally:
+        setup.world.root.release()
+        setup.teardown()
+
+
+def test_no_phase_runs_on_tampered_configuration():
+    result = ScenarioRunner().run(scenario_by_id("corrupted-config"))
+    smoke = phase_of(result.report, TestPhase.CHAT_SMOKE)
+    assert smoke.outcome is TestPhaseOutcome.SKIPPED
+    assert "configure" in smoke.detail
+
+
+# --- workflow inválido ------------------------------------------------------
+
+
+def test_an_unusable_workflow_never_reports_itself_ready():
+    result = ScenarioRunner().run(scenario_by_id("invalid-workflow"))
+    assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
+
+    configure = phase_of(result.report, TestPhase.CONFIGURE)
+    assert configure.outcome is TestPhaseOutcome.FAILED
+    workflow = next(item for item in configure.data["actions"] if item["target"] == "text_to_image")
+    assert not workflow["ok"]
+    assert "model-not-declared" in workflow["detail"]
+
+
+def test_an_unusable_workflow_leaves_no_configuration_behind():
+    """Nothing half-configured is left for a runtime to pick up."""
+    setup = scenario_by_id("invalid-workflow").setup()
+    root = setup.world.root.path
+    try:
+        StackTestHarness(setup.world).run(new_run_id(), setup.spec)
+        assert not setup.world.config_writer.tampered
+        assert list(root.rglob("*.env")) == []
+    finally:
+        setup.world.root.release()
+        setup.teardown()
+
+
+def test_the_invalid_workflow_row_names_its_seam():
+    plan = InjectionPlan.of(Injection.INVALID_WORKFLOW)
+    assert plan.as_report_data()["seams"] == ["workflow-source"]

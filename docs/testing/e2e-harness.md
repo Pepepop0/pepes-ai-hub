@@ -13,6 +13,7 @@ existentes; não reimplementa nenhum deles.
 | `e2e/seams.py` | `Injection` e `InjectionPlan` — falhas nomeadas, determinísticas |
 | `e2e/roots.py` | Root efêmero (removido) vs configurado (nunca apagado) |
 | `e2e/metrics.py` | Medição monotônica; amostras cruas + count/mediana/máximo |
+| `e2e/fixtures.py` | Repositório-fixture: manifests e grafos reais, um profile declarado |
 | `e2e/scenarios.py` | Matriz P0 e o runner que verifica invariantes de fora |
 
 ## O que o harness não faz
@@ -46,6 +47,35 @@ marcador são o código real rodando sem alteração.
 ComfyUI e Open WebUI precisam de `git` e `pip`. Um fake disso não provaria nada
 sobre a instalação real, então um run controlado **não os instala** e diz isso
 no relatório (`installable_components`), em vez de fingir.
+
+## Configuração gerada, adulterada e recusada
+
+Dois cenários P0 precisam de um run que **chegue** à configuração gerada. O
+profile `pepe` exige 12,45 GB de pesos ComfyUI, então num run controlado esses
+roles não estão disponíveis e a configuração é bloqueada bem antes de existir
+arquivo — resposta correta, mas não é sobre isso que esses dois cenários falam.
+
+Por isso eles apontam `repo_root` para um repositório-fixture: `manifests/` e
+`workflows/` são cópias literais dos reais; só o profile é escrito ali, e
+profile é dado que o loader valida como qualquer outro. O fixture vive em
+diretório próprio, fora do root managed, e some no teardown do cenário — nunca
+pode ser confundido com algo que o run instalou.
+
+- **`corrupted-config`** — `ControlledConfigWriter` é o seam `config-write`:
+  herda `ManagedConfigWriter` e, só sob `CONFIG_TAMPERED`, edita o **corpo** do
+  arquivo recém-escrito e deixa o cabeçalho intacto. O arquivo continua
+  nomeando o manager e continua reivindicando o digest que geramos, então
+  ownership sozinho não vê nada; quem vê é `verify()` recalculando o digest dos
+  bytes em disco. O seam não calcula digest nenhum — há um teste por AST que
+  falha se `sha256`/`content_digest` aparecer nessa classe.
+- **`invalid-workflow`** — o profile-fixture habilita image generation e declara
+  `text_to_image`, mas não declara nenhum dos três roles que o grafo carrega.
+  `resolve_workflow` responde `model-not-declared`, `apply_workflow` recusa e
+  `build_stack_configuration` recusa junto. Nenhuma validação é escrita aqui: o
+  cenário fornece a entrada e lê a resposta do domínio.
+
+Em ambos: fase falha fechada, nenhuma fase posterior roda (o smoke fica
+`skipped`), e o cleanup continua correto.
 
 ## Providers reais
 

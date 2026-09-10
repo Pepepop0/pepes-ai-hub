@@ -118,13 +118,49 @@ Verifier = Callable[[TestRunReport, ControlledWorld], list[str]]
 
 @dataclass(frozen=True)
 class Scenario:
-    """One P0 row: how to set it up, and what must be true afterwards."""
+    """One P0 row: how to set it up, and what must be true afterwards.
+
+    The expectations are declared rather than inferred. A verifier that only
+    collects problems passes whenever it happens to find none, so a row whose
+    run failed for an unrelated reason -- or whose phase never ran at all --
+    would still read as passed. Each row therefore names the state it expects
+    for the run, the phase it is actually about, and what that phase must
+    report. A failing run is a pass only where the row says so.
+    """
 
     id: str
     title: str
     setup: Callable[[], ScenarioSetup]
     verify: Verifier
+    phase: TestPhase = TestPhase.PREFLIGHT
+    outcomes: tuple[TestPhaseOutcome, ...] = (TestPhaseOutcome.PASSED,)
+    state: TestRunState = TestRunState.PASSED
+    cleanup: TestPhaseOutcome = TestPhaseOutcome.PASSED
     mutating: bool = True
+
+    def verdict(self, report: TestRunReport) -> list[str]:
+        """Whether the run itself matched what this row is about."""
+        problems: list[str] = []
+        if report.state is not self.state:
+            problems.append(
+                f"the run is {report.state} and this row expects {self.state}: {report.detail}"
+            )
+        result = _phase(report, self.phase)
+        if result is None:
+            return problems + [f"{self.phase} never ran, so this row proved nothing"]
+        if result.outcome not in self.outcomes:
+            expected = " or ".join(str(item) for item in self.outcomes)
+            problems.append(
+                f"{self.phase} is {result.outcome} and this row expects {expected}: {result.detail}"
+            )
+        cleanup = _phase(report, TestPhase.CLEANUP)
+        if cleanup is None:
+            problems.append("cleanup never ran")
+        elif cleanup.outcome is not self.cleanup:
+            problems.append(
+                f"cleanup is {cleanup.outcome} and this row expects {self.cleanup}: {cleanup.detail}"
+            )
+        return problems
 
 
 # --- helpers ---------------------------------------------------------------
@@ -229,6 +265,7 @@ def _clean_root() -> ScenarioSetup:
 
 
 def _verify_clean_root(report: TestRunReport, world: ControlledWorld) -> list[str]:
+    """A correct plan, and a provisioning report that names its own limits."""
     problems = _cleanup_problems(report) + _no_residual(world)
     plan = _phase(report, TestPhase.PLAN)
     if plan is None or plan.outcome is not TestPhaseOutcome.PASSED:
@@ -239,29 +276,83 @@ def _verify_clean_root(report: TestRunReport, world: ControlledWorld) -> list[st
         problems.append("plan never proposes preparing the layout")
     if actions and actions.index("prepare-layout") > actions.index("install"):
         problems.append("plan proposes installing before preparing the layout")
+
+    # This mode installs Ollama and nothing else. The row is only honest if the
+    # report says which components it actually exercised and which it did not.
+    provision = _phase(report, TestPhase.PROVISION)
+    if provision is None:
+        return problems + ["provision never ran"]
+    components = provision.data.get("components", {})
+    if components.get("installed") != [OLLAMA]:
+        problems.append(f"this mode claims to have installed {components.get('installed')}")
+    if not components.get("not_attempted"):
+        problems.append("a partial provisioning run does not say what it skipped")
+    if set(components.get("attempted", [])) & set(components.get("not_attempted", [])):
+        problems.append("a component is reported both attempted and not attempted")
     return problems
 
 
 def _second_run() -> ScenarioSetup:
-    world = controlled_world(ready_ports=[MANAGED_OLLAMA_PORT])
+    """Install and acquire for real, then ask again.
+
+    The store starts empty so the first pass genuinely pulls, and the fixture
+    weights are genuinely downloaded. Without that the second pass would have
+    nothing to be idempotent about.
+    """
+    fixture = repo_fixture(STACK_PROFILE)
+    world = controlled_world(
+        ready_ports=[MANAGED_OLLAMA_PORT],
+        repo_root=fixture.path,
+        fixture_models=True,
+        ollama_models=[],
+    )
     return ScenarioSetup(
         world,
-        _spec(TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.PROVISION, TestPhase.SECOND_PLAN),
-        "install, then plan again",
+        _spec(
+            TestPhase.PREFLIGHT,
+            TestPhase.PLAN,
+            TestPhase.PROVISION,
+            TestPhase.ACQUIRE_MODELS,
+            TestPhase.SECOND_PLAN,
+            profile=STACK_PROFILE,
+        ),
+        "install and acquire for real, then ask a second time",
+        fixture.release,
     )
 
 
 def _verify_second_run(report: TestRunReport, world: ControlledWorld) -> list[str]:
+    """Idempotence for what this mode installs, measured, not assumed."""
     problems = _cleanup_problems(report) + _no_residual(world)
+
+    provision = _phase(report, TestPhase.PROVISION)
+    acquire = _phase(report, TestPhase.ACQUIRE_MODELS)
     second = _phase(report, TestPhase.SECOND_PLAN)
-    if second is None:
-        return problems + ["second_plan never ran"]
-    if second.outcome is TestPhaseOutcome.FAILED:
-        problems.append(f"second plan proposed mutation: {second.detail}")
+    if provision is None or acquire is None or second is None:
+        return problems + ["the first pass did not run, so there is nothing to repeat"]
+
+    # The first pass really did something. Otherwise the second proves nothing.
+    installed = provision.data.get("components", {}).get("installed", [])
+    if OLLAMA not in installed:
+        problems.append(f"the first pass installed nothing to be idempotent about: {installed}")
+    first_downloads = acquire.data.get("downloads", 0)
+    first_pulls = list(acquire.data.get("pulls", []))
+    if first_downloads < len(FIXTURE_MODELS):
+        problems.append(f"the fixture weights were never downloaded: {first_downloads}")
+    if not first_pulls:
+        problems.append("the chat model was never pulled, so a second pull cannot be ruled out")
+
+    # The second pass proposes nothing, and measurably did nothing.
+    if second.data.get("would_install") or second.data.get("would_acquire"):
+        problems.append(f"a second run proposes work: {second.detail}")
+    if second.data.get("downloads") != first_downloads:
+        problems.append(
+            f"a second run downloaded again: {first_downloads} -> {second.data.get('downloads')}"
+        )
+    if list(second.data.get("pulls", [])) != first_pulls:
+        problems.append(f"a second run pulled again: {first_pulls} -> {second.data.get('pulls')}")
     if second.data.get("created_directories"):
         problems.append("a dry-run second plan created directories")
-    if getattr(world.ollama, "pulls", []):
-        problems.append("a second run pulled a model")
     return problems
 
 
@@ -767,13 +858,26 @@ def _verify_invalid_workflow(report: TestRunReport, world: ControlledWorld) -> l
 
 
 P0_SCENARIOS: tuple[Scenario, ...] = (
-    Scenario("clean-root", "Clean-root install", _clean_root, _verify_clean_root),
-    Scenario("second-run", "Second run proposes nothing", _second_run, _verify_second_run),
+    Scenario(
+        "clean-root",
+        "Controlled partial provisioning from a clean root (Ollama only)",
+        _clean_root,
+        _verify_clean_root,
+        phase=TestPhase.PROVISION,
+    ),
+    Scenario(
+        "second-run",
+        "Partial controlled stack idempotence",
+        _second_run,
+        _verify_second_run,
+        phase=TestPhase.SECOND_PLAN,
+    ),
     Scenario(
         "external-ollama",
         "External Ollama coexistence",
         _external("ollama"),
         _verify_external("ollama"),
+        phase=TestPhase.PREFLIGHT,
         mutating=False,
     ),
     Scenario(
@@ -781,33 +885,103 @@ P0_SCENARIOS: tuple[Scenario, ...] = (
         "External ComfyUI coexistence",
         _external("comfyui"),
         _verify_external("comfyui"),
+        phase=TestPhase.PREFLIGHT,
         mutating=False,
     ),
-    Scenario("port-collision", "Managed port collision", _port_collision, _verify_port_collision),
-    Scenario("corrupted-model", "Corrupted model", _corrupted_model, _verify_corrupted_model),
+    Scenario(
+        "port-collision",
+        "Managed port collision",
+        _port_collision,
+        _verify_port_collision,
+        phase=TestPhase.PREFLIGHT,
+        outcomes=(TestPhaseOutcome.BLOCKED,),
+    ),
+    Scenario(
+        "corrupted-model",
+        "Corrupted managed model",
+        _corrupted_model,
+        _verify_corrupted_model,
+        phase=TestPhase.CONFIGURE,
+        outcomes=(TestPhaseOutcome.BLOCKED,),
+    ),
     Scenario(
         "interrupted-download",
         "Interrupted model download",
         _interrupted_download,
         _verify_interrupted_download,
+        phase=TestPhase.ACQUIRE_MODELS,
+        outcomes=(TestPhaseOutcome.FAILED,),
+        state=TestRunState.FAILED,
     ),
-    Scenario("readiness-failure", "Readiness failure", _readiness_failure, _verify_readiness),
-    Scenario("crash-after-start", "Crash after start", _crash_after_start, _verify_crash),
-    Scenario("stop-cleanup", "Stop and cleanup", _stop_and_cleanup, _verify_stop),
-    Scenario("missing-model", "Missing required model", _missing_model, _verify_missing_model),
-    Scenario("cuda-unavailable", "CUDA unavailable", _cuda_unavailable, _verify_cuda),
+    Scenario(
+        "readiness-failure",
+        "Readiness failure",
+        _readiness_failure,
+        _verify_readiness,
+        phase=TestPhase.START,
+        outcomes=(TestPhaseOutcome.FAILED,),
+        state=TestRunState.FAILED,
+    ),
+    Scenario(
+        "crash-after-start",
+        "Crash after start",
+        _crash_after_start,
+        _verify_crash,
+        phase=TestPhase.STOP,
+    ),
+    Scenario(
+        "stop-cleanup",
+        "Stop and cleanup",
+        _stop_and_cleanup,
+        _verify_stop,
+        phase=TestPhase.STOP,
+    ),
+    Scenario(
+        "missing-model",
+        "Missing required model",
+        _missing_model,
+        _verify_missing_model,
+        phase=TestPhase.CONFIGURE,
+        outcomes=(TestPhaseOutcome.BLOCKED,),
+    ),
+    Scenario(
+        "cuda-unavailable",
+        "CUDA unavailable",
+        _cuda_unavailable,
+        _verify_cuda,
+        phase=TestPhase.IMAGE_SMOKE,
+        # Without a usable device the profile is genuinely incompatible, so the
+        # block can land in preflight and the GPU phase is then never attempted.
+        # Either way no workload ran, which is what this row is about.
+        outcomes=(TestPhaseOutcome.BLOCKED, TestPhaseOutcome.SKIPPED),
+    ),
     Scenario(
         "corrupted-config",
         "Corrupted managed configuration",
         _corrupted_config,
         _verify_corrupted_config,
+        phase=TestPhase.CONFIGURE,
+        outcomes=(TestPhaseOutcome.FAILED,),
+        state=TestRunState.FAILED,
     ),
-    Scenario("invalid-workflow", "Invalid workflow", _invalid_workflow, _verify_invalid_workflow),
+    Scenario(
+        "invalid-workflow",
+        "Invalid workflow",
+        _invalid_workflow,
+        _verify_invalid_workflow,
+        phase=TestPhase.CONFIGURE,
+        outcomes=(TestPhaseOutcome.FAILED,),
+        state=TestRunState.FAILED,
+    ),
     Scenario(
         "cleanup-after-failure",
         "Cleanup after a failing phase",
         _cleanup_after_exception,
         _verify_cleanup_after_failure,
+        phase=TestPhase.CLEANUP,
+        outcomes=(TestPhaseOutcome.FAILED,),
+        state=TestRunState.FAILED,
+        cleanup=TestPhaseOutcome.FAILED,
     ),
 )
 
@@ -825,6 +999,7 @@ class ScenarioRunner:
         report: TestRunReport | None = None
         try:
             report = harness.run(new_run_id(), setup.spec)
+            diagnostics.extend(scenario.verdict(report))
             diagnostics.extend(scenario.verify(report, setup.world))
         except Exception as exc:  # noqa: BLE001 - a scenario crash is a diagnostic
             diagnostics.append(f"{type(exc).__name__}: {exc}")

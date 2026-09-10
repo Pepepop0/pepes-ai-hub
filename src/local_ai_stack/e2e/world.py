@@ -308,11 +308,14 @@ def controlled_world(
     clock = StepClock()
     artifacts = ControlledArtifacts()
     catalog = fixture_model_catalog(artifacts.register_model) if fixture_models else None
+    pinned = _pinned_references(catalog)
     return ControlledWorld(
         root=root if root is not None else allocate_root(),
         facts=controlled_facts(cuda=cuda),
         runner=ControlledRunner(on_path=dict(on_path or {}), env=dict(environment or {})),
-        ollama=ControlledOllama(installed=ollama_models, reachable=ollama_reachable, plan=plan),
+        ollama=ControlledOllama(
+            installed=ollama_models, reachable=ollama_reachable, plan=plan, pinned=pinned
+        ),
         endpoints=endpoints,
         inventory=inventory,
         comfyui=ControlledComfyUI(),
@@ -325,6 +328,18 @@ def controlled_world(
         repo_root=repo_root if repo_root is not None else detect_repo_root(),
         clock=clock,
     )
+
+
+def _pinned_references(catalog: ModelCatalog | None) -> dict[str, str]:
+    """Reference to pinned digest, for every Ollama model in the catalog."""
+    from ..models import OllamaModelSource
+
+    resolved = catalog if catalog is not None else model_catalog()
+    return {
+        spec.source.reference: spec.source.digest
+        for spec in resolved.specs.values()
+        if isinstance(spec.source, OllamaModelSource) and spec.source.digest
+    }
 
 
 def real_world(

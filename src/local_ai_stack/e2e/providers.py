@@ -256,8 +256,13 @@ class ControlledOllama:
         installed: Sequence[OllamaModelEntry] = (),
         reachable: bool = True,
         plan: InjectionPlan | None = None,
+        pinned: Mapping[str, str] | None = None,
     ) -> None:
         self.installed = list(installed)
+        # What a registry would serve for each reference. A store that invented
+        # its own digest would make every freshly pulled model look republished,
+        # which is a real failure mode and not the one under test here.
+        self.pinned = dict(pinned or {})
         self.reachable = reachable
         self.plan = plan or InjectionPlan.none()
         self.pulls: list[str] = []
@@ -278,7 +283,7 @@ class ControlledOllama:
         if self.plan.active(Injection.MODEL_MISSING):
             raise OllamaClientError(f"could not pull {reference}: controlled store refuses")
         self.pulls.append(reference)
-        digest = hashlib.sha256(reference.encode("utf-8")).hexdigest()
+        digest = self.pinned.get(reference) or hashlib.sha256(reference.encode("utf-8")).hexdigest()
         self.installed.append(OllamaModelEntry(name=reference, digest=digest, size_bytes=1))
 
     # --- rota de chat ------------------------------------------------------

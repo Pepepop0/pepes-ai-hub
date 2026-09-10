@@ -50,6 +50,7 @@ from ..integration import (
 from ..model_resolver import StackModelResolver
 from ..planning import build_install_plan
 from ..profiles import Profile, load_profiles
+from ..provisioning import ProvisionOutcome
 from ..registry import ManagedProcessRegistry
 from ..test_contracts import (
     TestEvent,
@@ -265,6 +266,9 @@ class StackTestHarness:
             # the ephemeral root.
             cleanup = self._cleanup(context, sequence)
             results.append(cleanup)
+            if not failure_detail and cleanup.outcome is TestPhaseOutcome.FAILED:
+                # Otherwise the run reports itself failed without saying why.
+                failure_detail = cleanup.detail
 
         state = (
             TestRunState.FAILED
@@ -459,9 +463,25 @@ class StackTestHarness:
             actions=self.world.install_actions(provision, context.require_profile()),
             options=context.options,
         )
-        target = self.world.installable_plan(phases.provisioning)
+        full = phases.provisioning
+        target = self.world.installable_plan(full)
         report = executor.execute(target, dry_run=False)
+
+        installed = [item.component_id for item in report.results if item.changed]
+        attempted = {item.component_id for item in report.results}
+        declared = {step.target for step in full.steps if str(step.action) == "install"}
+        # Named explicitly, because a run that installs one component out of
+        # three must not read as a whole-stack install.
+        components = {
+            "installed": sorted(installed),
+            "attempted": sorted(attempted),
+            "declared": sorted(declared),
+            "not_attempted": sorted(declared - attempted),
+            "external": list(context.data.get("external_components", [])),
+        }
+        context.data["components"] = components
         data = {
+            "components": components,
             "installable_components": sorted(self.world.install_components),
             "created_directories": [str(path) for path in report.created_directories],
             "results": [
@@ -473,7 +493,10 @@ class StackTestHarness:
         if not report.ok:
             failed = ", ".join(item.component_id for item in report.failures)
             raise PhaseFailed(f"provisioning failed for: {failed}")
-        return f"provisioned {len(report.results)} components", data
+        detail = ", ".join(components["installed"]) or "nothing"
+        if components["not_attempted"]:
+            detail += f" (not attempted here: {', '.join(components['not_attempted'])})"
+        return f"provisioned {detail}", data
 
     def _phase_start(self, context: RunContext) -> tuple[str, dict[str, Any]]:
         controller = self._controller(context)
@@ -511,6 +534,7 @@ class StackTestHarness:
         data = {
             "actions": _actions(report),
             "pulls": list(getattr(self.world.ollama, "pulls", [])),
+            "downloads": len(self.world.artifacts.requests),
         }
         if not report.ok:
             raise PhaseFailed(f"model acquisition failed: {_why(report)}", data)
@@ -693,35 +717,58 @@ class StackTestHarness:
         return f"stopped {len(stopped)} managed services", data
 
     def _phase_second_plan(self, context: RunContext) -> tuple[str, dict[str, Any]]:
-        """Prove verified current state proposes no new mutation."""
+        """Prove that what this run really installed proposes nothing further.
+
+        A dry run never reports INSTALLED, so looking for that outcome could
+        never fail. What it does report is ``dry-run`` for a component it would
+        install and ``skipped`` for one that is already there, and that
+        difference is the measurement.
+
+        The claim is scoped to what this mode actually provisioned. Asking
+        whether a component the run never installed would install is a real
+        question, but it is not idempotence.
+        """
+        profile = context.require_profile()
         with context.metrics.measure(Metric.PLAN, run="second"):
-            plan = build_install_plan(
-                context.require_profile(), installation=context.installation, stack=None
-            )
+            plan = build_install_plan(profile, installation=context.installation, stack=None)
         provision = provision_context(context.installation, runner=self.world.runner)
         executor = plan_executor(
             provision,
             self.world.provisioners(provision),
-            actions=self.world.install_actions(provision, context.require_profile()),
+            actions=self.world.install_actions(provision, profile),
             options=context.options,
         )
-        report = executor.execute(plan, dry_run=True)
-        changed = [item.component_id for item in report.results if str(item.outcome) == "installed"]
-        downloads = list(getattr(self.world.ollama, "pulls", []))
+        phases = stage_managed_plan(plan)
+        report = executor.execute(self.world.installable_plan(phases.provisioning), dry_run=True)
+        models = executor.execute(_only(phases.after_ollama_ready, "acquire-model"), dry_run=True)
+
+        would_install = [
+            item.component_id
+            for item in report.results
+            if str(item.outcome) == str(ProvisionOutcome.DRY_RUN)
+        ]
+        would_acquire = [item.target for item in models.action_results if item.changed]
         data = {
             "results": [
                 {"component": item.component_id, "outcome": str(item.outcome)}
                 for item in report.results
             ],
-            "would_change": changed,
-            "pulls_so_far": downloads,
+            "model_actions": _actions(models),
+            "would_install": would_install,
+            "would_acquire": would_acquire,
+            "pulls": list(getattr(self.world.ollama, "pulls", [])),
+            "downloads": len(self.world.artifacts.requests),
             "created_directories": [str(path) for path in report.created_directories],
         }
-        if changed:
+        proposed = would_install + would_acquire
+        if proposed:
             raise PhaseFailed(
-                "a second plan proposes to reinstall verified components: " + ", ".join(changed)
+                "a second run proposes work for verified state: " + ", ".join(proposed), data
             )
-        return "second plan proposes no mutation for verified state", data
+        return (
+            f"a second run proposes nothing for {len(report.results)} verified component(s) "
+            f"and {len(models.action_results)} model(s)"
+        ), data
 
     # --- cleanup -----------------------------------------------------------
 

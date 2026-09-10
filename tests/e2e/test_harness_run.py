@@ -727,3 +727,94 @@ def test_an_external_installation_is_classified_and_left_alone(component):
     finally:
         setup.world.root.release()
         setup.teardown()
+
+
+# --- veredito declarado, não inferido ---------------------------------------
+
+
+def test_every_scenario_declares_the_phase_it_is_about():
+    for scenario in P0_SCENARIOS:
+        assert scenario.phase in scenario.setup().spec.phases or (
+            scenario.phase is TestPhase.CLEANUP
+        ), f"{scenario.id} names a phase it never runs"
+
+
+def test_a_failing_run_is_not_a_passing_scenario():
+    """The defect this contract exists to prevent: a silent false pass."""
+    from dataclasses import replace
+
+    row = replace(scenario_by_id("readiness-failure"), state=TestRunState.PASSED)
+    result = ScenarioRunner().run(row)
+    assert result.outcome is ScenarioOutcome.FAILED
+    assert any("expects passed" in item for item in result.diagnostics)
+
+
+def test_a_phase_that_never_ran_is_not_a_passing_scenario():
+    from dataclasses import replace
+
+    row = replace(scenario_by_id("clean-root"), phase=TestPhase.IMAGE_SMOKE)
+    result = ScenarioRunner().run(row)
+    assert result.outcome is ScenarioOutcome.FAILED
+    assert any("never ran" in item for item in result.diagnostics)
+
+
+def test_a_row_that_expects_a_failure_says_so():
+    """Rows about failures are declared, not inferred from a silent verifier."""
+    expected_failures = {row.id for row in P0_SCENARIOS if row.state is TestRunState.FAILED}
+    assert expected_failures == {
+        "interrupted-download",
+        "readiness-failure",
+        "corrupted-config",
+        "invalid-workflow",
+        "cleanup-after-failure",
+    }
+
+
+def test_only_the_cleanup_row_tolerates_a_failing_cleanup():
+    tolerant = [row.id for row in P0_SCENARIOS if row.cleanup is not TestPhaseOutcome.PASSED]
+    assert tolerant == ["cleanup-after-failure"]
+
+
+# --- idempotência parcial, medida -------------------------------------------
+
+
+def test_the_second_run_row_measures_a_first_pass_that_really_did_work():
+    result = ScenarioRunner().run(scenario_by_id("second-run"))
+    assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
+
+    acquire = phase_of(result.report, TestPhase.ACQUIRE_MODELS)
+    second = phase_of(result.report, TestPhase.SECOND_PLAN)
+    assert acquire.data["pulls"], "nothing was pulled, so nothing can be idempotent"
+    assert acquire.data["downloads"] >= 3
+
+    assert second.data["would_install"] == []
+    assert second.data["would_acquire"] == []
+    assert second.data["downloads"] == acquire.data["downloads"]
+    assert second.data["pulls"] == acquire.data["pulls"]
+
+
+def test_the_second_plan_looks_for_an_outcome_a_dry_run_can_produce():
+    """`installed` never appears in a dry run, so it could never fail."""
+    result = ScenarioRunner().run(scenario_by_id("second-run"))
+    outcomes = {
+        item["outcome"] for item in phase_of(result.report, TestPhase.SECOND_PLAN).data["results"]
+    }
+    assert "installed" not in outcomes
+    assert outcomes <= {"skipped", "dry-run", "failed"}
+
+
+# --- honestidade sobre o que foi realmente instalado ------------------------
+
+
+def test_a_partial_provisioning_run_names_what_it_did_not_attempt():
+    result = ScenarioRunner().run(scenario_by_id("clean-root"))
+    components = phase_of(result.report, TestPhase.PROVISION).data["components"]
+    assert components["installed"] == ["ollama"]
+    assert set(components["not_attempted"]) == {"comfyui", "open-webui"}
+    assert set(components["declared"]) == {"ollama", "comfyui", "open-webui"}
+
+
+def test_the_clean_root_row_does_not_call_itself_a_whole_stack_install():
+    title = scenario_by_id("clean-root").title.lower()
+    assert "partial" in title
+    assert "ollama only" in title

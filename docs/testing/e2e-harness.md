@@ -13,7 +13,7 @@ existentes; não reimplementa nenhum deles.
 | `e2e/seams.py` | `Injection` e `InjectionPlan` — falhas nomeadas, determinísticas |
 | `e2e/roots.py` | Root efêmero (removido) vs configurado (nunca apagado) |
 | `e2e/metrics.py` | Medição monotônica; amostras cruas + count/mediana/máximo |
-| `e2e/fixtures.py` | Repositório-fixture: manifests e grafos reais, um profile declarado |
+| `e2e/fixtures.py` | Fixtures: repositório, catálogo de pesos pequenos, instalação external real |
 | `e2e/scenarios.py` | Matriz P0 e o runner que verifica invariantes de fora |
 
 ## O que o harness não faz
@@ -26,6 +26,32 @@ nos domínios. O harness compõe `preflight_managed_stack`, `build_install_plan`
 Um teste garante isso: `harness.py` não contém `taskkill`, nem cálculo de
 checksum, nem decisão própria de "é external".
 
+## Spec, world e injections: uma fonte de verdade cada
+
+O world é a autoridade sobre root e providers. Uma spec que peça
+`root_mode=CONFIGURED` contra um world efêmero, ou `provider_mode=LOCAL_REAL`
+contra providers controlados, é **recusada antes de qualquer fase** — todas as
+fases pedidas viram `blocked` e o run é `failed`. Nada é normalizado em
+silêncio: um relatório que nomeia um modo em que ninguém rodou é pior que
+nenhum relatório.
+
+`local-real` não existe ainda. `real_world()` **recusa** mesmo com a capability
+de rede, porque antes ela devolvia facts reais e cliente Ollama real enquanto
+mantinha inventário, probes e launcher controlados — um scan de processos
+controlado seria reportado como evidência sobre a máquina real.
+
+Existe **um** `InjectionPlan` por run, o do world; o harness não aceita outro.
+Uma injection declarada no relatório é uma injection que uma seam recebeu de
+fato: o transporte controlado registra quais URLs interrompeu ou corrompeu, e
+há teste que confere o relatório contra a seam.
+
+## Cleanup cobre o run inteiro
+
+O root existe desde a construção do world, então **tudo** a partir da validação
+da spec roda dentro do `try` cujo `finally` o libera. Um run que nem consegue
+carregar o profile ainda limpa. O contexto é construído em dois passos: um sem
+I/O, que dá ao cleanup o que ele libera, e o bind do profile, que pode falhar.
+
 ## Regras de fase
 
 - Falha para o run inteiro.
@@ -37,6 +63,47 @@ checksum, nem decisão própria de "é external".
 - `cleanup` roda de um `finally`, sempre, e reporta independente. Uma falha de
   cleanup nunca transforma uma falha anterior em passe.
 
+## Veredito de cenário
+
+Um verificador que só junta problemas passa sempre que não achar nenhum. Cada
+linha da matriz portanto **declara** o que espera: o estado do run, a fase de
+que ela realmente trata, o outcome dessa fase, e o outcome do cleanup. Um run
+`failed` só é cenário `passed` onde a linha diz isso (readiness, download
+interrompido, config adulterada, workflow inválido, cleanup após falha). Uma
+fase que nunca rodou nunca é prova.
+
+## O que cada linha realmente exercita
+
+- **chat_smoke** manda uma geração para o endpoint que o profile resolveu,
+  nomeando o modelo que o resolver disse estar disponível. O store controlado
+  recusa uma referência que não tem. `/api/version` provava porta aberta, que o
+  start já provava.
+- **image_smoke** renderiza o workflow declarado — manifest real, grafo real,
+  `resolve_workflow`/`verify_workflow_references`/`render_workflow` reais — e o
+  submete. A prova é o contrato de submissão: binding de modelo com o
+  `runtime_name` resolvido, parâmetros nos endereços que o manifest declarou,
+  resultado de volta. Nada executa: sem GPU, sem imagem.
+- **crash-after-start** começa de verdade, fica ready de verdade, e morre na
+  **próxima** observação. É o caso que um relatório de start sozinho não pega.
+  O stop lê `controller.statuses()` antes de tocar em nada.
+- **external coexistence** cria uma instalação real onde os *hints do próprio
+  provisioner* olham, fora do root managed. Cada componente tem prova própria:
+  classificado external, coexistência não recusada, endpoint managed separado
+  do external, nunca adotado, nunca `stoppable`, nunca iniciado ou parado,
+  bytes em disco inalterados, processo vivo depois.
+- **corrupted-model** instala e verifica pesos de verdade e só então muda os
+  bytes; quem pega é o installer re-hasheando um arquivo que já tinha aceito.
+- **interrupted-download** age no URL de *modelo*, não no binário do componente.
+
+## Pesos de fixture
+
+O profile `pepe` exige 12,45 GB de pesos ComfyUI. O catálogo-fixture soma ao
+catálogo real três pesos de algumas dezenas de bytes, fixados no SHA-256
+exatamente dos bytes que o transporte controlado serve. Download, verificação
+de checksum e colocação via `ManagedModelPaths` são o caminho real sobre
+arquivos reais: o que é fixture é o **tamanho** dos pesos, não o tratamento
+deles.
+
 ## Modo controlado
 
 Substitui só os seams com efeito colateral. O provisioner do Ollama recebe um
@@ -45,8 +112,13 @@ bytes servidos — então o download, a verificação, a extração e a escrita 
 marcador são o código real rodando sem alteração.
 
 ComfyUI e Open WebUI precisam de `git` e `pip`. Um fake disso não provaria nada
-sobre a instalação real, então um run controlado **não os instala** e diz isso
-no relatório (`installable_components`), em vez de fingir.
+sobre a instalação real, então um run controlado **não os instala**. A fase de
+provisioning nomeia isso: `components.installed`, `components.declared` e
+`components.not_attempted` vão no relatório, e a linha se chama *controlled
+partial provisioning (Ollama only)*, não "clean-root install". A idempotência
+que a matriz prova é a do que esse modo instala de fato — *partial controlled
+stack idempotence* — medida em downloads e pulls antes e depois, não inferida
+de um outcome que um dry-run nunca produz.
 
 ## Configuração gerada, adulterada e recusada
 

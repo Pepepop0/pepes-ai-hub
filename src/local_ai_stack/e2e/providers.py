@@ -167,6 +167,10 @@ class ControlledArtifacts:
 
     payloads: dict[str, bytes] = field(default_factory=dict)
     requests: list[str] = field(default_factory=list)
+    # What the injections actually did here, so a report can be checked against
+    # the seam instead of against its own declaration.
+    interrupted: list[str] = field(default_factory=list)
+    corrupted: list[str] = field(default_factory=list)
 
     def register(self, url: str, payload: bytes) -> str:
         self.payloads[url] = payload
@@ -184,8 +188,10 @@ class ControlledArtifacts:
             if active.active(Injection.DOWNLOAD_INTERRUPTED):
                 # A short write: the transport stops mid-body. The downloader
                 # must not promote the partial file.
+                self.interrupted.append(url)
                 raise httpx.ReadError("controlled transport closed mid-transfer")
             if active.active(Injection.CHECKSUM_MISMATCH):
+                self.corrupted.append(url)
                 payload = payload + b"-tampered"
             return httpx.Response(200, content=payload)
 

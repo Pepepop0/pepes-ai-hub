@@ -26,10 +26,10 @@ from ..integration import (
     default_provisioners,
 )
 from ..managed_config import ManagedConfigWriter
-from ..ollama_models import HttpOllamaClient, OllamaModelEntry
+from ..ollama_models import OllamaModelEntry
 from ..profiles import Profile
 from ..runner import CommandRunner
-from ..system import SystemFacts, detect_system
+from ..system import SystemFacts
 from ..test_contracts import TestProviderMode
 from .providers import (
     ControlledArtifacts,
@@ -279,32 +279,26 @@ def real_world(
     options: IntegrationOptions | None = None,
     repo_root: Path | None = None,
 ) -> ControlledWorld:
-    """A world backed by the real machine. Opt-in, never a default.
+    """A world backed by the real machine. Not implemented, and it says so.
 
-    Refuses to exist without the network capability, because every real
-    dependency it binds — the Ollama store, the download transport — needs it.
-    Nothing in the automatic suite calls this.
+    This used to hand back real system facts and a real Ollama client while
+    still using the controlled inventory, endpoints and launcher — a world that
+    called itself ``local-real`` and would have reported a controlled process
+    scan as evidence about the real machine. That is the one thing a test
+    harness must never do, so it refuses instead.
+
+    The network capability is still checked first, because a caller without it
+    is wrong for a second, independent reason.
     """
     if not allow_network:
         raise CapabilityRefused(
             "a real-provider world requires the explicit network capability; "
             "controlled providers are the default for every automatic test"
         )
-    resolved_options = options or IntegrationOptions()
-    inventory = ControlledInventory()
-    return ControlledWorld(
-        root=root,
-        facts=detect_system(),
-        runner=CommandRunner(),
-        ollama=HttpOllamaClient(),
-        endpoints=ControlledEndpoints(),
-        inventory=inventory,
-        artifacts=ControlledArtifacts(),
-        options=resolved_options,
-        injections=InjectionPlan.none(),
-        provider_mode=TestProviderMode.LOCAL_REAL,
-        repo_root=repo_root if repo_root is not None else detect_repo_root(),
-        clock=None,
+    raise CapabilityRefused(
+        "local-real providers are not implemented: process scanning, listener scanning "
+        "and process launching have no real implementation bound here, and reporting "
+        "controlled seams as local-real would make the run lie about what it proved"
     )
 
 

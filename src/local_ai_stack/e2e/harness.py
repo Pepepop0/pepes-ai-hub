@@ -16,6 +16,15 @@ Two rules shape the whole file:
   classification and path authority stay where they already live. When a domain
   says a component is EXTERNAL, the harness records that and moves on; it has no
   opinion of its own to substitute.
+
+Two consequences of the first rule are easy to get wrong and are handled here
+explicitly. The root is acquired when the world is built, so *everything* from
+spec validation onwards runs inside the try whose finally releases it; a run
+that cannot even load its profile still cleans up. And the spec is checked
+against the world before anything runs: a spec asking for a configured root or
+local-real providers against an ephemeral, controlled world is refused rather
+than quietly reinterpreted, because a report that names the wrong mode is worse
+than no report.
 """
 
 from __future__ import annotations
@@ -97,6 +106,14 @@ class PhaseFailed(PhaseOutcomeError):
     """The phase ran and the application behaved wrongly."""
 
 
+class SpecRefused(RuntimeError):
+    """The run was never started: the spec does not match this world.
+
+    A precondition, not a failure of the application. It is still reported as a
+    failed *run*, because the caller asked for something that did not happen.
+    """
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
 
@@ -109,9 +126,11 @@ class RunContext:
     world: ControlledWorld
     root: TestRoot
     metrics: MetricRecorder
-    profile: Profile
     options: IntegrationOptions
     injections: InjectionPlan
+    # Bound after the spec is accepted. A context exists before that so cleanup
+    # has something to release when the profile itself is the thing that failed.
+    profile: Profile | None = None
     data: dict[str, Any] = field(default_factory=dict)
     controller: object | None = None
     registry: ManagedProcessRegistry | None = None
@@ -122,6 +141,11 @@ class RunContext:
     def installation(self):
         return self.root.installation
 
+    def require_profile(self) -> Profile:
+        if self.profile is None:  # pragma: no cover - phases run after binding
+            raise PhaseFailed("no profile is bound to this run")
+        return self.profile
+
 
 class StackTestHarness:
     """Implements the shared ``TestHarness`` protocol."""
@@ -131,13 +155,22 @@ class StackTestHarness:
         world: ControlledWorld,
         *,
         repo_root: Path | None = None,
-        injections: InjectionPlan | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self.world = world
         self.repo_root = Path(repo_root) if repo_root is not None else world.repo_root
-        self.injections = injections or world.injections
         self._clock = clock
+
+    @property
+    def injections(self) -> InjectionPlan:
+        """The one plan for this run: the world's.
+
+        There is deliberately no way to give the harness a different one. A
+        second plan could name an injection the seams never received, and an
+        injection nobody can observe is worse than none -- it makes the report
+        lie in the direction of having tested more.
+        """
+        return self.world.injections
 
     # --- protocolo ---------------------------------------------------------
 
@@ -152,11 +185,15 @@ class StackTestHarness:
         started_at = _utc_now()
         sequence.run_state(TestRunState.RUNNING)
 
-        context = self._context(spec)
+        # Built before anything can fail, because the root already exists and
+        # the finally below is what releases it.
+        context = self._bare_context(spec)
         results: list[TestPhaseResult] = []
         failure_detail = ""
 
         try:
+            self._refuse_mismatch(spec)
+            self._bind_profile(context)
             halted = ""
             blocked = ""
             for phase in spec.phases:
@@ -184,6 +221,18 @@ class StackTestHarness:
                 elif result.outcome is TestPhaseOutcome.BLOCKED:
                     blocked = f"{phase} was blocked"
 
+        except SpecRefused as exc:
+            # Nothing ran, so nothing is a phase failure; the run is what failed.
+            failure_detail = f"run refused: {exc}"
+            results.extend(
+                TestPhaseResult(
+                    phase=phase,
+                    outcome=TestPhaseOutcome.BLOCKED,
+                    detail=failure_detail,
+                )
+                for phase in spec.phases
+                if phase is not TestPhase.CLEANUP
+            )
         except BaseException as exc:  # noqa: BLE001 - recorded, then re-raised path
             failure_detail = f"{type(exc).__name__}: {exc}"
             results.append(
@@ -202,7 +251,7 @@ class StackTestHarness:
 
         state = (
             TestRunState.FAILED
-            if any(item.outcome is TestPhaseOutcome.FAILED for item in results)
+            if failure_detail or any(item.outcome is TestPhaseOutcome.FAILED for item in results)
             else TestRunState.PASSED
         )
         report = TestRunReport(
@@ -221,20 +270,49 @@ class StackTestHarness:
 
     # --- montagem ----------------------------------------------------------
 
-    def _context(self, spec: TestRunSpec) -> RunContext:
-        profiles = {item.id: item for item in load_profiles(self.repo_root / "profiles")}
-        if spec.profile_id not in profiles:
-            raise PhaseFailed(f"unknown profile {spec.profile_id!r}")
-        root = self.world.root
+    def _bare_context(self, spec: TestRunSpec) -> RunContext:
+        """Everything cleanup needs, built without touching the filesystem."""
         return RunContext(
             spec=spec,
             world=self.world,
-            root=root,
+            root=self.world.root,
             metrics=MetricRecorder(self._clock or self.world.monotonic),
-            profile=profiles[spec.profile_id],
             options=self.world.options,
             injections=self.injections,
         )
+
+    def _bind_profile(self, context: RunContext) -> None:
+        """Load the requested profile. Failing here still reaches cleanup."""
+        profiles = {item.id: item for item in load_profiles(self.repo_root / "profiles")}
+        if context.spec.profile_id not in profiles:
+            known = ", ".join(sorted(profiles)) or "none"
+            raise PhaseFailed(
+                f"unknown profile {context.spec.profile_id!r}; this repository declares: {known}"
+            )
+        context.profile = profiles[context.spec.profile_id]
+
+    def _refuse_mismatch(self, spec: TestRunSpec) -> None:
+        """The world is the single source of truth. A spec may not contradict it.
+
+        Normalising silently would be the worst option available: the report
+        would name a mode nobody ran in.
+        """
+        world = self.world
+        if spec.root_mode is not world.root.mode:
+            raise SpecRefused(
+                f"the spec asks for a {spec.root_mode} root while this world holds a "
+                f"{world.root.mode} one"
+            )
+        if spec.provider_mode is not world.provider_mode:
+            raise SpecRefused(
+                f"the spec asks for {spec.provider_mode} providers while this world is "
+                f"{world.provider_mode}"
+            )
+        if spec.provider_mode is TestProviderMode.LOCAL_REAL:
+            raise SpecRefused(
+                "local-real providers are not implemented; controlled providers must never "
+                "be reported as local-real"
+            )
 
     def _report_context(self, context: RunContext) -> dict[str, Any]:
         return {
@@ -302,7 +380,7 @@ class StackTestHarness:
         provision = provision_context(context.installation, runner=self.world.runner)
         report = preflight_managed_stack(
             provision,
-            context.profile,
+            context.require_profile(),
             context.options,
             provisioners=self.world.provisioners(provision),
             facts=facts,
@@ -331,9 +409,9 @@ class StackTestHarness:
 
     def _phase_plan(self, context: RunContext) -> tuple[str, dict[str, Any]]:
         """Build the dry-run plan. Nothing is executed."""
-        with context.metrics.measure(Metric.PLAN, profile=context.profile.id):
+        with context.metrics.measure(Metric.PLAN, profile=context.require_profile().id):
             plan = build_install_plan(
-                context.profile,
+                context.require_profile(),
                 installation=context.installation,
                 stack=None,
             )
@@ -361,7 +439,7 @@ class StackTestHarness:
         executor = plan_executor(
             provision,
             self.world.provisioners(provision),
-            actions=self.world.install_actions(provision, context.profile),
+            actions=self.world.install_actions(provision, context.require_profile()),
             options=context.options,
         )
         target = self.world.installable_plan(phases.provisioning)
@@ -400,10 +478,6 @@ class StackTestHarness:
         return f"managed {OLLAMA} started and ready", data
 
     def _phase_acquire_models(self, context: RunContext) -> tuple[str, dict[str, Any]]:
-        if context.spec.provider_mode is TestProviderMode.LOCAL_REAL and not (
-            context.spec.allow_network
-        ):
-            raise PhaseBlocked("real model acquisition requires the network capability")
         phases = context.data.get("_plan_phases")
         if phases is None:
             raise PhaseBlocked("acquire_models needs a plan")
@@ -411,7 +485,7 @@ class StackTestHarness:
         executor = plan_executor(
             provision,
             self.world.provisioners(provision),
-            actions=self.world.install_actions(provision, context.profile),
+            actions=self.world.install_actions(provision, context.require_profile()),
             options=context.options,
         )
         acquire = _only(phases.after_ollama_ready, "acquire-model")
@@ -427,8 +501,8 @@ class StackTestHarness:
 
     def _phase_configure(self, context: RunContext) -> tuple[str, dict[str, Any]]:
         resolver = self._resolver(context)
-        with context.metrics.measure(Metric.MODEL_RESOLVE, profile=context.profile.id):
-            resolved = resolver.resolve_profile(context.profile)
+        with context.metrics.measure(Metric.MODEL_RESOLVE, profile=context.require_profile().id):
+            resolved = resolver.resolve_profile(context.require_profile())
         roles = {
             role: {
                 "state": str(model.state),
@@ -451,7 +525,7 @@ class StackTestHarness:
         executor = plan_executor(
             provision,
             self.world.provisioners(provision),
-            actions=self.world.install_actions(provision, context.profile),
+            actions=self.world.install_actions(provision, context.require_profile()),
             options=context.options,
         )
         configure = _only(phases.after_ollama_ready, "apply-workflow", "configure")
@@ -512,13 +586,13 @@ class StackTestHarness:
         """Prove verified current state proposes no new mutation."""
         with context.metrics.measure(Metric.PLAN, run="second"):
             plan = build_install_plan(
-                context.profile, installation=context.installation, stack=None
+                context.require_profile(), installation=context.installation, stack=None
             )
         provision = provision_context(context.installation, runner=self.world.runner)
         executor = plan_executor(
             provision,
             self.world.provisioners(provision),
-            actions=self.world.install_actions(provision, context.profile),
+            actions=self.world.install_actions(provision, context.require_profile()),
             options=context.options,
         )
         report = executor.execute(plan, dry_run=True)
@@ -609,7 +683,7 @@ class StackTestHarness:
             registry,
             layout=context.installation.layout,
             launcher=self.world.launcher(registry),
-            endpoints=context.options.endpoints_for(context.profile),
+            endpoints=context.options.endpoints_for(context.require_profile()),
             http=self.world.endpoints.http,
             tcp=self.world.endpoints.tcp,
             list_processes=self.world.inventory.list_processes,

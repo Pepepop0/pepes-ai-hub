@@ -19,6 +19,7 @@ from local_ai_stack.e2e.harness import (
     StackTestHarness,
     new_run_id,
 )
+from local_ai_stack.e2e.roots import allocate_root
 from local_ai_stack.e2e.scenarios import (
     P0_SCENARIOS,
     ScenarioOutcome,
@@ -33,6 +34,7 @@ from local_ai_stack.test_contracts import (
     TestHarness,
     TestPhase,
     TestPhaseOutcome,
+    TestProviderMode,
     TestRootMode,
     TestRunSpec,
     TestRunState,
@@ -202,11 +204,16 @@ def test_a_configured_root_survives_the_run(tmp_path):
 
 
 def test_a_real_world_refuses_without_the_network_capability(tmp_path):
-    from local_ai_stack.e2e.roots import allocate_root
-
     root = allocate_root(TestRootMode.CONFIGURED, configured=tmp_path / "real")
     with pytest.raises(CapabilityRefused, match="explicit network capability"):
         real_world(root=root, allow_network=False)
+
+
+def test_a_real_world_refuses_even_with_the_capability(tmp_path):
+    """Until real seams exist, nothing may call controlled providers real."""
+    root = allocate_root(TestRootMode.CONFIGURED, configured=tmp_path / "real")
+    with pytest.raises(CapabilityRefused, match="not implemented"):
+        real_world(root=root, allow_network=True)
 
 
 def test_no_default_test_path_builds_a_real_world():
@@ -227,9 +234,8 @@ def test_the_gpu_phase_needs_its_capability():
     assert "GPU capability" in image.detail
 
 
-def test_real_model_acquisition_needs_the_network_capability():
-    from local_ai_stack.test_contracts import TestProviderMode
-
+def test_a_local_real_spec_is_refused_rather_than_run_on_controlled_seams():
+    """The one thing a harness must never do is call controlled providers real."""
     world = controlled_world(ready_ports=[OLLAMA_PORT])
     report = StackTestHarness(world).run(
         new_run_id(),
@@ -237,12 +243,132 @@ def test_real_model_acquisition_needs_the_network_capability():
             profile_id="pepe",
             phases=(TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.ACQUIRE_MODELS),
             provider_mode=TestProviderMode.LOCAL_REAL,
-            allow_network=False,
+            allow_network=True,
         ),
     )
-    acquire = next(item for item in report.phases if item.phase is TestPhase.ACQUIRE_MODELS)
-    assert acquire.outcome is TestPhaseOutcome.BLOCKED
-    assert "network capability" in acquire.detail
+    assert report.state is TestRunState.FAILED
+    assert "run refused" in report.detail
+    assert all(
+        item.outcome is TestPhaseOutcome.BLOCKED
+        for item in report.phases
+        if item.phase is not TestPhase.CLEANUP
+    )
+
+
+def test_a_configured_spec_is_refused_against_an_ephemeral_world():
+    world = controlled_world(ready_ports=[OLLAMA_PORT])
+    report = StackTestHarness(world).run(
+        new_run_id(),
+        spec(TestPhase.PREFLIGHT, TestPhase.PLAN, root_mode=TestRootMode.CONFIGURED),
+    )
+    assert report.state is TestRunState.FAILED
+    assert "configured root" in report.detail
+    assert "ephemeral" in report.detail
+
+
+def test_an_ephemeral_spec_is_refused_against_a_configured_world(tmp_path):
+    persistent = tmp_path / "stack"
+    persistent.mkdir()
+    world = controlled_world(
+        root=allocate_root(TestRootMode.CONFIGURED, configured=persistent),
+        ready_ports=[OLLAMA_PORT],
+    )
+    report = StackTestHarness(world).run(new_run_id(), spec(TestPhase.PREFLIGHT))
+    assert report.state is TestRunState.FAILED
+    assert "run refused" in report.detail
+    assert persistent.exists()
+
+
+def test_a_refused_run_still_releases_its_root():
+    world = controlled_world(ready_ports=[OLLAMA_PORT])
+    root = world.root
+    StackTestHarness(world).run(
+        new_run_id(),
+        spec(TestPhase.PREFLIGHT, root_mode=TestRootMode.CONFIGURED),
+    )
+    assert not root.exists()
+
+
+# --- o contexto é construído dentro do finally do cleanup -------------------
+
+
+def test_an_unknown_profile_fails_the_run_and_still_cleans_up():
+    """The profile is loaded inside the try whose finally releases the root."""
+    world = controlled_world(ready_ports=[OLLAMA_PORT])
+    root = world.root
+    report = StackTestHarness(world).run(new_run_id(), spec(TestPhase.PREFLIGHT, TestPhase.PLAN))
+    assert report.state is TestRunState.PASSED  # sanity: the profile normally loads
+
+    world = controlled_world(ready_ports=[OLLAMA_PORT])
+    root = world.root
+    report = StackTestHarness(world).run(
+        new_run_id(),
+        TestRunSpec(profile_id="no-such-profile", phases=(TestPhase.PREFLIGHT, TestPhase.PLAN)),
+    )
+
+    assert report.state is TestRunState.FAILED
+    assert "unknown profile" in report.detail
+    assert not root.exists()
+    assert world.managed_residual() == ()
+    cleanup = phase_of(report, TestPhase.CLEANUP)
+    assert cleanup.outcome is TestPhaseOutcome.PASSED
+
+
+def test_a_repository_without_profiles_fails_the_run_and_still_cleans_up(tmp_path):
+    """Not even a loadable profiles directory. The root must still go."""
+    (tmp_path / "profiles").mkdir()
+    world = controlled_world(ready_ports=[OLLAMA_PORT], repo_root=tmp_path)
+    root = world.root
+    report = StackTestHarness(world).run(new_run_id(), spec(TestPhase.PREFLIGHT))
+    assert report.state is TestRunState.FAILED
+    assert not root.exists()
+
+
+def test_a_failing_run_never_deletes_a_configured_root(tmp_path):
+    persistent = tmp_path / "stack"
+    persistent.mkdir()
+    (persistent / "keep.txt").write_text("mine", encoding="utf-8")
+    world = controlled_world(
+        root=allocate_root(TestRootMode.CONFIGURED, configured=persistent),
+        ready_ports=[OLLAMA_PORT],
+    )
+    report = StackTestHarness(world).run(
+        new_run_id(),
+        TestRunSpec(
+            profile_id="no-such-profile",
+            phases=(TestPhase.PREFLIGHT,),
+            root_mode=TestRootMode.CONFIGURED,
+        ),
+    )
+    assert report.state is TestRunState.FAILED
+    assert (persistent / "keep.txt").read_text(encoding="utf-8") == "mine"
+
+
+# --- uma única fonte de injections -----------------------------------------
+
+
+def test_the_harness_cannot_be_given_injections_of_its_own():
+    """A second plan could name an injection no seam ever received."""
+    world = controlled_world(injections=InjectionPlan.of(Injection.PORT_OCCUPIED))
+    harness = StackTestHarness(world)
+    assert harness.injections is world.injections
+    with pytest.raises(TypeError):
+        StackTestHarness(world, injections=InjectionPlan.none())
+
+
+def test_a_declared_injection_really_reached_its_seam():
+    """No decorative injections: the report names what the seams received."""
+    world = controlled_world(
+        ready_ports=[OLLAMA_PORT],
+        injections=InjectionPlan.of(Injection.DOWNLOAD_INTERRUPTED),
+    )
+    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.PROVISION)
+
+    declared = report.context["injection"]["injections"]
+    assert declared == ["download-interrupted"]
+    # The transport seam was actually asked for bytes, and actually refused.
+    assert world.artifacts.requests, "the http-transport seam was never reached"
+    assert world.artifacts.interrupted, "the declared injection never acted"
 
 
 # --- bloqueio para de mutar ------------------------------------------------

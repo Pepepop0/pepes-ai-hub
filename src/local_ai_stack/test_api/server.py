@@ -38,6 +38,7 @@ from .payloads import (
     run_spec_payload,
 )
 from .runs import (
+    EventsAhead,
     EventsExpired,
     RunInProgress,
     RunRecord,
@@ -48,6 +49,11 @@ from .runs import (
 )
 from .sanitize import sanitize
 from .scheduler import RunScheduler
+
+
+class ShutdownTimeout(RuntimeError):
+    """stop() could not finish because a run is still executing."""
+
 
 API_PREFIX = "/internal/test/v1"
 SERVER_NAME = "pepitos-ai-hub-test-control"
@@ -296,6 +302,9 @@ class _Handler(BaseHTTPRequestHandler):
                 keepalive_seconds=self.api.config.keepalive_seconds,
             )
             first = next(stream, ...)
+        except EventsAhead as error:
+            self._error(HTTPStatus.CONFLICT, "events-ahead", str(error))
+            return
         except EventsExpired as error:
             self._error(HTTPStatus.CONFLICT, "events-expired", str(error))
             return
@@ -372,17 +381,35 @@ class TestApi:
         return self
 
     def stop(self, *, timeout: float = 5.0) -> None:
-        """Stop serving, release the port, and leave no worker running."""
+        """Stop serving and release everything, or say that it could not.
+
+        A run is never interrupted. The harness owns whatever it started, and
+        cutting its thread down would leave a process, a file or a download
+        half finished with nobody left to complete it.
+
+        So the order is: refuse new work, stop accepting requests, then give
+        the run the timeout to end on its own. If it is still going after that,
+        this raises :class:`ShutdownTimeout` instead of closing the socket and
+        reporting a shutdown that did not happen. Everything needed to finish
+        is kept, so calling ``stop`` again once the run ends completes it.
+        """
         self.stopping.set()
-        http, thread, self._http, self._thread = self._http, self._thread, None, None
-        if http is not None:
-            http.shutdown()
-        if thread is not None:
-            thread.join(timeout=timeout)
-        self.scheduler.shutdown(timeout=timeout)
-        if http is not None:
-            http.server_close()
-            self._bound = None
+        if self._http is None:
+            self.scheduler.shutdown(timeout=timeout)
+            return
+        self._http.shutdown()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+        if not self.scheduler.shutdown(timeout=timeout):
+            raise ShutdownTimeout(
+                "the test control server stopped accepting requests, but a run is still "
+                "executing and will not be interrupted; nothing was released. Call stop() "
+                "again once the run has finished."
+            )
+        self._http.server_close()
+        self._http = None
+        self._thread = None
+        self._bound = None
 
     def wait(self, timeout: float | None = None) -> None:
         """Block on the serving thread. Used by the command line entry point."""
@@ -477,6 +504,7 @@ class TestApi:
 __all__ = [
     "API_PREFIX",
     "EmptyStatusSource",
+    "ShutdownTimeout",
     "StatusSource",
     "TestApi",
     "TestApiConfig",

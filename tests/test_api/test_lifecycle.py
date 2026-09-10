@@ -8,7 +8,7 @@ from http.client import HTTPConnection
 
 import pytest
 
-from local_ai_stack.test_api import TestApi, TestApiConfig, TestApiToken
+from local_ai_stack.test_api import ShutdownTimeout, TestApi, TestApiConfig, TestApiToken
 from local_ai_stack.test_api.server import API_PREFIX
 
 from .conftest import (
@@ -19,6 +19,7 @@ from .conftest import (
     gated_script,
     open_stream,
     parse_frames,
+    report,
     wait_for_run,
 )
 
@@ -216,3 +217,113 @@ def test_a_stopped_server_answers_nothing():
     with pytest.raises(OSError):
         connection.request("GET", f"{API_PREFIX}/health")
         connection.getresponse()
+
+
+# --- stopping with a run still going ----------------------------------------
+
+
+def test_stop_refuses_to_claim_a_shutdown_it_could_not_finish(serve):
+    """The blocker: stop() used to return while the harness was still working."""
+    before = set(api_threads())
+    started, release = threading.Event(), threading.Event()
+    api = serve(ScriptedHarness(gated_script(started, release)))
+    host, port = api.address
+    run_id = Client(api).create_run().json()["run_id"]
+    assert started.wait(timeout=10)
+
+    with pytest.raises(ShutdownTimeout, match="still"):
+        api.stop(timeout=0.2)
+
+    # Nothing was released, and nothing was cut short.
+    assert not port_is_free(host, port), "the socket is still held"
+    assert api.address == (host, port), "the server does not pretend to be gone"
+    assert api.store.get(run_id).active, "the run was not interrupted"
+    assert set(api_threads()) > before, "the worker is still there, by design"
+
+    release.set()
+    finished = wait_for_run(api, run_id)
+    assert finished.state.value == "passed", "the run finished on its own terms"
+
+    api.stop(timeout=10)
+
+    assert port_is_free(host, port)
+    assert set(api_threads()) <= before
+    with pytest.raises(RuntimeError, match="not running"):
+        _ = api.address
+
+
+def test_a_refused_stop_lets_the_harness_finish_its_work(serve):
+    """No thread is killed, so whatever the harness was doing still completes."""
+    started, release = threading.Event(), threading.Event()
+    done: list[str] = []
+
+    def slow(run_id, spec, emit):
+        started.set()
+        release.wait(timeout=10)
+        done.append("finished")
+        return report(run_id, spec)
+
+    api = serve(ScriptedHarness(slow))
+    run_id = Client(api).create_run().json()["run_id"]
+    assert started.wait(timeout=10)
+
+    with pytest.raises(ShutdownTimeout):
+        api.stop(timeout=0.2)
+    assert done == [], "still in the middle of it"
+
+    release.set()
+    wait_for_run(api, run_id)
+    assert done == ["finished"]
+    assert api.store.get(run_id).report is not None
+
+    api.stop(timeout=10)
+
+
+def test_a_refused_stop_has_already_stopped_accepting_requests(serve):
+    """What did happen is that no new work can arrive while it winds down."""
+    started, release = threading.Event(), threading.Event()
+    api = serve(ScriptedHarness(gated_script(started, release)))
+    Client(api).create_run()
+    assert started.wait(timeout=10)
+
+    with pytest.raises(ShutdownTimeout):
+        api.stop(timeout=0.2)
+
+    with pytest.raises(OSError):
+        Client(api, timeout=0.4).get("/health")
+
+    release.set()
+    api.stop(timeout=10)
+
+
+def test_stopping_a_second_time_after_the_run_ends_completes_the_shutdown(serve):
+    before = set(api_threads())
+    started, release = threading.Event(), threading.Event()
+    api = serve(ScriptedHarness(gated_script(started, release)))
+    host, port = api.address
+    Client(api).create_run()
+    assert started.wait(timeout=10)
+
+    for _ in range(3):
+        with pytest.raises(ShutdownTimeout):
+            api.stop(timeout=0.1)
+        assert not port_is_free(host, port)
+
+    release.set()
+    api.stop(timeout=10)
+
+    assert port_is_free(host, port)
+    assert set(api_threads()) <= before
+    api.stop(timeout=1)  # and it stays stopped
+
+
+def test_a_stop_with_no_run_in_flight_still_finishes_in_one_call(serve):
+    before = set(api_threads())
+    api = serve()
+    host, port = api.address
+    run_id = Client(api).create_run().json()["run_id"]
+    wait_for_run(api, run_id)
+
+    api.stop(timeout=10)
+    assert port_is_free(host, port)
+    assert set(api_threads()) <= before

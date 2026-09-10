@@ -64,6 +64,10 @@ class EventsExpired(RunError):
     """The requested resume point has already left the bounded buffer."""
 
 
+class EventsAhead(RunError):
+    """The requested resume point is past anything this run has emitted."""
+
+
 def new_run_id() -> str:
     """An opaque identifier with no meaning and no filesystem interpretation."""
     return secrets.token_hex(16)
@@ -260,11 +264,21 @@ class RunStore:
             return bounded
 
     def events_since(self, run_id: str, after: int) -> list[TestEvent]:
-        """Retained events with a sequence above ``after``."""
+        """Retained events with a sequence above ``after``.
+
+        A cursor has to land inside the range this run actually produced. Below
+        the buffer it is expired; above everything emitted it names an event
+        that never existed, and answering "nothing new yet" would tell a client
+        it is caught up on a stream it has never seen.
+        """
         with self._condition:
             record = self._records.get(run_id)
             if record is None:
                 raise UnknownRun("no such run")
+            if after > record.emitted:
+                raise EventsAhead(
+                    f"resume point {after} is past the {record.emitted} event(s) this run emitted"
+                )
             if after and record.events and after < record.events[0].sequence - 1:
                 raise EventsExpired("the requested resume point is no longer buffered")
             return [event for event in record.events if event.sequence > after]
@@ -338,6 +352,7 @@ __all__ = [
     "MAX_EVENT_DATA_BYTES",
     "MAX_RUNS",
     "RUN_ID_PATTERN",
+    "EventsAhead",
     "EventsExpired",
     "RunError",
     "RunInProgress",

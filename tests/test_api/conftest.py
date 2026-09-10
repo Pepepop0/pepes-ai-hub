@@ -16,7 +16,7 @@ from http.client import HTTPConnection, HTTPResponse
 import pytest
 
 from local_ai_stack import test_contracts as contracts
-from local_ai_stack.test_api import TestApi, TestApiConfig, TestApiToken
+from local_ai_stack.test_api import ShutdownTimeout, TestApi, TestApiConfig, TestApiToken
 from local_ai_stack.test_api.server import API_PREFIX
 
 # Bound to names that pytest will not try to collect as test classes, the way
@@ -176,9 +176,10 @@ class Reply:
 class Client:
     """A small HTTP client so header handling stays explicit in the tests."""
 
-    def __init__(self, api: TestApi, token: str | None = SECRET) -> None:
+    def __init__(self, api: TestApi, token: str | None = SECRET, *, timeout: float = 10.0) -> None:
         self.api = api
         self.token = token
+        self.timeout = timeout
 
     def request(
         self,
@@ -200,7 +201,7 @@ class Client:
             if content_type is not None:
                 sent.setdefault("Content-Type", content_type)
             sent.setdefault("Content-Length", str(len(payload)))
-        connection = HTTPConnection(*self.api.address, timeout=10)
+        connection = HTTPConnection(*self.api.address, timeout=self.timeout)
         try:
             connection.request(method, f"{API_PREFIX}{path}", body=payload, headers=sent)
             response = connection.getresponse()
@@ -299,7 +300,12 @@ def serve():
 
     yield _serve
     for api in started:
-        api.stop()
+        try:
+            api.stop(timeout=15)
+        except ShutdownTimeout:
+            # A run outlived the first attempt. It is never interrupted, so the
+            # only thing to do is wait for it and finish the shutdown properly.
+            api.stop(timeout=30)
 
 
 @pytest.fixture

@@ -23,9 +23,9 @@ from .auth import (
 )
 from .binding import LOOPBACK_HOST, BindRefused, resolve_bind_host
 from .payloads import PayloadError, parse_run_spec
-from .runs import RunInProgress, RunRecord, RunStore, UnknownRun
+from .runs import EventsAhead, EventsExpired, RunInProgress, RunRecord, RunStore, UnknownRun
 from .scheduler import RunScheduler
-from .server import API_PREFIX, StatusSource, TestApi, TestApiConfig
+from .server import API_PREFIX, ShutdownTimeout, StatusSource, TestApi, TestApiConfig
 
 __all__ = [
     "API_PREFIX",
@@ -33,11 +33,14 @@ __all__ = [
     "ENV_TOKEN_FILE",
     "LOOPBACK_HOST",
     "BindRefused",
+    "EventsAhead",
+    "EventsExpired",
     "PayloadError",
     "RunInProgress",
     "RunRecord",
     "RunScheduler",
     "RunStore",
+    "ShutdownTimeout",
     "StatusSource",
     "TestApi",
     "TestApiConfig",

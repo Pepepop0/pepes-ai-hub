@@ -10,6 +10,11 @@ interface to whatever answers the lookup, and the server exists to be reachable
 from this machine only. There is deliberately no override: a non-loopback bind
 is an error, not an option, and remote access belongs behind an authenticated
 tunnel that terminates here.
+
+It also includes ``::1``. The server opens an IPv4 socket, as the rest of the
+stack does, so accepting an IPv6 address here would approve an address that
+:meth:`TestApi.start` cannot bind. One address family, agreed on by the
+validator and the socket, is the smaller and honest version.
 """
 
 from __future__ import annotations
@@ -41,6 +46,11 @@ def resolve_bind_host(host: str = LOOPBACK_HOST) -> str:
         raise BindRefused(
             f"refusing to bind {candidate!r}: the test server is loopback-only and offers "
             "no override; remote access belongs behind an authenticated tunnel"
+        )
+    if address.version != 4:
+        raise BindRefused(
+            f"refusing to bind {candidate!r}: this server binds an IPv4 loopback socket, "
+            "so an IPv6 address would be approved here and fail to open"
         )
     return str(address)
 

@@ -310,3 +310,107 @@ def test_a_report_is_still_the_harness_report_after_streaming(serve):
     body = client.get(f"/runs/{run_id}").json()
     assert body["report"]["detail"] == "all good"
     assert body["report"]["state"] == "passed"
+
+
+# --- a cursor ahead of the run ----------------------------------------------
+
+
+def test_a_resume_point_ahead_of_everything_emitted_is_refused(api, client):
+    """The blocker: an empty stream would say "caught up" about events that never existed."""
+    run_id = finished_run(client)
+    emitted = len(stream_events(api, run_id))
+
+    connection, response = open_stream(api, run_id, last_event_id=emitted + 1)
+    try:
+        assert response.status == 409
+        body = json.loads(response.read())
+        assert body["error"] == "events-ahead"
+        assert str(emitted) in body["detail"]
+    finally:
+        connection.close()
+
+
+def test_the_last_event_is_caught_up_and_the_next_one_is_ahead(api, client):
+    """The boundary is exact: emitted resumes, emitted + 1 is a lie."""
+    run_id = finished_run(client, phases=["preflight", "plan"])
+    emitted = len(stream_events(api, run_id))
+
+    assert stream_events(api, run_id, last_event_id=emitted) == []
+
+    connection, response = open_stream(api, run_id, last_event_id=emitted + 1)
+    try:
+        assert response.status == 409
+    finally:
+        connection.close()
+
+
+def test_a_cursor_ahead_of_a_run_that_has_emitted_nothing_is_refused(serve):
+    started, release = threading.Event(), threading.Event()
+
+    def silent(run_id, spec, emit):
+        started.set()
+        release.wait(timeout=10)
+        return report(run_id, spec)
+
+    api = serve(ScriptedHarness(silent))
+    client = Client(api)
+    run_id = client.create_run().json()["run_id"]
+    assert started.wait(timeout=10)
+    try:
+        assert api.store.get(run_id).emitted == 0
+        connection, response = open_stream(api, run_id, last_event_id=1)
+        try:
+            assert response.status == 409
+            assert json.loads(response.read())["error"] == "events-ahead"
+        finally:
+            connection.close()
+    finally:
+        release.set()
+    wait_for_run(api, run_id)
+
+
+def test_a_cursor_ahead_is_told_apart_from_a_cursor_behind(serve):
+    """Two different mistakes, two different answers, neither of them silence."""
+
+    def chatty(run_id, spec, emit):
+        for index in range(6):
+            emit(event(run_id, EventKind.PROGRESS, message=f"step {index}"))
+        emit(event(run_id, EventKind.RESULT, message="done"))
+        return report(run_id, spec)
+
+    api = serve(ScriptedHarness(chatty))
+    client = Client(api)
+    run_id = finished_run(client)
+
+    record = api.store.get(run_id)
+    kept = list(record.events)[-2:]
+    record.events.clear()
+    record.events.extend(kept)
+
+    answers = {}
+    for cursor in (1, record.emitted + 5):
+        connection, response = open_stream(api, run_id, last_event_id=cursor)
+        try:
+            answers[cursor] = (response.status, json.loads(response.read())["error"])
+        finally:
+            connection.close()
+
+    assert answers[1] == (409, "events-expired")
+    assert answers[record.emitted + 5] == (409, "events-ahead")
+
+
+def test_a_refused_cursor_still_leaves_the_stream_usable(api, client):
+    """Rejecting a cursor is not a state change: replay and the ending survive."""
+    run_id = finished_run(client, phases=["preflight", "plan"])
+    before = stream_events(api, run_id)
+
+    connection, response = open_stream(api, run_id, last_event_id=len(before) + 99)
+    try:
+        assert response.status == 409
+    finally:
+        connection.close()
+
+    after = stream_events(api, run_id)
+    assert after == before
+    assert [frame["event"] for frame in after].count("result") == 1
+    assert stream_events(api, run_id, last_event_id=2) == before[2:]

@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from ..test_contracts import TestRunReport, TestRunSpec, TestRunState
 from .auth import ENV_TOKEN, ENV_TOKEN_FILE, TokenError, token_from_environment
 from .binding import LOOPBACK_HOST, BindRefused
-from .server import TestApi, TestApiConfig
+from .server import ShutdownTimeout, TestApi, TestApiConfig
 
 
 class UnwiredHarness:
@@ -88,8 +88,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         api.wait()
     except KeyboardInterrupt:
         pass
-    finally:
-        api.stop()
+    try:
+        api.stop(timeout=30)
+    except ShutdownTimeout as error:
+        print(f"{error}", file=sys.stderr)
+        return 3
     return 0
 
 

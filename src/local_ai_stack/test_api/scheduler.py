@@ -14,6 +14,7 @@ otherwise one built from the report it returned, so a stream always ends.
 from __future__ import annotations
 
 import threading
+import time
 
 from ..test_contracts import (
     TestEvent,
@@ -96,14 +97,22 @@ class RunScheduler:
             )
         self._store.finish(run_id, state=state, report=report, detail=report.detail)
 
-    def shutdown(self, timeout: float = 5.0) -> None:
-        """Wait for in-flight runs so a stopped server leaves no worker behind."""
+    def shutdown(self, timeout: float = 5.0) -> bool:
+        """Wait for in-flight runs, and report whether any is still going.
+
+        A run is never interrupted. The harness owns whatever it started, so
+        the only honest options are to wait for it or to say it is still there.
+        The deadline is shared across workers, so the wait is bounded by
+        ``timeout`` rather than by ``timeout`` per thread.
+        """
         with self._lock:
             threads = list(self._threads)
+        deadline = time.monotonic() + timeout
         for thread in threads:
-            thread.join(timeout=timeout)
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
             self._threads = [thread for thread in self._threads if thread.is_alive()]
+            return not self._threads
 
     @property
     def busy(self) -> bool:

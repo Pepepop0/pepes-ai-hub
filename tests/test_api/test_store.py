@@ -9,6 +9,7 @@ import pytest
 from local_ai_stack import test_contracts as contracts
 from local_ai_stack.test_api.runs import (
     MAX_EVENTS_PER_RUN,
+    EventsAhead,
     EventsExpired,
     RunInProgress,
     RunStore,
@@ -233,3 +234,53 @@ def test_timestamps_are_utc_and_ordered(store):
     record = store.create(SPEC)
     assert record.created_at.endswith("Z")
     assert first <= record.created_at
+
+
+# --- a cursor ahead of the run ----------------------------------------------
+
+
+def test_a_cursor_past_everything_emitted_is_an_error(store):
+    """Answering "nothing new" would claim the reader is caught up on nothing."""
+    record = store.create(SPEC)
+    for _ in range(3):
+        store.append(record.run_id, event(record.run_id, EventKind.PROGRESS))
+
+    assert [item.sequence for item in store.events_since(record.run_id, 3)] == []
+    with pytest.raises(EventsAhead, match="3 event"):
+        store.events_since(record.run_id, 4)
+    with pytest.raises(EventsAhead):
+        store.events_since(record.run_id, 9999)
+
+
+def test_a_cursor_on_a_run_that_has_emitted_nothing_is_ahead(store):
+    record = store.create(SPEC)
+    assert store.events_since(record.run_id, 0) == []
+    with pytest.raises(EventsAhead):
+        store.events_since(record.run_id, 1)
+
+
+def test_the_two_out_of_range_cursors_are_different_errors(store):
+    record = store.create(SPEC)
+    for _ in range(6):
+        store.append(record.run_id, event(record.run_id, EventKind.PROGRESS))
+    kept = list(record.events)[-2:]
+    record.events.clear()
+    record.events.extend(kept)
+
+    with pytest.raises(EventsExpired):
+        store.events_since(record.run_id, 1)
+    with pytest.raises(EventsAhead):
+        store.events_since(record.run_id, 7)
+
+
+def test_eviction_does_not_turn_a_valid_cursor_into_a_future_one(store):
+    """`emitted` counts everything, so trimming the buffer never moves the ceiling."""
+    record = store.create(SPEC)
+    for _ in range(5):
+        store.append(record.run_id, event(record.run_id, EventKind.PROGRESS))
+    record.events.clear()
+
+    assert record.emitted == 5
+    assert store.events_since(record.run_id, 5) == []
+    with pytest.raises(EventsAhead):
+        store.events_since(record.run_id, 6)

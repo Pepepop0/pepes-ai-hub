@@ -28,10 +28,15 @@ one the server was not started with is refused with `403 not-enabled`. This is
 what keeps "real providers are separately gated" a property of the deployment
 rather than a promise about request bodies.
 
-`--host` accepts a literal loopback address and nothing else. `0.0.0.0`, a LAN
-address and the name `localhost` are all refused before a socket exists. There
-is no override. Remote use belongs behind an authenticated tunnel that
-terminates on this machine.
+`--host` accepts a literal IPv4 loopback address and nothing else. `0.0.0.0`,
+a LAN address, the name `localhost` and the IPv6 loopback `::1` are all refused
+before a socket exists. There is no override. Remote use belongs behind an
+authenticated tunnel that terminates on this machine.
+
+`::1` is refused rather than supported because the server opens an IPv4 socket,
+as the rest of the stack does. Approving an address the socket cannot open
+would be worse than not offering the family at all, so the validator and the
+socket agree on one family. Tests bind every approved address for real.
 
 ## Routes
 
@@ -95,7 +100,8 @@ and fan-out; it does not rewrite what an event means.
   trusted from the producer;
 - `event` is the `TestEventKind` value;
 - `data` is the whole serialized event;
-- `Last-Event-ID` resumes after that sequence;
+- `Last-Event-ID` resumes after that sequence, and has to name a point the
+  run actually reached;
 - keep-alives are comment lines carrying no application state;
 - exactly one `result` event ends a stream.
 
@@ -106,11 +112,32 @@ after the terminal event is dropped and counted in the run's diagnostics.
 
 Retention is bounded: 32 runs, 512 events per run, 8 KiB of data per event.
 Oversized event data is replaced by its size and long messages are truncated,
-which is what keeps the stream from becoming a log dump. A `Last-Event-ID` that
-has already left the buffer answers `409 events-expired` rather than silently
-skipping a gap.
+which is what keeps the stream from becoming a log dump.
+
+A cursor outside the run's range is an error rather than silence, in both
+directions. Below the buffer it answers `409 events-expired` instead of
+skipping a gap. Above everything the run emitted it answers `409 events-ahead`
+instead of an empty stream, which would tell a reader it was caught up on
+events that never existed. The ceiling counts everything ever emitted, so
+trimming the buffer never turns a valid cursor into a future one.
 
 SSE is output only. There is no route that accepts a command over a stream.
+
+## Stopping
+
+`TestApi.stop()` closes the listener, then gives the timeout to whatever run is
+in flight. A run is never interrupted: the harness owns whatever it started, so
+cutting its thread down would leave a process, a file or a download half
+finished with nobody left to complete it.
+
+If the run is still going when the timeout expires, `stop()` raises
+`ShutdownTimeout` rather than closing the socket and reporting a shutdown that
+did not happen. The port stays bound, `address` keeps answering, and the server
+keeps everything it needs, so calling `stop()` again once the run ends
+completes the shutdown properly. What has already happened by then is that no
+new request is accepted, so nothing else can start while it winds down.
+
+There is no forced termination and no cancellation. See "Not in this round".
 
 ## What the API cannot do
 

@@ -32,6 +32,7 @@ from ..inventory import (
     ProcessReport,
     ScanOutcome,
 )
+from ..jobs import Membership
 from ..launcher import LaunchOutcome, LaunchResult, StopOutcome, StopResult
 from ..managed_config import ManagedConfigWriter, ManagedFile, read_managed
 from ..model_installer import ModelInstaller, ModelStatus
@@ -570,6 +571,13 @@ class ControlledLauncher:
 
     Ownership still comes from the real registry: this only reports the pid it
     "started", and the registry decides whether that pid is ours.
+
+    A start produces a *tree*, not a pid. The descendants are entries in the
+    controlled process inventory like any other process, and membership is kept
+    the way the real launcher keeps it -- a set per service, answered through
+    ``owns``/``tree_pids``. That matters because a stop that terminated only the
+    root would leave those entries alive, and the world's residual check would
+    find them, which is exactly the failure this models.
     """
 
     def __init__(
@@ -581,6 +589,7 @@ class ControlledLauncher:
         pid: int = CONTROLLED_PID,
         ready_port: int | None = None,
         endpoints: ControlledEndpoints | None = None,
+        descendants: int = 1,
     ) -> None:
         self.registry = registry
         self.inventory = inventory
@@ -588,9 +597,17 @@ class ControlledLauncher:
         self.pid = pid
         self.ready_port = ready_port
         self.endpoints = endpoints
+        self.descendants = descendants
         self.starts: list[str] = []
         self.stops: list[str] = []
         self.closed = False
+        # service id -> the pids this launcher can prove it started, root first.
+        self.members: dict[str, tuple[int, ...]] = {}
+        # The same, kept after the job is forgotten, because a caller checking
+        # cleanup still needs to know what was started.
+        self.started_trees: dict[str, tuple[int, ...]] = {}
+        # Everything ever spawned, so residual checks cover descendants too.
+        self.spawned: set[int] = set()
 
     # The controller calls these three.
     def start(self, spec: object, **kwargs: object) -> LaunchResult:
@@ -606,6 +623,14 @@ class ControlledLauncher:
         executable = getattr(spec, "executable", "controlled.exe")
         self.starts.append(service_id)
         self.inventory.spawn(self.pid, executable, self.ready_port)
+        tree = [self.pid]
+        for offset in range(1, self.descendants + 1):
+            child = self.pid + offset
+            self.inventory.spawn(child, f"{executable}-worker-{offset}")
+            tree.append(child)
+        self.members[service_id] = tuple(tree)
+        self.started_trees[service_id] = tuple(tree)
+        self.spawned.update(tree)
         create_time = next(
             (item.create_time for item in self.inventory.processes if item.pid == self.pid), None
         )
@@ -639,34 +664,54 @@ class ControlledLauncher:
                 pid=self.pid,
                 detail="controlled stop refused",
             )
-        self.inventory.kill(self.pid)
+        tree = self.members.get(service_id, (self.pid,))
+        for member in tree:
+            self.inventory.kill(member)
         self.registry.unregister(service_id)
+        self.forget_job(service_id)
         return StopResult(
             outcome=StopOutcome.STOPPED,
             service_id=service_id,
             pid=self.pid,
-            detail="controlled stop",
-            tree_pids=(self.pid,),
+            detail=f"controlled stop of {len(tree)} process(es)",
+            tree_pids=tree,
         )
 
     def forget_job(self, service_id: str) -> None:
-        return None
+        """Give up the proof. Members keep running, as in the real launcher."""
+        self.members.pop(service_id, None)
 
     def close_all(self) -> None:
         if self.plan.active(Injection.CLEANUP_FAILURE):
             raise ControlledViolation("controlled cleanup failure")
         self.closed = True
 
-    def owns(self, service_id: str, pid: int) -> object:
-        from ..launcher import Membership
+    def members_started(self, service_id: str) -> tuple[int, ...]:
+        """What this launcher started for a service, job handle or not."""
+        return self.started_trees.get(service_id, ())
 
-        return Membership.UNKNOWN
+    def proved(self, service_id: str, pid: int) -> Membership:
+        """Membership as it stood at start, for checking cleanup afterwards."""
+        tree = self.started_trees.get(service_id)
+        if tree is None:
+            return Membership.UNPROVABLE
+        return Membership.MEMBER if pid in tree else Membership.NOT_MEMBER
+
+    def owns(self, service_id: str, pid: int) -> Membership:
+        tree = self.members.get(service_id)
+        if tree is None:
+            return Membership.UNPROVABLE
+        return Membership.MEMBER if pid in tree else Membership.NOT_MEMBER
 
     def tree_pids(self, service_id: str, pid: int) -> tuple[int, ...] | None:
-        return None
+        tree = self.members.get(service_id)
+        if tree is None or pid not in tree:
+            return None
+        return tree
 
     def surviving_members(self, proved: tuple[int, ...] | None, root_pid: int) -> tuple[int, ...]:
-        return ()
+        alive = set(self.inventory.pids())
+        return tuple(pid for pid in (proved or ()) if pid != root_pid and pid in alive)
 
 
 # --- managed configuration -------------------------------------------------

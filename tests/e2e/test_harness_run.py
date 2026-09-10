@@ -944,3 +944,100 @@ def test_a_workflow_whose_model_roles_are_undeclared_also_fails_closed():
     finally:
         world.root.release()
         fixture.release()
+
+
+# --- estado pós-crash e árvore de processos ---------------------------------
+
+
+def test_the_second_observation_confirms_the_post_crash_state():
+    """The first read can catch a transition; the second has to be settled."""
+    result = ScenarioRunner().run(scenario_by_id("crash-after-start"))
+    assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
+
+    stop = phase_of(result.report, Phase.STOP)
+    settled = next(item for item in stop.data["confirmed"] if item["service"] == "ollama")
+    assert settled["runtime"] != "RUNNING"
+    assert settled["state"] != "UP"
+    assert settled["stoppable"] is False
+    assert settled["pid"] is None
+    assert stop.data["registry"] == []
+
+
+def test_the_crash_row_starts_from_a_service_that_was_really_up():
+    result = ScenarioRunner().run(scenario_by_id("crash-after-start"))
+    start = phase_of(result.report, Phase.START)
+    assert start.data["ready"] is True
+    first = next(item for item in phase_of(result.report, Phase.STOP).data["observed"])
+    assert first["service"] == "ollama"
+
+
+def test_stopping_ends_the_whole_managed_tree():
+    setup = scenario_by_id("stop-cleanup").setup()
+    try:
+        report = StackTestHarness(setup.world).run(new_run_id(), setup.spec)
+        launcher = setup.world._launcher
+        tree = launcher.members_started("ollama")
+        assert len(tree) >= 2, "the row never started a tree"
+
+        stop = phase_of(report, Phase.STOP)
+        result = next(item for item in stop.data["stopped"] if item["service"] == "ollama")
+        assert result["stopped_tree"] is True
+        assert sorted(result["tree_pids"]) == sorted(tree)
+        assert result["left_running"] == []
+
+        alive = set(setup.world.inventory.pids())
+        assert not set(tree) & alive
+        assert stop.data["registry"] == []
+        assert phase_of(report, Phase.CLEANUP).data["job_handles_released"] is True
+    finally:
+        setup.world.root.release()
+        setup.teardown()
+
+
+def test_a_stop_that_forgets_a_descendant_fails_the_row(monkeypatch):
+    """The negative: leave one worker alive and the row must not pass."""
+    from local_ai_stack.e2e.providers import ControlledLauncher
+
+    original = ControlledLauncher.stop
+
+    def stop_only_the_root(self, service_id, **kwargs):
+        self.members[service_id] = (self.pid,)
+        return original(self, service_id, **kwargs)
+
+    monkeypatch.setattr(ControlledLauncher, "stop", stop_only_the_root)
+    result = ScenarioRunner().run(scenario_by_id("stop-cleanup"))
+    assert result.outcome is ScenarioOutcome.FAILED
+    assert any("survived" in item or "tree" in item for item in result.diagnostics)
+
+
+def test_neither_the_unrelated_nor_the_external_process_is_touched():
+    from local_ai_stack.e2e.providers import EXTERNAL_PID, UNRELATED_PID
+
+    setup = scenario_by_id("stop-cleanup").setup()
+    try:
+        StackTestHarness(setup.world).run(new_run_id(), setup.spec)
+        alive = set(setup.world.inventory.pids())
+        assert UNRELATED_PID in alive
+        assert EXTERNAL_PID in alive
+        assert setup.world.external_lost() == ()
+    finally:
+        setup.world.root.release()
+        setup.teardown()
+
+
+def test_membership_is_answered_not_assumed():
+    """A pid nobody started is never claimed as ours."""
+    from local_ai_stack.e2e.providers import UNRELATED_PID
+    from local_ai_stack.jobs import Membership
+
+    setup = scenario_by_id("stop-cleanup").setup()
+    try:
+        StackTestHarness(setup.world).run(new_run_id(), setup.spec)
+        launcher = setup.world._launcher
+        for member in launcher.members_started("ollama"):
+            assert launcher.proved("ollama", member) is Membership.MEMBER
+        assert launcher.proved("ollama", UNRELATED_PID) is Membership.NOT_MEMBER
+        assert launcher.proved("nobody-started-this", 1) is Membership.UNPROVABLE
+    finally:
+        setup.world.root.release()
+        setup.teardown()

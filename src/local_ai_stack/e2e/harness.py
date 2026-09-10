@@ -50,6 +50,7 @@ from ..integration import (
     provision_context,
     stage_managed_plan,
 )
+from ..launcher import StopOutcome
 from ..model_resolver import StackModelResolver
 from ..planning import build_install_plan
 from ..profiles import Profile, load_profiles
@@ -705,31 +706,35 @@ class StackTestHarness:
         # What is actually there, before anything is touched. This is where a
         # crash between two observations becomes visible, and where an external
         # service shows up as external and unstoppable rather than as ours.
-        observed = [
-            {
-                "service": _name(status.service_id),
-                "origin": _name(status.origin),
-                "state": _name(status.state),
-                "runtime": _name(status.runtime.state),
-                "stoppable": status.stoppable,
-            }
-            for status in controller.statuses().values()
-        ]
+        observed = _snapshot(controller)
+        # Looked at again, because the first read can catch a service mid
+        # transition: the process list is gathered before the health probe, so a
+        # process that dies during the probe is still in the earlier snapshot.
+        # The second read is the one that describes a settled state.
+        confirmed = _snapshot(controller)
         context.data["observed"] = observed
+        context.data["confirmed"] = confirmed
         stopped: list[dict[str, Any]] = []
         for service_id in list(context.started_services):
             result = controller.stop(service_id)
             stopped.append(
                 {
                     "service": service_id,
-                    "outcome": str(result.outcome),
+                    "outcome": _name(result.outcome),
                     "tree_pids": list(result.tree_pids),
+                    "left_running": list(result.left_running),
+                    "stopped_tree": result.stopped_tree,
                 }
             )
             if result.stopped:
                 context.started_services.remove(service_id)
-        data = {"observed": observed, "stopped": stopped}
-        if any(item["outcome"] == "failed" for item in stopped):
+        data = {
+            "observed": observed,
+            "confirmed": confirmed,
+            "stopped": stopped,
+            "registry": sorted(context.registry.load().entries) if context.registry else [],
+        }
+        if any(item["outcome"] == _name(StopOutcome.FAILED) for item in stopped):
             raise PhaseFailed("a managed service refused to stop")
         return f"stopped {len(stopped)} managed services", data
 
@@ -837,6 +842,9 @@ class StackTestHarness:
             "problems": problems,
             "root": root.as_report_data(),
             "external_survivors": list(self.world.external_survivors()),
+            "job_handles_released": bool(
+                self.world._launcher is None or self.world._launcher.closed
+            ),
         }
         if context is not None:
             context.cleanup_report = report
@@ -884,6 +892,21 @@ class StackTestHarness:
             installer=self.world.model_installer(context.installation.layout),
             catalog=self.world.model_catalog(),
         )
+
+
+def _snapshot(controller) -> list[dict[str, Any]]:
+    """One reading of every service the controller knows about."""
+    return [
+        {
+            "service": _name(status.service_id),
+            "origin": _name(status.origin),
+            "state": _name(status.state),
+            "runtime": _name(status.runtime.state),
+            "stoppable": status.stoppable,
+            "pid": status.runtime.pid,
+        }
+        for status in controller.statuses().values()
+    ]
 
 
 def _name(value: Any) -> str:

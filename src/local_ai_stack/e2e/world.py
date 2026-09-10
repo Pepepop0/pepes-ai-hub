@@ -269,11 +269,15 @@ class ControlledWorld:
             self._launcher.close_all()
 
     def managed_residual(self) -> tuple[int, ...]:
-        """Pids this run spawned that are still alive."""
+        """Pids this run spawned that are still alive -- descendants included.
+
+        A stop that terminated only the root would leave its workers running,
+        and that is the difference this has to be able to see.
+        """
         if self._launcher is None:
             return ()
         current = set(self.inventory.pids())
-        return tuple(sorted({self.launcher_pid} & current))
+        return tuple(sorted(self._launcher.spawned & current))
 
     def external_survivors(self) -> tuple[int, ...]:
         """Pids that existed before the run and must still exist after it."""

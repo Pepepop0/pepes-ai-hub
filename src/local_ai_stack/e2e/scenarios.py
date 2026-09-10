@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from ..jobs import Membership
 from ..managed_config import Ownership
 from ..models import ManagedModelPaths, ModelState
 from ..ollama_models import OllamaModelEntry
@@ -628,21 +629,38 @@ def _verify_crash(report: TestRunReport, world: ControlledWorld) -> list[str]:
         problems.append("the crash injection never acted")
 
     stop = _phase(report, TestPhase.STOP)
-    observed = {item["service"]: item for item in (stop.data.get("observed", []) if stop else [])}
-    status = observed.get(OLLAMA)
+    if stop is None:
+        return problems + ["stop never ran, so the post-crash state was never read"]
+    # The first read can catch the service mid transition; the second is the one
+    # that has to describe a settled post-crash state.
+    settled = {item["service"]: item for item in stop.data.get("confirmed", [])}
+    status = settled.get(OLLAMA)
     if status is None:
-        problems.append("the runtime never reported on the crashed service")
-    elif status["state"] == "UP":
-        problems.append("the runtime still reports the crashed service as UP")
+        problems.append("the runtime never confirmed the state of the crashed service")
+    else:
+        if status["runtime"] == "RUNNING":
+            problems.append("the process is still reported running after the crash")
+        if status["state"] == "UP":
+            problems.append("the service is still reported UP after the crash")
+        if status["stoppable"]:
+            problems.append("a process that no longer exists is still reported stoppable")
 
-    if world.launcher_pid in world.inventory.pids():
-        problems.append("the crashed pid is still reported alive")
+    if world.managed_residual():
+        problems.append(f"a managed process survived the crash: {world.managed_residual()}")
+    if stop.data.get("registry"):
+        problems.append(f"the registry still holds an entry: {stop.data['registry']}")
     return problems
 
 
 def _stop_and_cleanup() -> ScenarioSetup:
-    world = controlled_world(ready_ports=[MANAGED_OLLAMA_PORT])
+    """A managed tree, an unrelated process, and an external one."""
+    install = external_install("ollama")
+    world = controlled_world(
+        ready_ports=[MANAGED_OLLAMA_PORT],
+        external_processes=[(EXTERNAL_PORTS["ollama"], str(install.path))],
+    )
     world.inventory.occupy(39999)  # an unrelated process that must survive
+    world.external = install
     return ScenarioSetup(
         world,
         _spec(
@@ -652,18 +670,59 @@ def _stop_and_cleanup() -> ScenarioSetup:
             TestPhase.START,
             TestPhase.STOP,
         ),
-        "a managed service plus an unrelated process",
+        "a managed process tree beside an unrelated and an external process",
+        install.release,
     )
 
 
 def _verify_stop(report: TestRunReport, world: ControlledWorld) -> list[str]:
-    from .providers import UNRELATED_PID
+    """Ownership of a tree: everything ours ends, nothing else is touched."""
+    from .providers import EXTERNAL_PID, UNRELATED_PID
 
     problems = _cleanup_problems(report) + _no_residual(world)
-    if UNRELATED_PID not in world.inventory.pids():
+    launcher = world._launcher
+    if launcher is None:
+        return problems + ["nothing was ever started"]
+
+    # A start produces a tree, and the launcher can prove which pids are in it.
+    tree = launcher.members_started(OLLAMA)
+    if len(tree) < 2:
+        problems.append(f"only one process was started, so no tree was exercised: {tree}")
+    for member in tree:
+        if launcher.proved(OLLAMA, member) is not Membership.MEMBER:
+            problems.append(f"pid {member} was never proved a member of our tree")
+    if launcher.proved(OLLAMA, UNRELATED_PID) is Membership.MEMBER:
+        problems.append("an unrelated pid was claimed as a member of our tree")
+
+    stop = _phase(report, TestPhase.STOP)
+    if stop is None:
+        return problems + ["stop never ran"]
+    stopped = {item["service"]: item for item in stop.data.get("stopped", [])}
+    result = stopped.get(OLLAMA)
+    if result is None:
+        problems.append("the managed service was never stopped")
+    else:
+        if not result["stopped_tree"]:
+            problems.append(f"stop ended a single process, not a tree: {result['tree_pids']}")
+        if sorted(result["tree_pids"]) != sorted(tree):
+            problems.append(f"stop reported {result['tree_pids']} for a tree of {tree}")
+        if result["left_running"]:
+            problems.append(f"members were left running: {result['left_running']}")
+
+    alive = set(world.inventory.pids())
+    survivors = set(tree) & alive
+    if survivors:
+        problems.append(f"managed tree members survived: {sorted(survivors)}")
+    if UNRELATED_PID not in alive:
         problems.append("the unrelated process was stopped")
-    if world.launcher_pid in world.inventory.pids():
-        problems.append("the managed process survived stop and cleanup")
+    if EXTERNAL_PID not in alive:
+        problems.append("the external process was stopped")
+
+    if stop.data.get("registry"):
+        problems.append(f"the registry still holds an entry: {stop.data['registry']}")
+    cleanup = _phase(report, TestPhase.CLEANUP)
+    if cleanup is not None and not cleanup.data.get("job_handles_released"):
+        problems.append("a job handle was never released")
     return problems
 
 

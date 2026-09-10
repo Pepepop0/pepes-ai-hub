@@ -33,6 +33,8 @@ from ..inventory import (
 )
 from ..launcher import LaunchOutcome, LaunchResult, StopOutcome, StopResult
 from ..managed_config import ManagedConfigWriter, ManagedFile, read_managed
+from ..model_installer import ModelInstaller, ModelStatus
+from ..models import FileModelSource
 from ..ollama_models import OllamaClientError, OllamaModelEntry
 from ..probes import ProbeOutcome, ProbeResult
 from ..runner import CommandResult, CommandRunner
@@ -166,15 +168,23 @@ class ControlledArtifacts:
     """
 
     payloads: dict[str, bytes] = field(default_factory=dict)
+    # Which kind of thing each URL serves. A download interruption is a claim
+    # about *model* acquisition, so interrupting the component binary instead
+    # would prove a different row than the one the matrix names.
+    kinds: dict[str, str] = field(default_factory=dict)
     requests: list[str] = field(default_factory=list)
     # What the injections actually did here, so a report can be checked against
     # the seam instead of against its own declaration.
     interrupted: list[str] = field(default_factory=list)
     corrupted: list[str] = field(default_factory=list)
 
-    def register(self, url: str, payload: bytes) -> str:
+    def register(self, url: str, payload: bytes, *, kind: str = "component") -> str:
         self.payloads[url] = payload
+        self.kinds[url] = kind
         return hashlib.sha256(payload).hexdigest()
+
+    def register_model(self, url: str, payload: bytes) -> str:
+        return self.register(url, payload, kind="model")
 
     def transport(self, plan: InjectionPlan | None = None) -> httpx.MockTransport:
         active = plan or InjectionPlan.none()
@@ -185,7 +195,7 @@ class ControlledArtifacts:
             if url not in self.payloads:
                 raise ControlledViolation(f"controlled run requested an unknown URL: {url}")
             payload = self.payloads[url]
-            if active.active(Injection.DOWNLOAD_INTERRUPTED):
+            if active.active(Injection.DOWNLOAD_INTERRUPTED) and self.kinds.get(url) == "model":
                 # A short write: the transport stops mid-body. The downloader
                 # must not promote the partial file.
                 self.interrupted.append(url)
@@ -547,6 +557,48 @@ class ControlledConfigWriter(ManagedConfigWriter):
         self.after_tampering[path] = read_managed(path)
 
 
+class ControlledModelInstaller(ModelInstaller):
+    """The model-store seam. Installs for real; corrupts only when injected.
+
+    Downloading, checksum verification, placement through ``ManagedModelPaths``
+    and detection are all inherited. Under ``MODEL_TAMPERED`` one extra thing
+    happens: after a file model has been installed *and verified*, its bytes are
+    changed on disk.
+
+    That ordering is the whole point of the row. The file was genuinely valid a
+    moment earlier, so nothing about the install path can be blamed; what has to
+    catch it is the installer re-hashing the file it already accepted.
+    """
+
+    def __init__(self, *args, injections: InjectionPlan | None = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.injections = injections or InjectionPlan.none()
+        self.tampered: list[Path] = []
+        # What the domain said about each file the instant after it was edited.
+        # Kept here because an ephemeral root is gone by the time a scenario
+        # checks its invariants.
+        self.after_tampering: dict[str, ModelStatus] = {}
+
+    def apply(self, spec, *, dry_run: bool = False):
+        result = super().apply(spec, dry_run=dry_run)
+        if dry_run or not result.ok or not self.injections.active(Injection.MODEL_TAMPERED):
+            return result
+        if not isinstance(spec.source, FileModelSource):
+            return result
+        self._tamper(spec)
+        return result
+
+    def _tamper(self, spec) -> None:
+        """Change the bytes. What that means is the installer's to say."""
+        destination = self.paths.destination_for(spec)
+        if not destination.is_file():  # pragma: no cover - apply just wrote it
+            return
+        with destination.open("ab") as handle:
+            handle.write(b"corrupted-by-e2e")
+        self.tampered.append(destination)
+        self.after_tampering[str(spec.id)] = self.detect(spec)
+
+
 __all__ = [
     "CONTROLLED_PID",
     "EXTERNAL_PID",
@@ -558,6 +610,7 @@ __all__ = [
     "ControlledEndpoints",
     "ControlledInventory",
     "ControlledLauncher",
+    "ControlledModelInstaller",
     "ControlledOllama",
     "ControlledRunner",
     "ControlledViolation",

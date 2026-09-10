@@ -47,10 +47,7 @@ from ..integration import (
     provision_context,
     stage_managed_plan,
 )
-from ..model_catalog import model_catalog
-from ..model_installer import ModelInstaller
 from ..model_resolver import StackModelResolver
-from ..models import ManagedModelPaths
 from ..planning import build_install_plan
 from ..profiles import Profile, load_profiles
 from ..registry import ManagedProcessRegistry
@@ -696,12 +693,11 @@ class StackTestHarness:
         return controller
 
     def _resolver(self, context: RunContext) -> StackModelResolver:
-        installer = ModelInstaller(
-            ManagedModelPaths.from_layout(context.installation.layout),
-            downloader=self.world.downloader(),
-            ollama=self.world.ollama,
+        """One installer and one catalog per run, shared with the executor."""
+        return StackModelResolver(
+            installer=self.world.model_installer(context.installation.layout),
+            catalog=self.world.model_catalog(),
         )
-        return StackModelResolver(installer=installer, catalog=model_catalog())
 
 
 def _actions(report) -> list[dict[str, Any]]:

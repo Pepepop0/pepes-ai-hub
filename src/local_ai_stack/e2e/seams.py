@@ -37,6 +37,7 @@ class Seam(StrEnum):
     PROCESS_LAUNCH = "process-launch"
     CONFIG_WRITE = "config-write"
     WORKFLOW_SOURCE = "workflow-source"
+    MODEL_STORE = "model-store"
     CLOCK = "clock"
     EVENT_SINK = "event-sink"
     SYSTEM_FACTS = "system-facts"
@@ -55,6 +56,7 @@ class Injection(StrEnum):
     SERVICE_CRASH = "service-crash"
     CUDA_UNAVAILABLE = "cuda-unavailable"
     MODEL_MISSING = "model-missing"
+    MODEL_TAMPERED = "model-tampered"
     STOP_FAILURE = "stop-failure"
     CLEANUP_FAILURE = "cleanup-failure"
 
@@ -73,6 +75,7 @@ SEAM_FOR: Mapping[Injection, Seam] = MappingProxyType(
         Injection.SERVICE_CRASH: Seam.PROCESS_LAUNCH,
         Injection.CUDA_UNAVAILABLE: Seam.SYSTEM_FACTS,
         Injection.MODEL_MISSING: Seam.OLLAMA_CLIENT,
+        Injection.MODEL_TAMPERED: Seam.MODEL_STORE,
         Injection.STOP_FAILURE: Seam.PROCESS_LAUNCH,
         Injection.CLEANUP_FAILURE: Seam.PROCESS_LAUNCH,
     }

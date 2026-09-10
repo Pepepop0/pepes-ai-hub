@@ -358,17 +358,20 @@ def test_the_harness_cannot_be_given_injections_of_its_own():
 
 def test_a_declared_injection_really_reached_its_seam():
     """No decorative injections: the report names what the seams received."""
-    world = controlled_world(
-        ready_ports=[OLLAMA_PORT],
-        injections=InjectionPlan.of(Injection.DOWNLOAD_INTERRUPTED),
-    )
-    report = run(world, TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.PROVISION)
-
-    declared = report.context["injection"]["injections"]
-    assert declared == ["download-interrupted"]
-    # The transport seam was actually asked for bytes, and actually refused.
-    assert world.artifacts.requests, "the http-transport seam was never reached"
-    assert world.artifacts.interrupted, "the declared injection never acted"
+    setup = scenario_by_id("interrupted-download").setup()
+    try:
+        report = StackTestHarness(setup.world).run(new_run_id(), setup.spec)
+        declared = report.context["injection"]["injections"]
+        assert declared == ["download-interrupted"]
+        # The transport seam was asked for bytes, and actually refused them.
+        assert setup.world.artifacts.requests, "the http-transport seam was never reached"
+        interrupted = setup.world.artifacts.interrupted
+        assert interrupted, "the declared injection never acted"
+        kinds = {setup.world.artifacts.kinds[url] for url in interrupted}
+        assert kinds == {"model"}, f"a model injection acted somewhere else: {kinds}"
+    finally:
+        setup.world.root.release()
+        setup.teardown()
 
 
 # --- bloqueio para de mutar ------------------------------------------------

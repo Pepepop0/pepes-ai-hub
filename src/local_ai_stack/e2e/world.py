@@ -26,17 +26,20 @@ from ..integration import (
     default_provisioners,
 )
 from ..managed_config import ManagedConfigWriter
+from ..model_catalog import ModelCatalog, model_catalog
 from ..ollama_models import OllamaModelEntry
 from ..profiles import Profile
 from ..runner import CommandRunner
 from ..system import SystemFacts
 from ..test_contracts import TestProviderMode
+from .fixtures import fixture_model_catalog
 from .providers import (
     ControlledArtifacts,
     ControlledConfigWriter,
     ControlledEndpoints,
     ControlledInventory,
     ControlledLauncher,
+    ControlledModelInstaller,
     ControlledOllama,
     ControlledRunner,
     StepClock,
@@ -67,6 +70,9 @@ class ControlledWorld:
     # The CONFIG_WRITE seam. A real ``ManagedConfigWriter`` unless a scenario
     # supplies the controlled subclass; ``None`` means the domain default.
     config_writer: ManagedConfigWriter | None = None
+    # The catalog this run resolves against. ``None`` means the shipped one;
+    # a fixture catalog adds weights small enough to install offline.
+    catalog: ModelCatalog | None = None
     injections: InjectionPlan = field(default_factory=InjectionPlan.none)
     provider_mode: TestProviderMode = TestProviderMode.CONTROLLED
     repo_root: Path = field(default_factory=detect_repo_root)
@@ -79,6 +85,7 @@ class ControlledWorld:
     # controlled run leaves them to detection instead of pretending.
     install_components: frozenset[str] = frozenset({"ollama"})
     _launcher: ControlledLauncher | None = field(default=None, repr=False)
+    _installers: dict[str, ControlledModelInstaller] = field(default_factory=dict, repr=False)
     _baseline_pids: tuple[int, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
@@ -175,23 +182,41 @@ class ControlledWorld:
             install_root=plan.install_root,
         )
 
+    def model_catalog(self) -> ModelCatalog:
+        """The one catalog this run resolves against, wherever it is asked."""
+        return self.catalog if self.catalog is not None else model_catalog()
+
+    def model_installer(self, layout) -> ControlledModelInstaller:
+        """The model-store seam, bound to one layout.
+
+        Cached per layout so a scenario can read back what the seam did after
+        the run, and so every phase talks to the same store.
+        """
+        from ..models import ManagedModelPaths
+
+        key = str(layout.models)
+        installer = self._installers.get(key)
+        if installer is None:
+            installer = ControlledModelInstaller(
+                ManagedModelPaths.from_layout(layout),
+                downloader=self.downloader(),
+                ollama=self.ollama,
+                injections=self.injections,
+            )
+            self._installers[key] = installer
+        return installer
+
     def install_actions(self, context, profile: Profile):
         """Real action handlers, with the model installer bound to our seams."""
 
         def build_installer(_profile: Profile):
-            from ..model_installer import ModelInstaller
-            from ..models import ManagedModelPaths
-
-            return ModelInstaller(
-                ManagedModelPaths.from_layout(context.layout),
-                downloader=self.downloader(),
-                ollama=self.ollama,
-            )
+            return self.model_installer(context.layout)
 
         return default_install_actions(
             context,
             repo_root=self.repo_root,
             installer_factory=build_installer,
+            catalog=self.model_catalog(),
             config_writer=self.config_writer,
             options=self.options,
         )
@@ -245,6 +270,7 @@ def controlled_world(
     ollama_reachable: bool = True,
     ready_ports: Sequence[int] = (),
     repo_root: Path | None = None,
+    fixture_models: bool = False,
 ) -> ControlledWorld:
     """An offline, processless world. This is what tests use by default."""
     plan = injections or InjectionPlan.none()
@@ -255,6 +281,8 @@ def controlled_world(
     inventory = ControlledInventory()
     endpoints = ControlledEndpoints(ready=set(ready_ports), plan=plan)
     clock = StepClock()
+    artifacts = ControlledArtifacts()
+    catalog = fixture_model_catalog(artifacts.register_model) if fixture_models else None
     return ControlledWorld(
         root=root if root is not None else allocate_root(),
         facts=controlled_facts(cuda=cuda),
@@ -262,9 +290,10 @@ def controlled_world(
         ollama=ControlledOllama(installed=ollama_models, reachable=ollama_reachable, plan=plan),
         endpoints=endpoints,
         inventory=inventory,
-        artifacts=ControlledArtifacts(),
+        artifacts=artifacts,
         options=resolved_options,
         config_writer=ControlledConfigWriter(plan),
+        catalog=catalog,
         injections=plan,
         provider_mode=TestProviderMode.CONTROLLED,
         repo_root=repo_root if repo_root is not None else detect_repo_root(),

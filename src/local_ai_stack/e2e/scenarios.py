@@ -18,7 +18,7 @@ from enum import StrEnum
 from typing import Any
 
 from ..managed_config import Ownership
-from ..models import ManagedModelPaths
+from ..models import ManagedModelPaths, ModelState
 from ..ollama_models import OllamaModelEntry
 from ..test_contracts import (
     TestPhase,
@@ -28,7 +28,15 @@ from ..test_contracts import (
     TestRunSpec,
     TestRunState,
 )
-from .fixtures import BROKEN_WORKFLOW_PROFILE, CHAT_ONLY_PROFILE, repo_fixture
+from .fixtures import (
+    BROKEN_WORKFLOW_PROFILE,
+    CHAT_DIGEST,
+    CHAT_ONLY_PROFILE,
+    CHAT_REFERENCE,
+    FIXTURE_MODELS,
+    STACK_PROFILE,
+    repo_fixture,
+)
 from .harness import StackTestHarness, new_run_id
 from .seams import Injection, InjectionPlan
 from .world import ControlledWorld, controlled_world
@@ -150,8 +158,48 @@ def _no_residual(world: ControlledWorld) -> list[str]:
     return problems
 
 
-def _ollama_entry(reference: str = "hermes3:8b") -> OllamaModelEntry:
-    return OllamaModelEntry(name=reference, digest="4f6b83f30b62aaaa", size_bytes=1)
+def _ollama_entry(reference: str = CHAT_REFERENCE) -> OllamaModelEntry:
+    return OllamaModelEntry(name=reference, digest=CHAT_DIGEST, size_bytes=1)
+
+
+STACK_PHASES = (
+    TestPhase.PREFLIGHT,
+    TestPhase.PLAN,
+    TestPhase.PROVISION,
+    TestPhase.ACQUIRE_MODELS,
+    TestPhase.CONFIGURE,
+)
+
+
+def _stack_world(injections: InjectionPlan, *, ready=(MANAGED_OLLAMA_PORT,)):
+    """A run whose every declared model can genuinely be installed offline.
+
+    The shipped profile's three image roles are 12.45 GB of real weights. The
+    fixture catalog pins three small ones instead, checksummed to the exact
+    bytes the controlled transport serves, so download, SHA-256 verification and
+    placement are the real code paths on real files. What is a fixture is the
+    size of the weights, not the handling of them.
+    """
+    fixture = repo_fixture(STACK_PROFILE)
+    world = controlled_world(
+        ready_ports=list(ready),
+        repo_root=fixture.path,
+        injections=injections,
+        fixture_models=True,
+        ollama_models=[_ollama_entry()],
+    )
+    return world, fixture
+
+
+def _installer(world: ControlledWorld):
+    return world.model_installer(world.root.installation.layout)
+
+
+def _fixture_specs(world: ControlledWorld):
+    catalog = world.model_catalog()
+    return [
+        catalog.require(catalog.normalize(f"comfyui/{name}")) for _r, name, *_ in FIXTURE_MODELS
+    ]
 
 
 def _spec(
@@ -260,53 +308,89 @@ def _verify_port_collision(report: TestRunReport, world: ControlledWorld) -> lis
 
 
 def _corrupted_model() -> ScenarioSetup:
-    world = controlled_world(ready_ports=[MANAGED_OLLAMA_PORT])
+    world, fixture = _stack_world(InjectionPlan.of(Injection.MODEL_TAMPERED))
     return ScenarioSetup(
         world,
-        _spec(TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.PROVISION, TestPhase.CONFIGURE),
-        "a managed model file has the wrong bytes",
+        _spec(*STACK_PHASES, profile=STACK_PROFILE),
+        "managed weights are installed and verified, then their bytes change",
+        fixture.release,
     )
 
 
 def _verify_corrupted_model(report: TestRunReport, world: ControlledWorld) -> list[str]:
+    """Valid, then corrupted, then refused -- by the installer, not by us."""
     problems = _cleanup_problems(report) + _no_residual(world)
+    acquire = _phase(report, TestPhase.ACQUIRE_MODELS)
+    if acquire is None or acquire.outcome is not TestPhaseOutcome.PASSED:
+        # Without a real install first, the corruption proves nothing.
+        problems.append("the weights were never installed and verified in the first place")
+
+    installer = _installer(world)
+    if len(installer.tampered) != len(FIXTURE_MODELS):
+        problems.append(f"expected every managed weight to be edited, got {installer.tampered}")
+    for model_id, status in installer.after_tampering.items():
+        # The installer's own detection, re-hashing the file it had accepted.
+        if status.state is not ModelState.INVALID:
+            problems.append(f"{model_id} is {status.state} after its bytes changed")
+
     configure = _phase(report, TestPhase.CONFIGURE)
     if configure is None:
         return problems + ["configure never ran"]
     if configure.outcome is TestPhaseOutcome.PASSED:
-        problems.append("configuration succeeded with an unavailable model")
+        problems.append("configuration succeeded with a corrupted model")
     roles = configure.data.get("roles", {})
     leaked = [role for role, value in roles.items() if value.get("has_location")]
     available = [role for role, value in roles.items() if value.get("state") == "available"]
-    if leaked and available != leaked:
+    if sorted(leaked) != sorted(available):
         problems.append(f"a non-available role exposed a location: {leaked}")
+    if not [role for role, value in roles.items() if value.get("state") == "invalid"]:
+        problems.append(f"no role was reported invalid; got {roles}")
     return problems
 
 
 def _interrupted_download() -> ScenarioSetup:
-    world = controlled_world(
-        ready_ports=[MANAGED_OLLAMA_PORT],
-        injections=InjectionPlan.of(Injection.DOWNLOAD_INTERRUPTED),
-    )
+    world, fixture = _stack_world(InjectionPlan.of(Injection.DOWNLOAD_INTERRUPTED))
     return ScenarioSetup(
         world,
-        _spec(TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.PROVISION, TestPhase.CONFIGURE),
-        "the transport stops mid-body",
+        _spec(*STACK_PHASES, profile=STACK_PROFILE),
+        "the transport stops mid-body while a managed weight is being acquired",
+        fixture.release,
     )
 
 
 def _verify_interrupted_download(report: TestRunReport, world: ControlledWorld) -> list[str]:
+    """A model download, not a component download, and nothing is promoted."""
     problems = _cleanup_problems(report) + _no_residual(world)
-    layout = world.root.installation.layout
-    paths = ManagedModelPaths.from_layout(layout)
+
+    model_urls = [url for url in world.artifacts.interrupted if world.artifacts.kinds.get(url)]
+    if not any(world.artifacts.kinds.get(url) == "model" for url in model_urls):
+        problems.append("no model download was interrupted, so this proves nothing about models")
+
+    acquire = _phase(report, TestPhase.ACQUIRE_MODELS)
+    if acquire is None:
+        return problems + ["acquire_models never ran"]
+    if acquire.outcome is not TestPhaseOutcome.FAILED:
+        problems.append(f"an interrupted download did not fail acquisition: {acquire.outcome}")
+
+    paths = ManagedModelPaths.from_layout(world.root.installation.layout)
     if paths.root.exists():
-        promoted = [item for item in paths.root.rglob("*") if item.is_file()]
-        partial = [item for item in promoted if item.suffix == ".part"]
-        finished = [item for item in promoted if item.suffix != ".part"]
+        files = [item for item in paths.root.rglob("*") if item.is_file()]
+        partial = [item for item in files if item.suffix == ".part"]
+        finished = [item for item in files if item.suffix != ".part"]
         if finished:
             problems.append(f"a partial download was promoted: {finished}")
         if partial:
             problems.append(f"a .part file survived: {partial}")
+
+    # Nothing became available, and a retry is still the proposed next step.
+    installer = _installer(world)
+    for spec in _fixture_specs(world):
+        status = installer.detect(spec)
+        if status.state is ModelState.AVAILABLE:
+            problems.append(f"{spec.id} became available from an interrupted download")
+        actions = [step.action for step in installer.plan(spec).steps]
+        if "download" not in actions:
+            problems.append(f"a retry is no longer proposed for {spec.id}: {actions}")
     return problems
 
 

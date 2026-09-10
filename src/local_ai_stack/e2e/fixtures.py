@@ -24,7 +24,17 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..artifacts import Artifact
 from ..installation import detect_repo_root
+from ..model_catalog import ModelCatalog, model_catalog
+from ..models import (
+    FileModelSource,
+    ModelId,
+    ModelKind,
+    ModelPlacement,
+    ModelProvider,
+    ModelSpec,
+)
 
 FIXTURE_PREFIX = "pepito-e2e-repo-"
 
@@ -34,6 +44,34 @@ COPIED = ("manifests", "workflows")
 
 CHAT_ONLY_PROFILE = "e2e-chat"
 BROKEN_WORKFLOW_PROFILE = "e2e-workflow"
+STACK_PROFILE = "e2e-stack"
+
+CHAT_REFERENCE = "hermes3:8b"
+CHAT_DIGEST = "4f6b83f30b62aaaa"
+
+# Three fixture weights, one per role the shipped text-to-image graph loads.
+# They are a few dozen bytes each: small enough to serve from memory, real
+# enough that the installer downloads them, checks the SHA-256 it was pinned
+# to, and places them through ManagedModelPaths like any other file model.
+FIXTURE_MODELS = (
+    (
+        "image.diffusion",
+        "e2e_diffusion",
+        ModelKind.DIFFUSION,
+        ModelPlacement.DIFFUSION_MODELS,
+        "e2e-diffusion.safetensors",
+    ),
+    (
+        "image.text_encoder",
+        "e2e_text_encoder",
+        ModelKind.TEXT_ENCODER,
+        ModelPlacement.TEXT_ENCODERS,
+        "e2e-text-encoder.safetensors",
+    ),
+    ("image.vae", "e2e_vae", ModelKind.VAE, ModelPlacement.VAE, "e2e-vae.safetensors"),
+)
+
+MODEL_URL = "https://controlled.invalid/models/{filename}"
 
 _HEADER = """schema_version: 1
 id: {id}
@@ -121,10 +159,93 @@ workflows:
     + _RUNTIME
 )
 
+# Everything a text-to-image run needs, all of it installable offline: the chat
+# model comes from the controlled Ollama store, the three image roles from the
+# fixture catalog below. This is the only profile that reaches image smoke.
+STACK_YAML = (
+    _HEADER.format(
+        id=STACK_PROFILE,
+        name="E2E stack",
+        description="Fixture profile whose every declared model is installable offline.",
+    )
+    + """
+services:
+  ollama: {enabled: true, port: 11434}
+  open-webui: {enabled: true, port: 8080}
+  comfyui: {enabled: true, port: 8188}
+
+features:
+  chat: true
+  vision: false
+  tools: true
+  image_generation: true
+  image_editing: false
+
+models:
+  chat:
+    primary: ollama/hermes3_8b
+    status: candidate
+  image:
+    diffusion: comfyui/e2e_diffusion
+    text_encoder: comfyui/e2e_text_encoder
+    vae: comfyui/e2e_vae
+
+workflows:
+  text_to_image: {manifest_id: flux2_klein_t2i}
+"""
+    + _RUNTIME
+)
+
 PROFILE_YAML = {
     CHAT_ONLY_PROFILE: CHAT_ONLY_YAML,
     BROKEN_WORKFLOW_PROFILE: BROKEN_WORKFLOW_YAML,
+    STACK_PROFILE: STACK_YAML,
 }
+
+
+def fixture_model_payload(name: str) -> bytes:
+    """Deterministic bytes for one fixture weight.
+
+    Deterministic matters twice over: the checksum in the catalog is the digest
+    of exactly these bytes, and a run that produced different bytes each time
+    could not tell a corrupted file from a new one.
+    """
+    return f"pepito-e2e fixture weights for {name}\n".encode()
+
+
+def fixture_model_catalog(register) -> ModelCatalog:
+    """The shipped catalog plus three installable fixture weights.
+
+    ``register(url, payload) -> sha256`` is the controlled transport's own
+    registration, so the checksum pinned here is genuinely the digest of the
+    bytes that will be served. Nothing about verification is faked: the
+    installer downloads, hashes and compares exactly as it does for a real
+    12 GB weight.
+    """
+    shipped = model_catalog()
+    specs = dict(shipped.specs)
+    for _role, name, kind, placement, filename in FIXTURE_MODELS:
+        model_id = ModelId.from_parts(ModelProvider.COMFYUI, name)
+        url = MODEL_URL.format(filename=filename)
+        payload = fixture_model_payload(name)
+        digest = register(url, payload)
+        specs[model_id] = ModelSpec(
+            id=model_id,
+            kind=kind,
+            source=FileModelSource(
+                artifact=Artifact(
+                    id=f"fixture-{name}",
+                    url=url,
+                    filename=filename,
+                    sha256=digest,
+                    size_bytes=len(payload),
+                    version="e2e",
+                    component="comfyui",
+                ),
+                placement=placement,
+            ),
+        )
+    return ModelCatalog(specs=specs, unpinned=dict(shipped.unpinned), aliases=dict(shipped.aliases))
 
 
 @dataclass
@@ -158,9 +279,15 @@ def repo_fixture(profile_id: str, *, source: Path | None = None) -> RepoFixture:
 
 __all__ = [
     "BROKEN_WORKFLOW_PROFILE",
+    "CHAT_DIGEST",
     "CHAT_ONLY_PROFILE",
+    "CHAT_REFERENCE",
+    "FIXTURE_MODELS",
     "FIXTURE_PREFIX",
     "PROFILE_YAML",
+    "STACK_PROFILE",
     "RepoFixture",
+    "fixture_model_catalog",
+    "fixture_model_payload",
     "repo_fixture",
 ]

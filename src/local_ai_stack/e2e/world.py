@@ -14,7 +14,7 @@ default test path can reach it by accident.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +35,7 @@ from ..test_contracts import TestProviderMode
 from .fixtures import fixture_model_catalog
 from .providers import (
     ControlledArtifacts,
+    ControlledComfyUI,
     ControlledConfigWriter,
     ControlledEndpoints,
     ControlledInventory,
@@ -65,6 +66,7 @@ class ControlledWorld:
     ollama: object
     endpoints: ControlledEndpoints
     inventory: ControlledInventory
+    comfyui: ControlledComfyUI
     artifacts: ControlledArtifacts
     options: IntegrationOptions
     # The CONFIG_WRITE seam. A real ``ManagedConfigWriter`` unless a scenario
@@ -73,6 +75,9 @@ class ControlledWorld:
     # The catalog this run resolves against. ``None`` means the shipped one;
     # a fixture catalog adds weights small enough to install offline.
     catalog: ModelCatalog | None = None
+    # An installation this run did not create, when a scenario declared one.
+    # Held so a verifier can compare it before and after from outside the run.
+    external: object | None = None
     injections: InjectionPlan = field(default_factory=InjectionPlan.none)
     provider_mode: TestProviderMode = TestProviderMode.CONTROLLED
     repo_root: Path = field(default_factory=detect_repo_root)
@@ -229,8 +234,21 @@ class ControlledWorld:
                 plan=self.injections,
                 pid=self.launcher_pid,
                 ready_port=self._ollama_port(),
+                # A crash is something the probes observe, so the launcher needs
+                # to be able to arm it there rather than pretend at start time.
+                endpoints=self.endpoints,
             )
         return self._launcher
+
+    def chat(self, endpoint: str, reference: str, prompt: str):
+        """The chat route for this world, or nothing to call."""
+        route = getattr(self.ollama, "chat", None)
+        if route is None:
+            raise CapabilityRefused(
+                "this world's Ollama client has no chat route; a smoke test may not "
+                "claim a chat capability it cannot exercise"
+            )
+        return route(endpoint, reference, prompt)
 
     def _ollama_port(self) -> int | None:
         override = self.options.port_overrides.get("ollama")
@@ -271,6 +289,9 @@ def controlled_world(
     ready_ports: Sequence[int] = (),
     repo_root: Path | None = None,
     fixture_models: bool = False,
+    on_path: Mapping[str, str] | None = None,
+    environment: Mapping[str, str] | None = None,
+    external_processes: Sequence[tuple[int, str]] = (),
 ) -> ControlledWorld:
     """An offline, processless world. This is what tests use by default."""
     plan = injections or InjectionPlan.none()
@@ -279,6 +300,10 @@ def controlled_world(
         alongside_external=frozenset({"ollama", "comfyui"}),
     )
     inventory = ControlledInventory()
+    # Registered before the world exists, so its baseline snapshot counts these
+    # as pre-existing. A process added afterwards would look like ours.
+    for port, executable in external_processes:
+        inventory.add_external(port, executable=executable)
     endpoints = ControlledEndpoints(ready=set(ready_ports), plan=plan)
     clock = StepClock()
     artifacts = ControlledArtifacts()
@@ -286,10 +311,11 @@ def controlled_world(
     return ControlledWorld(
         root=root if root is not None else allocate_root(),
         facts=controlled_facts(cuda=cuda),
-        runner=ControlledRunner(env={}),
+        runner=ControlledRunner(on_path=dict(on_path or {}), env=dict(environment or {})),
         ollama=ControlledOllama(installed=ollama_models, reachable=ollama_reachable, plan=plan),
         endpoints=endpoints,
         inventory=inventory,
+        comfyui=ControlledComfyUI(),
         artifacts=artifacts,
         options=resolved_options,
         config_writer=ControlledConfigWriter(plan),

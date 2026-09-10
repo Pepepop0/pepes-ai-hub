@@ -35,9 +35,10 @@ from .fixtures import (
     CHAT_REFERENCE,
     FIXTURE_MODELS,
     STACK_PROFILE,
+    external_install,
     repo_fixture,
 )
-from .harness import StackTestHarness, new_run_id
+from .harness import OLLAMA, StackTestHarness, new_run_id
 from .seams import Injection, InjectionPlan
 from .world import ControlledWorld, controlled_world
 
@@ -57,6 +58,11 @@ FULL_PHASES = (
 
 MANAGED_OLLAMA_PORT = 21434
 MANAGED_COMFYUI_PORT = 28188
+
+# Where an external installation listens: the profile's own default, which is
+# deliberately not the managed override. Sharing a port would be a collision,
+# and a collision is a different row.
+EXTERNAL_PORTS = {"ollama": 11434, "comfyui": 8188}
 
 
 class ScenarioOutcome(StrEnum):
@@ -259,24 +265,103 @@ def _verify_second_run(report: TestRunReport, world: ControlledWorld) -> list[st
     return problems
 
 
-def _external(component: str, port: int) -> Callable[[], ScenarioSetup]:
+EXTERNAL_PHASES = (TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.STOP)
+
+# What each external fixture looked like before the run. Compared afterwards,
+# this is the proof that nothing the hub does not own was modified.
+_EXTERNAL_BEFORE: dict[str, dict[str, bytes]] = {}
+
+
+def _external(component: str) -> Callable[[], ScenarioSetup]:
+    """A real installation of one component, outside the managed root.
+
+    Detection reads the filesystem and the environment, so an external
+    component has to actually be one. The fixture creates it where that
+    component's own hints look, and the controlled runner reports it exactly as
+    a real machine would.
+    """
+
     def build() -> ScenarioSetup:
-        world = controlled_world(ready_ports=[port])
-        world.inventory.add_external(port, name=f"{component}.exe")
-        return ScenarioSetup(world, _spec(*READ_ONLY_PHASES), f"healthy external {component}")
+        install = external_install(component)
+        # A profile that enables both services, so "alongside external" is
+        # genuinely exercised rather than skipped for a disabled component.
+        fixture = repo_fixture(STACK_PROFILE)
+        port = EXTERNAL_PORTS[component]
+        world = controlled_world(
+            ready_ports=[port],
+            repo_root=fixture.path,
+            fixture_models=True,
+            on_path=install.on_path,
+            environment=install.env,
+            external_processes=[(port, str(install.path))],
+        )
+        _EXTERNAL_BEFORE[component] = install.snapshot()
+        world.external = install  # read back by the verifier
+
+        def release() -> None:
+            fixture.release()
+            install.release()
+
+        return ScenarioSetup(
+            world,
+            _spec(*EXTERNAL_PHASES, profile=STACK_PROFILE),
+            f"a real external {component} installation the hub must leave alone",
+            release,
+        )
 
     return build
 
 
-def _verify_external(report: TestRunReport, world: ControlledWorld) -> list[str]:
-    problems = _cleanup_problems(report) + _no_residual(world)
-    if world.external_lost():
-        problems.append("an external process did not survive the run")
-    if world.launcher_pid in world.inventory.pids():
-        problems.append("the harness started a managed process during a read-only run")
-    if getattr(world.ollama, "pulls", []):
-        problems.append("an external component was written to")
-    return problems
+def _verify_external(component: str) -> Verifier:
+    def verify(report: TestRunReport, world: ControlledWorld) -> list[str]:
+        problems = _cleanup_problems(report) + _no_residual(world)
+
+        preflight = _phase(report, TestPhase.PREFLIGHT)
+        if preflight is None:
+            return problems + ["preflight never ran"]
+        external = preflight.data.get("external_components", [])
+        if component not in external:
+            problems.append(f"{component} was not classified external; got {external}")
+        if preflight.outcome is not TestPhaseOutcome.PASSED:
+            problems.append(f"coexistence was refused: {preflight.detail}")
+
+        # Managed authority is somewhere else entirely: our endpoint is not the
+        # one the external installation listens on.
+        endpoints = report.context.get("endpoints", {})
+        managed = endpoints.get(component, "")
+        if f":{EXTERNAL_PORTS[component]}" in managed:
+            problems.append(f"the managed {component} endpoint is the external one: {managed}")
+
+        # Observation only: never adopted, never started, never stopped.
+        stop = _phase(report, TestPhase.STOP)
+        observed = {
+            item["service"]: item for item in (stop.data.get("observed", []) if stop else [])
+        }
+        status = observed.get(component)
+        if status is None:
+            problems.append(f"the runtime never reported on {component}")
+        else:
+            if status["stoppable"]:
+                problems.append(f"the hub considers the external {component} its to stop")
+            if status["origin"] == "managed":
+                problems.append(f"the external {component} was adopted as managed")
+        launcher = world._launcher
+        if launcher is not None and (launcher.starts or launcher.stops):
+            problems.append(
+                f"the hub started or stopped something: {launcher.starts}/{launcher.stops}"
+            )
+
+        # It survived, and it is byte for byte what it was.
+        if world.external_lost():
+            problems.append("an external process did not survive the run")
+        install = world.external
+        if install is not None and install.snapshot() != _EXTERNAL_BEFORE.get(component):
+            problems.append("the external installation on disk was modified")
+        if getattr(world.ollama, "pulls", []):
+            problems.append("an external model store was written to")
+        return problems
+
+    return verify
 
 
 def _port_collision() -> ScenarioSetup:
@@ -419,13 +504,37 @@ def _crash_after_start() -> ScenarioSetup:
     )
     return ScenarioSetup(
         world,
-        _spec(TestPhase.PREFLIGHT, TestPhase.PLAN, TestPhase.PROVISION, TestPhase.START),
-        "the managed process exits after starting",
+        _spec(
+            TestPhase.PREFLIGHT,
+            TestPhase.PLAN,
+            TestPhase.PROVISION,
+            TestPhase.START,
+            TestPhase.STOP,
+        ),
+        "the managed process starts, is observed ready, and then exits",
     )
 
 
 def _verify_crash(report: TestRunReport, world: ControlledWorld) -> list[str]:
+    """Ready first, then gone. A start report alone cannot catch that."""
     problems = _cleanup_problems(report) + _no_residual(world)
+
+    start = _phase(report, TestPhase.START)
+    if start is None:
+        return problems + ["start never ran"]
+    if start.outcome is not TestPhaseOutcome.PASSED or not start.data.get("ready"):
+        problems.append(f"the service was never observed ready: {start.detail}")
+    if not world.endpoints.crashed:
+        problems.append("the crash injection never acted")
+
+    stop = _phase(report, TestPhase.STOP)
+    observed = {item["service"]: item for item in (stop.data.get("observed", []) if stop else [])}
+    status = observed.get(OLLAMA)
+    if status is None:
+        problems.append("the runtime never reported on the crashed service")
+    elif status["state"] == "UP":
+        problems.append("the runtime still reports the crashed service as UP")
+
     if world.launcher_pid in world.inventory.pids():
         problems.append("the crashed pid is still reported alive")
     return problems
@@ -663,15 +772,15 @@ P0_SCENARIOS: tuple[Scenario, ...] = (
     Scenario(
         "external-ollama",
         "External Ollama coexistence",
-        _external("ollama", MANAGED_OLLAMA_PORT),
-        _verify_external,
+        _external("ollama"),
+        _verify_external("ollama"),
         mutating=False,
     ),
     Scenario(
         "external-comfyui",
         "External ComfyUI coexistence",
-        _external("comfyui", MANAGED_COMFYUI_PORT),
-        _verify_external,
+        _external("comfyui"),
+        _verify_external("comfyui"),
         mutating=False,
     ),
     Scenario("port-collision", "Managed port collision", _port_collision, _verify_port_collision),

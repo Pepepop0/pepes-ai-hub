@@ -73,6 +73,14 @@ FIXTURE_MODELS = (
 
 MODEL_URL = "https://controlled.invalid/models/{filename}"
 
+# Where each provisioner looks for an installation it does not own. These
+# are the provisioner's own hints, so an external fixture is found by the
+# real detection path rather than by anything declared here.
+EXTERNAL_LAYOUT = {
+    "ollama": ("LOCALAPPDATA", Path("Programs") / "Ollama", "ollama.exe"),
+    "comfyui": ("LOCALAPPDATA", Path("Comfy-Desktop"), None),
+}
+
 _HEADER = """schema_version: 1
 id: {id}
 name: {name}
@@ -249,6 +257,64 @@ def fixture_model_catalog(register) -> ModelCatalog:
 
 
 @dataclass
+class ExternalInstall:
+    """An installation this hub does not own, on disk where the hub looks.
+
+    Detection reads the filesystem, so an external component has to actually be
+    one: a directory, and for Ollama an executable, outside the managed root.
+    ``env`` and ``on_path`` are what the controlled runner reports, exactly as a
+    real environment would.
+    """
+
+    component: str
+    base: Path
+    path: Path
+    env: dict[str, str]
+    on_path: dict[str, str]
+
+    def snapshot(self) -> dict[str, bytes]:
+        """Every file under the external installation, by content.
+
+        Compared before and after a run, this is what proves the hub did not
+        modify, replace or remove something it does not own.
+        """
+        return {
+            str(item.relative_to(self.base)): item.read_bytes()
+            for item in sorted(self.base.rglob("*"))
+            if item.is_file()
+        }
+
+    def release(self) -> None:
+        shutil.rmtree(self.base, ignore_errors=True)
+
+
+def external_install(component: str) -> ExternalInstall:
+    """Create an external installation of one component and say where it is."""
+    try:
+        variable, relative, executable = EXTERNAL_LAYOUT[component]
+    except KeyError:
+        known = ", ".join(sorted(EXTERNAL_LAYOUT))
+        raise KeyError(f"no external layout for {component!r}; known: {known}") from None
+
+    base = Path(tempfile.mkdtemp(prefix=f"pepito-e2e-external-{component}-"))
+    directory = base / relative
+    directory.mkdir(parents=True)
+    path = directory
+    on_path: dict[str, str] = {}
+    if executable is not None:
+        path = directory / executable
+        path.write_bytes(b"external installation; never touched by the hub\n")
+        on_path[component] = str(path)
+    return ExternalInstall(
+        component=component,
+        base=base,
+        path=path,
+        env={variable: str(base)},
+        on_path=on_path,
+    )
+
+
+@dataclass
 class RepoFixture:
     """A repository root a run can be pointed at, and the promise to remove it."""
 
@@ -282,11 +348,14 @@ __all__ = [
     "CHAT_DIGEST",
     "CHAT_ONLY_PROFILE",
     "CHAT_REFERENCE",
+    "EXTERNAL_LAYOUT",
     "FIXTURE_MODELS",
     "FIXTURE_PREFIX",
     "PROFILE_YAML",
     "STACK_PROFILE",
+    "ExternalInstall",
     "RepoFixture",
+    "external_install",
     "fixture_model_catalog",
     "fixture_model_payload",
     "repo_fixture",

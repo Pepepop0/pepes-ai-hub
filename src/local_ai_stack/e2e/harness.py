@@ -63,6 +63,15 @@ from ..test_contracts import (
     TestRunSpec,
     TestRunState,
 )
+from ..workflows import (
+    NodeBinding,
+    WorkflowParameters,
+    load_workflow_graph,
+    load_workflow_manifest,
+    render_workflow,
+    resolve_workflow,
+    verify_workflow_references,
+)
 from .metrics import Metric, MetricRecorder
 from .providers import ControlledViolation
 from .roots import RootError, TestRoot
@@ -81,6 +90,17 @@ MUTATING_PHASES = frozenset(
 )
 
 OLLAMA = str(ComponentId.OLLAMA)
+
+# The role a chat smoke exercises, and the workflow an image smoke submits.
+# Both are profile vocabulary, not harness invention.
+CHAT_ROLE = "chat.primary"
+IMAGE_WORKFLOW = "text_to_image"
+
+CHAT_PROMPT = "reply with one short sentence"
+# Small and fixed: this proves the submission contract, not image quality.
+IMAGE_PARAMETERS = WorkflowParameters(
+    prompt="a controlled smoke prompt", width=512, height=512, steps=4, seed=7
+)
 
 
 class PhaseOutcomeError(RuntimeError):
@@ -533,35 +553,128 @@ class StackTestHarness:
         return "managed configuration applied and verified", data
 
     def _phase_chat_smoke(self, context: RunContext) -> tuple[str, dict[str, Any]]:
-        endpoints = context.data.get("endpoints", {})
-        endpoint = endpoints.get("ollama")
+        """Send a generation to the chat model this profile resolved.
+
+        A version probe proves a port answers, which the start phase already
+        proved. What this row is for is the chat capability: the request goes to
+        the endpoint the profile resolved, names the model the resolver said is
+        available, and comes back with something.
+        """
+        endpoint = context.data.get("endpoints", {}).get(OLLAMA)
         if not endpoint:
             raise PhaseBlocked("chat smoke needs a resolved Ollama endpoint")
-        with context.metrics.measure(Metric.CHAT_SMOKE, endpoint=endpoint):
-            probe = self.world.endpoints.http(f"{endpoint}/api/version", 5.0)
-        data = {"endpoint": endpoint, "outcome": str(probe.outcome), "status": probe.status_code}
-        if not probe.ok:
-            raise PhaseFailed(f"chat route did not answer: {probe.detail}")
-        return "chat route answered", data
+
+        resolver = self._resolver(context)
+        chat = resolver.resolve_profile(context.require_profile()).get(CHAT_ROLE)
+        if chat is None:
+            raise PhaseBlocked(f"this profile declares no {CHAT_ROLE} model")
+        if not chat.available:
+            raise PhaseBlocked(f"the chat model is {chat.state}: {chat.detail}")
+        reference = chat.require_location().reference
+
+        with context.metrics.measure(Metric.CHAT_SMOKE, endpoint=endpoint, model=reference):
+            reply = self.world.chat(endpoint, reference, CHAT_PROMPT)
+
+        data = {
+            "endpoint": reply.endpoint,
+            "model": reply.model,
+            "prompt": reply.prompt,
+            "answered": bool(reply.content),
+            "done": reply.done,
+        }
+        if reply.endpoint != endpoint or reply.model != reference:
+            raise PhaseFailed(
+                f"the chat request went to {reply.endpoint}/{reply.model}, "
+                f"not {endpoint}/{reference}"
+            )
+        if not reply.ok:
+            raise PhaseFailed("the chat route accepted the request but produced nothing")
+        return f"chat answered from {reference}", data
 
     def _phase_image_smoke(self, context: RunContext) -> tuple[str, dict[str, Any]]:
+        """Render the declared workflow and submit it.
+
+        The proof here is the workflow execution contract, not a health route:
+        the graph the manifest declared, with the model binding filled from the
+        resolved location and the parameters at their declared addresses, is
+        what gets submitted. No GPU runs; the provider accepts and answers.
+        """
         if not context.spec.allow_gpu:
             raise PhaseBlocked("image smoke requires the GPU capability, which was not granted")
         if not self.world.facts.gpus:
             raise PhaseBlocked("image smoke is blocked: no usable CUDA device was detected")
-        endpoints = context.data.get("endpoints", {})
-        endpoint = endpoints.get("comfyui")
+        endpoint = context.data.get("endpoints", {}).get(str(ComponentId.COMFYUI))
         if not endpoint:
             raise PhaseBlocked("image smoke needs a resolved ComfyUI endpoint")
-        with context.metrics.measure(Metric.IMAGE_SMOKE, endpoint=endpoint):
-            probe = self.world.endpoints.http(f"{endpoint}/system_stats", 5.0)
-        data = {"endpoint": endpoint, "outcome": str(probe.outcome)}
-        if not probe.ok:
-            raise PhaseFailed(f"image route did not answer: {probe.detail}")
-        return "image route answered", data
+
+        profile = context.require_profile()
+        declaration = profile.workflows.get(IMAGE_WORKFLOW)
+        if declaration is None:
+            raise PhaseBlocked(f"this profile declares no {IMAGE_WORKFLOW!r} workflow")
+        specs = load_workflow_manifest(self.repo_root / "manifests" / "workflows.yaml")
+        spec = specs.get(declaration.manifest_id)
+        if spec is None:
+            raise PhaseBlocked(f"workflow {declaration.manifest_id!r} is not in the manifest")
+
+        resolution = resolve_workflow(
+            spec, profile, self._resolver(context), repo_root=self.repo_root
+        )
+        if not resolution.ready:
+            raise PhaseBlocked(
+                f"workflow is {resolution.state}: {'; '.join(resolution.problems)}",
+                {"workflow": str(resolution.state), "problems": list(resolution.problems)},
+            )
+        graph = load_workflow_graph(resolution)
+        mismatches = verify_workflow_references(resolution, graph)
+        if mismatches:
+            raise PhaseFailed(f"workflow does not match its template: {'; '.join(mismatches)}")
+
+        rendered = render_workflow(resolution, IMAGE_PARAMETERS, graph=graph)
+        with context.metrics.measure(Metric.IMAGE_SMOKE, endpoint=endpoint, workflow=spec.id):
+            job = self.world.comfyui.submit(endpoint, rendered)
+            result = self.world.comfyui.result(job.prompt_id)
+
+        submitted = {
+            parameter.value: _at(rendered, spec.binding(parameter)) for parameter in spec.parameters
+        }
+        images = [
+            image
+            for output in result.get("outputs", {}).values()
+            for image in output.get("images", [])
+        ]
+        data = {
+            "endpoint": endpoint,
+            "workflow": spec.id,
+            "prompt_id": job.prompt_id,
+            "runtime_name": resolution.runtime_name,
+            "submitted": submitted,
+            "images": len(images),
+        }
+        if submitted.get("model") != resolution.runtime_name:
+            raise PhaseFailed(
+                f"the submitted graph names {submitted.get('model')!r} instead of the "
+                f"resolved {resolution.runtime_name!r}"
+            )
+        if not images:
+            raise PhaseFailed("the workflow was accepted but produced no result")
+        return f"workflow {spec.id} submitted as {job.prompt_id}", data
 
     def _phase_stop(self, context: RunContext) -> tuple[str, dict[str, Any]]:
         controller = self._controller(context)
+        # What is actually there, before anything is touched. This is where a
+        # crash between two observations becomes visible, and where an external
+        # service shows up as external and unstoppable rather than as ours.
+        observed = [
+            {
+                "service": _name(status.service_id),
+                "origin": _name(status.origin),
+                "state": _name(status.state),
+                "runtime": _name(status.runtime.state),
+                "stoppable": status.stoppable,
+            }
+            for status in controller.statuses().values()
+        ]
+        context.data["observed"] = observed
         stopped: list[dict[str, Any]] = []
         for service_id in list(context.started_services):
             result = controller.stop(service_id)
@@ -574,7 +687,7 @@ class StackTestHarness:
             )
             if result.stopped:
                 context.started_services.remove(service_id)
-        data = {"stopped": stopped}
+        data = {"observed": observed, "stopped": stopped}
         if any(item["outcome"] == "failed" for item in stopped):
             raise PhaseFailed("a managed service refused to stop")
         return f"stopped {len(stopped)} managed services", data
@@ -698,6 +811,21 @@ class StackTestHarness:
             installer=self.world.model_installer(context.installation.layout),
             catalog=self.world.model_catalog(),
         )
+
+
+def _name(value: Any) -> str:
+    """An enum's own value, so a report never carries a repr."""
+    return str(getattr(value, "value", value))
+
+
+def _at(graph: dict[str, Any], binding: NodeBinding) -> Any:
+    """Read one binding back out of a rendered graph, at its declared address."""
+    node = graph.get(binding.node_id)
+    if not isinstance(node, dict):
+        return None
+    inputs = node.get("inputs")
+    target = inputs if isinstance(inputs, dict) else node
+    return target.get(binding.key)
 
 
 def _actions(report) -> list[dict[str, Any]]:

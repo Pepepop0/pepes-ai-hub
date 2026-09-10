@@ -29,6 +29,7 @@ from local_ai_stack.e2e.scenarios import (
 from local_ai_stack.e2e.seams import Injection, InjectionPlan
 from local_ai_stack.e2e.world import CapabilityRefused, controlled_world, real_world
 from local_ai_stack.managed_config import Ownership
+from local_ai_stack.ollama_models import OllamaModelEntry
 from local_ai_stack.test_contracts import (
     TestEventKind,
     TestHarness,
@@ -557,3 +558,172 @@ def test_an_unusable_workflow_leaves_no_configuration_behind():
 def test_the_invalid_workflow_row_names_its_seam():
     plan = InjectionPlan.of(Injection.INVALID_WORKFLOW)
     assert plan.as_report_data()["seams"] == ["workflow-source"]
+
+
+# --- chat e image provam contrato, não readiness ----------------------------
+
+
+def test_chat_smoke_sends_a_generation_to_the_resolved_model():
+    """A version probe proves a port answers; this proves the chat contract."""
+    from local_ai_stack.e2e.fixtures import CHAT_REFERENCE, STACK_PROFILE, repo_fixture
+
+    fixture = repo_fixture(STACK_PROFILE)
+    world = controlled_world(
+        ready_ports=[OLLAMA_PORT],
+        repo_root=fixture.path,
+        fixture_models=True,
+        ollama_models=[
+            OllamaModelEntry(name=CHAT_REFERENCE, digest="4f6b83f30b62aaaa", size_bytes=1)
+        ],
+    )
+    try:
+        report = StackTestHarness(world).run(
+            new_run_id(),
+            TestRunSpec(
+                profile_id=STACK_PROFILE,
+                phases=(
+                    TestPhase.PREFLIGHT,
+                    TestPhase.PLAN,
+                    TestPhase.PROVISION,
+                    TestPhase.ACQUIRE_MODELS,
+                    TestPhase.CHAT_SMOKE,
+                ),
+            ),
+        )
+        chat = phase_of(report, TestPhase.CHAT_SMOKE)
+        assert chat.outcome is TestPhaseOutcome.PASSED, chat.detail
+        assert chat.data["model"] == CHAT_REFERENCE
+        assert chat.data["answered"]
+
+        # The request reached the store, at the endpoint the profile resolved.
+        endpoint, reference, prompt = world.ollama.chats[-1]
+        assert reference == CHAT_REFERENCE
+        assert str(OLLAMA_PORT) in endpoint
+        assert prompt
+        assert chat.data["endpoint"] == endpoint
+    finally:
+        world.root.release()
+        fixture.release()
+
+
+def test_a_chat_route_refuses_a_model_that_is_not_in_the_store():
+    from local_ai_stack.e2e.providers import ControlledOllama
+    from local_ai_stack.ollama_models import OllamaClientError
+
+    store = ControlledOllama(installed=[])
+    with pytest.raises(OllamaClientError, match="not in the controlled store"):
+        store.chat("http://127.0.0.1:21434", "nobody:installed", "hi")
+
+
+def test_image_smoke_submits_the_rendered_workflow():
+    """The proof is the submission, not a health route."""
+    from local_ai_stack.e2e.fixtures import CHAT_REFERENCE, STACK_PROFILE, repo_fixture
+
+    fixture = repo_fixture(STACK_PROFILE)
+    world = controlled_world(
+        ready_ports=[OLLAMA_PORT, 28188],
+        repo_root=fixture.path,
+        fixture_models=True,
+        ollama_models=[
+            OllamaModelEntry(name=CHAT_REFERENCE, digest="4f6b83f30b62aaaa", size_bytes=1)
+        ],
+    )
+    try:
+        report = StackTestHarness(world).run(
+            new_run_id(),
+            TestRunSpec(
+                profile_id=STACK_PROFILE,
+                phases=(
+                    TestPhase.PREFLIGHT,
+                    TestPhase.PLAN,
+                    TestPhase.PROVISION,
+                    TestPhase.ACQUIRE_MODELS,
+                    TestPhase.IMAGE_SMOKE,
+                ),
+                allow_gpu=True,
+            ),
+        )
+        image = phase_of(report, TestPhase.IMAGE_SMOKE)
+        assert image.outcome is TestPhaseOutcome.PASSED, image.detail
+
+        # One submission, carrying the whole graph.
+        assert len(world.comfyui.submissions) == 1
+        submitted = image.data["submitted"]
+        assert submitted["model"] == image.data["runtime_name"]
+        assert submitted["prompt"]
+        assert submitted["steps"] == 4
+        assert submitted["seed"] == 7
+        assert image.data["images"] == 1
+
+        # And the graph really carries it, at the node the manifest declared.
+        assert world.comfyui.submitted("75:70", "unet_name") == image.data["runtime_name"]
+    finally:
+        world.root.release()
+        fixture.release()
+
+
+def test_no_gpu_workload_runs_during_an_image_smoke():
+    """A controlled ComfyUI accepts and answers; it never executes."""
+    from local_ai_stack.e2e.providers import ControlledComfyUI
+
+    comfyui = ControlledComfyUI()
+    job = comfyui.submit("http://127.0.0.1:28188", {"1": {"inputs": {"a": 1}}})
+    assert comfyui.result(job.prompt_id)["status"] == "success"
+    assert not hasattr(comfyui, "execute")
+    assert not hasattr(comfyui, "run")
+
+
+def test_an_empty_workflow_submission_is_a_violation():
+    from local_ai_stack.e2e.providers import ControlledComfyUI, ControlledViolation
+
+    with pytest.raises(ControlledViolation):
+        ControlledComfyUI().submit("http://127.0.0.1:28188", {})
+
+
+# --- crash e coexistência ---------------------------------------------------
+
+
+def test_a_crash_happens_after_readiness_not_instead_of_it():
+    result = ScenarioRunner().run(scenario_by_id("crash-after-start"))
+    assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
+
+    start = phase_of(result.report, TestPhase.START)
+    assert start.outcome is TestPhaseOutcome.PASSED
+    assert start.data["ready"] is True
+
+    observed = {
+        item["service"]: item for item in phase_of(result.report, TestPhase.STOP).data["observed"]
+    }
+    assert observed["ollama"]["state"] != "UP"
+
+
+def test_a_crash_is_never_proved_by_an_exception():
+    """Every phase of the crash row ran; none of them raised."""
+    result = ScenarioRunner().run(scenario_by_id("crash-after-start"))
+    for item in result.report.phases:
+        assert "Error" not in item.detail, f"{item.phase}: {item.detail}"
+        assert "traceback" not in item.data
+
+
+@pytest.mark.parametrize("component", ["ollama", "comfyui"])
+def test_an_external_installation_is_classified_and_left_alone(component):
+    setup = scenario_by_id(f"external-{component}").setup()
+    before = setup.world.external.snapshot()
+    try:
+        report = StackTestHarness(setup.world).run(new_run_id(), setup.spec)
+        preflight = phase_of(report, TestPhase.PREFLIGHT)
+        assert component in preflight.data["external_components"]
+        assert preflight.outcome is TestPhaseOutcome.PASSED
+
+        observed = {
+            item["service"]: item for item in phase_of(report, TestPhase.STOP).data["observed"]
+        }
+        assert observed[component]["stoppable"] is False
+        assert observed[component]["origin"] != "managed"
+
+        assert setup.world.external.snapshot() == before
+        assert setup.world.external_lost() == ()
+        assert setup.world.ollama.pulls == []
+    finally:
+        setup.world.root.release()
+        setup.teardown()

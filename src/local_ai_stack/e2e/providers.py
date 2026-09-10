@@ -21,6 +21,7 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -261,6 +262,7 @@ class ControlledOllama:
         self.plan = plan or InjectionPlan.none()
         self.pulls: list[str] = []
         self.list_calls = 0
+        self.chats: list[tuple[str, str, str]] = []
 
     def list_models(self) -> tuple[OllamaModelEntry, ...]:
         self.list_calls += 1
@@ -279,6 +281,110 @@ class ControlledOllama:
         digest = hashlib.sha256(reference.encode("utf-8")).hexdigest()
         self.installed.append(OllamaModelEntry(name=reference, digest=digest, size_bytes=1))
 
+    # --- rota de chat ------------------------------------------------------
+
+    def chat(self, endpoint: str, reference: str, prompt: str) -> ChatReply:
+        """A synthetic completion from the model the caller named.
+
+        The reference is checked against the store rather than accepted. A chat
+        route that answered for a model nobody installed would let a run report
+        a capability it does not have, which is the failure this row exists to
+        rule out.
+        """
+        if not self.reachable:
+            raise OllamaClientError("controlled Ollama store is unreachable")
+        known = [entry.name for entry in self.list_models()]
+        if reference not in known:
+            raise OllamaClientError(
+                f"{reference} is not in the controlled store; it holds: "
+                f"{', '.join(known) or 'nothing'}"
+            )
+        self.chats.append((endpoint, reference, prompt))
+        return ChatReply(
+            endpoint=endpoint,
+            model=reference,
+            prompt=prompt,
+            content=f"controlled reply from {reference}",
+        )
+
+
+@dataclass(frozen=True)
+class ChatReply:
+    """One synthetic completion, and what was asked to produce it."""
+
+    endpoint: str
+    model: str
+    prompt: str
+    content: str
+    done: bool = True
+
+    @property
+    def ok(self) -> bool:
+        return self.done and bool(self.content)
+
+
+# --- ComfyUI ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ImageJob:
+    """One accepted workflow submission, kept whole."""
+
+    prompt_id: str
+    endpoint: str
+    graph: Mapping[str, Any]
+
+
+@dataclass
+class ControlledComfyUI:
+    """A ComfyUI that accepts a workflow and answers about it.
+
+    Deliberately not a health probe. It takes the rendered API graph, keeps it,
+    and answers with a prompt id and a synthetic output. That is what makes it
+    possible to assert on what was *submitted* -- the model binding, the
+    parameters, the node addresses the manifest declared -- instead of only that
+    something answered.
+
+    It executes nothing: no GPU is involved and no image exists.
+    """
+
+    submissions: list[ImageJob] = field(default_factory=list)
+    reachable: bool = True
+
+    def submit(self, endpoint: str, graph: Mapping[str, Any]) -> ImageJob:
+        if not self.reachable:
+            raise ControlledViolation("controlled ComfyUI is not reachable")
+        if not isinstance(graph, Mapping) or not graph:
+            raise ControlledViolation("a workflow submission needs a non-empty graph")
+        job = ImageJob(
+            prompt_id=f"controlled-{len(self.submissions) + 1}",
+            endpoint=endpoint,
+            graph=dict(graph),
+        )
+        self.submissions.append(job)
+        return job
+
+    def result(self, prompt_id: str) -> dict[str, Any]:
+        job = next((item for item in self.submissions if item.prompt_id == prompt_id), None)
+        if job is None:
+            raise ControlledViolation(f"unknown prompt id {prompt_id!r}")
+        return {
+            "prompt_id": prompt_id,
+            "status": "success",
+            "outputs": {"save": {"images": [{"filename": f"{prompt_id}.png", "type": "output"}]}},
+        }
+
+    def submitted(self, node_id: str, key: str) -> Any:
+        """Read one field back out of the last submitted graph, by its address."""
+        if not self.submissions:
+            raise ControlledViolation("nothing was submitted")
+        node = self.submissions[-1].graph.get(node_id)
+        if not isinstance(node, Mapping):
+            return None
+        inputs = node.get("inputs")
+        target = inputs if isinstance(inputs, Mapping) else node
+        return target.get(key)
+
 
 # --- probes ----------------------------------------------------------------
 
@@ -292,6 +398,29 @@ class ControlledEndpoints:
     payloads: dict[str, object] = field(default_factory=dict)
     http_calls: list[str] = field(default_factory=list)
     tcp_calls: list[tuple[str, int]] = field(default_factory=list)
+    # A service that dies *after* it was observed ready. Armed by the launcher,
+    # counted here: the first observation answers, every later one finds nothing,
+    # which is what a process exiting between two checks actually looks like.
+    _crash_port: int | None = field(default=None, repr=False)
+    _crash: Callable[[], None] | None = field(default=None, repr=False)
+    _observations: int = field(default=0, repr=False)
+    crashed: bool = False
+
+    def arm_crash(self, port: int | None, kill: Callable[[], None]) -> None:
+        self._crash_port = port
+        self._crash = kill
+        self._observations = 0
+
+    def _observe(self, port: int) -> None:
+        """Count observations of the armed port and let it die after the first."""
+        if self._crash is None or port != self._crash_port:
+            return
+        self._observations += 1
+        if self._observations < 2 or self.crashed:
+            return
+        self.crashed = True
+        self.ready.discard(port)
+        self._crash()
 
     def _port_of(self, url: str) -> int:
         try:
@@ -304,6 +433,7 @@ class ControlledEndpoints:
         if self.plan.active(Injection.READINESS_TIMEOUT):
             return ProbeResult(ProbeOutcome.TIMEOUT, detail="controlled readiness timeout")
         port = self._port_of(url)
+        self._observe(port)
         if port not in self.ready:
             return ProbeResult(ProbeOutcome.REFUSED, detail="controlled: nothing listening")
         import json as _json
@@ -320,6 +450,7 @@ class ControlledEndpoints:
         self.tcp_calls.append((host, port))
         if self.plan.active(Injection.READINESS_TIMEOUT):
             return ProbeResult(ProbeOutcome.TIMEOUT, detail="controlled readiness timeout")
+        self._observe(port)
         if port in self.ready:
             return ProbeResult(ProbeOutcome.OK, latency_ms=1.0)
         return ProbeResult(ProbeOutcome.REFUSED, detail="controlled: nothing listening")
@@ -364,17 +495,24 @@ class ControlledInventory:
             ProcessInfo(pid, "unrelated.exe", r"C:\Other\unrelated.exe", "unrelated --serve", 1.0)
         )
 
-    def add_external(self, port: int, *, pid: int = EXTERNAL_PID, name: str = "ollama.exe") -> None:
+    def add_external(
+        self,
+        port: int,
+        *,
+        pid: int = EXTERNAL_PID,
+        name: str = "ollama.exe",
+        executable: str | None = None,
+    ) -> None:
+        """A process this run did not start, at the path it was really found.
+
+        ``executable`` matters: the controller decides origin by matching a
+        running process against what it owns, so a scenario that wants a
+        genuinely external process has to point at the external install rather
+        than at an invented path.
+        """
+        path = executable or rf"C:\Users\Someone\AppData\Local\Programs\Ollama\{name}"
         self.listeners.append(Listener("127.0.0.1", port, pid))
-        self.processes.append(
-            ProcessInfo(
-                pid,
-                name,
-                rf"C:\Users\Someone\AppData\Local\Programs\Ollama\{name}",
-                f"{name} serve",
-                1.0,
-            )
-        )
+        self.processes.append(ProcessInfo(pid, Path(path).name, path, f"{path} serve", 1.0))
 
     def spawn(self, pid: int, executable: str, port: int | None = None) -> None:
         self.processes.append(
@@ -409,12 +547,14 @@ class ControlledLauncher:
         plan: InjectionPlan | None = None,
         pid: int = CONTROLLED_PID,
         ready_port: int | None = None,
+        endpoints: ControlledEndpoints | None = None,
     ) -> None:
         self.registry = registry
         self.inventory = inventory
         self.plan = plan or InjectionPlan.none()
         self.pid = pid
         self.ready_port = ready_port
+        self.endpoints = endpoints
         self.starts: list[str] = []
         self.stops: list[str] = []
         self.closed = False
@@ -432,14 +572,6 @@ class ControlledLauncher:
         service_id = getattr(spec, "service_id", "unknown")
         executable = getattr(spec, "executable", "controlled.exe")
         self.starts.append(service_id)
-        if self.plan.active(Injection.SERVICE_CRASH):
-            # Started, then gone. Nothing is registered, because nothing lives.
-            return LaunchResult(
-                outcome=LaunchOutcome.STARTED,
-                service_id=service_id,
-                pid=self.pid,
-                detail="controlled process started and exited",
-            )
         self.inventory.spawn(self.pid, executable, self.ready_port)
         create_time = next(
             (item.create_time for item in self.inventory.processes if item.pid == self.pid), None
@@ -453,6 +585,10 @@ class ControlledLauncher:
             create_time=create_time,
         )
         self.registry.register(entry)
+        if self.plan.active(Injection.SERVICE_CRASH) and self.endpoints is not None:
+            # It really starts and really becomes ready. It dies on the next
+            # observation, which is the case a start report alone cannot catch.
+            self.endpoints.arm_crash(self.ready_port, lambda: self.inventory.kill(self.pid))
         return LaunchResult(
             outcome=LaunchOutcome.STARTED,
             service_id=service_id,
@@ -605,7 +741,9 @@ __all__ = [
     "TAMPER_KEY",
     "TAMPER_LINE",
     "UNRELATED_PID",
+    "ChatReply",
     "ControlledArtifacts",
+    "ControlledComfyUI",
     "ControlledConfigWriter",
     "ControlledEndpoints",
     "ControlledInventory",
@@ -614,6 +752,7 @@ __all__ = [
     "ControlledOllama",
     "ControlledRunner",
     "ControlledViolation",
+    "ImageJob",
     "StepClock",
     "controlled_facts",
     "refusing_client_factory",

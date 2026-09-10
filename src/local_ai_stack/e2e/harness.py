@@ -18,9 +18,12 @@ Two rules shape the whole file:
   opinion of its own to substitute.
 
 Two consequences of the first rule are easy to get wrong and are handled here
-explicitly. The root is acquired when the world is built, so *everything* from
-spec validation onwards runs inside the try whose finally releases it; a run
-that cannot even load its profile still cleans up. And the spec is checked
+explicitly. The root is acquired when the world is built -- before ``run`` is
+even called -- so *everything* the run does, including building its own
+context, happens inside the try whose finally releases it. Cleanup therefore
+does not require a context to exist: it releases the world's processes and the
+world's root, which is what was acquired. A run that fails while constructing
+itself still cleans up. And the spec is checked
 against the world before anything runs: a spec asking for a configured root or
 local-real providers against an ephemeral, controlled world is refused rather
 than quietly reinterpreted, because a report that names the wrong mode is worse
@@ -203,13 +206,14 @@ class StackTestHarness:
         started_at = _utc_now()
         sequence.run_state(TestRunState.RUNNING)
 
-        # Built before anything can fail, because the root already exists and
-        # the finally below is what releases it.
-        context = self._bare_context(spec)
+        # The root exists before this method is entered, so nothing here --
+        # including building the context -- may happen outside the try.
+        context: RunContext | None = None
         results: list[TestPhaseResult] = []
         failure_detail = ""
 
         try:
+            context = self._bare_context(spec)
             self._refuse_mismatch(spec)
             self._bind_profile(context)
             halted = ""
@@ -283,7 +287,7 @@ class StackTestHarness:
             started_at=started_at,
             finished_at=_utc_now(),
             detail=failure_detail,
-            context=self._report_context(context),
+            context=self._report_context(context, spec, cleanup),
         )
         sequence.run_state(state)
         sequence.result(report)
@@ -335,7 +339,20 @@ class StackTestHarness:
                 "be reported as local-real"
             )
 
-    def _report_context(self, context: RunContext) -> dict[str, Any]:
+    def _report_context(
+        self, context: RunContext | None, spec: TestRunSpec, cleanup: TestPhaseResult
+    ) -> dict[str, Any]:
+        """The run's context, including for a run that never built one."""
+        if context is None:
+            return {
+                "root": self.world.root.as_report_data(),
+                "provider_mode": str(spec.provider_mode),
+                "capabilities": {"network": spec.allow_network, "gpu": spec.allow_gpu},
+                "injection": self.injections.as_report_data(),
+                "metrics": {},
+                "cleanup": dict(cleanup.data),
+                "endpoints": {},
+            }
         return {
             "root": context.root.as_report_data(),
             "provider_mode": str(context.spec.provider_mode),
@@ -772,15 +789,23 @@ class StackTestHarness:
 
     # --- cleanup -----------------------------------------------------------
 
-    def _cleanup(self, context: RunContext, sequence: _Sequencer) -> TestPhaseResult:
-        """Always runs. Reports its own outcome, independent of earlier phases."""
+    def _cleanup(self, context: RunContext | None, sequence: _Sequencer) -> TestPhaseResult:
+        """Always runs, with or without a context.
+
+        What has to be released belongs to the *world*: the processes it
+        launched and the root it allocated. Both exist before a run starts, so
+        a run that failed while building its own context still has them to
+        release, and this must not depend on that context existing.
+        """
         sequence.phase_state(TestPhase.CLEANUP, "running")
         started = self.world.monotonic()
         problems: list[str] = []
         released: list[str] = []
+        metrics = context.metrics if context is not None else MetricRecorder(self.world.monotonic)
+        root = context.root if context is not None else self.world.root
 
-        with context.metrics.measure(Metric.CLEANUP):
-            if context.controller is not None:
+        with metrics.measure(Metric.CLEANUP):
+            if context is not None and context.controller is not None:
                 for service_id in list(context.started_services):
                     try:
                         result = context.controller.stop(service_id)
@@ -802,18 +827,19 @@ class StackTestHarness:
                 problems.append("managed processes still present: " + ", ".join(map(str, residual)))
 
             try:
-                detail = context.root.release()
-                released.append(detail)
+                released.append(root.release())
             except RootError as exc:
                 problems.append(str(exc))
 
         duration = max(0.0, self.world.monotonic() - started)
-        context.cleanup_report = {
+        report = {
             "released": released,
             "problems": problems,
-            "root": context.root.as_report_data(),
+            "root": root.as_report_data(),
             "external_survivors": list(self.world.external_survivors()),
         }
+        if context is not None:
+            context.cleanup_report = report
         outcome = TestPhaseOutcome.FAILED if problems else TestPhaseOutcome.PASSED
         detail = "; ".join(problems) if problems else "no managed residual; root released"
         sequence.phase_state(TestPhase.CLEANUP, str(outcome), detail)
@@ -822,7 +848,7 @@ class StackTestHarness:
             outcome=outcome,
             detail=detail,
             duration_seconds=duration,
-            data=dict(context.cleanup_report),
+            data=dict(report),
         )
 
     # --- composição --------------------------------------------------------

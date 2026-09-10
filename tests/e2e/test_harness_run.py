@@ -827,3 +827,87 @@ def test_the_clean_root_row_does_not_call_itself_a_whole_stack_install():
     title = scenario_by_id("clean-root").title.lower()
     assert "partial" in title
     assert "ollama only" in title
+
+
+# --- cleanup cobre até a construção do próprio run --------------------------
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["_bare_context", "_refuse_mismatch", "_bind_profile"],
+)
+def test_a_failure_while_building_the_run_still_releases_the_root(monkeypatch, target):
+    """The root exists before `run` is entered, so nothing may happen outside the try."""
+    world = controlled_world(ready_ports=[OLLAMA_PORT])
+    root = world.root
+    assert root.exists()
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError(f"controlled failure in {target}")
+
+    monkeypatch.setattr(StackTestHarness, target, boom)
+    report = StackTestHarness(world).run(new_run_id(), spec(Phase.PREFLIGHT, Phase.PLAN))
+
+    assert report.state is RunState.FAILED
+    assert f"controlled failure in {target}" in report.detail
+    assert not root.exists()
+    assert world.managed_residual() == ()
+    assert world.external_lost() == ()
+    cleanup = phase_of(report, Phase.CLEANUP)
+    assert cleanup.outcome is Outcome.PASSED
+    assert report.context["cleanup"]["problems"] == []
+
+
+def test_a_failure_while_building_the_run_never_deletes_a_configured_root(monkeypatch, tmp_path):
+    persistent = tmp_path / "stack"
+    persistent.mkdir()
+    (persistent / "keep.txt").write_text("mine", encoding="utf-8")
+    world = controlled_world(
+        root=allocate_root(RootMode.CONFIGURED, configured=persistent),
+        ready_ports=[OLLAMA_PORT],
+    )
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("controlled failure in _bare_context")
+
+    monkeypatch.setattr(StackTestHarness, "_bare_context", boom)
+    report = StackTestHarness(world).run(
+        new_run_id(), spec(Phase.PREFLIGHT, root_mode=RootMode.CONFIGURED)
+    )
+
+    assert report.state is RunState.FAILED
+    assert (persistent / "keep.txt").read_text(encoding="utf-8") == "mine"
+    assert "never deleted" in report.context["root"]["cleanup_detail"]
+
+
+def test_a_run_that_never_built_a_context_still_reports_one(monkeypatch):
+    world = controlled_world(ready_ports=[OLLAMA_PORT])
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("controlled failure in _bare_context")
+
+    monkeypatch.setattr(StackTestHarness, "_bare_context", boom)
+    report = StackTestHarness(world).run(new_run_id(), spec(Phase.PREFLIGHT))
+
+    assert report.context["provider_mode"] == "controlled"
+    assert report.context["root"]["removed"] is True
+    assert report.context["cleanup"]["problems"] == []
+
+
+def test_a_launcher_that_started_something_is_released_without_a_context(monkeypatch):
+    """Partially built runs still release what the world already holds."""
+    world = controlled_world(ready_ports=[OLLAMA_PORT])
+    registry_stub = type("R", (), {"register": lambda *a: None, "unregister": lambda *a: None})()
+    launcher = world.launcher(registry_stub)
+    launcher.start(type("S", (), {"service_id": "ollama", "executable": "ollama.exe"})())
+    assert world.launcher_pid in world.inventory.pids()
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("controlled failure in _bare_context")
+
+    monkeypatch.setattr(StackTestHarness, "_bare_context", boom)
+    report = StackTestHarness(world).run(new_run_id(), spec(Phase.PREFLIGHT))
+
+    assert report.state is RunState.FAILED
+    assert launcher.closed, "the launcher was never released"
+    assert not world.root.exists()

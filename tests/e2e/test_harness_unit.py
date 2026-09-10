@@ -562,3 +562,58 @@ def test_no_injection_exists_for_something_that_is_just_a_world():
     names = {item.value for item in Injection}
     assert "port-occupied" not in names
     assert "cuda-unavailable" not in names
+
+
+# --- interrupção realmente no meio da transferência -------------------------
+
+
+def test_an_interrupted_download_writes_bytes_before_it_fails(tmp_path):
+    """`bytes_written_before_failure > 0`, from the downloader's own accounting."""
+    from local_ai_stack.download import Downloader, DownloadError, DownloadSpec
+    from local_ai_stack.e2e.fixtures import fixture_model_catalog
+    from local_ai_stack.e2e.providers import TRANSFER_CHUNK, ControlledArtifacts
+
+    artifacts = ControlledArtifacts()
+    catalog = fixture_model_catalog(artifacts.register_model)
+    spec = catalog.require(catalog.normalize("comfyui/e2e_diffusion")).source.artifact
+
+    plan = InjectionPlan.of(Injection.DOWNLOAD_INTERRUPTED)
+    downloader = Downloader(
+        client_factory=artifacts.client_factory(plan),
+        max_attempts=1,
+        chunk_size=TRANSFER_CHUNK,
+    )
+    target = DownloadSpec.from_artifact(spec, tmp_path)
+
+    written = []
+    with pytest.raises(DownloadError):
+        downloader.fetch(target, progress=lambda item: written.append(item.downloaded_bytes))
+
+    assert written, "the transfer failed before a single chunk was written"
+    assert max(written) > 0
+    assert max(written) < (spec.size_bytes or 0), "the whole body arrived; nothing was interrupted"
+    assert artifacts.delivered[spec.url] == max(written)
+
+    # And the domain cleaned up after itself: no .part, no promoted file.
+    assert not downloader.part_path(target.destination).exists()
+    assert not target.destination.exists()
+
+
+def test_a_completed_download_is_promoted(tmp_path):
+    """The control: the same transport without the injection finishes."""
+    from local_ai_stack.download import Downloader, DownloadSpec
+    from local_ai_stack.e2e.fixtures import fixture_model_catalog
+    from local_ai_stack.e2e.providers import TRANSFER_CHUNK, ControlledArtifacts
+
+    artifacts = ControlledArtifacts()
+    catalog = fixture_model_catalog(artifacts.register_model)
+    spec = catalog.require(catalog.normalize("comfyui/e2e_diffusion")).source.artifact
+    downloader = Downloader(
+        client_factory=artifacts.client_factory(), max_attempts=1, chunk_size=TRANSFER_CHUNK
+    )
+    target = DownloadSpec.from_artifact(spec, tmp_path)
+
+    result = downloader.fetch(target)
+    assert result.ok
+    assert target.destination.exists()
+    assert artifacts.delivered == {}

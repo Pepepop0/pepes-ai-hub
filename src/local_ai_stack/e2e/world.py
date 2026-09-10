@@ -34,6 +34,7 @@ from ..system import SystemFacts
 from ..test_contracts import TestProviderMode
 from .fixtures import fixture_model_catalog
 from .providers import (
+    TRANSFER_CHUNK,
     ControlledArtifacts,
     ControlledComfyUI,
     ControlledConfigWriter,
@@ -112,9 +113,16 @@ class ControlledWorld:
     # --- seams -------------------------------------------------------------
 
     def downloader(self) -> Downloader:
-        """A downloader wired to the controlled transport."""
+        """A downloader wired to the controlled transport.
+
+        The chunk size is tiny so that a fixture weight arrives in several
+        pieces. It is the only way an interruption can land *after* bytes have
+        been written to the `.part` file rather than before the first read.
+        """
         return Downloader(
-            client_factory=self.artifacts.client_factory(self.injections), max_attempts=1
+            client_factory=self.artifacts.client_factory(self.injections),
+            max_attempts=1,
+            chunk_size=TRANSFER_CHUNK,
         )
 
     def provisioners(self, context) -> dict[str, object]:

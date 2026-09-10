@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,11 @@ from ..probes import ProbeOutcome, ProbeResult
 from ..runner import CommandResult, CommandRunner
 from ..system import GPUInfo, NvidiaFacts, SystemFacts
 from .seams import Injection, InjectionPlan
+
+# Small enough that a fixture weight of a few dozen bytes is delivered in
+# several pieces, so an interruption really happens mid-transfer instead of
+# before the first chunk is handed to the downloader.
+TRANSFER_CHUNK = 8
 
 CONTROLLED_PID = 44100
 UNRELATED_PID = 9911
@@ -178,6 +183,10 @@ class ControlledArtifacts:
     # the seam instead of against its own declaration.
     interrupted: list[str] = field(default_factory=list)
     corrupted: list[str] = field(default_factory=list)
+    # Bytes that reached the client before an interruption, per URL. An
+    # interruption that delivered nothing is a refused connection, not a
+    # transfer that stopped half way, and the two fail in different places.
+    delivered: dict[str, int] = field(default_factory=dict)
 
     def register(self, url: str, payload: bytes, *, kind: str = "component") -> str:
         self.payloads[url] = payload
@@ -197,16 +206,35 @@ class ControlledArtifacts:
                 raise ControlledViolation(f"controlled run requested an unknown URL: {url}")
             payload = self.payloads[url]
             if active.active(Injection.DOWNLOAD_INTERRUPTED) and self.kinds.get(url) == "model":
-                # A short write: the transport stops mid-body. The downloader
-                # must not promote the partial file.
+                # A real short transfer: the response starts, part of the body
+                # arrives, and then the connection dies. The downloader is
+                # already writing into its `.part` file by that point, which is
+                # the state this row is about.
                 self.interrupted.append(url)
-                raise httpx.ReadError("controlled transport closed mid-transfer")
+                return httpx.Response(
+                    200,
+                    headers={"content-length": str(len(payload))},
+                    content=self._interrupted_body(url, payload),
+                )
             if active.active(Injection.CHECKSUM_MISMATCH):
                 self.corrupted.append(url)
                 payload = payload + b"-tampered"
             return httpx.Response(200, content=payload)
 
         return httpx.MockTransport(handle)
+
+    def _interrupted_body(self, url: str, payload: bytes) -> Iterator[bytes]:
+        """Deliver the first half in transfer-sized pieces, then die."""
+        half = max(TRANSFER_CHUNK, len(payload) // 2)
+        sent = 0
+        for start in range(0, half, TRANSFER_CHUNK):
+            chunk = payload[start : start + TRANSFER_CHUNK]
+            if not chunk:
+                break
+            sent += len(chunk)
+            self.delivered[url] = sent
+            yield chunk
+        raise httpx.ReadError("controlled transport closed mid-transfer")
 
     def client_factory(self, plan: InjectionPlan | None = None) -> Callable[[], httpx.Client]:
         transport = self.transport(plan)
@@ -745,6 +773,7 @@ __all__ = [
     "EXTERNAL_PID",
     "TAMPER_KEY",
     "TAMPER_LINE",
+    "TRANSFER_CHUNK",
     "UNRELATED_PID",
     "ChatReply",
     "ControlledArtifacts",

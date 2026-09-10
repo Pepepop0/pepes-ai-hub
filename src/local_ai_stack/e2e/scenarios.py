@@ -539,9 +539,17 @@ def _verify_interrupted_download(report: TestRunReport, world: ControlledWorld) 
     """A model download, not a component download, and nothing is promoted."""
     problems = _cleanup_problems(report) + _no_residual(world)
 
-    model_urls = [url for url in world.artifacts.interrupted if world.artifacts.kinds.get(url)]
-    if not any(world.artifacts.kinds.get(url) == "model" for url in model_urls):
+    interrupted = [
+        url for url in world.artifacts.interrupted if world.artifacts.kinds.get(url) == "model"
+    ]
+    if not interrupted:
         problems.append("no model download was interrupted, so this proves nothing about models")
+    # Mid-transfer, not a refused connection: bytes reached the client, and the
+    # downloader was already writing them, before the stream died.
+    for url in interrupted:
+        delivered = world.artifacts.delivered.get(url, 0)
+        if delivered <= 0:
+            problems.append(f"nothing was delivered before {url} failed, so it never started")
 
     acquire = _phase(report, TestPhase.ACQUIRE_MODELS)
     if acquire is None:

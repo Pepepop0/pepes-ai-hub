@@ -258,6 +258,7 @@ def preflight_managed_stack(
     facts: SystemFacts | None = None,
     listener_report: ListenerReport | None = None,
     minimum_free_bytes: int = 0,
+    managed_pids: frozenset[int] = frozenset(),
 ) -> ManagedPreflightReport:
     """Prove isolation before an opt-in managed plan mutates anything.
 
@@ -265,6 +266,11 @@ def preflight_managed_stack(
     before layout preparation or any provisioner ``apply``.  An unavailable
     listener scan fails closed because it cannot prove that the selected ports
     are free.
+
+    ``managed_pids`` names processes this manager itself started and still
+    owns, as the registry proves them.  A managed port held by one of them is
+    not a collision: it is the stack already running.  Anything else on a
+    managed port still is.
     """
     endpoints = options.endpoints_for(profile)
     compatibility = evaluate_compatibility(facts or detect_system(), profile)
@@ -343,7 +349,11 @@ def preflight_managed_stack(
         )
     else:
         for spec in enabled_specs:
-            collisions = listeners.on_port(spec.port, spec.host)
+            collisions = [
+                listener
+                for listener in listeners.on_port(spec.port, spec.host)
+                if listener.pid is None or listener.pid not in managed_pids
+            ]
             if not collisions:
                 continue
             pids = sorted({listener.pid for listener in collisions if listener.pid is not None})

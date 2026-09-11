@@ -6,20 +6,17 @@ import threading
 
 import pytest
 
-from local_ai_stack.test_api.__main__ import UnwiredHarness, build_parser, main
+from local_ai_stack.test_api import TestApi as Api
+from local_ai_stack.test_api.__main__ import build_parser, main
 from local_ai_stack.test_api.auth import ENV_TOKEN
 
 from .conftest import (
     SECRET,
     Client,
-    Phase,
-    RunSpec,
     ScriptedHarness,
     gated_script,
     open_stream,
 )
-
-SPEC = RunSpec(profile_id="pepe", phases=(Phase.PREFLIGHT,))
 
 
 def test_a_profile_must_be_named():
@@ -68,27 +65,33 @@ def test_a_public_bind_is_refused_at_the_command_line(monkeypatch, capsys):
 def test_the_token_is_never_echoed(monkeypatch, capsys):
     """A started server prints its address, never its secret."""
     monkeypatch.setenv(ENV_TOKEN, SECRET)
-    finished = threading.Event()
-
-    def run() -> None:
-        main(["--profile", "pepe"])
-        finished.set()
-
-    worker = threading.Thread(target=run, daemon=True)
-    worker.start()
-    # main() blocks on the serving thread; stopping the test is enough, because
-    # every thread it owns is a daemon. What matters is what it printed.
-    worker.join(timeout=1.0)
+    monkeypatch.setattr(Api, "wait", lambda self: None)
+    assert main(["--profile", "pepe"]) == 0
     captured = capsys.readouterr().err
     assert "listening on http://127.0.0.1:" in captured
     assert SECRET not in captured
 
 
-def test_the_placeholder_harness_fails_rather_than_pretends():
-    report = UnwiredHarness().run("a" * 32, SPEC)
-    assert report.state.value == "failed"
-    assert "no test harness" in report.detail
-    assert report.phases == ()
+def test_the_entry_point_executes_the_real_harness(monkeypatch):
+    monkeypatch.setenv(ENV_TOKEN, SECRET)
+    reports = []
+
+    def exercise(self):
+        run_id = Client(self).create_run(phases=["preflight", "plan"]).json()["run_id"]
+        record = self.store.wait_for_finish(run_id)
+        reports.append(record.report)
+
+    monkeypatch.setattr(Api, "wait", exercise)
+    assert main(["--profile", "pepe"]) == 0
+    assert reports[0].state.value == "passed"
+    assert reports[0].context["provider_mode"] == "controlled"
+    assert reports[0].context["root"]["removed"] is True
+
+
+def test_real_providers_remain_unsupported_even_with_the_flag(monkeypatch, capsys):
+    monkeypatch.setenv(ENV_TOKEN, SECRET)
+    assert main(["--profile", "pepe", "--allow-real-providers"]) == 2
+    assert "local-real providers are unsupported" in capsys.readouterr().err
 
 
 def test_an_abrupt_disconnect_is_not_a_server_error(serve):

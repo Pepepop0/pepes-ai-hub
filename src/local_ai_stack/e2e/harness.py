@@ -371,7 +371,14 @@ class StackTestHarness:
                 "python": self.world.facts.python_version,
             },
             "endpoints": dict(context.data.get("endpoints", {})),
-            **{key: value for key, value in context.data.items() if key != "endpoints"},
+            # Domain plan objects are execution state, not report data. Keep
+            # their public projection above, so an HTTP reader can serialize
+            # the actual report without learning domain implementation types.
+            **{
+                key: value
+                for key, value in context.data.items()
+                if key != "endpoints" and not key.startswith("_")
+            },
         }
 
     # --- despacho ----------------------------------------------------------

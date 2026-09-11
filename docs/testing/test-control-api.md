@@ -5,8 +5,9 @@ API, it is not started by the product, and it is not reachable from another
 machine.
 
 Implements the surface frozen in [`POST_MVP_TEST_PHASE.md`](../POST_MVP_TEST_PHASE.md)
-against the contracts in `local_ai_stack.test_contracts`. It lives entirely in
-`src/local_ai_stack/test_api/` and adds no dependency: the server is
+against the contracts in `local_ai_stack.test_contracts`. HTTP lives in
+`src/local_ai_stack/test_api/`; `test_application.py` composes it with the
+controlled `StackTestHarness`. It adds no dependency: the server is
 `http.server` from the standard library.
 
 ## Starting it
@@ -18,15 +19,21 @@ python -m local_ai_stack.test_api --profile pepe
 
 The token comes from `PEPITOS_AI_HUB_TEST_TOKEN`, or from a file named by
 `PEPITOS_AI_HUB_TEST_TOKEN_FILE`. There is no default and no generated
-fallback: without a token the server exits. It is never passed as an argument,
-so it does not reach shell history or a process listing, and it is never
-printed.
+fallback: without a token the server exits. The server command does not contain
+the token as an argument, and startup output never prints it.
 
-Every capability beyond reading is off unless the command line turns it on:
-`--allow-real-providers`, `--allow-network`, `--allow-gpu`. A run that asks for
-one the server was not started with is refused with `403 not-enabled`. This is
-what keeps "real providers are separately gated" a property of the deployment
-rather than a promise about request bodies.
+The server starts only through this explicit command or an explicit Python
+`start()` call. The default harness mode is `controlled`, with a fresh ephemeral
+world for each accepted run. Controlled provisioning can write fixtures inside
+that run's root; importing or starting the API creates no harness root.
+
+`--allow-network` and `--allow-gpu` permit the corresponding request flags;
+without them such requests receive `403 not-enabled`. They do not replace the
+controlled providers or enable real network/GPU workloads. `local-real` remains
+unsupported: `--allow-real-providers` refuses startup, and a `local-real` HTTP
+request is denied. The application also refuses it before allocating a world
+if invoked directly. Configured roots are unsupported by this composition;
+requesting one produces a failed run without allocating a root or accepting a path.
 
 `--host` accepts a literal IPv4 loopback address and nothing else. `0.0.0.0`,
 a LAN address, the name `localhost` and the IPv6 loopback `::1` are all refused
@@ -125,7 +132,7 @@ SSE is output only. There is no route that accepts a command over a stream.
 
 ## Stopping
 
-`TestApi.stop()` closes the listener, then gives the timeout to whatever run is
+`TestApi.stop()` stops accepting requests, then gives the timeout to whatever run is
 in flight. A run is never interrupted: the harness owns whatever it started, so
 cutting its thread down would leave a process, a file or a download half
 finished with nobody left to complete it.
@@ -139,13 +146,50 @@ new request is accepted, so nothing else can start while it winds down.
 
 There is no forced termination and no cancellation. See "Not in this round".
 
+## Following a run
+
+For example, after starting with `--profile pepe --port 8787`, use PowerShell
+with the token already in the environment:
+
+```powershell
+$headers = @{ Authorization = "Bearer $env:PEPITOS_AI_HUB_TEST_TOKEN" }
+$body = @{ profile_id = 'pepe'; phases = @('preflight', 'plan') } | ConvertTo-Json
+$run = Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8787/internal/test/v1/runs' -Headers $headers -ContentType 'application/json' -Body $body
+$env:TEST_RUN_ID = $run.run_id
+```
+
+Read SSE using an environment-backed header, without putting the token in a
+client command argument. Set `TEST_LAST_EVENT_ID` to the last received `id`
+when reconnecting; the server resumes strictly after it.
+
+```powershell
+@'
+import http.client, os
+connection = http.client.HTTPConnection("127.0.0.1", 8787, timeout=30)
+headers = {
+    "Authorization": "Bearer " + os.environ["PEPITOS_AI_HUB_TEST_TOKEN"],
+    "Last-Event-ID": os.environ.get("TEST_LAST_EVENT_ID", "0"),
+}
+try:
+    connection.request("GET", "/internal/test/v1/runs/" + os.environ["TEST_RUN_ID"] + "/events", headers=headers)
+    response = connection.getresponse()
+    for line in response:
+        print(line.decode(), end="", flush=True)
+finally:
+    connection.close()
+'@ | python -
+```
+
 ## What the API cannot do
 
-The package imports `test_contracts` and one address constant from `endpoints`,
-and nothing else from the product. It does not import `subprocess`, `psutil`,
-`shutil`, `ctypes`, `winreg` or any HTTP client, and it never imports the
-harness implementation — only the `TestHarness` protocol. Tests assert this by
-parsing the package rather than by reading its prose.
+Routes, scheduler and payload validation import `test_contracts` and one address
+constant from `endpoints`, with no domain implementation imports. The sole
+composition exception is `__main__.py` importing `create_test_api` from
+`test_application.py`. That external module supplies a per-run harness factory
+through the `TestHarness` protocol. HTTP does not become a service locator.
+The API package still imports no `subprocess`, `psutil`, `shutil`, `ctypes`,
+`winreg`, HTTP client or E2E implementation. AST tests enforce this boundary,
+including the exact entry-point exception.
 
 So the API cannot start a process, stop one, adopt an external one, write
 configuration, download anything, or delete a model. It calls
@@ -161,15 +205,25 @@ replaced, anything named like a secret is redacted, strings are truncated and
 depth is capped. A loopback URL survives, because "where does this service
 listen" is what status exists to answer.
 
-No status source is wired in yet, so those four keys are empty. Connecting one
-is cross-integration work.
+The composed source is a detached snapshot of the last completed controlled run.
+Before the first run these four keys are empty. It exposes controlled system/GPU
+facts, service observations explicitly labelled `before_stop`, cleanup results,
+and model resolution labelled `resolution-before-cleanup`. These are test-world
+observations, not live facts about the user's machine or models surviving cleanup.
+During a run the last completed snapshot remains available alongside `active_run`.
+Reading status only copies this snapshot: it invokes no harness, scan, start,
+stop, installation, configuration write or acquisition.
 
 ## Not in this round
 
 - No cancellation. `TestRunState` is `queued`, `running`, `passed`, `failed`;
   a cancelled state would be a change to the frozen contract, so it is a
   `NEEDS_DECISION` rather than an invention.
-- No harness. `python -m local_ai_stack.test_api` starts with a placeholder
-  that fails every run instead of pretending to pass one. Wiring the real
-  harness is a one-line change once that branch lands.
+- No local-real providers or kernel Win32 Job Object proof (P1/local-real).
+- No configured-root selection or arbitrary paths through HTTP.
+- Controlled provisioning installs Ollama only. Full offline model/config/smoke
+  tests inject a server-side fixture catalog; the CLI uses shipped profiles and
+  does not pretend that their real model weights were installed. See
+  [the harness limits](e2e-harness.md) and [integration evidence](integration.md).
+- No durable run store: restarting the API loses reports and replay history.
 - No tunnel, no Tailscale, no SSH. Deliberately out of scope.

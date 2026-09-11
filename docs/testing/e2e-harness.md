@@ -3,6 +3,11 @@
 Implementa o `TestHarness` de `test_contracts.py`. Orquestra os domínios
 existentes; não reimplementa nenhum deles.
 
+Integrado à Test Control API por `test_application.py`: uma factory cria um
+world controlado e um `StackTestHarness` novo por run. HTTP conhece apenas o
+protocolo. Veja [modo de start e SSE](test-control-api.md) e
+[evidências de integração](integration.md).
+
 ## Módulos
 
 | Arquivo | Papel |
@@ -80,6 +85,13 @@ Além disso, uma fase `passed` não pode esconder um resultado estruturado com
 `ok=False`: o veredito de toda linha varre `ok`, ações e resultados de
 componente de cada fase aprovada. Há testes que adulteram cada um e exigem que
 a linha caia.
+
+Todas as linhas P0 exigem cleanup aprovado. Em `cleanup-after-failure`, a
+injection `STOP_FAILURE` usa `stop_failure_once=True`: recusa o stop da fase,
+que falha, e permite o retry no cleanup. A falha do run permanece registrada;
+nenhum processo, membership ou registro managed pode sobreviver. A recusa
+persistente continua disponível em testes negativos de diagnóstico de cleanup,
+mas não conta como cleanup P0 aprovado.
 
 ## O que cada linha realmente exercita
 
@@ -161,10 +173,11 @@ pode ser confundido com algo que o run instalou.
   bytes em disco. O seam não calcula digest nenhum — há um teste por AST que
   falha se `sha256`/`content_digest` aparecer nessa classe.
 - **`invalid-workflow`** — o profile-fixture habilita image generation e declara
-  `text_to_image`, mas não declara nenhum dos três roles que o grafo carrega.
-  `resolve_workflow` responde `model-not-declared`, `apply_workflow` recusa e
-  `build_stack_configuration` recusa junto. Nenhuma validação é escrita aqui: o
-  cenário fornece a entrada e lê a resposta do domínio.
+  `text_to_image`, com os três modelos fixture AVAILABLE. `INVALID_WORKFLOW`
+  remove o nó `75:70` do template e preserva o binding que o referencia.
+  Materialização e verificação reais recusam o grafo estruturalmente inválido.
+  Sem a injection, o mesmo profile chega ao image smoke. A ausência de roles é
+  coberta separadamente e não representa esta linha P0.
 
 Em ambos: fase falha fechada, nenhuma fase posterior roda (o smoke fica
 `skipped`), e o cleanup continua correto.

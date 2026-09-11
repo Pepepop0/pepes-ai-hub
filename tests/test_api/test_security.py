@@ -109,6 +109,17 @@ def test_the_package_reaches_only_the_frozen_contract():
     for path in modules():
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for name in local_imports(tree):
+            # Only the explicit entry point may call the composition factory.
+            # Routes, scheduler and payload validation retain the protocol boundary.
+            if path.name == "__main__.py" and name == "test_application":
+                imported = [
+                    alias.name
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.ImportFrom) and node.module == name
+                    for alias in node.names
+                ]
+                assert imported == ["create_test_api"]
+                continue
             if name.split(".")[0] not in ALLOWED_LOCAL_IMPORTS:
                 offenders.append(f"{path.name}: {name}")
     assert offenders == []

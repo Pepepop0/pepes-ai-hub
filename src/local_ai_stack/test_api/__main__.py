@@ -5,8 +5,7 @@
 The token comes from the environment, never from an argument, so it does not
 land in shell history or in a process listing. The bind address defaults to
 loopback and a non-loopback value is refused rather than accepted with a
-warning. Real providers, network and GPU are each off unless asked for here,
-which is what makes a request for them refusable at the door.
+warning. The application uses controlled providers; local-real is unsupported.
 """
 
 from __future__ import annotations
@@ -15,26 +14,10 @@ import argparse
 import sys
 from collections.abc import Sequence
 
-from ..test_contracts import TestRunReport, TestRunSpec, TestRunState
+from ..test_application import create_test_api
 from .auth import ENV_TOKEN, ENV_TOKEN_FILE, TokenError, token_from_environment
 from .binding import LOOPBACK_HOST, BindRefused
-from .server import ShutdownTimeout, TestApi, TestApiConfig
-
-
-class UnwiredHarness:
-    """Stands in until a harness implementation is wired in at integration.
-
-    It fails every run instead of pretending to pass one. The API is what is
-    being exercised here; the phases belong to the harness branch.
-    """
-
-    def run(self, run_id: str, spec: TestRunSpec, *, emit=None) -> TestRunReport:
-        return TestRunReport(
-            run_id=run_id,
-            state=TestRunState.FAILED,
-            spec=spec,
-            detail="no test harness is wired into this build",
-        )
+from .server import ShutdownTimeout, TestApiConfig
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,10 +58,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_network=arguments.allow_network,
         allow_gpu=arguments.allow_gpu,
     )
-    api = TestApi(config, UnwiredHarness())
     try:
+        api = create_test_api(config)
         api.start()
-    except BindRefused as error:
+    except (BindRefused, ValueError) as error:
         print(f"{error}", file=sys.stderr)
         return 2
 

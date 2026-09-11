@@ -657,7 +657,13 @@ class ControlledLauncher:
 
     def stop(self, service_id: str, **kwargs: object) -> StopResult:
         self.stops.append(service_id)
-        if self.plan.active(Injection.STOP_FAILURE):
+        # A transient refusal lets the cleanup scenario prove recovery without
+        # accepting residual processes. Unbounded refusal remains available for
+        # tests of cleanup failure reporting itself.
+        first_only = self.plan.detail.get("stop_failure_once", False)
+        if self.plan.active(Injection.STOP_FAILURE) and (
+            not first_only or self.stops.count(service_id) == 1
+        ):
             return StopResult(
                 outcome=StopOutcome.FAILED,
                 service_id=service_id,

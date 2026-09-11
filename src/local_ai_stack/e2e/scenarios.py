@@ -840,7 +840,8 @@ def _verify_cuda(report: TestRunReport, world: ControlledWorld) -> list[str]:
 
 def _cleanup_after_exception() -> ScenarioSetup:
     world = controlled_world(
-        ready_ports=[MANAGED_OLLAMA_PORT], injections=InjectionPlan.of(Injection.STOP_FAILURE)
+        ready_ports=[MANAGED_OLLAMA_PORT],
+        injections=InjectionPlan.of(Injection.STOP_FAILURE, stop_failure_once=True),
     )
     return ScenarioSetup(
         world,
@@ -851,12 +852,12 @@ def _cleanup_after_exception() -> ScenarioSetup:
             TestPhase.START,
             TestPhase.STOP,
         ),
-        "stop is refused, so cleanup must report it rather than hide it",
+        "the first stop is refused; cleanup must retry and release the managed tree",
     )
 
 
 def _verify_cleanup_after_failure(report: TestRunReport, world: ControlledWorld) -> list[str]:
-    problems: list[str] = []
+    problems = _cleanup_problems(report) + _no_residual(world)
     if report.state is not TestRunState.FAILED:
         problems.append("a refused stop did not fail the run")
     # The root is still released even though a phase failed.
@@ -865,6 +866,11 @@ def _verify_cleanup_after_failure(report: TestRunReport, world: ControlledWorld)
     cleanup = _phase(report, TestPhase.CLEANUP)
     if cleanup is None:
         problems.append("cleanup did not run after a failure")
+    else:
+        if cleanup.data.get("membership") or cleanup.data.get("registry"):
+            problems.append("cleanup retained managed ownership or registry entries")
+        if not cleanup.data.get("job_handles_released"):
+            problems.append("cleanup did not release the logical job handle")
     return problems
 
 
@@ -1139,10 +1145,9 @@ P0_SCENARIOS: tuple[Scenario, ...] = (
         "Cleanup after a failing phase",
         _cleanup_after_exception,
         _verify_cleanup_after_failure,
-        phase=TestPhase.CLEANUP,
+        phase=TestPhase.STOP,
         outcomes=(TestPhaseOutcome.FAILED,),
         state=TestRunState.FAILED,
-        cleanup=TestPhaseOutcome.FAILED,
     ),
 )
 

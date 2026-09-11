@@ -792,9 +792,24 @@ def test_a_row_that_expects_a_failure_says_so():
     }
 
 
-def test_only_the_cleanup_row_tolerates_a_failing_cleanup():
+def test_no_p0_row_tolerates_a_failing_cleanup():
     tolerant = [row.id for row in P0_SCENARIOS if row.cleanup is not Outcome.PASSED]
-    assert tolerant == ["cleanup-after-failure"]
+    assert tolerant == []
+
+
+def test_cleanup_after_failure_retries_the_stop_and_releases_every_resource(scenario_run):
+    setup = scenario_run(scenario_by_id("cleanup-after-failure"))
+    report = StackTestHarness(setup.world).run(new_run_id(), setup.spec)
+    assert report.state is RunState.FAILED
+    assert phase_of(report, Phase.STOP).outcome is Outcome.FAILED
+    cleanup = phase_of(report, Phase.CLEANUP)
+    assert cleanup.outcome is Outcome.PASSED
+    assert setup.world._launcher.stops.count("ollama") == 2
+    assert setup.world.managed_residual() == ()
+    assert setup.world._launcher.members == {}
+    assert cleanup.data["registry"] == []
+    assert cleanup.data["job_handles_released"]
+    assert not setup.world.root.exists()
 
 
 # --- idempotência parcial, medida -------------------------------------------

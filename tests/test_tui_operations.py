@@ -1,0 +1,924 @@
+"""Wave A: the first-run wizard, the Dashboard, and operations as the TUI sees them.
+
+Everything runs against a scripted application. No service starts, nothing is
+downloaded, no browser opens: the launcher is a list the test reads back.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable, Coroutine
+from pathlib import Path
+
+import pytest
+from hub_fakes import INSTALL_STEPS, FakeHubApplication, install_script, ready_application
+from test_app import all_profiles, integration_snapshot, reference_facts, stopped_runtime
+from textual.widgets import Button, Input, Static
+
+from local_ai_stack.app import LocalAIStackApp, OperationObserved, UnwiredHubApplication
+from local_ai_stack.config import GeneralConfig, InstalledConfig, UiConfig
+from local_ai_stack.installation import InstallLocationMode
+from local_ai_stack.operation_contracts import OperationEventKind, OperationState
+from local_ai_stack.pets import unsafe_characters
+from local_ai_stack.tui.application import (
+    HubApplication,
+    InstallSelection,
+    LaunchRefusal,
+)
+from local_ai_stack.tui.navigation import SECTION_ITEMS, Section
+from local_ai_stack.tui.operations import observe
+from local_ai_stack.tui.presenters import render_operation
+from local_ai_stack.tui.widgets import DashboardPanel, RightRail
+from local_ai_stack.tui.wizard import CHOICE_STEPS, WizardScreen, WizardStep
+
+# --- helpers ------------------------------------------------------------------
+
+
+def run(coroutine: Callable[[], Coroutine[object, object, None]]) -> None:
+    asyncio.run(coroutine())
+
+
+def hub(
+    application: FakeHubApplication | None = None,
+    *,
+    first_run_wizard: bool = True,
+    installed_config: InstalledConfig | None = None,
+) -> tuple[LocalAIStackApp, FakeHubApplication, list[str]]:
+    opened: list[str] = []
+    fake = application if application is not None else FakeHubApplication()
+    app = LocalAIStackApp(
+        facts=reference_facts(),
+        profiles=all_profiles(),
+        runtime_snapshot=stopped_runtime(),
+        installed_config=installed_config,
+        integration=integration_snapshot(),
+        application=fake,
+        open_browser=lambda url: opened.append(url) or True,
+        first_run_wizard=first_run_wizard,
+    )
+    return app, fake, opened
+
+
+async def click(pilot, selector: str) -> None:
+    """Press a button now. The press animation would otherwise swallow a quick second click."""
+    button = pilot.app.screen.query_one(selector, Button)
+    button.active_effect_duration = 0
+    button.remove_class("-active")
+    await pilot.click(selector)
+    await pilot.pause()
+
+
+async def pump(pilot, fake: FakeHubApplication, count: int | None = None) -> None:
+    """Deliver scripted events one by one, letting the screen react between them."""
+    delivered = 0
+    while count is None or delivered < count:
+        if fake.step() is None:
+            break
+        delivered += 1
+        await pilot.pause()
+
+
+def wizard(app: LocalAIStackApp) -> WizardScreen:
+    screen = app.screen
+    assert isinstance(screen, WizardScreen), type(screen).__name__
+    return screen
+
+
+def text(app: LocalAIStackApp, selector: str) -> str:
+    return str(app.screen.query_one(selector, Static).content)
+
+
+async def walk_to_review(pilot, *, profile: str = "capella", mode: str = "default") -> None:
+    await click(pilot, "#wizard-next")
+    await click(pilot, f"#wizard-profile-{profile}")
+    await click(pilot, "#wizard-next")
+    await click(pilot, f"#wizard-mode-{mode}")
+    await click(pilot, "#wizard-next")
+
+
+# --- the fake honours the protocol ----------------------------------------------
+
+
+def test_the_fake_is_an_application_and_its_streams_are_valid():
+    fake = FakeHubApplication()
+    assert isinstance(fake, HubApplication)
+    fake.install(InstallSelection("capella"))
+    delivered = fake.run_to_end()
+    assert [event.sequence for event in delivered] == list(range(1, len(delivered) + 1))
+    assert delivered[0].state is OperationState.PREPARING
+    assert delivered[-1].kind is OperationEventKind.RESULT
+    assert sum(event.kind is OperationEventKind.RESULT for event in delivered) == 1
+    assert fake.ready and fake.profile_id == "capella"
+
+
+# --- first run --------------------------------------------------------------------
+
+
+def test_opening_without_an_installation_shows_the_wizard():
+    async def exercise() -> None:
+        app, _, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            assert screen.state.step is WizardStep.WELCOME
+            assert "Bem-vindo" in text(app, "#wizard-step-welcome")
+            assert "passo 1 de 4" in text(app, "#wizard-title")
+            assert "Pepito's AI Hub" in text(app, "#wizard-footer")
+
+    run(exercise)
+
+
+def test_opening_with_an_installation_goes_straight_to_the_dashboard():
+    async def exercise() -> None:
+        app, _, _ = hub(ready_application())
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            assert not isinstance(app.screen, WizardScreen)
+            overview = str(app.query_one("#dashboard-overview", Static).content)
+            assert "Profile: [b]Capella[/b]" in overview
+            assert overview.count("Running") == 3
+            assert "Stack: [b]Pronta[/b]" in overview
+            assert not app.query_one("#dashboard-open-webui", Button).disabled
+
+    run(exercise)
+
+
+def test_the_wizard_walks_welcome_profile_mode_review():
+    async def exercise() -> None:
+        app, _, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            seen = [screen.state.step]
+            for _ in range(3):
+                await click(pilot, "#wizard-next")
+                seen.append(screen.state.step)
+            assert seen == list(CHOICE_STEPS)
+            assert str(screen.query_one("#wizard-next", Button).label) == "Instalar"
+
+            await click(pilot, "#wizard-back")
+            assert screen.state.step is WizardStep.MODE
+            await pilot.press("escape")
+            await pilot.pause()
+            assert screen.state.step is WizardStep.PROFILE
+
+    run(exercise)
+
+
+def test_the_wizard_can_be_skipped_for_now():
+    async def exercise() -> None:
+        app, fake, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await click(pilot, "#wizard-skip")
+            assert not isinstance(app.screen, WizardScreen)
+            assert fake.calls == []
+            assert "Nenhuma stack instalada" in str(
+                app.query_one("#dashboard-overview", Static).content
+            )
+
+    run(exercise)
+
+
+# --- profile selection ------------------------------------------------------------
+
+
+def test_capella_is_suggested_and_every_profile_is_offered():
+    async def exercise() -> None:
+        app, _, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await click(pilot, "#wizard-next")
+            labels = [str(b.label) for b in screen.query("#wizard-profile-buttons Button")]
+            assert labels == ["Capella", "Pepe", "Test"]
+            assert screen.state.profile_id == "capella"
+            assert screen.query_one("#wizard-profile-capella", Button).variant == "primary"
+            assert "Recomendado" in text(app, "#wizard-profile-summary")
+
+    run(exercise)
+
+
+def test_choosing_a_profile_updates_the_summary_and_the_selection():
+    async def exercise() -> None:
+        app, _, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await click(pilot, "#wizard-next")
+            await click(pilot, "#wizard-profile-test")
+            assert screen.state.profile_id == "test"
+            assert screen.query_one("#wizard-profile-test", Button).variant == "primary"
+            assert screen.query_one("#wizard-profile-capella", Button).variant == "default"
+            assert "experimentar" in text(app, "#wizard-profile-summary")
+
+    run(exercise)
+
+
+def test_without_a_suggested_profile_nothing_is_preselected_and_continue_waits():
+    async def exercise() -> None:
+        fake = FakeHubApplication(
+            profile_choices_value=tuple(
+                choice
+                for choice in FakeHubApplication().profile_choices()
+                if choice.id != "capella"
+            )
+        )
+        app, _, _ = hub(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await click(pilot, "#wizard-next")
+            assert screen.state.profile_id is None
+            assert screen.query_one("#wizard-next", Button).disabled
+            await click(pilot, "#wizard-profile-pepe")
+            assert not screen.query_one("#wizard-next", Button).disabled
+
+    run(exercise)
+
+
+# --- install mode -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["default", "portable"])
+def test_default_and_portable_need_no_path(mode):
+    async def exercise() -> None:
+        app, fake, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_review(pilot, mode=mode)
+            assert screen.state.mode is InstallLocationMode(mode)
+            assert not screen.query_one("#wizard-custom-root", Input).display
+            await click(pilot, "#wizard-next")
+            selection = fake.calls[0][1]
+            assert selection == InstallSelection("capella", InstallLocationMode(mode))
+
+    run(exercise)
+
+
+def test_custom_needs_an_absolute_path_and_refuses_a_relative_one():
+    async def exercise() -> None:
+        app, fake, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await click(pilot, "#wizard-next")
+            await click(pilot, "#wizard-next")
+            await click(pilot, "#wizard-mode-custom")
+            assert screen.query_one("#wizard-custom-root", Input).display
+            assert screen.query_one("#wizard-next", Button).disabled
+
+            screen.set_custom_root("relative\\folder")
+            await pilot.pause()
+            assert "Caminho inválido" in text(app, "#wizard-custom-error")
+            assert screen.query_one("#wizard-next", Button).disabled
+
+            screen.set_custom_root(r"D:\PepitosAIHub")
+            await pilot.pause()
+            assert text(app, "#wizard-custom-error") == ""
+            assert not screen.query_one("#wizard-next", Button).disabled
+
+            await click(pilot, "#wizard-next")
+            assert r"D:\PepitosAIHub" in text(app, "#wizard-step-review")
+            await click(pilot, "#wizard-next")
+            assert fake.calls[0][1] == InstallSelection(
+                "capella", InstallLocationMode.CUSTOM, r"D:\PepitosAIHub"
+            )
+
+    run(exercise)
+
+
+# --- installing -----------------------------------------------------------------------
+
+
+def test_install_shows_every_stage_the_producer_reports_in_order():
+    async def exercise() -> None:
+        app, fake, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_review(pilot)
+            await click(pilot, "#wizard-next")
+            assert screen.state.step is WizardStep.PROGRESS
+            assert fake.calls == [("install", InstallSelection("capella"))]
+
+            seen: list[str] = []
+            while (event := fake.step()) is not None:
+                await pilot.pause()
+                if event.kind is not OperationEventKind.PROGRESS:
+                    seen.append(event.message)
+                    pane = text(
+                        app,
+                        "#wizard-step-progress"
+                        if not event.state.terminal
+                        else "#wizard-step-done",
+                    )
+                    assert event.message in pane
+            assert seen[:7] == list(INSTALL_STEPS)
+            assert seen[-1] == "Concluído"
+
+    run(exercise)
+
+
+def test_progress_within_a_stage_is_shown_as_a_count_not_a_percentage():
+    async def exercise() -> None:
+        app, fake, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await walk_to_review(pilot)
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake, 6)  # up to and including the first download tick
+            pane = text(app, "#wizard-step-progress")
+            assert "Baixando modelos  1/3" in pane
+            assert "%" not in pane
+            assert "[b]Em andamento[/b]" in pane
+
+    run(exercise)
+
+
+def test_a_successful_install_ends_on_done_with_open_webui():
+    async def exercise() -> None:
+        app, fake, opened = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_review(pilot)
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake)
+
+            assert screen.state.step is WizardStep.DONE
+            assert "[b]Tudo pronto[/b]" in text(app, "#wizard-step-done")
+            visible = [b.id for b in screen.query("#wizard-actions Button") if b.display]
+            assert visible == ["wizard-open-webui", "wizard-finish"]
+
+            await click(pilot, "#wizard-open-webui")
+            assert opened == ["http://127.0.0.1:8080/"]
+
+            await click(pilot, "#wizard-finish")
+            assert not isinstance(app.screen, WizardScreen)
+            overview = str(app.query_one("#dashboard-overview", Static).content)
+            assert "Profile: [b]Capella[/b]" in overview
+            assert overview.count("Running") == 3
+            assert str(app.query_one("#rail-profile", Static).content) == "Capella"
+            assert str(app.query_one("#rail-stack", Static).content) == "Pronta"
+
+    run(exercise)
+
+
+def test_a_failed_install_shows_a_short_reason_and_offers_a_retry():
+    async def exercise() -> None:
+        app, fake, _ = hub(FakeHubApplication(install_fail_at="Instalando ComfyUI"))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_review(pilot)
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake)
+
+            assert screen.state.step is WizardStep.DONE
+            pane = text(app, "#wizard-step-done")
+            assert "[b]Não foi possível concluir[/b]" in pane
+            assert "[!]" in pane and "Instalando ComfyUI" in pane
+            assert "Verifique a conexão" in pane
+            assert "Código: download-failed" in pane
+            assert "Traceback" not in pane and "Exception" not in pane
+            visible = [b.id for b in screen.query("#wizard-actions Button") if b.display]
+            assert visible == ["wizard-retry"]
+            assert not fake.ready
+
+            fake.install_fail_at = None
+            await click(pilot, "#wizard-retry")
+            assert screen.state.step is WizardStep.REVIEW
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake)
+            assert screen.state.step is WizardStep.DONE
+            assert "[b]Tudo pronto[/b]" in text(app, "#wizard-step-done")
+            assert len(fake.calls) == 2, "a retry is a new operation, not a reopened one"
+
+    run(exercise)
+
+
+def test_pressing_install_twice_starts_one_operation():
+    async def exercise() -> None:
+        app, fake, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_review(pilot)
+            button = screen.query_one("#wizard-next", Button)
+            button.active_effect_duration = 0
+            await pilot.click("#wizard-next")
+            await pilot.click("#wizard-next")
+            await pilot.pause()
+            assert len(fake.calls) == 1
+            assert button.disabled
+
+    run(exercise)
+
+
+def test_a_refused_install_stays_on_review_and_says_why():
+    async def exercise() -> None:
+        app, fake, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            fake.unavailable = True
+            await walk_to_review(pilot)
+            await click(pilot, "#wizard-next")
+            # The refusal lands the wizard back on review with the reason.
+            assert "não está disponível" in text(app, "#wizard-step-review")
+            assert screen.query_one("#wizard-next", Button).disabled
+
+    run(exercise)
+
+
+# --- operation events, as the contract defines them ------------------------------------
+
+
+def test_the_view_reports_only_states_the_contract_defines():
+    view = None
+    states = []
+    for event in install_script("op"):
+        view = observe(view, event)
+        states.append(view.state)
+    assert set(states) <= set(OperationState)
+    assert states[0] is OperationState.PREPARING
+    assert OperationState.RUNNING in states
+    assert OperationState.FINALIZING in states
+    assert states[-1] is OperationState.SUCCEEDED
+    assert view.terminal and view.succeeded
+
+
+def test_the_view_refuses_duplicates_regressions_and_post_terminal_events():
+    events = install_script("op")
+    view = None
+    for event in events:
+        view = observe(view, event)
+    terminal = view
+    assert observe(terminal, events[3]) is terminal, "an old sequence changes nothing"
+    assert observe(terminal, events[-1]) is terminal, "a repeated result changes nothing"
+
+    partial = observe(observe(None, events[0]), events[1])
+    assert observe(partial, events[1]) is partial, "a duplicate is not a new step"
+    assert observe(partial, events[0]) is partial, "sequence never goes backwards"
+
+
+def test_a_new_operation_id_replaces_the_view():
+    first = install_script("first")
+    view = None
+    for event in first:
+        view = observe(view, event)
+    fresh = observe(view, install_script("second")[0])
+    assert fresh.operation_id == "second"
+    assert fresh.steps == ("Verificando ambiente",)
+    assert not fresh.terminal
+
+
+def test_a_replay_that_starts_mid_stream_seeds_the_view():
+    """A subscription replays the latest event, which may be far from sequence 1."""
+    events = install_script("op")
+    view = observe(None, events[5])
+    assert view.sequence == 6
+    assert view.steps == (events[5].message,)
+
+
+def test_the_terminal_event_ends_the_operation_on_screen():
+    async def exercise() -> None:
+        app, fake, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_review(pilot)
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake)
+            assert screen.state.step is WizardStep.DONE
+            assert app.operation_view.terminal
+            assert app.operation_view.steps[-1] == "Concluído"
+            # Nothing after the terminal event is shown, whatever a producer does.
+            late = install_script(app.operation_view.operation_id)[2]
+            before = app.operation_view
+            app.post_message(OperationObserved(late))
+            await pilot.pause()
+            assert app.operation_view is before
+
+    run(exercise)
+
+
+def test_rendering_an_operation_marks_done_current_and_failed_steps():
+    view = None
+    for event in install_script("op")[:4]:
+        view = observe(view, event)
+    rendered = render_operation(view)
+    assert rendered.index("[x]") < rendered.index("[>]")
+    assert rendered.count("[x]") == 3 and rendered.count("[>]") == 1
+
+    failed = None
+    for event in install_script("op", fail_at="Instalando Ollama"):
+        failed = observe(failed, event)
+    rendered = render_operation(failed)
+    assert rendered.count("[!]") == 1
+    assert "download-failed" in rendered
+
+
+# --- the dashboard ------------------------------------------------------------------------
+
+
+def test_the_dashboard_shows_profile_services_gpu_and_one_primary_action():
+    async def exercise() -> None:
+        app, _, _ = hub(ready_application())
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            overview = str(app.query_one("#dashboard-overview", Static).content)
+            assert "Profile: [b]Capella[/b]" in overview
+            for name in ("Ollama", "Open WebUI", "ComfyUI"):
+                assert name in overview
+            assert "NVIDIA GeForce RTX 5070" in overview
+            assert "VRAM 2427 / 12227 MiB em uso" in overview
+            primary = [str(b.label) for b in app.query("#dashboard-primary Button")]
+            secondary = [str(b.label) for b in app.query("#dashboard-secondary Button")]
+            assert primary == ["Abrir Open WebUI"]
+            assert secondary == ["Iniciar stack", "Reiniciar", "Parar stack"]
+            # No cockpit: the overview never names a port, a path or a process.
+            for word in ("8080", "PID", "venv", ":\\", "Process"):
+                assert word not in overview
+
+    run(exercise)
+
+
+def test_service_status_changes_are_reflected_after_a_refresh():
+    async def exercise() -> None:
+        fake = ready_application()
+        app, _, _ = hub(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            fake.health["comfyui"] = "DOWN"
+            app.refresh_projections()
+            await pilot.pause()
+            overview = str(app.query_one("#dashboard-overview", Static).content)
+            assert "Stopped" in overview and overview.count("Running") == 2
+            assert "Parcialmente disponível" in overview
+            assert str(app.query_one("#rail-stack", Static).content) == "Parcialmente disponível"
+
+    run(exercise)
+
+
+@pytest.mark.parametrize(
+    ("button", "command", "health"),
+    [
+        ("dashboard-stop", "stop", "DOWN"),
+        ("dashboard-start", "start", "UP"),
+        ("dashboard-restart", "restart", "UP"),
+    ],
+)
+def test_stack_commands_ask_the_application_and_follow_the_operation(button, command, health):
+    async def exercise() -> None:
+        fake = ready_application()
+        if command == "start":
+            fake.health = dict.fromkeys(fake.health, "DOWN")
+        app, _, _ = hub(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await click(pilot, f"#{button}")
+            assert fake.calls == [(command, None)]
+            await pump(pilot, fake, 2)
+            panel = app.query_one(DashboardPanel)
+            assert panel.query_one("#dashboard-start", Button).disabled, "busy while it runs"
+            assert "[b]Em andamento[/b]" in str(
+                app.query_one("#dashboard-operation", Static).content
+            )
+            await pump(pilot, fake)
+            assert not panel.query_one("#dashboard-start", Button).disabled
+            overview = str(app.query_one("#dashboard-overview", Static).content)
+            expected = "Running" if health == "UP" else "Stopped"
+            assert overview.count(expected) == 3
+
+    run(exercise)
+
+
+def test_a_second_command_while_one_runs_is_refused_not_queued():
+    async def exercise() -> None:
+        fake = ready_application()
+        app, _, _ = hub(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await click(pilot, "#dashboard-restart")
+            await pump(pilot, fake, 1)
+            # The button is disabled; ask the app directly, as a keyboard shortcut might.
+            app.run_stack_command("stop")
+            await pilot.pause()
+            assert [name for name, _ in fake.calls] == ["restart"]
+            assert "em andamento" in str(app.query_one("#dashboard-notice", Static).content)
+
+    run(exercise)
+
+
+def test_a_failed_command_is_reported_without_a_traceback():
+    async def exercise() -> None:
+        fake = ready_application(lifecycle_fails=True)
+        app, _, _ = hub(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await click(pilot, "#dashboard-stop")
+            await pump(pilot, fake)
+            panel = str(app.query_one("#dashboard-operation", Static).content)
+            assert "[b]Não foi possível concluir[/b]" in panel
+            assert "Um serviço não respondeu a tempo." in panel
+            assert "Traceback" not in panel
+
+    run(exercise)
+
+
+# --- Open WebUI -----------------------------------------------------------------------------
+
+
+def test_open_webui_asks_for_a_target_and_never_builds_the_address():
+    async def exercise() -> None:
+        fake = ready_application()
+        app, _, opened = hub(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await click(pilot, "#dashboard-open-webui")
+            assert fake.calls == [("open_webui_target", None)]
+            assert opened == ["http://127.0.0.1:8080/"]
+            assert "Abrindo Open WebUI" in str(app.query_one("#dashboard-notice", Static).content)
+
+    run(exercise)
+
+
+def test_open_webui_with_the_backend_unavailable_says_so():
+    async def exercise() -> None:
+        fake = ready_application()
+        app, _, opened = hub(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            fake.unavailable = True
+            await click(pilot, "#dashboard-open-webui")
+            assert opened == []
+            assert "não está disponível" in str(app.query_one("#dashboard-notice", Static).content)
+            assert not app.query_one("#dashboard-open-webui", Button).disabled, "usable again"
+
+    run(exercise)
+
+
+def test_open_webui_that_is_not_ready_is_refused_with_the_reason():
+    async def exercise() -> None:
+        fake = ready_application(
+            webui=LaunchRefusal("O Open WebUI ainda está iniciando. Tente em instantes.")
+        )
+        app, _, opened = hub(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await click(pilot, "#dashboard-open-webui")
+            assert opened == []
+            assert "ainda está iniciando" in str(app.query_one("#dashboard-notice", Static).content)
+
+    run(exercise)
+
+
+def test_a_double_click_opens_the_browser_once():
+    async def exercise() -> None:
+        fake = ready_application()
+        app, _, opened = hub(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            button = app.query_one("#dashboard-open-webui", Button)
+            button.active_effect_duration = 0
+            await pilot.click("#dashboard-open-webui")
+            await pilot.click("#dashboard-open-webui")
+            await pilot.pause()
+            assert opened == ["http://127.0.0.1:8080/"]
+            assert fake.calls.count(("open_webui_target", None)) == 1
+            assert button.disabled, "held down for the cooldown"
+
+    run(exercise)
+
+
+def test_the_browser_refusing_to_open_is_reported_with_the_address():
+    async def exercise() -> None:
+        fake = ready_application()
+        app, _, _ = hub(fake)
+        app.open_browser = lambda url: False
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await click(pilot, "#dashboard-open-webui")
+            notice = str(app.query_one("#dashboard-notice", Static).content)
+            assert "não abriu" in notice and "http://127.0.0.1:8080/" in notice
+
+    run(exercise)
+
+
+# --- right rail -------------------------------------------------------------------------
+
+
+def test_the_rail_shows_the_pet_for_the_installed_profile():
+    async def exercise() -> None:
+        app, _, _ = hub(ready_application())
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            rail = app.query_one(RightRail)
+            assert str(app.query_one("#rail-profile", Static).content) == "Capella"
+            assert rail.appearance.resolved.pet_id == "hello-kitty"
+            assert "VRAM 2427 / 12227 MiB em uso" in str(app.query_one("#rail-gpu", Static).content)
+
+    run(exercise)
+
+
+def test_the_test_profile_has_no_pet_and_the_rail_degrades_to_text():
+    async def exercise() -> None:
+        app, _, _ = hub(ready_application(profile_id="test"))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            rail = app.query_one(RightRail)
+            assert str(app.query_one("#rail-profile", Static).content) == "Test"
+            assert rail.appearance.resolved.pet_id == "none"
+            assert rail.appearance.animator is None
+            slot = str(app.query_one("#pet-slot", Static).content)
+            assert unsafe_characters(slot) == ()
+
+    run(exercise)
+
+
+def test_a_general_pet_override_wins_over_the_profile():
+    async def exercise() -> None:
+        config = InstalledConfig(
+            profile_id="capella", general=GeneralConfig(ui=UiConfig(pet="claw"))
+        )
+        app, _, _ = hub(ready_application(), installed_config=config)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.query_one(RightRail).appearance.resolved.pet_id == "claw"
+
+    run(exercise)
+
+
+def test_a_missing_pet_degrades_safely():
+    async def exercise() -> None:
+        config = InstalledConfig(
+            profile_id="capella", general=GeneralConfig(ui=UiConfig(pet="does-not-exist"))
+        )
+        app, _, _ = hub(ready_application(), installed_config=config)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            rail = app.query_one(RightRail)
+            assert rail.appearance.animator is None
+            assert "Pet unavailable" in rail.appearance.pet_text
+            assert "Pet unavailable" in str(app.query_one("#pet-slot", Static).content)
+
+    run(exercise)
+
+
+def test_the_rail_survives_a_resize_around_the_wizard_and_the_dashboard():
+    async def exercise() -> None:
+        app, _, _ = hub()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await click(pilot, "#wizard-skip")
+            rail = app.query_one(RightRail)
+            assert not rail.has_class("narrow")
+            await pilot.resize_terminal(70, 24)
+            await pilot.pause()
+            assert rail.has_class("narrow")
+            await pilot.resize_terminal(120, 40)
+            await pilot.pause()
+            assert not rail.has_class("narrow")
+
+    run(exercise)
+
+
+# --- navigation and settings -----------------------------------------------------------------
+
+
+def test_the_three_sections_and_their_routes_stay_simple():
+    assert [item.label for item in SECTION_ITEMS[Section.DASHBOARD]] == ["Visão geral", "Serviços"]
+    assert [item.label for item in SECTION_ITEMS[Section.INSTALLATION]] == [
+        "Instalar",
+        "Perfil",
+        "Local",
+        "Plano",
+    ]
+    assert [item.label for item in SECTION_ITEMS[Section.SETTINGS]] == ["Geral", "Interface"]
+
+
+def test_settings_show_only_real_options():
+    async def exercise() -> None:
+        app, _, _ = hub(ready_application())
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.press("3")
+            await pilot.pause()
+            general = str(app.query_one("#view-settings-general", Static).content)
+            assert "Profile: capella" in general
+            assert "Installation mode:" in general
+            await click(pilot, "#side-settings-interface")
+            interface = str(app.query_one("#view-settings-interface", Static).content)
+            assert "Theme:" in interface and "Pet:" in interface
+            assert "Right rail" in interface
+            labels = [str(b.label) for b in app.query("#sidebar-settings Button")]
+            assert labels == ["Geral", "Interface"]
+
+    run(exercise)
+
+
+def test_the_installation_section_reopens_the_wizard():
+    async def exercise() -> None:
+        app, fake, _ = hub(ready_application())
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.press("2")
+            await pilot.pause()
+            summary = str(app.query_one("#install-summary", Static).content)
+            assert "Perfil: [b]Capella[/b]" in summary
+            assert str(app.query_one("#install-open-wizard", Button).label) == "Reinstalar"
+            await click(pilot, "#install-open-wizard")
+            assert isinstance(app.screen, WizardScreen)
+            await click(pilot, "#wizard-skip")
+            assert not isinstance(app.screen, WizardScreen)
+            assert fake.calls == []
+
+    run(exercise)
+
+
+def test_no_emoji_anywhere_on_screen():
+    async def exercise() -> None:
+        app, fake, _ = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await walk_to_review(pilot)
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake)
+            shown = " ".join(str(w.content) for w in app.screen.query(Static))
+            await click(pilot, "#wizard-finish")
+            shown += " ".join(str(w.content) for w in app.query(Static))
+            shown += " ".join(str(b.label) for b in app.query(Button))
+            assert unsafe_characters(shown) == ()
+
+    run(exercise)
+
+
+# --- the unwired composition -----------------------------------------------------------------
+
+
+def test_the_unwired_application_reads_the_machine_and_refuses_commands():
+    unwired = UnwiredHubApplication(reference_facts(), stopped_runtime(), tuple(all_profiles()))
+    assert isinstance(unwired, HubApplication)
+    assert not unwired.installation().ready
+    assert {view.health for view in unwired.services_snapshot().services} == {"DOWN"}
+    assert unwired.vram_snapshot().total_mib == 12227
+    assert [choice.id for choice in unwired.profile_choices()] == [
+        profile.id for profile in all_profiles()
+    ]
+    with pytest.raises(Exception, match="não está conectada"):
+        unwired.install(InstallSelection("capella"))
+    refusal = unwired.open_webui_target()
+    assert isinstance(refusal, LaunchRefusal)
+
+
+# --- the boundary -------------------------------------------------------------------------------
+
+
+def test_the_tui_imports_contracts_never_the_backend():
+    """Claude 1's implementation is never reached from here, only the frozen contracts."""
+    import ast
+
+    import local_ai_stack
+
+    package = Path(local_ai_stack.__file__).resolve().parent
+    sources = [package / "app.py", *sorted((package / "tui").glob("*.py"))]
+    forbidden = {"image_generation", "resource_coordination", "comfyui_jobs", "e2e"}
+    offenders = []
+    for path in sources:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                head = node.module.split(".")[0]
+                if head in forbidden or any(part in forbidden for part in node.module.split(".")):
+                    offenders.append(f"{path.name}: {node.module}")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if any(part in forbidden for part in alias.name.split(".")):
+                        offenders.append(f"{path.name}: {alias.name}")
+    assert offenders == []
+
+
+def test_the_frozen_contracts_were_not_edited_here():
+    """Ownership: those three files belong to Codex and are read, never written, by Wave A."""
+    import subprocess
+
+    import local_ai_stack
+
+    package = Path(local_ai_stack.__file__).resolve().parent
+    root = package.parents[1]
+    if not (root / ".git").exists():
+        pytest.skip("not a checkout")
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD", "--"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.split()
+    frozen = {
+        "src/local_ai_stack/operation_contracts.py",
+        "src/local_ai_stack/image_generation_contracts.py",
+        "src/local_ai_stack/application_contracts.py",
+    }
+    assert not (frozen & set(changed))

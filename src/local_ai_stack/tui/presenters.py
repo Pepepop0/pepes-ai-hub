@@ -5,6 +5,7 @@ from pathlib import Path
 
 from rich.markup import escape
 
+from ..application_contracts import ServicesSnapshot, VramSnapshot
 from ..compatibility import evaluate_compatibility
 from ..config import InstalledConfig
 from ..execution import ExecutionReport, ExecutionStep
@@ -12,8 +13,10 @@ from ..integration import ComponentIntegration
 from ..planning import InstallPlan, build_install_plan
 from ..profiles import MIB_PER_GIB, Profile
 from ..provisioning import LaunchAvailability
-from ..runtime import ServiceRuntime, StackRuntime
+from ..runtime import ServiceRuntime
 from ..system import SystemFacts
+from .application import InstallationView
+from .operations import OperationView
 
 
 def mask_home(value: str) -> str:
@@ -199,38 +202,6 @@ def render_plan_execution(report: ExecutionReport | None) -> str:
     return "\n".join(lines)
 
 
-def render_dashboard(facts: SystemFacts, runtime: StackRuntime, profile: Profile) -> str:
-    report = evaluate_compatibility(facts, profile)
-    compatibility = "COMPATIBLE" if report.compatible else "INCOMPATIBLE"
-    lines = [
-        "[b]Stack status[/b]",
-        "",
-        "Service       Health    Process",
-        "-------------------------------",
-    ]
-    lines.extend(
-        f"{service.name:<13} {_state_cell(service.health.state.value, 9)} "
-        f"{_state(service.process.state.value)}"
-        for service in runtime.services
-    )
-    lines.extend(
-        [
-            "",
-            f"Stack: {_state(runtime.state.value)}",
-            f"Profile: [b]{escape(profile.name)}[/b]",
-            f"Compatibility: {_state(compatibility)}",
-            "",
-            "[b]GPU[/b]",
-        ]
-    )
-    if facts.gpus:
-        gpu = max(facts.gpus, key=lambda item: item.vram_total_mib)
-        lines.extend([escape(gpu.name), f"VRAM {gpu.vram_total_mib} MiB"])
-    else:
-        lines.append("No NVIDIA GPU detected")
-    return "\n".join(lines)
-
-
 NO_PROVISIONER_REASON = (
     "No provisioner owns this component yet, so this hub cannot start or stop it."
 )
@@ -344,3 +315,109 @@ def render_interface_settings(config: InstalledConfig) -> str:
 
 def placeholder(title: str, message: str) -> str:
     return f"[b]{escape(title)}[/b]\n\n{escape(terminal_text(message))}"
+
+
+# --- the Hub screens: overview and operations ---------------------------------
+
+# Service health as a person reads it. The vocabulary is the contract's; the
+# words are ours.
+HEALTH_LABELS: dict[str, str] = {
+    "UP": "Running",
+    "DOWN": "Stopped",
+    "DEGRADED": "Degraded",
+    "UNKNOWN": "Unknown",
+}
+
+SERVICE_NAMES: dict[str, str] = {
+    "ollama": "Ollama",
+    "open-webui": "Open WebUI",
+    "comfyui": "ComfyUI",
+}
+
+
+def health_label(health: str) -> str:
+    return HEALTH_LABELS.get(health, health)
+
+
+def _health_cell(health: str, width: int) -> str:
+    colour = _state_color(health)
+    return f"[{colour}]{health_label(health):<{width}}[/{colour}]"
+
+
+def stack_summary(services: ServicesSnapshot) -> str:
+    """One line for the whole stack: ready, stopped, or somewhere in between."""
+    states = {service.health for service in services.services}
+    if not states:
+        return "Sem serviços"
+    if states == {"UP"}:
+        return "Pronta"
+    if states == {"DOWN"}:
+        return "Parada"
+    if "DEGRADED" in states or ("UP" in states and "DOWN" in states):
+        return "Parcialmente disponível"
+    return "Desconhecida"
+
+
+def render_vram(vram: VramSnapshot, gpu_name: str | None = None) -> str:
+    lines = [gpu_name] if gpu_name else []
+    if vram.total_mib is None:
+        lines.append("VRAM desconhecida")
+    elif vram.free_mib is None:
+        lines.append(f"VRAM {vram.total_mib} MiB")
+    else:
+        lines.append(f"VRAM {vram.used_mib} / {vram.total_mib} MiB em uso")
+    return "\n".join(escape(line) for line in lines)
+
+
+def render_overview(
+    installation: InstallationView,
+    profile_name: str,
+    services: ServicesSnapshot,
+    vram: VramSnapshot,
+    gpu_name: str | None,
+) -> str:
+    """The Dashboard as the first thing a person sees: what is there, and whether it runs."""
+    lines = [f"Profile: [b]{escape(profile_name)}[/b]", ""]
+    if not installation.ready:
+        lines.append("[yellow]Nenhuma stack instalada ainda.[/yellow]")
+        lines.append("Use Instalação para preparar esta máquina.")
+        return "\n".join(lines)
+    width = max(len(name) for name in SERVICE_NAMES.values()) + 2
+    for service in services.services:
+        name = SERVICE_NAMES.get(service.service_id, service.service_id)
+        lines.append(f"{escape(name):<{width}} {_health_cell(service.health, 9)}")
+    lines.extend(
+        [
+            "",
+            "[b]GPU[/b]",
+            render_vram(vram, gpu_name) if gpu_name or vram.total_mib is not None else "Sem GPU",
+            "",
+            f"Stack: [b]{escape(stack_summary(services))}[/b]",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def render_operation(view: OperationView | None, *, idle_text: str = "") -> str:
+    """One operation as a checklist: done steps, the current one, and how it ended."""
+    if view is None:
+        return escape(idle_text)
+    lines = [f"[b]{escape(view.headline)}[/b]", ""]
+    steps = list(view.steps)
+    for index, step in enumerate(steps):
+        last = index == len(steps) - 1
+        if not last or view.succeeded:
+            marker, colour = "[x]", "green"
+        elif view.failed:
+            marker, colour = "[!]", "red"
+        else:
+            marker, colour = "[>]", "yellow"
+        suffix = f"  {view.progress_text}" if last and view.progress_text else ""
+        # The markers are literal brackets, not markup tags.
+        lines.append(f"[{colour}]{escape(marker)}[/{colour}] {escape(step)}{escape(suffix)}")
+    if view.failed:
+        lines.append("")
+        for diagnostic in view.diagnostics:
+            lines.append(f"[red]{escape(diagnostic.message)}[/red]")
+            lines.append(f"[dim]Código: {escape(diagnostic.code)}[/dim]")
+    return "\n".join(lines)

@@ -76,6 +76,26 @@ FIXTURE_MODELS = (
 
 MODEL_URL = "https://controlled.invalid/models/{filename}"
 
+# The shipped image profiles' own model names, backed by fixture weights. The
+# ids are the real ones from manifests/models.yaml; only the bytes are small.
+SHIPPED_IMAGE_MODELS = (
+    (
+        "image.diffusion",
+        "flux2_klein_fp8",
+        ModelKind.DIFFUSION,
+        ModelPlacement.DIFFUSION_MODELS,
+        "flux2-klein-fp8.safetensors",
+    ),
+    (
+        "image.text_encoder",
+        "qwen_3_4b_encoder",
+        ModelKind.TEXT_ENCODER,
+        ModelPlacement.TEXT_ENCODERS,
+        "qwen-3-4b-encoder.safetensors",
+    ),
+    ("image.vae", "flux2_vae", ModelKind.VAE, ModelPlacement.VAE, "flux2-vae.safetensors"),
+)
+
 # The workflow the image profile declares, and therefore the graph the
 # workflow-source seam corrupts.
 IMAGE_WORKFLOW_ID = "flux2_klein_t2i"
@@ -228,8 +248,13 @@ def fixture_model_payload(name: str) -> bytes:
     return f"pepito-e2e fixture weights for {name}\n".encode()
 
 
-def fixture_model_catalog(register) -> ModelCatalog:
+def fixture_model_catalog(register, models=None) -> ModelCatalog:
     """The shipped catalog plus three installable fixture weights.
+
+    ``models`` defaults to :data:`FIXTURE_MODELS`. Passing the shipped
+    profile's own model names instead replaces those catalog entries with
+    small weights, so a shipped profile can be installed offline without a
+    single line of it being rewritten.
 
     ``register(url, payload) -> sha256`` is the controlled transport's own
     registration, so the checksum pinned here is genuinely the digest of the
@@ -239,7 +264,7 @@ def fixture_model_catalog(register) -> ModelCatalog:
     """
     shipped = model_catalog()
     specs = dict(shipped.specs)
-    for _role, name, kind, placement, filename in FIXTURE_MODELS:
+    for _role, name, kind, placement, filename in models if models is not None else FIXTURE_MODELS:
         model_id = ModelId.from_parts(ModelProvider.COMFYUI, name)
         url = MODEL_URL.format(filename=filename)
         payload = fixture_model_payload(name)
@@ -341,6 +366,7 @@ def repo_fixture(
     *,
     source: Path | None = None,
     injections: InjectionPlan | None = None,
+    profile_yaml: str | None = None,
 ) -> RepoFixture:
     """Copy the real manifests and graphs, then declare one fixture profile.
 
@@ -349,11 +375,14 @@ def repo_fixture(
     copies is corrupted on the way in, so the workflow domain is handed a real
     template that no longer matches its own manifest.
     """
-    try:
-        body = PROFILE_YAML[profile_id]
-    except KeyError:
-        known = ", ".join(sorted(PROFILE_YAML))
-        raise KeyError(f"unknown fixture profile {profile_id!r}; known: {known}") from None
+    if profile_yaml is not None:
+        body = profile_yaml
+    else:
+        try:
+            body = PROFILE_YAML[profile_id]
+        except KeyError:
+            known = ", ".join(sorted(PROFILE_YAML))
+            raise KeyError(f"unknown fixture profile {profile_id!r}; known: {known}") from None
 
     plan = injections or InjectionPlan.none()
     origin = Path(source) if source is not None else detect_repo_root()
@@ -405,6 +434,7 @@ __all__ = [
     "FIXTURE_PREFIX",
     "IMAGE_WORKFLOW_ID",
     "PROFILE_YAML",
+    "SHIPPED_IMAGE_MODELS",
     "STACK_PROFILE",
     "ExternalInstall",
     "RepoFixture",

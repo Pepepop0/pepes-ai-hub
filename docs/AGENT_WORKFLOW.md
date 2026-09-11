@@ -2,6 +2,14 @@
 
 Nunca colocar Codex + dois Claudes na mesma working tree.
 
+## Wave A — operações e TUI
+
+A divisão abaixo registra o ownership do MVP. Para a próxima Wave A, seguir os
+caminhos e contratos congelados em [Operation Contract Foundation](OPERATION_CONTRACT.md#wave-a-ownership):
+Claude 1 assume geração/recursos; Claude 2 assume TUI e sua composição em `app.py`;
+Codex mantém contratos e integração. Cada frente parte do commit da foundation
+em sua própria worktree.
+
 ## Worktrees
 
 ```powershell

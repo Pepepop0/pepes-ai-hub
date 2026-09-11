@@ -765,6 +765,20 @@ def _verify_stop(report: TestRunReport, world: ControlledWorld) -> list[str]:
     cleanup = _phase(report, TestPhase.CLEANUP)
     if cleanup is not None and not cleanup.data.get("job_handles_released"):
         problems.append("a job handle was never released")
+
+    # Ownership is a resource. Stopping the processes is not enough if the
+    # launcher still claims them: that is the proof a later run would act on.
+    if launcher.members:
+        problems.append(f"job ownership residual: membership still held {launcher.members}")
+    for member in tree:
+        if launcher.owns(OLLAMA, member) is Membership.MEMBER:
+            problems.append(f"job ownership residual: pid {member} is still proved a member")
+    if cleanup is not None and cleanup.data.get("membership"):
+        problems.append(f"cleanup reports membership still held: {cleanup.data['membership']}")
+    if cleanup is not None and cleanup.data.get("registry"):
+        problems.append(f"cleanup reports registry entries: {cleanup.data['registry']}")
+    if not launcher.closed:
+        problems.append("the launcher handle was never closed")
     return problems
 
 

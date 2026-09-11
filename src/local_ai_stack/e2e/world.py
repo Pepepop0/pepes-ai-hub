@@ -264,9 +264,22 @@ class ControlledWorld:
 
     # --- provas de cleanup -------------------------------------------------
 
-    def release_processes(self) -> None:
-        if self._launcher is not None:
-            self._launcher.close_all()
+    def release_processes(self) -> list:
+        """Stop every tree the launcher still owns, then release its handles.
+
+        This is the path cleanup takes when there is no controller -- a run
+        that failed while building its own context. Closing the handles alone
+        would give up the proof of origin and leave the processes running, so
+        each owned tree is stopped through the launcher first; the handles are
+        released afterwards. Returns the stop results so failures are reported,
+        not swallowed.
+        """
+        launcher = self._launcher
+        if launcher is None:
+            return []
+        results = [launcher.stop(service_id) for service_id in list(launcher.members)]
+        launcher.close_all()
+        return results
 
     def managed_residual(self) -> tuple[int, ...]:
         """Pids this run spawned that are still alive -- descendants included.

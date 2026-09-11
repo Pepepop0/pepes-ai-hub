@@ -51,6 +51,7 @@ from ..integration import (
     stage_managed_plan,
 )
 from ..launcher import StopOutcome
+from ..model_installer import ModelResult
 from ..model_resolver import StackModelResolver
 from ..planning import build_install_plan
 from ..profiles import Profile, load_profiles
@@ -771,7 +772,15 @@ class StackTestHarness:
             for item in report.results
             if str(item.outcome) == str(ProvisionOutcome.DRY_RUN)
         ]
-        would_acquire = [item.target for item in models.action_results if item.changed]
+        # `changed` is only true for an acquisition that happened, and a dry run
+        # never acquires. What the installer *would* do is its plan: the steps
+        # it returns with a dry-run result.
+        proposals = {
+            item.target: [step.summary for step in _planned_steps(item)]
+            for item in models.action_results
+            if _planned_steps(item)
+        }
+        would_acquire = sorted(proposals)
         # A dry run that *failed* is not a dry run that proposed nothing. Both
         # reports have to be ok, and no single result may have failed, before
         # "nothing to do" means anything.
@@ -790,6 +799,7 @@ class StackTestHarness:
             "model_actions": _actions(models),
             "would_install": would_install,
             "would_acquire": would_acquire,
+            "proposed_steps": proposals,
             "pulls": list(getattr(self.world.ollama, "pulls", [])),
             "downloads": len(self.world.artifacts.requests),
             "created_directories": [str(path) for path in report.created_directories],
@@ -841,13 +851,30 @@ class StackTestHarness:
                         problems.append(f"{service_id} stop raised {type(exc).__name__}: {exc}")
 
             try:
-                self.world.release_processes()
+                for result in self.world.release_processes():
+                    released.append(f"{result.service_id}:{_name(result.outcome)}")
+                    if not result.stopped:
+                        problems.append(f"{result.service_id} did not stop: {result.detail}")
             except Exception as exc:  # noqa: BLE001
                 problems.append(f"launcher release failed: {type(exc).__name__}: {exc}")
 
             residual = self.world.managed_residual()
             if residual:
                 problems.append("managed processes still present: " + ", ".join(map(str, residual)))
+
+            # Proof of ownership and the registry are resources too. Both are
+            # read before the root goes, because the registry lives in it.
+            launcher = self.world._launcher
+            membership = (
+                {service: list(pids) for service, pids in launcher.members.items()}
+                if launcher is not None
+                else {}
+            )
+            if membership:
+                problems.append(f"managed membership still held: {membership}")
+            registry_entries = _registry_entries(launcher)
+            if registry_entries:
+                problems.append(f"registry still holds: {registry_entries}")
 
             try:
                 released.append(root.release())
@@ -863,6 +890,8 @@ class StackTestHarness:
             "job_handles_released": bool(
                 self.world._launcher is None or self.world._launcher.closed
             ),
+            "membership": membership,
+            "registry": registry_entries,
         }
         if context is not None:
             context.cleanup_report = report
@@ -910,6 +939,23 @@ class StackTestHarness:
             installer=self.world.model_installer(context.installation.layout),
             catalog=self.world.model_catalog(),
         )
+
+
+def _planned_steps(item) -> tuple:
+    """The model installer's own plan for one action, from its result."""
+    payload = getattr(item, "payload", None)
+    if not isinstance(payload, ModelResult):
+        return ()
+    return tuple(payload.steps)
+
+
+def _registry_entries(launcher) -> list[str]:
+    """What the launcher's registry still records, or nothing it can load."""
+    registry = getattr(launcher, "registry", None)
+    load = getattr(registry, "load", None)
+    if load is None:
+        return []
+    return sorted(load().entries)
 
 
 def _snapshot(controller) -> list[dict[str, Any]]:

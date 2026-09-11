@@ -28,6 +28,7 @@ from local_ai_stack.e2e.scenarios import (
 )
 from local_ai_stack.e2e.seams import Injection, InjectionPlan
 from local_ai_stack.e2e.world import CapabilityRefused, controlled_world, real_world
+from local_ai_stack.jobs import Membership
 from local_ai_stack.managed_config import Ownership
 from local_ai_stack.ollama_models import OllamaModelEntry
 from local_ai_stack.test_contracts import (
@@ -129,20 +130,27 @@ def test_the_harness_defines_no_ownership_of_its_own():
 
 def test_a_full_controlled_run_passes_every_phase():
     world = controlled_world(ready_ports=[OLLAMA_PORT])
-    report = run(
-        world,
-        Phase.PREFLIGHT,
-        Phase.PLAN,
-        Phase.PROVISION,
-        Phase.START,
-        Phase.STOP,
-        Phase.SECOND_PLAN,
-    )
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN, Phase.PROVISION, Phase.START, Phase.STOP)
     outcomes = {item.phase: item.outcome for item in report.phases}
     assert report.state is RunState.PASSED, report.detail
     assert outcomes[Phase.PROVISION] is Outcome.PASSED
     assert outcomes[Phase.START] is Outcome.PASSED
-    assert outcomes[Phase.SECOND_PLAN] is Outcome.PASSED
+    assert outcomes[Phase.STOP] is Outcome.PASSED
+
+
+def test_a_second_plan_without_acquisition_proposes_the_missing_models():
+    """Regression: this used to pass because `changed` is never true in a dry run.
+
+    The shipped profile's models were never acquired, so a second pass has work
+    to do and must say so. Idempotence is proved by the second-run row, where
+    the first pass really acquires everything.
+    """
+    world = controlled_world(ready_ports=[OLLAMA_PORT])
+    report = run(world, Phase.PREFLIGHT, Phase.PLAN, Phase.PROVISION, Phase.SECOND_PLAN)
+    second = phase_of(report, Phase.SECOND_PLAN)
+    assert second.outcome is Outcome.FAILED
+    assert "ollama/hermes3_8b" in second.data["would_acquire"]
+    assert all(second.data["proposed_steps"][target] for target in second.data["would_acquire"])
 
 
 def test_a_controlled_run_never_reaches_the_real_network():
@@ -1169,3 +1177,193 @@ def test_the_doctored_reports_also_fail_through_the_runner(clean_second_run, mon
     monkeypatch.setattr(scenarios.StackTestHarness, "run", lambda self, *a, **k: doctored)
     result = ScenarioRunner().run(scenario_by_id("second-run"))
     assert result.outcome is ScenarioOutcome.FAILED
+
+
+# --- cleanup antecipado remove a árvore managed, não só o root ---------------
+
+
+def _started_world():
+    """A world whose launcher already owns a root and a descendant."""
+    from local_ai_stack.registry import ManagedProcessRegistry
+
+    install = _external_for_cleanup()
+    world = controlled_world(
+        ready_ports=[OLLAMA_PORT],
+        external_processes=[(11434, str(install.path))],
+    )
+    world.inventory.occupy(39999)
+    world.external = install
+    layout = world.root.installation.layout
+    layout.ensure()
+    registry = ManagedProcessRegistry.from_layout(layout)
+    launcher = world.launcher(registry)
+    spec_stub = type(
+        "Spec", (), {"service_id": "ollama", "executable": "ollama.exe", "argv": ("ollama.exe",)}
+    )()
+    launcher.start(spec_stub)
+    assert len(launcher.members["ollama"]) >= 2
+    assert sorted(registry.load().entries) == ["ollama"]
+    return world, registry, install
+
+
+def _external_for_cleanup():
+    from local_ai_stack.e2e.fixtures import external_install
+
+    return external_install("ollama")
+
+
+def assert_nothing_managed_survived(world, report):
+    """Every resource the run owned is gone; nothing it did not own is."""
+    from local_ai_stack.e2e.providers import EXTERNAL_PID, UNRELATED_PID
+
+    launcher = world._launcher
+    assert world.managed_residual() == (), f"managed pids survived: {world.managed_residual()}"
+    assert launcher.members == {}, f"membership still held: {launcher.members}"
+    for pid in launcher.members_started("ollama"):
+        assert launcher.owns("ollama", pid) is not Membership.MEMBER
+    cleanup = phase_of(report, Phase.CLEANUP)
+    assert cleanup.data["membership"] == {}
+    assert cleanup.data["registry"] == []
+    assert cleanup.data["job_handles_released"] is True
+    assert not world.root.exists()
+    alive = set(world.inventory.pids())
+    assert UNRELATED_PID in alive
+    assert EXTERNAL_PID in alive
+
+
+@pytest.mark.parametrize("target", ["_bare_context", "_refuse_mismatch", "_bind_profile"])
+def test_an_early_failure_stops_a_managed_tree_that_was_already_running(monkeypatch, target):
+    world, _registry, install = _started_world()
+    try:
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError(f"controlled failure in {target}")
+
+        monkeypatch.setattr(StackTestHarness, target, boom)
+        report = StackTestHarness(world).run(new_run_id(), spec(Phase.PREFLIGHT))
+
+        assert report.state is RunState.FAILED
+        assert phase_of(report, Phase.CLEANUP).outcome is Outcome.PASSED
+        assert_nothing_managed_survived(world, report)
+    finally:
+        install.release()
+
+
+def test_an_early_cleanup_that_forgets_a_member_is_caught(monkeypatch):
+    """The negative: stop only the root and the residual check must fail."""
+    from local_ai_stack.e2e.providers import ControlledLauncher
+
+    original = ControlledLauncher.stop
+
+    def stop_only_the_root(self, service_id, **kwargs):
+        self.members[service_id] = (self.pid,)
+        return original(self, service_id, **kwargs)
+
+    monkeypatch.setattr(ControlledLauncher, "stop", stop_only_the_root)
+    world, _registry, install = _started_world()
+    try:
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("controlled failure in _bare_context")
+
+        monkeypatch.setattr(StackTestHarness, "_bare_context", boom)
+        report = StackTestHarness(world).run(new_run_id(), spec(Phase.PREFLIGHT))
+
+        assert phase_of(report, Phase.CLEANUP).outcome is Outcome.FAILED
+        with pytest.raises(AssertionError, match="managed pids survived"):
+            assert_nothing_managed_survived(world, report)
+    finally:
+        install.release()
+
+
+def test_closing_the_launcher_without_stopping_would_leave_the_tree_running():
+    """Why cleanup stops first: close_all alone gives up proof, not processes."""
+    world, _registry, install = _started_world()
+    try:
+        launcher = world._launcher
+        tree = launcher.members["ollama"]
+        launcher.close_all()
+        assert launcher.members == {}
+        assert set(tree) <= set(world.inventory.pids())
+    finally:
+        world.root.release()
+        install.release()
+
+
+# --- second run detecta aquisição que o domínio proporia ---------------------
+
+
+def _remove_vae_between_passes(monkeypatch):
+    """Delete one managed weight after acquisition, before the second pass."""
+    from local_ai_stack.models import ManagedModelPaths
+
+    original = StackTestHarness._phase_second_plan
+    removed = []
+
+    def second_plan_after_removal(self, context):
+        catalog = self.world.model_catalog()
+        vae = catalog.require(catalog.normalize("comfyui/e2e_vae"))
+        path = ManagedModelPaths.from_layout(context.installation.layout).destination_for(vae)
+        path.unlink()
+        removed.append(path)
+        return original(self, context)
+
+    monkeypatch.setattr(StackTestHarness, "_phase_second_plan", second_plan_after_removal)
+    return removed
+
+
+def test_a_model_removed_between_passes_is_proposed_for_acquisition(monkeypatch):
+    removed = _remove_vae_between_passes(monkeypatch)
+    result = ScenarioRunner().run(scenario_by_id("second-run"))
+
+    assert removed, "the weight was never removed"
+    assert result.outcome is ScenarioOutcome.FAILED
+    second = phase_of(result.report, Phase.SECOND_PLAN)
+    assert second.outcome is Outcome.FAILED
+    assert second.data["would_acquire"] == ["comfyui/e2e_vae"]
+    steps = second.data["proposed_steps"]["comfyui/e2e_vae"]
+    assert any(step.startswith("Download e2e-vae.safetensors") for step in steps)
+    assert any("proposes work" in item for item in result.diagnostics)
+
+
+def test_with_nothing_removed_the_second_pass_proposes_no_acquisition():
+    result = ScenarioRunner().run(scenario_by_id("second-run"))
+    assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
+    second = phase_of(result.report, Phase.SECOND_PLAN)
+    assert second.data["would_acquire"] == []
+    assert second.data["proposed_steps"] == {}
+
+
+# --- stop libera a membership, não só os processos ---------------------------
+
+
+def test_stop_cleanup_fails_if_the_job_is_never_forgotten(monkeypatch):
+    """The negative: processes stopped, proof of ownership kept."""
+    from local_ai_stack.e2e.providers import ControlledLauncher
+
+    monkeypatch.setattr(ControlledLauncher, "forget_job", lambda self, service_id: None)
+    result = ScenarioRunner().run(scenario_by_id("stop-cleanup"))
+
+    assert result.outcome is ScenarioOutcome.FAILED
+    assert any("membership" in item or "job ownership" in item for item in result.diagnostics), (
+        result.diagnostics
+    )
+
+
+def test_after_stop_no_previously_managed_pid_is_still_owned():
+    setup = scenario_by_id("stop-cleanup").setup()
+    try:
+        report = StackTestHarness(setup.world).run(new_run_id(), setup.spec)
+        launcher = setup.world._launcher
+        tree = launcher.members_started("ollama")
+        assert len(tree) >= 2
+        for pid in tree:
+            assert launcher.owns("ollama", pid) is not Membership.MEMBER
+        assert launcher.members == {}
+        cleanup = phase_of(report, Phase.CLEANUP)
+        assert cleanup.data["membership"] == {}
+        assert cleanup.data["registry"] == []
+        assert launcher.closed
+    finally:
+        setup.world.root.release()
+        setup.teardown()

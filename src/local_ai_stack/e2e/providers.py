@@ -682,8 +682,16 @@ class ControlledLauncher:
         self.members.pop(service_id, None)
 
     def close_all(self) -> None:
+        """Release every job handle, as the real launcher does.
+
+        Members keep running -- a job is a proof of origin, not a leash -- so
+        whoever calls this must have stopped the trees first. Membership is
+        given up here, not merely flagged.
+        """
         if self.plan.active(Injection.CLEANUP_FAILURE):
             raise ControlledViolation("controlled cleanup failure")
+        for service_id in list(self.members):
+            self.forget_job(service_id)
         self.closed = True
 
     def members_started(self, service_id: str) -> tuple[int, ...]:

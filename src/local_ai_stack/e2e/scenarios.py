@@ -145,6 +145,7 @@ class Scenario:
             problems.append(
                 f"the run is {report.state} and this row expects {self.state}: {report.detail}"
             )
+        problems.extend(_hidden_failures(report))
         result = _phase(report, self.phase)
         if result is None:
             return problems + [f"{self.phase} never ran, so this row proved nothing"]
@@ -168,6 +169,36 @@ class Scenario:
 
 def _phase(report: TestRunReport, phase: TestPhase):
     return next((item for item in report.phases if item.phase is phase), None)
+
+
+def _hidden_failures(report: TestRunReport) -> list[str]:
+    """A phase marked PASSED whose own structured results say otherwise.
+
+    The harness raises when an execution report is not ok, so this should never
+    find anything. It is here because "should never" is exactly the class of
+    claim a test suite exists to check: a phase that swallowed a failed
+    provisioning result, model action or domain report would otherwise read as
+    green all the way up.
+    """
+    problems: list[str] = []
+    for item in report.phases:
+        if item.outcome is not TestPhaseOutcome.PASSED:
+            continue
+        if item.data.get("ok") is False:
+            problems.append(f"{item.phase} passed while its own report says ok=False")
+        for key in ("actions", "model_actions"):
+            for action in item.data.get(key, []):
+                if action.get("ok") is False:
+                    problems.append(
+                        f"{item.phase} passed with a failed {action.get('action')} "
+                        f"for {action.get('target')}: {action.get('detail')}"
+                    )
+        for result in item.data.get("results", []):
+            if result.get("outcome") == "failed":
+                problems.append(
+                    f"{item.phase} passed with {result.get('component')} reported failed"
+                )
+    return problems
 
 
 def _last_phase(report: TestRunReport) -> TestPhase | None:
@@ -330,6 +361,17 @@ def _verify_second_run(report: TestRunReport, world: ControlledWorld) -> list[st
     second = _phase(report, TestPhase.SECOND_PLAN)
     if provision is None or acquire is None or second is None:
         return problems + ["the first pass did not run, so there is nothing to repeat"]
+
+    # The first pass was clean. A partial failure followed by "nothing to do"
+    # is not idempotence, it is two runs agreeing to skip the broken part.
+    for phase in (provision, acquire):
+        if phase.outcome is not TestPhaseOutcome.PASSED or phase.data.get("ok") is not True:
+            problems.append(f"{phase.phase} did not complete cleanly: {phase.detail}")
+    failed_actions = [a for a in acquire.data.get("actions", []) if not a.get("ok")]
+    if failed_actions:
+        problems.append(f"a model action failed in the first pass: {failed_actions}")
+    if second.data.get("ok") is not True or second.data.get("failed"):
+        problems.append(f"the second pass reported failures: {second.data.get('failed')}")
 
     # The first pass really did something. Otherwise the second proves nothing.
     installed = provision.data.get("components", {}).get("installed", [])

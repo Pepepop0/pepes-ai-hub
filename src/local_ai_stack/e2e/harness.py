@@ -499,6 +499,7 @@ class StackTestHarness:
         }
         context.data["components"] = components
         data = {
+            "ok": report.ok,
             "components": components,
             "installable_components": sorted(self.world.install_components),
             "created_directories": [str(path) for path in report.created_directories],
@@ -550,6 +551,7 @@ class StackTestHarness:
         with context.metrics.measure(Metric.MODEL_VERIFY, steps=len(acquire.steps)):
             report = executor.execute(acquire, dry_run=False)
         data = {
+            "ok": report.ok,
             "actions": _actions(report),
             "pulls": list(getattr(self.world.ollama, "pulls", [])),
             "downloads": len(self.world.artifacts.requests),
@@ -589,7 +591,7 @@ class StackTestHarness:
         )
         configure = _only(phases.after_ollama_ready, "apply-workflow", "configure")
         report = executor.execute(configure, dry_run=False)
-        data = {"roles": roles, "actions": _actions(report)}
+        data = {"roles": roles, "ok": report.ok, "actions": _actions(report)}
         if not report.ok:
             raise PhaseFailed(f"managed configuration failed: {_why(report)}", data)
         return "managed configuration applied and verified", data
@@ -770,7 +772,17 @@ class StackTestHarness:
             if str(item.outcome) == str(ProvisionOutcome.DRY_RUN)
         ]
         would_acquire = [item.target for item in models.action_results if item.changed]
+        # A dry run that *failed* is not a dry run that proposed nothing. Both
+        # reports have to be ok, and no single result may have failed, before
+        # "nothing to do" means anything.
+        failed = [
+            item.component_id
+            for item in report.results
+            if str(item.outcome) == str(ProvisionOutcome.FAILED)
+        ] + [item.target for item in models.action_results if not item.ok]
         data = {
+            "ok": report.ok and models.ok and not failed,
+            "failed": failed,
             "results": [
                 {"component": item.component_id, "outcome": str(item.outcome)}
                 for item in report.results
@@ -782,6 +794,12 @@ class StackTestHarness:
             "downloads": len(self.world.artifacts.requests),
             "created_directories": [str(path) for path in report.created_directories],
         }
+        if not data["ok"]:
+            raise PhaseFailed(
+                "a second run could not establish verified state: "
+                + (", ".join(failed) or _why(report) + "; " + _why(models)),
+                data,
+            )
         proposed = would_install + would_acquire
         if proposed:
             raise PhaseFailed(

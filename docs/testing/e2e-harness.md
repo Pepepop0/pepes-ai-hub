@@ -76,6 +76,11 @@ que ela realmente trata, o outcome dessa fase, e o outcome do cleanup. Um run
 interrompido, config adulterada, workflow inválido, cleanup após falha). Uma
 fase que nunca rodou nunca é prova.
 
+Além disso, uma fase `passed` não pode esconder um resultado estruturado com
+`ok=False`: o veredito de toda linha varre `ok`, ações e resultados de
+componente de cada fase aprovada. Há testes que adulteram cada um e exigem que
+a linha caia.
+
 ## O que cada linha realmente exercita
 
 - **chat_smoke** manda uma geração para o endpoint que o profile resolveu,
@@ -95,6 +100,13 @@ fase que nunca rodou nunca é prova.
   classificado external, coexistência não recusada, endpoint managed separado
   do external, nunca adotado, nunca `stoppable`, nunca iniciado ou parado,
   bytes em disco inalterados, processo vivo depois.
+- **second-run** exige primeiro passe limpo (provisioning e modelos `ok`,
+  nenhuma ação `failed`) e segundo passe `ok` sem `failed`; "failed" não é
+  forma válida de "nada a fazer".
+- **stop-cleanup** para uma árvore (root + worker) com membership provada, ao
+  lado de um processo não relacionado e de um external que sobrevivem.
+- **crash-after-start** lê o estado duas vezes; a segunda leitura é a que tem
+  de mostrar processo parado e serviço fora de UP.
 - **corrupted-model** instala e verifica pesos de verdade e só então muda os
   bytes; quem pega é o installer re-hasheando um arquivo que já tinha aceito.
 - **invalid-workflow** roda com os três modelos genuinamente AVAILABLE. A seam

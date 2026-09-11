@@ -814,7 +814,8 @@ def test_the_second_plan_looks_for_an_outcome_a_dry_run_can_produce():
         item["outcome"] for item in phase_of(result.report, Phase.SECOND_PLAN).data["results"]
     }
     assert "installed" not in outcomes
-    assert outcomes <= {"skipped", "dry-run", "failed"}
+    # "failed" is not a valid way for a second pass to propose nothing.
+    assert outcomes <= {"skipped"}
 
 
 # --- honestidade sobre o que foi realmente instalado ------------------------
@@ -1041,3 +1042,130 @@ def test_membership_is_answered_not_assumed():
     finally:
         setup.world.root.release()
         setup.teardown()
+
+
+# --- second run não aceita falhas internas ----------------------------------
+
+
+def test_a_failed_provisioning_result_fails_the_second_run_row(monkeypatch):
+    """Force provisioning to fail and the idempotence row must not pass."""
+    from local_ai_stack.execution import ExecutionReport
+
+    monkeypatch.setattr(ExecutionReport, "ok", property(lambda self: False))
+    result = ScenarioRunner().run(scenario_by_id("second-run"))
+    assert result.outcome is ScenarioOutcome.FAILED
+
+
+def test_a_failed_model_action_fails_the_second_run_row(monkeypatch):
+    from local_ai_stack.e2e.providers import ControlledModelInstaller
+    from local_ai_stack.model_installer import ModelOutcome, ModelResult
+
+    original = ControlledModelInstaller.apply
+
+    def refuse_one(self, spec, *, dry_run=False):
+        result = original(self, spec, dry_run=dry_run)
+        if str(spec.id) == "comfyui/e2e_vae":
+            return ModelResult(
+                model_id=result.model_id,
+                outcome=ModelOutcome.FAILED,
+                status=result.status,
+                detail="controlled refusal",
+            )
+        return result
+
+    monkeypatch.setattr(ControlledModelInstaller, "apply", refuse_one)
+    result = ScenarioRunner().run(scenario_by_id("second-run"))
+    assert result.outcome is ScenarioOutcome.FAILED
+    assert any("e2e_vae" in item or "acquire" in item for item in result.diagnostics)
+
+
+def test_a_failed_result_during_the_second_pass_is_not_idempotence(monkeypatch):
+    """Make only the dry-run pass fail: nothing proposed, but not ok either."""
+    from local_ai_stack.e2e.providers import ControlledModelInstaller
+    from local_ai_stack.model_installer import ModelOutcome, ModelResult
+
+    original = ControlledModelInstaller.apply
+
+    def fail_when_dry(self, spec, *, dry_run=False):
+        result = original(self, spec, dry_run=dry_run)
+        if dry_run:
+            return ModelResult(
+                model_id=result.model_id,
+                outcome=ModelOutcome.FAILED,
+                status=result.status,
+                detail="dry fail",
+            )
+        return result
+
+    monkeypatch.setattr(ControlledModelInstaller, "apply", fail_when_dry)
+    result = ScenarioRunner().run(scenario_by_id("second-run"))
+    assert result.outcome is ScenarioOutcome.FAILED
+    second = phase_of(result.report, Phase.SECOND_PLAN)
+    assert second.outcome is Outcome.FAILED
+    assert second.data["ok"] is False
+
+
+# --- um PASSED não esconde resultado estruturado com ok=False ---------------
+
+
+def _doctored(report, phase, **changes):
+    """The same report with one phase's data altered, and nothing else."""
+    from dataclasses import replace
+
+    phases = tuple(
+        replace(item, data={**item.data, **changes}) if item.phase is phase else item
+        for item in report.phases
+    )
+    return replace(report, phases=phases)
+
+
+@pytest.fixture(scope="module")
+def clean_second_run():
+    result = ScenarioRunner().run(scenario_by_id("second-run"))
+    assert result.outcome is ScenarioOutcome.PASSED, "; ".join(result.diagnostics)
+    return result.report
+
+
+def test_the_clean_second_run_has_no_hidden_failures(clean_second_run):
+    assert scenario_by_id("second-run").verdict(clean_second_run) == []
+
+
+def test_a_passed_phase_with_provisioning_ok_false_fails_the_row(clean_second_run):
+    doctored = _doctored(clean_second_run, Phase.PROVISION, ok=False)
+    problems = scenario_by_id("second-run").verdict(doctored)
+    assert any("ok=False" in item for item in problems)
+
+
+def test_a_passed_phase_with_models_ok_false_fails_the_row(clean_second_run):
+    doctored = _doctored(clean_second_run, Phase.ACQUIRE_MODELS, ok=False)
+    problems = scenario_by_id("second-run").verdict(doctored)
+    assert any("acquire_models passed while" in item for item in problems)
+
+
+def test_a_passed_phase_with_a_failed_action_fails_the_row(clean_second_run):
+    acquire = phase_of(clean_second_run, Phase.ACQUIRE_MODELS)
+    actions = [dict(item) for item in acquire.data["actions"]]
+    actions[0]["ok"] = False
+    doctored = _doctored(clean_second_run, Phase.ACQUIRE_MODELS, actions=actions)
+    problems = scenario_by_id("second-run").verdict(doctored)
+    assert any("failed acquire-model" in item for item in problems)
+
+
+def test_a_passed_phase_with_a_failed_component_fails_the_row(clean_second_run):
+    doctored = _doctored(
+        clean_second_run,
+        Phase.PROVISION,
+        results=[{"component": "ollama", "outcome": "failed"}],
+    )
+    problems = scenario_by_id("second-run").verdict(doctored)
+    assert any("ollama reported failed" in item for item in problems)
+
+
+def test_the_doctored_reports_also_fail_through_the_runner(clean_second_run, monkeypatch):
+    """End to end: the runner, not just the verdict helper, refuses them."""
+    from local_ai_stack.e2e import scenarios
+
+    doctored = _doctored(clean_second_run, Phase.ACQUIRE_MODELS, ok=False)
+    monkeypatch.setattr(scenarios.StackTestHarness, "run", lambda self, *a, **k: doctored)
+    result = ScenarioRunner().run(scenario_by_id("second-run"))
+    assert result.outcome is ScenarioOutcome.FAILED

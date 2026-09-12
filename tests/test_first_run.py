@@ -8,6 +8,7 @@ No network, no GPU, no real process. Every test cleans up after itself.
 
 from __future__ import annotations
 
+import itertools
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,7 @@ from local_ai_stack.e2e.seams import Injection, InjectionPlan
 from local_ai_stack.installation import detect_repo_root
 from local_ai_stack.integration import IntegrationOptions
 from local_ai_stack.operation_contracts import (
+    OperationActivityCategory,
     OperationEvent,
     OperationEventKind,
     OperationPhase,
@@ -266,6 +268,150 @@ def test_ollama_pull_publishes_no_byte_transfer_progress(stack):
     transfers = _transfer_events(recorder)
     assert not any(CHAT_REFERENCE in event.message for event in transfers)
     assert not any("ollama/" in event.message for event in transfers)
+
+
+# --- atividade e observabilidade ---------------------------------------------
+
+
+def _activity_events(recorder: Recorder):
+    return [event for event in recorder.events if event.activity is not None]
+
+
+def test_model_downloads_combine_activity_and_transfer_in_one_event(stack):
+    recorder = Recorder()
+    stack.app.first_run("op-1", CAPELLA, emit=recorder)
+
+    combined = [event for event in _transfer_events(recorder) if event.activity is not None]
+    assert combined, "no event carried both activity and transfer together"
+    assert all(event.activity.category is OperationActivityCategory.MODEL for event in combined)
+    assert all(event.activity.action == "downloading" for event in combined)
+
+
+def test_model_acquisition_publishes_verified_and_installed_milestones(stack):
+    recorder = Recorder()
+    stack.app.first_run("op-1", CAPELLA, emit=recorder)
+
+    details = [event for event in recorder.events if event.detail is not None]
+    model_details = [d for d in details if d.detail.category is OperationActivityCategory.MODEL]
+    actions = {d.detail.action for d in model_details}
+    assert "verified" in actions
+    assert "installed" in actions
+
+
+def test_provisioning_publishes_activity_for_every_managed_component(stack):
+    recorder = Recorder()
+    stack.app.first_run("op-1", CAPELLA, emit=recorder)
+
+    activities = _activity_events(recorder)
+    categories = {event.activity.category for event in activities}
+    assert OperationActivityCategory.PREPARATION in categories
+    assert OperationActivityCategory.ENVIRONMENT in categories
+    assert OperationActivityCategory.DEPENDENCY in categories
+    actions = {event.activity.action for event in activities}
+    assert {"checking", "preparing", "creating", "installing", "verifying"} <= actions
+
+
+def test_service_start_publishes_starting_waiting_and_ready(stack):
+    recorder = Recorder()
+    stack.app.first_run("op-1", CAPELLA, emit=recorder)
+
+    activities = _activity_events(recorder)
+    service_actions = {
+        event.activity.action
+        for event in activities
+        if event.activity.category is OperationActivityCategory.SERVICE
+    }
+    readiness_actions = {
+        event.activity.action
+        for event in activities
+        if event.activity.category is OperationActivityCategory.READINESS
+    }
+    assert "starting" in service_actions
+    assert "waiting" in readiness_actions
+    ready_details = [
+        event
+        for event in recorder.events
+        if event.detail is not None
+        and event.detail.category is OperationActivityCategory.READINESS
+        and event.detail.action == "ready"
+    ]
+    assert len(ready_details) == 3, "Ollama, Open WebUI and ComfyUI each report ready"
+
+
+def test_workflow_and_configuration_publish_activity_and_verified_detail(stack):
+    recorder = Recorder()
+    stack.app.first_run("op-1", CAPELLA, emit=recorder)
+
+    activities = _activity_events(recorder)
+    assert any(
+        event.activity.category is OperationActivityCategory.WORKFLOW
+        and event.activity.action == "applying"
+        for event in activities
+    )
+    details = [event for event in recorder.events if event.detail is not None]
+    assert any(
+        d.detail.category is OperationActivityCategory.WORKFLOW and d.detail.action == "applied"
+        for d in details
+    )
+    assert any(
+        d.detail.category is OperationActivityCategory.CONFIGURATION
+        and d.detail.action == "verified"
+        for d in details
+    )
+
+
+def test_a_second_run_publishes_only_checking_activity_never_installation_work(stack):
+    """Idempotence at the activity level: verification is real, work is not invented."""
+    stack.app.first_run("op-1", CAPELLA)
+
+    recorder = Recorder()
+    result = stack.app.first_run("op-2", CAPELLA, emit=recorder)
+
+    assert result.state is OperationState.SUCCEEDED
+    assert recorder.events[-1].message == "Tudo pronto (nada a fazer)"
+    actions = {event.activity.action for event in _activity_events(recorder)}
+    forbidden = {"cloning", "creating", "installing", "downloading", "preparing"}
+    assert not (actions & forbidden), actions
+    # A skipped model still reports a real, non-noisy milestone.
+    model_details = {
+        d.detail.action
+        for d in recorder.events
+        if d.detail is not None and d.detail.category is OperationActivityCategory.MODEL
+    }
+    assert model_details == {"available"}
+
+
+def test_a_failure_preserves_the_last_activity_and_nothing_follows_the_result():
+    built = controlled_stack(injections=InjectionPlan.of(Injection.CHECKSUM_MISMATCH))
+    try:
+        _result, recorder = _first_failed(built)
+        terminal = [event for event in recorder.events if event.result is not None]
+        assert len(terminal) == 1
+        assert recorder.events.index(terminal[0]) == len(recorder.events) - 1
+        assert recorder.snapshot.activity is not None
+    finally:
+        built.release()
+
+
+def test_dedupe_never_repeats_an_identical_activity_signature_without_a_fresh_observation():
+    """A chatty observer's repeated ticks never flood the stream unobserved."""
+    recorder = Recorder()
+    built = controlled_stack()
+    try:
+        built.app.first_run("op-1", CAPELLA, emit=recorder)
+    finally:
+        built.release()
+    activities = _activity_events(recorder)
+    assert activities, "the run produced no activity events to check"
+    for previous, current in itertools.pairwise(activities):
+        same_signature = (
+            previous.activity.category == current.activity.category
+            and previous.activity.action == current.activity.action
+            and previous.activity.item == current.activity.item
+            and previous.activity.detail == current.activity.detail
+        )
+        if same_signature:
+            assert current.transfer is not None or current.progress is not None
 
 
 # --- perfis ---------------------------------------------------------------------

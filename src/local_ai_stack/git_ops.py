@@ -20,10 +20,12 @@ place a known revision of a repository at a known path.
 from __future__ import annotations
 
 import os
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .runner import CommandResult, CommandRunner
+from .runner import CommandResult, CommandRunner, OutputSink
 
 GIT = "git"
 DEFAULT_GIT_TIMEOUT = 300.0
@@ -84,6 +86,7 @@ class GitClient:
         cwd: Path | None = None,
         dry_run: bool | None = None,
         check: bool = False,
+        on_output: OutputSink | None = None,
     ) -> CommandResult:
         is_dry = self.dry_run if dry_run is None else dry_run
         result = self.runner.run(
@@ -91,6 +94,7 @@ class GitClient:
             cwd=cwd,
             timeout=self.timeout,
             dry_run=is_dry,
+            on_output=on_output,
         )
         if result.not_found:
             raise GitNotAvailableError("git was not found on PATH", result)
@@ -168,11 +172,14 @@ class GitClient:
         revision: str | None = None,
         depth: int | None = None,
         dry_run: bool | None = None,
+        on_output: OutputSink | None = None,
     ) -> CommandResult:
         """Clone into an explicit destination, optionally pinned to a revision.
 
         Refuses a destination that already contains files, so an existing
-        checkout is never clobbered.
+        checkout is never clobbered. ``--progress`` forces Git to report
+        transfer progress even though output is captured rather than a real
+        terminal; ``on_output`` sees it live, one line at a time, when given.
         """
         target = Path(destination)
         is_dry = self.dry_run if dry_run is None else dry_run
@@ -184,7 +191,7 @@ class GitClient:
                 "Refusing to overwrite an existing directory."
             )
 
-        args = ["clone"]
+        args = ["clone", "--progress"]
         if depth is not None:
             if depth < 1:
                 raise GitError("depth must be >= 1")
@@ -196,7 +203,7 @@ class GitClient:
             args += ["--depth", str(depth)]
         args += ["--", url, str(target)]
 
-        result = self._run(args, dry_run=is_dry, check=not is_dry)
+        result = self._run(args, dry_run=is_dry, check=not is_dry, on_output=on_output)
         if revision is not None and not is_dry:
             self.checkout(target, revision)
         return result
@@ -249,7 +256,50 @@ class GitClient:
 
 def clone_argv(url: str, destination: Path, *, depth: int | None = None) -> list[str]:
     """The exact argv a clone would use. Useful for plans and for tests."""
-    args = [GIT, "clone"]
+    args = [GIT, "clone", "--progress"]
     if depth is not None:
         args += ["--depth", str(depth)]
     return [*args, "--", url, str(Path(os.fspath(destination)))]
+
+
+# --- observacao de clone -----------------------------------------------------
+
+_RECEIVING_RE = re.compile(r"Receiving objects:\s+(\d+)%\s+\((\d+)/(\d+)\)")
+_RESOLVING_RE = re.compile(r"Resolving deltas:\s+(\d+)%\s+\((\d+)/(\d+)\)")
+
+
+@dataclass(frozen=True)
+class GitCloneEvent:
+    """One sanitized fact parsed from Git's own ``--progress`` output.
+
+    The percentage is Git's own count of objects or deltas, never a guess:
+    with ``--progress`` a clone always reports a real total, so there is no
+    "unknown total" case here the way there is for an HTTP download.
+    """
+
+    action: str  # "receiving" | "resolving"
+    completed: int
+    total: int
+    percent: int
+
+
+GitCloneObserver = Callable[[GitCloneEvent], None]
+
+
+class GitCloneOutputParser:
+    """Turns one ``git clone --progress`` invocation's stderr into events."""
+
+    def __init__(self, on_event: GitCloneObserver) -> None:
+        self._on_event = on_event
+
+    def feed(self, _stream: str, line: str) -> None:
+        text = line.strip()
+        match = _RECEIVING_RE.search(text)
+        if match:
+            percent, completed, total = (int(match.group(i)) for i in (1, 2, 3))
+            self._on_event(GitCloneEvent("receiving", completed, total, percent))
+            return
+        match = _RESOLVING_RE.search(text)
+        if match:
+            percent, completed, total = (int(match.group(i)) for i in (1, 2, 3))
+            self._on_event(GitCloneEvent("resolving", completed, total, percent))

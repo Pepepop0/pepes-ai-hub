@@ -32,6 +32,8 @@ from .components import ComponentId
 from .download import DownloadProgress
 from .execution import ExecutionReport
 from .operation_contracts import (
+    OperationActivity,
+    OperationActivityCategory,
     OperationDiagnostic,
     OperationPhase,
     OperationProgress,
@@ -41,6 +43,7 @@ from .operation_contracts import (
 from .operations import OperationStream, diagnostic, safe_text
 from .planning import InstallPlan, PlanAction, PlanStep
 from .profiles import Profile
+from .provisioning import ProvisionEvent
 from .services import ServiceState
 from .transfer_progress import TransferSampler
 
@@ -168,32 +171,52 @@ class FirstRunCoordinator:
                 ],
             )
 
+    def _on_provision_event(self, event: ProvisionEvent) -> None:
+        """Bridge one provisioner note onto the stream, without touching the TUI.
+
+        ``event.activity`` absent means legacy plain text with nothing typed to
+        publish -- it still reaches the log through :meth:`ProvisionContext.emit`,
+        just not the stream. Present, it is ongoing work (:meth:`activity`,
+        replacing whatever was published before) or a milestone
+        (:meth:`detail`, appended to the bounded timeline instead).
+        """
+        if event.activity is None:
+            return
+        if event.milestone:
+            self.stream.detail(event.activity, event.message)
+        else:
+            self.stream.activity(event.activity, event.message, transfer=event.transfer)
+
     def _provision(self, plan: InstallPlan) -> None:
         """Layout first, then each component on its own so a UI sees which one."""
-        executor = self.app.executor(self.profile)
-        layout_steps = _only(plan, lambda step: step.action is PlanAction.PREPARE_LAYOUT)
-        if layout_steps.steps:
-            self.stream.advance(
-                OperationState.RUNNING, OperationPhase.EXECUTION, "Preparando diretórios"
-            )
-            self._execute(executor, layout_steps, "Falha ao preparar diretórios")
-
-        installs = [step for step in plan.steps if step.action is PlanAction.INSTALL]
-        for index, step in enumerate(installs, start=1):
-            name = _DISPLAY.get(step.target, step.target)
-            self.stream.advance(
-                OperationState.RUNNING, OperationPhase.EXECUTION, f"Instalando {name}"
-            )
-            self.stream.progress(index - 1, len(installs), f"Instalando {name}")
-            report = self._execute(
-                executor,
-                _only(plan, lambda item, target=step.target: item.target == target),
-                f"Falha ao instalar {name}",
-            )
-            for result in report.results:
-                (self.report.installed if result.changed else self.report.skipped).append(
-                    result.component_id
+        self.app._activity_sink = self._on_provision_event
+        try:
+            executor = self.app.executor(self.profile)
+            layout_steps = _only(plan, lambda step: step.action is PlanAction.PREPARE_LAYOUT)
+            if layout_steps.steps:
+                self.stream.advance(
+                    OperationState.RUNNING, OperationPhase.EXECUTION, "Preparando diretórios"
                 )
+                self._execute(executor, layout_steps, "Falha ao preparar diretórios")
+
+            installs = [step for step in plan.steps if step.action is PlanAction.INSTALL]
+            for index, step in enumerate(installs, start=1):
+                name = _DISPLAY.get(step.target, step.target)
+                self.stream.advance(
+                    OperationState.RUNNING, OperationPhase.EXECUTION, f"Instalando {name}"
+                )
+                self.stream.progress(index - 1, len(installs), f"Instalando {name}")
+                report = self._execute(
+                    executor,
+                    _only(plan, lambda item, target=step.target: item.target == target),
+                    f"Falha ao instalar {name}",
+                )
+                for result in report.results:
+                    (self.report.installed if result.changed else self.report.skipped).append(
+                        result.component_id
+                    )
+        finally:
+            self.app._activity_sink = None
         if installs:
             self.stream.progress(len(installs), len(installs), "Componentes instalados")
 
@@ -220,6 +243,14 @@ class FirstRunCoordinator:
                 ],
             )
         self.stream.advance(state, OperationPhase.SERVICE_START, f"Iniciando {name}")
+        self.stream.activity(
+            OperationActivity(OperationActivityCategory.SERVICE, "starting", name),
+            f"Iniciando {name}",
+        )
+        self.stream.activity(
+            OperationActivity(OperationActivityCategory.READINESS, "waiting", name),
+            f"Aguardando {name} responder",
+        )
         report = controller.start(service_id, wait=True)
         if not report.ready:
             raise FirstRunStopped(
@@ -227,6 +258,9 @@ class FirstRunCoordinator:
                 f"{name} não ficou pronto",
                 [diagnostic("service-not-ready", f"{service_id}: {report.detail}")],
             )
+        self.stream.detail(
+            OperationActivity(OperationActivityCategory.READINESS, "ready", name), f"{name} pronto"
+        )
         self.report.started.append(service_id)
 
     def _acquire_models(self, plan: InstallPlan) -> None:
@@ -272,6 +306,9 @@ class FirstRunCoordinator:
                     update,
                     f"Baixando {target}",
                     progress=logical,
+                    activity=OperationActivity(
+                        OperationActivityCategory.MODEL, "downloading", target
+                    ),
                 )
 
         self.app._transfer_sink = on_transfer
@@ -296,6 +333,27 @@ class FirstRunCoordinator:
                     final,
                     f"Baixando {step.target}",
                     progress=logical,
+                    activity=OperationActivity(
+                        OperationActivityCategory.MODEL, "downloading", step.target
+                    ),
+                )
+        # A step this run did not touch (dry run aside, unreachable here) never
+        # reaches this point with a false milestone: `_execute` above already
+        # raised for a failure, so every action here really did conclude.
+        for action in report.action_results:
+            if action.changed:
+                self.stream.detail(
+                    OperationActivity(OperationActivityCategory.MODEL, "verified", action.target),
+                    f"Verificando checksum: {action.target}",
+                )
+                self.stream.detail(
+                    OperationActivity(OperationActivityCategory.MODEL, "installed", action.target),
+                    f"Modelo instalado: {action.target}",
+                )
+            else:
+                self.stream.detail(
+                    OperationActivity(OperationActivityCategory.MODEL, "available", action.target),
+                    f"Modelo já disponível: {action.target}",
                 )
         return report
 
@@ -330,6 +388,10 @@ class FirstRunCoordinator:
                     )
                 )
                 continue
+            self.stream.activity(
+                OperationActivity(OperationActivityCategory.WORKFLOW, "applying", step.target),
+                f"Aplicando workflow: {step.target}",
+            )
             self._execute(
                 executor,
                 _only(
@@ -340,11 +402,27 @@ class FirstRunCoordinator:
                 ),
                 "Falha ao aplicar configurações",
             )
+            self.stream.detail(
+                OperationActivity(OperationActivityCategory.WORKFLOW, "applied", step.target),
+                f"Workflow aplicado: {step.target}",
+            )
         if configure.steps:
+            self.stream.activity(
+                OperationActivity(
+                    OperationActivityCategory.CONFIGURATION, "configuring", self.profile.id
+                ),
+                "Configurando endpoints e caminhos de modelo",
+            )
             report = self._execute(executor, configure, "Falha ao aplicar configurações")
             self.report.configured = True
             self.report.configuration_changed = any(
                 action.changed for action in report.action_results
+            )
+            self.stream.detail(
+                OperationActivity(
+                    OperationActivityCategory.CONFIGURATION, "verified", self.profile.id
+                ),
+                "Configuração verificada",
             )
 
     def _start_the_rest(self) -> None:

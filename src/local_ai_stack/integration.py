@@ -391,12 +391,15 @@ def provision_context(
     *,
     runner: CommandRunner | None = None,
     events=None,
+    monotonic=None,
 ) -> ProvisionContext:
     """A context bound to one resolved installation. Touches no disk."""
+    kwargs = {} if monotonic is None else {"monotonic": monotonic}
     return ProvisionContext(
         installation=installation,
         runner=runner if runner is not None else CommandRunner(),
         events=events,
+        **kwargs,
     )
 
 

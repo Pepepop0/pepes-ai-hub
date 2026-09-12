@@ -46,8 +46,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .components import ComponentId
-from .git_ops import GitClient, GitError
+from .git_ops import GitClient, GitCloneEvent, GitCloneOutputParser, GitError
 from .markers import ManagedMarker, fingerprint_of, marker_path, read_marker, write_marker
+from .operation_contracts import OperationActivityCategory, TransferProgress
 from .provisioning import (
     ComponentState,
     Detection,
@@ -59,8 +60,11 @@ from .provisioning import (
     ProvisionPlan,
     ProvisionResult,
     ProvisionStep,
+    build_activity,
 )
 from .pyenv import (
+    PipEvent,
+    PipOutputParser,
     PythonEnvironment,
     PythonEnvironmentError,
     create_environment,
@@ -417,6 +421,13 @@ class ComfyUIProvisioner(Provisioner):
     # --- aplicacao ---------------------------------------------------------
 
     def apply(self, context: ProvisionContext, *, dry_run: bool = False) -> ProvisionResult:
+        context.emit(
+            self.component_id,
+            "Checking existing installation",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "checking", self.display_name
+            ),
+        )
         plan = self.plan(context)
         detection = plan.detection
 
@@ -471,6 +482,11 @@ class ComfyUIProvisioner(Provisioner):
                 "Git is required to install ComfyUI and was not found on PATH.",
             )
 
+        context.emit(
+            self.component_id,
+            "Locating a supported Python interpreter",
+            activity=build_activity(OperationActivityCategory.ENVIRONMENT, "locating", "Python"),
+        )
         interpreter = find_interpreter(
             context.runner, minimum=self.python_minimum, below=self.python_below
         )
@@ -497,6 +513,14 @@ class ComfyUIProvisioner(Provisioner):
     def _install(self, context, detection, plan, git, interpreter) -> ProvisionResult:
         directory = self.managed_dir(context)
         environment = self.environment(context)
+        repo_name = _repo_name(self.url)
+        context.emit(
+            self.component_id,
+            f"Preparing to install {self.display_name}",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "preparing", self.display_name
+            ),
+        )
         try:
             context.layout.ensure()
         except OSError as exc:
@@ -504,10 +528,15 @@ class ComfyUIProvisioner(Provisioner):
                 detection, FailureReason.FILESYSTEM, "Could not prepare the layout.", str(exc)
             )
 
-        context.emit(self.component_id, f"Cloning {self.url} at {self.revision}")
+        context.emit(
+            self.component_id,
+            f"Cloning {self.url} at {self.revision}",
+            activity=build_activity(OperationActivityCategory.TRANSFER, "cloning", repo_name),
+        )
+        on_clone_output = GitCloneOutputParser(self._git_progress(context, repo_name)).feed
         try:
             if not git.is_repository(directory):
-                git.clone(self.url, directory, revision=self.revision)
+                git.clone(self.url, directory, revision=self.revision, on_output=on_clone_output)
             else:
                 # Re-pinning to a newer tag needs it fetched first. fetch()
                 # refuses a dirty tree, so local edits are never discarded.
@@ -536,7 +565,13 @@ class ComfyUIProvisioner(Provisioner):
                     "The tag moved upstream. No marker was written; re-pin deliberately.",
                 )
 
-        context.emit(self.component_id, f"Creating the environment at {environment.root}")
+        context.emit(
+            self.component_id,
+            f"Creating the environment at {environment.root}",
+            activity=build_activity(
+                OperationActivityCategory.ENVIRONMENT, "creating", "ambiente virtual"
+            ),
+        )
         try:
             create_environment(context.runner, environment, interpreter)
         except PythonEnvironmentError as exc:
@@ -548,9 +583,19 @@ class ComfyUIProvisioner(Provisioner):
             )
 
         flags, requirements = self.dependencies.pip_arguments(directory)
-        context.emit(self.component_id, "Installing pinned dependencies")
+        context.emit(
+            self.component_id,
+            "Installing pinned dependencies",
+            activity=build_activity(
+                OperationActivityCategory.DEPENDENCY, "installing", "dependências"
+            ),
+        )
+        start = context.monotonic()
+        on_pip_output = PipOutputParser(self._pip_progress(context, start)).feed
         try:
-            pip_install(context.runner, environment, requirements, extra_args=flags)
+            pip_install(
+                context.runner, environment, requirements, extra_args=flags, on_output=on_pip_output
+            )
         except PythonEnvironmentError as exc:
             return self.failed(
                 detection, FailureReason.COMMAND_FAILED, "Could not install dependencies.", str(exc)
@@ -564,6 +609,13 @@ class ComfyUIProvisioner(Provisioner):
                 f"Looked in {directory}.",
             )
 
+        context.emit(
+            self.component_id,
+            f"Finalizing {self.display_name} installation",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "finalizing", self.display_name
+            ),
+        )
         # Last: only a complete install may claim ownership.
         write_marker(
             directory,
@@ -573,6 +625,13 @@ class ComfyUIProvisioner(Provisioner):
             checksum=self.commit,
             fingerprint=self.dependency_fingerprint(),
         )
+        context.emit(
+            self.component_id,
+            f"Verifying the {self.display_name} installation",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "verifying", self.display_name
+            ),
+        )
         final = self.verify(context)
         if not final.is_usable:
             return self.failed(
@@ -581,14 +640,71 @@ class ComfyUIProvisioner(Provisioner):
                 "ComfyUI was installed but did not verify.",
                 final.detail,
             )
-        context.emit(self.component_id, "Managed ComfyUI installed", EventLevel.INFO)
+        context.emit(
+            self.component_id,
+            "Managed ComfyUI installed",
+            EventLevel.INFO,
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "installed", self.display_name
+            ),
+            milestone=True,
+        )
         return self.installed(final, plan.steps, f"Installed into {directory}.")
+
+    def _git_progress(self, context: ProvisionContext, repo_name: str):
+        def on_event(event: GitCloneEvent) -> None:
+            context.emit(
+                self.component_id,
+                f"{event.action.capitalize()} objects ({event.percent}%)",
+                activity=build_activity(
+                    OperationActivityCategory.TRANSFER,
+                    event.action,
+                    repo_name,
+                    detail=f"{event.completed}/{event.total} objetos ({event.percent}%)",
+                ),
+            )
+
+        return on_event
+
+    def _pip_progress(self, context: ProvisionContext, start: float):
+        def on_event(pip_event: PipEvent) -> None:
+            elapsed = max(0.0, context.monotonic() - start)
+            transfer = None
+            if pip_event.completed_bytes is not None or pip_event.total_bytes is not None:
+                transfer = TransferProgress(
+                    completed_bytes=pip_event.completed_bytes or 0,
+                    total_bytes=pip_event.total_bytes,
+                    bytes_per_second=pip_event.bytes_per_second,
+                )
+            context.emit(
+                self.component_id,
+                f"{pip_event.action.capitalize()} {pip_event.package}",
+                activity=build_activity(
+                    OperationActivityCategory.DEPENDENCY,
+                    pip_event.action,
+                    pip_event.package,
+                    elapsed_seconds=elapsed,
+                ),
+                transfer=transfer,
+                milestone=pip_event.action == "installed",
+            )
+
+        return on_event
 
     # --- utilidades --------------------------------------------------------
 
     @staticmethod
     def _discard(directory: Path) -> None:  # pragma: no cover - defensive cleanup
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def _repo_name(url: str | None) -> str:
+    """A short display label for a repository URL. Never the whole URL."""
+    if not url:
+        return "repositório"
+    trimmed = url.rstrip("/")
+    name = trimmed.rsplit("/", 1)[-1]
+    return name[: -len(".git")] if name.endswith(".git") else name or "repositório"
 
 
 def provisioner_from_pin(

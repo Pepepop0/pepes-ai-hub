@@ -49,9 +49,11 @@ from .download import (
     DownloadCancelledError,
     Downloader,
     DownloadError,
+    DownloadProgress,
     DownloadSpec,
 )
 from .markers import MARKER_NAME, ManagedMarker, marker_path, read_marker, write_marker
+from .operation_contracts import OperationActivityCategory
 from .provisioning import (
     ComponentState,
     Detection,
@@ -64,7 +66,9 @@ from .provisioning import (
     ProvisionPlan,
     ProvisionResult,
     ProvisionStep,
+    build_activity,
 )
+from .transfer_progress import TransferSampler
 
 COMPONENT_ID = str(ComponentId.OLLAMA)
 EXECUTABLE = "ollama.exe" if os.name == "nt" else "ollama"
@@ -283,6 +287,13 @@ class OllamaProvisioner(Provisioner):
     # --- aplicacao ---------------------------------------------------------
 
     def apply(self, context: ProvisionContext, *, dry_run: bool = False) -> ProvisionResult:
+        context.emit(
+            self.component_id,
+            "Checking existing installation",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "checking", self.display_name
+            ),
+        )
         plan = self.plan(context)
         detection = plan.detection
 
@@ -327,6 +338,13 @@ class OllamaProvisioner(Provisioner):
         downloader = self.downloader or Downloader(layout=layout)
         target = self.managed_dir(context)
 
+        context.emit(
+            self.component_id,
+            f"Preparing to install {self.display_name}",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "preparing", self.display_name
+            ),
+        )
         try:
             layout.ensure()
         except OSError as exc:
@@ -334,19 +352,55 @@ class OllamaProvisioner(Provisioner):
                 detection, FailureReason.FILESYSTEM, "Could not prepare the layout.", str(exc)
             )
 
-        context.emit(self.component_id, f"Downloading {self.artifact.filename}")
         spec = DownloadSpec.from_artifact(self.artifact, layout.downloads)
+        sampler = TransferSampler(monotonic=context.monotonic)
+
+        def on_progress(raw: DownloadProgress) -> None:
+            update = sampler.sample(raw.downloaded_bytes, raw.total_bytes)
+            if update is not None:
+                context.emit(
+                    self.component_id,
+                    f"Downloading {self.artifact.filename}",
+                    activity=build_activity(
+                        OperationActivityCategory.TRANSFER, "downloading", self.artifact.filename
+                    ),
+                    transfer=update,
+                )
+
+        context.emit(
+            self.component_id,
+            f"Downloading {self.artifact.filename}",
+            activity=build_activity(
+                OperationActivityCategory.TRANSFER, "downloading", self.artifact.filename
+            ),
+        )
         try:
-            download = downloader.fetch(spec)
+            download = downloader.fetch(spec, progress=on_progress)
         except ChecksumMismatchError as exc:
             return self.failed(detection, FailureReason.CHECKSUM, str(exc))
         except DownloadCancelledError as exc:
             return self.failed(detection, FailureReason.CANCELLED, str(exc))
         except DownloadError as exc:
             return self.failed(detection, FailureReason.NETWORK, str(exc))
+        final_transfer = sampler.finish(download.downloaded_bytes, self.artifact.size_bytes)
+        if final_transfer is not None:
+            context.emit(
+                self.component_id,
+                f"Downloading {self.artifact.filename}",
+                activity=build_activity(
+                    OperationActivityCategory.TRANSFER, "downloading", self.artifact.filename
+                ),
+                transfer=final_transfer,
+            )
 
         staging = layout.cache / f"{COMPONENT_ID}-{self.artifact.id}"
-        context.emit(self.component_id, f"Extracting into {target}")
+        context.emit(
+            self.component_id,
+            f"Extracting {self.artifact.filename}",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "extracting", self.artifact.filename
+            ),
+        )
         try:
             _reset_directory(staging)
             _extract_zip(download.path, staging)
@@ -372,6 +426,13 @@ class OllamaProvisioner(Provisioner):
 
         # O marcador vai por ultimo: antes dele, a instalacao nao se diz nossa.
         self._write_marker(context)
+        context.emit(
+            self.component_id,
+            f"Verifying the {self.display_name} installation",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "verifying", self.display_name
+            ),
+        )
         final = self.verify(context)
         if not final.is_usable:
             return self.failed(
@@ -380,7 +441,15 @@ class OllamaProvisioner(Provisioner):
                 "Ollama was installed but did not verify.",
                 final.detail,
             )
-        context.emit(self.component_id, "Managed Ollama installed", EventLevel.INFO)
+        context.emit(
+            self.component_id,
+            "Managed Ollama installed",
+            EventLevel.INFO,
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "installed", self.display_name
+            ),
+            milestone=True,
+        )
         return self.installed(final, plan.steps, f"Installed into {target}.")
 
     def _write_marker(self, context: ProvisionContext) -> None:

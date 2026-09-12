@@ -38,6 +38,7 @@ from pathlib import Path
 
 from .components import ComponentId
 from .markers import ManagedMarker, marker_path, read_marker, write_marker
+from .operation_contracts import OperationActivityCategory, TransferProgress
 from .provisioning import (
     ComponentState,
     Detection,
@@ -49,8 +50,11 @@ from .provisioning import (
     ProvisionPlan,
     ProvisionResult,
     ProvisionStep,
+    build_activity,
 )
 from .pyenv import (
+    PipEvent,
+    PipOutputParser,
     PythonEnvironment,
     PythonEnvironmentError,
     create_environment,
@@ -263,6 +267,13 @@ class OpenWebUIProvisioner(Provisioner):
     # --- aplicacao ---------------------------------------------------------
 
     def apply(self, context: ProvisionContext, *, dry_run: bool = False) -> ProvisionResult:
+        context.emit(
+            self.component_id,
+            "Checking existing installation",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "checking", self.display_name
+            ),
+        )
         plan = self.plan(context)
         detection = plan.detection
 
@@ -290,6 +301,11 @@ class OpenWebUIProvisioner(Provisioner):
                 ),
             )
 
+        context.emit(
+            self.component_id,
+            "Locating a supported Python interpreter",
+            activity=build_activity(OperationActivityCategory.ENVIRONMENT, "locating", "Python"),
+        )
         interpreter = find_interpreter(context.runner, minimum=PYTHON_MINIMUM, below=PYTHON_BELOW)
         if interpreter is None:
             return self.failed(
@@ -310,6 +326,13 @@ class OpenWebUIProvisioner(Provisioner):
 
     def _install(self, context, detection, plan, requirement, interpreter) -> ProvisionResult:
         environment = self.environment(context)
+        context.emit(
+            self.component_id,
+            f"Preparing to install {self.display_name}",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "preparing", self.display_name
+            ),
+        )
         try:
             context.layout.ensure()
         except OSError as exc:
@@ -317,7 +340,13 @@ class OpenWebUIProvisioner(Provisioner):
                 detection, FailureReason.FILESYSTEM, "Could not prepare the layout.", str(exc)
             )
 
-        context.emit(self.component_id, f"Creating the environment at {environment.root}")
+        context.emit(
+            self.component_id,
+            f"Creating the environment at {environment.root}",
+            activity=build_activity(
+                OperationActivityCategory.ENVIRONMENT, "creating", "ambiente virtual"
+            ),
+        )
         try:
             create_environment(context.runner, environment, interpreter)
         except PythonEnvironmentError as exc:
@@ -328,9 +357,17 @@ class OpenWebUIProvisioner(Provisioner):
                 str(exc),
             )
 
-        context.emit(self.component_id, f"Installing {requirement}")
+        context.emit(
+            self.component_id,
+            f"Installing {requirement}",
+            activity=build_activity(
+                OperationActivityCategory.DEPENDENCY, "installing", DISTRIBUTION
+            ),
+        )
+        start = context.monotonic()
+        on_pip_output = PipOutputParser(self._pip_progress(context, start)).feed
         try:
-            pip_install(context.runner, environment, [requirement])
+            pip_install(context.runner, environment, [requirement], on_output=on_pip_output)
         except PythonEnvironmentError as exc:
             return self.failed(
                 detection,
@@ -354,6 +391,13 @@ class OpenWebUIProvisioner(Provisioner):
             source_id=DISTRIBUTION,
             version=self.version,
         )
+        context.emit(
+            self.component_id,
+            f"Verifying the {self.display_name} installation",
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "verifying", self.display_name
+            ),
+        )
         final = self.verify(context)
         if not final.is_usable:
             return self.failed(
@@ -362,8 +406,41 @@ class OpenWebUIProvisioner(Provisioner):
                 "Open WebUI was installed but did not verify.",
                 final.detail,
             )
-        context.emit(self.component_id, "Managed Open WebUI installed", EventLevel.INFO)
+        context.emit(
+            self.component_id,
+            "Managed Open WebUI installed",
+            EventLevel.INFO,
+            activity=build_activity(
+                OperationActivityCategory.PREPARATION, "installed", self.display_name
+            ),
+            milestone=True,
+        )
         return self.installed(final, plan.steps, f"Installed into {environment.root}.")
+
+    def _pip_progress(self, context: ProvisionContext, start: float):
+        def on_event(pip_event: PipEvent) -> None:
+            elapsed = max(0.0, context.monotonic() - start)
+            transfer = None
+            if pip_event.completed_bytes is not None or pip_event.total_bytes is not None:
+                transfer = TransferProgress(
+                    completed_bytes=pip_event.completed_bytes or 0,
+                    total_bytes=pip_event.total_bytes,
+                    bytes_per_second=pip_event.bytes_per_second,
+                )
+            context.emit(
+                self.component_id,
+                f"{pip_event.action.capitalize()} {pip_event.package}",
+                activity=build_activity(
+                    OperationActivityCategory.DEPENDENCY,
+                    pip_event.action,
+                    pip_event.package,
+                    elapsed_seconds=elapsed,
+                ),
+                transfer=transfer,
+                milestone=pip_event.action == "installed",
+            )
+
+        return on_event
 
 
 __all__ = ["COMPONENT_ID", "DISTRIBUTION", "OpenWebUIProvisioner"]

@@ -32,6 +32,7 @@ cannot use this contract to take ownership of someone else's binary.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -39,9 +40,35 @@ from pathlib import Path
 
 from .installation import ResolvedInstallation
 from .layout import StackLayout
+from .operation_contracts import OperationActivity, OperationActivityCategory, TransferProgress
+from .operations import safe_text
 from .runner import CommandRunner, sanitize
 
 logger = logging.getLogger(__name__)
+
+
+def build_activity(
+    category: OperationActivityCategory,
+    action: str,
+    item: str,
+    *,
+    detail: str | None = None,
+    elapsed_seconds: float | None = None,
+) -> OperationActivity:
+    """The one place a provisioner turns its own facts into a safe activity.
+
+    ``item`` and ``detail`` are sanitized here rather than trusted from the
+    caller: a package name or a repository slug is ordinarily harmless, but a
+    provisioner-specific parser is exactly the boundary the contract asks to
+    sanitize at, not a place to assume upstream text is already safe.
+    """
+    return OperationActivity(
+        category=category,
+        action=action,
+        item=safe_text(sanitize(item)),
+        detail=safe_text(sanitize(detail)) if detail is not None else None,
+        elapsed_seconds=elapsed_seconds,
+    )
 
 
 class ComponentState(StrEnum):
@@ -90,11 +117,28 @@ class EventLevel(StrEnum):
 
 @dataclass(frozen=True)
 class ProvisionEvent:
-    """A progress note a caller may render. Text is already sanitized."""
+    """A progress note a caller may render. Text is already sanitized.
+
+    ``activity`` is additive: a plain text note has none, and a caller that
+    only understands ``message`` loses nothing. When present, it is the
+    typed, bounded semantic observation this note is really about -- the one
+    an :class:`~local_ai_stack.operations.OperationStream` can publish as an
+    ``OperationActivity`` without re-deriving it from prose.
+    """
 
     component_id: str
     level: EventLevel
     message: str
+    activity: OperationActivity | None = None
+    # Additive, like ``activity``: a byte-transfer observation alongside the
+    # activity it belongs to (pip downloading one package, say), never on its
+    # own. A caller that only understands ``activity`` loses nothing.
+    transfer: TransferProgress | None = None
+    # False: this is current, ongoing work (a coordinator publishes it as the
+    # active item, replacing whatever it published before). True: this is a
+    # completed or otherwise meaningful milestone (a coordinator appends it to
+    # the bounded timeline instead). Meaningless without ``activity``.
+    milestone: bool = False
 
 
 EventSink = Callable[[ProvisionEvent], None]
@@ -248,14 +292,29 @@ class ProvisionContext:
     runner: CommandRunner = field(default_factory=CommandRunner)
     events: EventSink | None = None
     log: logging.Logger = logger
+    # A producer's elapsed-time authority (see docs/OPERATION_CONTRACT.md):
+    # a provisioner samples this, never wall-clock timestamps, to report how
+    # long a step has been running.
+    monotonic: Callable[[], float] = time.monotonic
 
     @property
     def layout(self) -> StackLayout:
         return self.installation.layout
 
-    def emit(self, component_id: str, message: str, level: EventLevel = EventLevel.INFO) -> None:
+    def emit(
+        self,
+        component_id: str,
+        message: str,
+        level: EventLevel = EventLevel.INFO,
+        *,
+        activity: OperationActivity | None = None,
+        transfer: TransferProgress | None = None,
+        milestone: bool = False,
+    ) -> None:
         """Publish a progress note. Sanitized before it leaves the backend."""
-        event = ProvisionEvent(component_id, level, sanitize(message))
+        event = ProvisionEvent(
+            component_id, level, sanitize(message), activity, transfer, milestone
+        )
         self.log.log(
             {
                 EventLevel.INFO: logging.INFO,

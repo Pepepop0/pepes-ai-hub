@@ -281,3 +281,89 @@ def test_failed_command_stderr_is_sanitized_in_exception():
     with pytest.raises(CommandFailedError) as exc:
         CommandRunner().run(py(code), check=True)
     assert "abcdef123456" not in str(exc.value)
+
+
+# --- on_output: saida ao vivo -----------------------------------------------
+
+
+def test_on_output_receives_each_line_as_the_process_writes_it():
+    seen: list[tuple[str, str]] = []
+    code = "print('one'); print('two'); import sys; sys.stderr.write('err\\n')"
+    r = CommandRunner().run(py(code), on_output=lambda stream, line: seen.append((stream, line)))
+    assert r.ok
+    assert ("stdout", "one") in seen
+    assert ("stdout", "two") in seen
+    assert ("stderr", "err") in seen
+
+
+def test_on_output_result_matches_the_non_streaming_result():
+    code = "print('hello')"
+    streamed = CommandRunner().run(py(code), on_output=lambda *_: None)
+    plain = CommandRunner().run(py(code))
+    assert streamed.returncode == plain.returncode
+    assert streamed.stdout == plain.stdout
+    assert streamed.ok
+
+
+def test_on_output_sees_a_carriage_return_updated_line_as_its_own_line():
+    """A pip-style progress bar redraws with `\\r`, not `\\n`."""
+    code = (
+        "import sys, time\n"
+        "for i in range(3):\n"
+        "    sys.stdout.write(f'\\r{i}/2 done')\n"
+        "    sys.stdout.flush()\n"
+        "sys.stdout.write('\\n')\n"
+    )
+    seen: list[str] = []
+    CommandRunner().run(py(code), on_output=lambda _stream, line: seen.append(line))
+    assert "0/2 done" in seen
+    assert "1/2 done" in seen
+    assert "2/2 done" in seen
+
+
+def test_on_output_preserves_nonzero_exit_code():
+    r = CommandRunner().run(
+        py("import sys; print('before'); sys.exit(5)"), on_output=lambda *_: None
+    )
+    assert r.returncode == 5
+    assert not r.ok
+
+
+def test_on_output_preserves_timeout_behavior():
+    r = CommandRunner().run(
+        py("import time; time.sleep(5)"), timeout=0.3, on_output=lambda *_: None
+    )
+    assert r.timed_out
+    assert r.returncode == RETURNCODE_TIMEOUT
+
+
+def test_on_output_preserves_missing_executable_behavior():
+    r = CommandRunner().run(["local-ai-stack-nao-existe-xyz"], on_output=lambda *_: None)
+    assert r.not_found
+    assert r.returncode == RETURNCODE_NOT_FOUND
+
+
+def test_on_output_check_still_raises_on_failure():
+    with pytest.raises(CommandFailedError):
+        CommandRunner().run(py("import sys; sys.exit(3)"), on_output=lambda *_: None, check=True)
+
+
+def test_on_output_is_rejected_together_with_input_text():
+    with pytest.raises(ValueError):
+        CommandRunner().run(py("pass"), on_output=lambda *_: None, input_text="x")
+
+
+def test_dry_run_never_invokes_on_output():
+    seen = []
+    r = CommandRunner(dry_run=True).run(py("print('nope')"), on_output=seen.append)
+    assert r.dry_run
+    assert seen == []
+
+
+def test_a_broken_on_output_callback_does_not_lose_the_result():
+    def explode(_stream: str, _line: str) -> None:
+        raise RuntimeError("bad parser")
+
+    r = CommandRunner().run(py("print('one'); print('two')"), on_output=explode)
+    assert r.ok
+    assert "one" in r.stdout and "two" in r.stdout

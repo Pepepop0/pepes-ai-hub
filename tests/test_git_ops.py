@@ -14,6 +14,8 @@ import pytest
 from local_ai_stack.git_ops import (
     DirtyWorkingTreeError,
     GitClient,
+    GitCloneEvent,
+    GitCloneOutputParser,
     GitCommandError,
     GitError,
     GitNotAvailableError,
@@ -150,6 +152,65 @@ def test_clone_refuses_a_non_empty_destination(tmp_path):
         client.clone("https://example.invalid/r.git", destination)
     assert "not empty" in str(exc.value)
     assert runner.calls == []
+
+
+def test_clone_always_requests_progress(tmp_path):
+    client, runner = client_with()
+    client.clone("https://example.invalid/r.git", tmp_path / "dest")
+    call = runner.argv_for("clone")
+    assert "--progress" in call
+
+
+def test_clone_forwards_on_output_to_the_runner(tmp_path):
+    def sink(_stream: str, _line: str) -> None:
+        pass
+
+    client, runner = client_with()
+    client.clone("https://example.invalid/r.git", tmp_path / "dest", on_output=sink)
+    assert runner.kwargs[-1]["on_output"] is sink
+
+
+# --- observacao de progresso -------------------------------------------------
+
+
+def events_for(*lines: str) -> list[GitCloneEvent]:
+    seen: list[GitCloneEvent] = []
+    parser = GitCloneOutputParser(seen.append)
+    for line in lines:
+        parser.feed("stderr", line)
+    return seen
+
+
+def test_receiving_objects_reports_percent_completed_and_total():
+    events = events_for("Receiving objects:  45% (450/1000), 12.34 MiB | 3.45 MiB/s")
+    assert events == [GitCloneEvent("receiving", 450, 1000, 45)]
+
+
+def test_resolving_deltas_reports_percent_completed_and_total():
+    events = events_for("Resolving deltas: 100% (200/200), done.")
+    assert events == [GitCloneEvent("resolving", 200, 200, 100)]
+
+
+def test_a_full_clone_transcript_produces_an_increasing_sequence():
+    events = events_for(
+        "Cloning into 'comfyui'...",
+        "remote: Enumerating objects: 1000, done.",
+        "Receiving objects:  10% (100/1000)",
+        "Receiving objects:  55% (550/1000)",
+        "Receiving objects: 100% (1000/1000), 5.00 MiB | 2.00 MiB/s, done.",
+        "Resolving deltas: 100% (400/400), done.",
+    )
+    assert [e.percent for e in events] == [10, 55, 100, 100]
+    assert [e.action for e in events] == [
+        "receiving",
+        "receiving",
+        "receiving",
+        "resolving",
+    ]
+
+
+def test_unrecognized_clone_lines_are_ignored():
+    assert events_for("Cloning into 'comfyui'...", "remote: Compressing objects: 100%") == []
 
 
 def test_clone_refuses_a_file_destination(tmp_path):

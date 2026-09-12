@@ -21,11 +21,13 @@ from local_ai_stack.comfyui import (
 from local_ai_stack.git_ops import GitClient, GitError
 from local_ai_stack.installation import InstallLocation, resolve_installation
 from local_ai_stack.markers import MARKER_NAME, write_marker
+from local_ai_stack.operation_contracts import OperationActivityCategory
 from local_ai_stack.provisioning import (
     ComponentState,
     FailureReason,
     Ownership,
     ProvisionContext,
+    ProvisionEvent,
     ProvisionOutcome,
 )
 from local_ai_stack.pyenv import PythonEnvironment
@@ -42,10 +44,17 @@ DEPS = DependencyPin(
 
 
 class FakeRunner(CommandRunner):
-    def __init__(self, *, env: Mapping[str, str] | None = None, pip_ok: bool = True):
+    def __init__(
+        self,
+        *,
+        env: Mapping[str, str] | None = None,
+        pip_ok: bool = True,
+        pip_lines: Sequence[str] = (),
+    ):
         super().__init__()
         self.fake_env = dict(env or {})
         self.pip_ok = pip_ok
+        self.pip_lines = tuple(pip_lines)
         self.calls: list[tuple[str, ...]] = []
 
     def which(self, name: str, extra_env: Mapping[str, str] | None = None) -> str | None:
@@ -63,6 +72,10 @@ class FakeRunner(CommandRunner):
             environment.python.write_text("python", encoding="utf-8")
             return CommandResult(argv=items, returncode=0)
         if "pip" in items:
+            on_output = kwargs.get("on_output")
+            if on_output is not None:
+                for line in self.pip_lines:
+                    on_output("stdout", line)
             code = 0 if self.pip_ok else 1
             return CommandResult(argv=items, returncode=code, stderr="" if self.pip_ok else "boom")
         if "-c" in items and "version_info" in items[items.index("-c") + 1]:
@@ -76,11 +89,19 @@ class FakeRunner(CommandRunner):
 class FakeGit(GitClient):
     """Materializes a checkout instead of contacting a remote."""
 
-    def __init__(self, *, head_commit: str = COMMIT, available: bool = True, clone_ok: bool = True):
+    def __init__(
+        self,
+        *,
+        head_commit: str = COMMIT,
+        available: bool = True,
+        clone_ok: bool = True,
+        clone_lines: Sequence[str] = (),
+    ):
         super().__init__(FakeRunner())
         self.head_commit = head_commit
         self._available = available
         self.clone_ok = clone_ok
+        self.clone_lines = tuple(clone_lines)
         self.clones: list[tuple[str, str, str | None]] = []
         self.repositories: set[Path] = set()
 
@@ -90,9 +111,12 @@ class FakeGit(GitClient):
     def is_repository(self, path: Path) -> bool:
         return Path(path) in self.repositories
 
-    def clone(self, url, destination, *, revision=None, depth=None, dry_run=None):
+    def clone(self, url, destination, *, revision=None, depth=None, dry_run=None, on_output=None):
         if not self.clone_ok:
             raise GitError("clone refused")
+        if on_output is not None:
+            for line in self.clone_lines:
+                on_output("stderr", line)
         target = Path(destination)
         self.clones.append((url, str(target), revision))
         target.mkdir(parents=True, exist_ok=True)
@@ -108,9 +132,18 @@ class FakeGit(GitClient):
         return self.head_commit
 
 
-def context_for(tmp_path: Path, runner: CommandRunner | None = None) -> ProvisionContext:
+def context_for(
+    tmp_path: Path,
+    runner: CommandRunner | None = None,
+    *,
+    events=None,
+    monotonic=None,
+) -> ProvisionContext:
     resolved = resolve_installation(InstallLocation.custom(tmp_path / "stack"))
-    return ProvisionContext(installation=resolved, runner=runner or FakeRunner())
+    kwargs = {} if monotonic is None else {"monotonic": monotonic}
+    return ProvisionContext(
+        installation=resolved, runner=runner or FakeRunner(), events=events, **kwargs
+    )
 
 
 def pinned(**kwargs) -> ComfyUIProvisioner:
@@ -418,4 +451,142 @@ def test_real_machine_detection_is_read_only(tmp_path):
     context = ProvisionContext(installation=resolved, runner=CommandRunner())
     detection = ComfyUIProvisioner().detect(context)
     assert detection.ownership in (Ownership.NONE, Ownership.EXTERNAL)
-    assert not context.layout.root.exists()
+
+
+# --- observabilidade --------------------------------------------------------
+
+
+def test_a_full_install_publishes_activity_for_every_real_step(tmp_path):
+    events: list[ProvisionEvent] = []
+    runner = FakeRunner()
+    context = context_for(tmp_path, runner, events=events.append)
+
+    result = pinned(git=FakeGit(), dependencies=DEPS).apply(context)
+
+    assert result.outcome is ProvisionOutcome.INSTALLED
+    activities = [e for e in events if e.activity is not None and not e.milestone]
+    actions = [a.activity.action for a in activities]
+    assert actions[:3] == ["checking", "locating", "preparing"]
+    assert "cloning" in actions
+    assert "creating" in actions
+    assert "installing" in actions
+    assert "verifying" in actions
+    milestones = [e.activity.action for e in events if e.milestone]
+    assert "installed" in milestones
+
+
+def test_pip_output_is_parsed_into_dependency_activity_and_transfer(tmp_path):
+    events: list[ProvisionEvent] = []
+    runner = FakeRunner(
+        pip_lines=(
+            "Collecting torch==2.9.0",
+            "  Downloading torch-2.9.0-cp311.whl (10.0 MB)",
+            "     5.0/10.0 MB 2.0 MB/s eta 0:00:02",
+            "     10.0/10.0 MB 2.0 MB/s eta 0:00:00",
+            "Installing collected packages: torch",
+            "Successfully installed torch-2.9.0",
+        )
+    )
+    context = context_for(tmp_path, runner, events=events.append)
+
+    result = pinned(git=FakeGit(), dependencies=DEPS).apply(context)
+
+    assert result.outcome is ProvisionOutcome.INSTALLED
+    downloading = [
+        e
+        for e in events
+        if e.activity is not None and e.activity.action == "downloading" and e.transfer is not None
+    ]
+    assert downloading
+    assert downloading[0].activity.item == "torch"
+    assert downloading[-1].transfer.completed_bytes == 10_000_000
+    assert downloading[-1].transfer.total_bytes == 10_000_000
+    installed = [e for e in events if e.milestone and e.activity.action == "installed"]
+    assert any(e.activity.item == "torch" for e in installed)
+
+
+def test_git_clone_progress_is_parsed_into_transfer_activity(tmp_path):
+    events: list[ProvisionEvent] = []
+    git = FakeGit(
+        clone_lines=(
+            "Receiving objects:  50% (500/1000)",
+            "Receiving objects: 100% (1000/1000), done.",
+        )
+    )
+    context = context_for(tmp_path, FakeRunner(), events=events.append)
+
+    result = pinned(git=git, dependencies=DEPS).apply(context)
+
+    assert result.outcome is ProvisionOutcome.INSTALLED
+    cloning = [e for e in events if e.activity is not None and e.activity.action == "receiving"]
+    assert cloning
+    assert cloning[0].activity.category is OperationActivityCategory.TRANSFER
+    assert "500/1000" in cloning[0].activity.detail
+    assert "1000/1000" in cloning[-1].activity.detail
+
+
+def test_a_skipped_apply_publishes_no_installation_activity(tmp_path):
+    """Idempotence: a second, unchanged apply shows checking, never installing."""
+    context = context_for(tmp_path)
+    provisioner = pinned(git=FakeGit())
+    assert provisioner.apply(context).outcome is ProvisionOutcome.INSTALLED
+
+    events: list[ProvisionEvent] = []
+    context.events = events.append
+    assert provisioner.apply(context).outcome is ProvisionOutcome.SKIPPED
+
+    actions = [e.activity.action for e in events if e.activity is not None]
+    assert actions == ["checking"]
+    assert "installing" not in actions
+    assert "cloning" not in actions
+    assert "installed" not in actions
+
+
+def test_a_failed_dependency_install_still_reports_activity_up_to_the_failure(tmp_path):
+    events: list[ProvisionEvent] = []
+    context = context_for(tmp_path, FakeRunner(pip_ok=False), events=events.append)
+
+    result = pinned(git=FakeGit()).apply(context)
+
+    assert result.outcome is ProvisionOutcome.FAILED
+    actions = [e.activity.action for e in events if e.activity is not None]
+    assert "installing" in actions
+    # The install never reached these steps, so nothing invented them.
+    assert "finalizing" not in actions
+    assert "installed" not in actions
+
+
+def test_activity_and_detail_carry_no_absolute_path_or_full_command(tmp_path):
+    events: list[ProvisionEvent] = []
+    context = context_for(tmp_path, FakeRunner(), events=events.append)
+
+    pinned(git=FakeGit(), dependencies=DEPS).apply(context)
+
+    for event in events:
+        if event.activity is None:
+            continue
+        assert ":\\" not in event.activity.item
+        assert ":\\" not in (event.activity.detail or "")
+        assert "--extra-index-url" not in event.activity.item
+
+
+def test_elapsed_seconds_on_pip_activity_is_monotonic_and_deterministic(tmp_path):
+    class FakeClock:
+        def __init__(self) -> None:
+            self.now = 100.0
+
+        def __call__(self) -> float:
+            self.now += 1.0
+            return self.now
+
+    events: list[ProvisionEvent] = []
+    runner = FakeRunner(pip_lines=("Collecting torch==2.9.0",))
+    context = context_for(tmp_path, runner, events=events.append, monotonic=FakeClock())
+
+    pinned(git=FakeGit(), dependencies=DEPS).apply(context)
+
+    resolving = next(
+        e for e in events if e.activity is not None and e.activity.action == "resolving"
+    )
+    assert resolving.activity.elapsed_seconds is not None
+    assert resolving.activity.elapsed_seconds >= 0

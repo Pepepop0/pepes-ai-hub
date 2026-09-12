@@ -19,13 +19,21 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# (stream, line) for each line a streamed command writes, as it writes it.
+# ``stream`` is "stdout" or "stderr"; ``line`` has no trailing newline. Never
+# given the process's raw combined text -- only a caller-supplied parser sees
+# it, one line at a time, and decides what (if anything) is safe to publish.
+OutputSink = Callable[[str, str], None]
+JOIN_TIMEOUT = 5.0
 
 DEFAULT_TIMEOUT = 30.0
 RETURNCODE_TIMEOUT = -1
@@ -205,10 +213,19 @@ class CommandRunner:
         check: bool = False,
         input_text: str | None = None,
         dry_run: bool | None = None,
+        on_output: OutputSink | None = None,
     ) -> CommandResult:
         """Roda argv e devolve um CommandResult.
 
         Nao levanta excecao por exit code diferente de zero a menos que check=True.
+
+        ``on_output``, quando fornecido, recebe cada linha de stdout/stderr
+        conforme o processo a produz, em vez de apenas o texto acumulado ao
+        final. E a unica forma como codigo externo enxerga a saida bruta: o
+        chamador (um parser especifico de git/pip/etc) decide o que, sanitizado,
+        vale a pena publicar. O ``CommandResult`` final carrega o mesmo texto
+        acumulado de sempre, para nao mudar nada para quem so olha o resultado.
+        Nao e suportado junto de ``input_text``.
         """
         items = _as_argv(argv)
         safe = sanitize_argv(items)
@@ -230,10 +247,26 @@ class CommandRunner:
                 safe_argv=safe,
             )
 
+        if on_output is not None and input_text is not None:
+            raise ValueError("on_output nao e suportado junto de input_text")
+
         self.log.debug(
             "run: %s (cwd=%s, timeout=%.1fs)", " ".join(safe), cwd_str, effective_timeout
         )
         start = time.monotonic()
+
+        if on_output is not None:
+            return self._run_streaming(
+                items,
+                safe=safe,
+                cwd_str=cwd_str,
+                env=env,
+                effective_timeout=effective_timeout,
+                check=check,
+                start=start,
+                on_output=on_output,
+            )
+
         try:
             completed = subprocess.run(
                 items,
@@ -250,57 +283,193 @@ class CommandRunner:
                 **_platform_kwargs(),
             )
         except subprocess.TimeoutExpired as exc:
-            result = CommandResult(
-                argv=items,
-                returncode=RETURNCODE_TIMEOUT,
-                stdout=_decode(exc.stdout),
-                stderr=_decode(exc.stderr),
-                duration_s=time.monotonic() - start,
-                timed_out=True,
-                cwd=cwd_str,
-                safe_argv=safe,
+            return self._timeout_result(
+                items, safe, cwd_str, effective_timeout, start, check, exc.stdout, exc.stderr
             )
-            self.log.warning("timeout apos %.1fs: %s", effective_timeout, " ".join(safe))
-            if check:
-                raise CommandTimeoutError(
-                    f"timeout apos {effective_timeout:.1f}s: {result.display}", result
-                ) from exc
-            return result
         except (FileNotFoundError, NotADirectoryError) as exc:
-            result = CommandResult(
-                argv=items,
-                returncode=RETURNCODE_NOT_FOUND,
-                stderr=f"command not found: {safe[0]}",
-                duration_s=time.monotonic() - start,
-                not_found=True,
-                cwd=cwd_str,
-                safe_argv=safe,
-            )
-            self.log.warning("executavel nao encontrado: %s", safe[0])
-            if check:
-                raise CommandNotFoundError(f"executavel nao encontrado: {safe[0]}", result) from exc
-            return result
+            return self._not_found_result(items, safe, cwd_str, start, check, exc)
         except OSError as exc:
-            detail = sanitize(str(exc))
-            result = CommandResult(
-                argv=items,
-                returncode=RETURNCODE_NOT_FOUND,
-                stderr=detail,
-                duration_s=time.monotonic() - start,
-                not_found=True,
-                cwd=cwd_str,
-                safe_argv=safe,
-            )
-            self.log.warning("falha ao iniciar %s: %s", safe[0], detail)
-            if check:
-                raise CommandNotFoundError(f"falha ao iniciar {safe[0]}: {detail}", result) from exc
-            return result
+            return self._start_failed_result(items, safe, cwd_str, start, check, exc)
 
+        return self._finished_result(
+            items,
+            safe,
+            cwd_str,
+            start,
+            check,
+            completed.returncode,
+            _decode(completed.stdout),
+            _decode(completed.stderr),
+        )
+
+    # --- execucao com saida ao vivo -----------------------------------------
+
+    def _run_streaming(
+        self,
+        items: tuple[str, ...],
+        *,
+        safe: tuple[str, ...],
+        cwd_str: str | None,
+        env: Mapping[str, str] | None,
+        effective_timeout: float,
+        check: bool,
+        start: float,
+        on_output: OutputSink,
+    ) -> CommandResult:
+        try:
+            process = subprocess.Popen(
+                items,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=cwd_str,
+                env=self.child_env(env),
+                shell=False,
+                **_platform_kwargs(),
+            )
+        except (FileNotFoundError, NotADirectoryError) as exc:
+            return self._not_found_result(items, safe, cwd_str, start, check, exc)
+        except OSError as exc:
+            return self._start_failed_result(items, safe, cwd_str, start, check, exc)
+
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        def pump(stream_name: str, pipe, sink: list[str]) -> None:
+            try:
+                for raw_line in iter(pipe.readline, ""):
+                    sink.append(raw_line)
+                    try:
+                        on_output(stream_name, raw_line.rstrip("\r\n"))
+                    except Exception:
+                        self.log.exception("on_output raised while reading %s", stream_name)
+            finally:
+                pipe.close()
+
+        readers = [
+            threading.Thread(target=pump, args=("stdout", process.stdout, stdout_chunks)),
+            threading.Thread(target=pump, args=("stderr", process.stderr, stderr_chunks)),
+        ]
+        for reader in readers:
+            reader.daemon = True
+            reader.start()
+
+        timed_out = False
+        try:
+            process.wait(timeout=effective_timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            process.wait()
+        for reader in readers:
+            reader.join(timeout=JOIN_TIMEOUT)
+
+        stdout_text = "".join(stdout_chunks)
+        stderr_text = "".join(stderr_chunks)
+        if timed_out:
+            return self._timeout_result(
+                items, safe, cwd_str, effective_timeout, start, check, stdout_text, stderr_text
+            )
+        return self._finished_result(
+            items, safe, cwd_str, start, check, process.returncode, stdout_text, stderr_text
+        )
+
+    # --- construcao do resultado --------------------------------------------
+
+    def _timeout_result(
+        self,
+        items: tuple[str, ...],
+        safe: tuple[str, ...],
+        cwd_str: str | None,
+        effective_timeout: float,
+        start: float,
+        check: bool,
+        stdout: str | bytes | None,
+        stderr: str | bytes | None,
+    ) -> CommandResult:
         result = CommandResult(
             argv=items,
-            returncode=completed.returncode,
-            stdout=_decode(completed.stdout),
-            stderr=_decode(completed.stderr),
+            returncode=RETURNCODE_TIMEOUT,
+            stdout=_decode(stdout),
+            stderr=_decode(stderr),
+            duration_s=time.monotonic() - start,
+            timed_out=True,
+            cwd=cwd_str,
+            safe_argv=safe,
+        )
+        self.log.warning("timeout apos %.1fs: %s", effective_timeout, " ".join(safe))
+        if check:
+            raise CommandTimeoutError(
+                f"timeout apos {effective_timeout:.1f}s: {result.display}", result
+            )
+        return result
+
+    def _not_found_result(
+        self,
+        items: tuple[str, ...],
+        safe: tuple[str, ...],
+        cwd_str: str | None,
+        start: float,
+        check: bool,
+        exc: Exception,
+    ) -> CommandResult:
+        result = CommandResult(
+            argv=items,
+            returncode=RETURNCODE_NOT_FOUND,
+            stderr=f"command not found: {safe[0]}",
+            duration_s=time.monotonic() - start,
+            not_found=True,
+            cwd=cwd_str,
+            safe_argv=safe,
+        )
+        self.log.warning("executavel nao encontrado: %s", safe[0])
+        if check:
+            raise CommandNotFoundError(f"executavel nao encontrado: {safe[0]}", result) from exc
+        return result
+
+    def _start_failed_result(
+        self,
+        items: tuple[str, ...],
+        safe: tuple[str, ...],
+        cwd_str: str | None,
+        start: float,
+        check: bool,
+        exc: Exception,
+    ) -> CommandResult:
+        detail = sanitize(str(exc))
+        result = CommandResult(
+            argv=items,
+            returncode=RETURNCODE_NOT_FOUND,
+            stderr=detail,
+            duration_s=time.monotonic() - start,
+            not_found=True,
+            cwd=cwd_str,
+            safe_argv=safe,
+        )
+        self.log.warning("falha ao iniciar %s: %s", safe[0], detail)
+        if check:
+            raise CommandNotFoundError(f"falha ao iniciar {safe[0]}: {detail}", result) from exc
+        return result
+
+    def _finished_result(
+        self,
+        items: tuple[str, ...],
+        safe: tuple[str, ...],
+        cwd_str: str | None,
+        start: float,
+        check: bool,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+    ) -> CommandResult:
+        result = CommandResult(
+            argv=items,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
             duration_s=time.monotonic() - start,
             cwd=cwd_str,
             safe_argv=safe,

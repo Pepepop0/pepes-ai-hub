@@ -10,6 +10,10 @@ Claude 1 assume geração/recursos; Claude 2 assume TUI e sua composição em `a
 Codex mantém contratos e integração. Cada frente parte do commit da foundation
 em sua própria worktree.
 
+Para a rodada de conflitos externos do first-run, o contrato, os limites de
+autoridade e o ownership por arquivo estão congelados em
+[External Conflict Policy Foundation](EXTERNAL_CONFLICT_POLICY.md#ownership-da-próxima-rodada).
+
 ## Worktrees
 
 ```powershell

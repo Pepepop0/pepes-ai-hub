@@ -51,6 +51,7 @@ from .provisioning import (
     ProvisionResult,
     ProvisionStep,
     build_activity,
+    reason_for_pip_failure,
 )
 from .pyenv import (
     PipEvent,
@@ -392,9 +393,9 @@ class OpenWebUIProvisioner(Provisioner):
         except PythonEnvironmentError as exc:
             return self.failed(
                 detection,
-                FailureReason.COMMAND_FAILED,
+                reason_for_pip_failure(exc.failure),
                 f"Could not install {requirement}.",
-                str(exc),
+                exc.failure.summary if exc.failure is not None else str(exc),
             )
 
         if not self.managed_executable(context).is_file():

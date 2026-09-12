@@ -42,6 +42,7 @@ from .installation import ResolvedInstallation
 from .layout import StackLayout
 from .operation_contracts import OperationActivity, OperationActivityCategory, TransferProgress
 from .operations import safe_text
+from .pyenv import PipFailure, PipFailureKind
 from .runner import CommandRunner, sanitize
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,28 @@ class FailureReason(StrEnum):
     FILESYSTEM = "filesystem"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"
+
+
+_PIP_FAILURE_REASONS = {
+    PipFailureKind.NETWORK: FailureReason.NETWORK,
+    PipFailureKind.CERTIFICATE: FailureReason.NETWORK,
+    PipFailureKind.NO_MATCHING_DISTRIBUTION: FailureReason.PRECONDITION,
+    PipFailureKind.RESOLUTION_CONFLICT: FailureReason.PRECONDITION,
+    PipFailureKind.INVALID_INVOCATION: FailureReason.PRECONDITION,
+    PipFailureKind.NO_DISK_SPACE: FailureReason.FILESYSTEM,
+}
+
+
+def reason_for_pip_failure(failure: PipFailure | None) -> FailureReason:
+    """The failure reason a classified pip problem really is.
+
+    Unclassified, a pip problem stays COMMAND_FAILED, which is what every pip
+    failure used to be: a network outage and a requirement that does not exist
+    are different problems, and only the ones pip named plainly are separated.
+    """
+    if failure is None:
+        return FailureReason.COMMAND_FAILED
+    return _PIP_FAILURE_REASONS.get(failure.kind, FailureReason.COMMAND_FAILED)
 
 
 class EventLevel(StrEnum):

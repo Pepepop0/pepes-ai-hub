@@ -24,6 +24,7 @@ import re
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from .runner import CommandResult, CommandRunner, OutputSink
@@ -49,8 +50,43 @@ _CANDIDATE_PREFIXES: tuple[tuple[str, ...], ...] = (
 )
 
 
+class PipFailureKind(StrEnum):
+    """What kind of thing went wrong, when pip's own output says so plainly.
+
+    Only signals pip states unambiguously are classified. Anything else stays
+    UNKNOWN rather than being guessed at: a wrong classification is worse than
+    an honest "pip failed", because it sends whoever reads it the wrong way.
+    """
+
+    INVALID_INVOCATION = "invalid-invocation"
+    NO_MATCHING_DISTRIBUTION = "no-matching-distribution"
+    RESOLUTION_CONFLICT = "resolution-conflict"
+    NETWORK = "network"
+    CERTIFICATE = "certificate"
+    BUILD_FAILED = "build-failed"
+    NO_DISK_SPACE = "no-disk-space"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class PipFailure:
+    """One classified pip failure, already short and safe to show."""
+
+    kind: PipFailureKind
+    summary: str
+
+
 class PythonEnvironmentError(RuntimeError):
-    """No suitable interpreter, or an environment operation failed."""
+    """No suitable interpreter, or an environment operation failed.
+
+    ``failure`` is set when the cause came from pip and could be classified,
+    so a provisioner can choose the right failure reason instead of calling
+    every pip problem a command failure.
+    """
+
+    def __init__(self, message: str, failure: PipFailure | None = None) -> None:
+        super().__init__(message)
+        self.failure = failure
 
 
 @dataclass(frozen=True)
@@ -163,7 +199,18 @@ _SIZE_UNITS = {
     "gib": 1024**3,
 }
 _COLLECTING_RE = re.compile(r"^Collecting\s+([A-Za-z0-9][A-Za-z0-9_.\-\[\],]*)")
-_DOWNLOADING_SIZE_RE = re.compile(r"^\s*Downloading\s+\S+\s+\(([\d.]+)\s*([kKmMgG]i?B)\)")
+# pip names the artifact it is fetching, which is how the payload downloads can
+# be attributed at all: they arrive in a later phase with no `Collecting` line
+# of their own, so the filename is the only thing that says which package they
+# belong to.
+_DOWNLOADING_SIZE_RE = re.compile(
+    r"^\s*Downloading\s+(?P<artifact>\S+)\s+\(([\d.]+)\s*([kKmMgG]i?B)\)"
+)
+# `<name>-<version>-...`: everything up to the first hyphen is the distribution,
+# normalized the way pip itself prints it back in "Installing collected
+# packages". A metadata fetch is resolver chatter about a package already
+# reported as `Collecting`, and its size is not the package's, so it is skipped.
+_ARTIFACT_NAME_RE = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9_.]*?)-\d")
 _PROGRESS_TICK_RE = re.compile(
     r"([\d.]+)\s*/\s*([\d.]+)\s*([kKmMgG]i?B)\s+([\d.]+)\s*([kKmMgG]i?B)/s"
 )
@@ -203,11 +250,16 @@ PipObserver = Callable[[PipEvent], None]
 class PipOutputParser:
     """Turns one pip invocation's line-by-line output into :class:`PipEvent`.
 
-    Stateful only across one call: it remembers which package the most recent
-    ``Collecting`` line named, since a progress tick or a download-size line
-    does not repeat it. Unrecognized lines (pip's own warnings, resolver
-    chatter) are silently ignored rather than forwarded -- nothing here ever
-    hands raw pip text to its observer.
+    Stateful only across one call: it tracks which package pip is currently
+    talking about, because a progress tick names no package at all. That is
+    also why a download is attributed from the artifact filename rather than
+    from the last ``Collecting`` line: pip resolves everything first and only
+    then fetches the payloads, so by download time the last package collected
+    is whichever one happened to be resolved last -- not the one arriving.
+
+    Unrecognized lines (pip's own warnings, resolver chatter) are silently
+    ignored rather than forwarded: nothing here hands raw pip text to its
+    observer.
     """
 
     def __init__(self, on_event: PipObserver) -> None:
@@ -224,9 +276,16 @@ class PipOutputParser:
             self._on_event(PipEvent("resolving", self._current))
             return
         match = _DOWNLOADING_SIZE_RE.match(text)
-        if match and self._current:
-            total = _size_to_bytes(match.group(1), match.group(2))
-            self._on_event(PipEvent("downloading", self._current, total_bytes=total))
+        if match:
+            artifact = match.group("artifact")
+            if artifact.endswith(".metadata"):
+                return
+            package = _package_of(artifact) or self._current
+            if package is None:
+                return
+            self._current = package
+            total = _size_to_bytes(match.group(2), match.group(3))
+            self._on_event(PipEvent("downloading", package, total_bytes=total))
             return
         match = _PROGRESS_TICK_RE.search(text)
         if match and self._current:
@@ -254,6 +313,18 @@ class PipOutputParser:
                 self._on_event(PipEvent("installed", token.rsplit("-", 1)[0]))
 
 
+def _package_of(artifact: str) -> str | None:
+    """The distribution an artifact filename belongs to, or None if unclear.
+
+    A URL is reduced to its last segment first, since pip prints a full index
+    URL when it is fetching from one; an unparseable name yields None rather
+    than a guess, and the caller keeps whatever it already knew.
+    """
+    name = artifact.rsplit("/", 1)[-1]
+    match = _ARTIFACT_NAME_RE.match(name)
+    return match.group("name").replace("_", "-").lower() if match else None
+
+
 def _split_names(joined: str) -> list[str]:
     return [name.strip() for name in joined.split(",") if name.strip()]
 
@@ -276,28 +347,140 @@ def pip_install(
     if not requirements:
         raise PythonEnvironmentError("no requirements given")
     result = runner.run(
-        [
-            str(environment.python),
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--no-input",
-            "--progress-bar",
-            "ascii",
-            *extra_args,
-            *requirements,
-        ],
+        pip_install_argv(environment, requirements, extra_args=extra_args),
         timeout=timeout,
         dry_run=dry_run,
         on_output=on_output,
     )
     if not dry_run and not result.ok:
+        failure = classify_pip_failure(result)
         raise PythonEnvironmentError(
-            f"pip install failed in {environment.root}: "
-            f"{result.stderr.strip() or result.stdout.strip()}"
+            f"pip install failed in {environment.root}: {failure.summary}", failure
         )
     return result
+
+
+def pip_install_argv(
+    environment: PythonEnvironment,
+    requirements: Sequence[str],
+    *,
+    extra_args: Sequence[str] = (),
+) -> list[str]:
+    """The exact argv an install would run. Useful for plans and for tests.
+
+    Every option here has to exist on the pip that ``python -m venv`` puts in
+    a fresh environment, which is whatever the host interpreter bundles -- not
+    the newest pip. Nothing probes pip's version first, so an option whose
+    spelling or accepted values changed between releases does not belong here:
+    pip rejects the whole invocation during argument parsing, before doing any
+    work, and the install fails with nothing installed and nothing attempted.
+    """
+    return [
+        str(environment.python),
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        *extra_args,
+        *requirements,
+    ]
+
+
+# Signals pip states plainly enough to classify. Each is matched against pip's
+# own combined output; the first match wins, so the more specific patterns
+# come first. Nothing here parses a traceback or keeps raw output.
+_PIP_SIGNALS: tuple[tuple[PipFailureKind, re.Pattern[str], str], ...] = (
+    (
+        PipFailureKind.INVALID_INVOCATION,
+        re.compile(r"(?:invalid choice|no such option|unrecognized arguments)", re.IGNORECASE),
+        "pip refused the install options; the installer asked for something this pip does not accept",
+    ),
+    (
+        PipFailureKind.NO_MATCHING_DISTRIBUTION,
+        re.compile(
+            r"(?:No matching distribution found for|Could not find a version that satisfies"
+            r" the requirement)\s*(?P<item>[^\s;(]+)?",
+            re.IGNORECASE,
+        ),
+        "no distribution matches {item} for this Python",
+    ),
+    (
+        PipFailureKind.RESOLUTION_CONFLICT,
+        re.compile(r"(?:ResolutionImpossible|conflict is caused by)", re.IGNORECASE),
+        "the pinned requirements conflict with each other",
+    ),
+    (
+        PipFailureKind.CERTIFICATE,
+        re.compile(
+            r"(?:CERTIFICATE_VERIFY_FAILED|SSLError|SSLCertVerificationError)", re.IGNORECASE
+        ),
+        "the package index could not be verified over TLS",
+    ),
+    (
+        PipFailureKind.NETWORK,
+        re.compile(
+            r"(?:Failed to establish a new connection|Temporary failure in name resolution"
+            r"|Network is unreachable|Read timed out|ConnectionResetError|ProxyError"
+            r"|Connection aborted|Could not fetch URL|retries exceeded)",
+            re.IGNORECASE,
+        ),
+        "the package index could not be reached",
+    ),
+    (
+        PipFailureKind.NO_DISK_SPACE,
+        re.compile(r"(?:No space left on device|not enough space|ENOSPC)", re.IGNORECASE),
+        "there is not enough disk space to install the dependencies",
+    ),
+    (
+        PipFailureKind.BUILD_FAILED,
+        re.compile(
+            r"(?:metadata-generation-failed|Failed building wheel for\s*(?P<item>\S+))",
+            re.IGNORECASE,
+        ),
+        "a dependency failed to build from source",
+    ),
+)
+
+# A requirement as pip names one back to us: a distribution name with an
+# optional version specifier and extras. Anything else a capture group picks up
+# -- a path, a URL, an index with credentials in it -- does not match, and is
+# dropped rather than repeated, so no part of pip's output can ride along.
+_REQUIREMENT_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+\-\[\]]{0,59}(?:[=<>!~]=?[^\s]{0,31})?$")
+
+# What an unclassified failure says. Pip's own last line is deliberately not
+# here: on a real failure it is as likely to be a traceback, a cache path or
+# the whole index URL as it is to be the cause, and the event stream is public.
+UNCLASSIFIED_SUMMARY = "pip failed without a cause it stated plainly"
+
+
+def classify_pip_failure(result: CommandResult) -> PipFailure:
+    """Turn one failed pip run into a short, safe, classified summary.
+
+    Deliberately not a parser of pip's whole output: it looks for a handful of
+    phrases pip itself uses and says nothing beyond them. What leaves here is
+    this module's own wording, plus at most one requirement pip named back --
+    never a line of pip's output, a path, a URL or a traceback.
+    """
+    if result.timed_out:
+        return PipFailure(PipFailureKind.NETWORK, "pip timed out while installing dependencies")
+    if result.not_found:
+        return PipFailure(
+            PipFailureKind.INVALID_INVOCATION, "the managed Python could not be executed"
+        )
+    combined = f"{result.stderr}\n{result.stdout}"
+    for kind, pattern, template in _PIP_SIGNALS:
+        match = pattern.search(combined)
+        if match is None:
+            continue
+        return PipFailure(kind, template.format(item=_requirement(match)))
+    return PipFailure(PipFailureKind.UNKNOWN, UNCLASSIFIED_SUMMARY)
+
+
+def _requirement(match: re.Match[str]) -> str:
+    """The requirement a pip message named, when it really is one."""
+    captured = (match.groupdict().get("item") or "").strip().strip(",;:'\"")
+    return captured if _REQUIREMENT_TOKEN.match(captured) else "it"
 
 
 def distribution_version(

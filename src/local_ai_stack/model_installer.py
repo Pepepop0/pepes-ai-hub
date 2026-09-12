@@ -31,6 +31,7 @@ from .download import (
     Downloader,
     DownloadError,
     DownloadSpec,
+    ProgressCallback,
     sha256_of,
 )
 from .models import (
@@ -258,7 +259,15 @@ class ModelInstaller:
 
     # --- aplicacao ---------------------------------------------------------
 
-    def apply(self, spec: ModelSpec, *, dry_run: bool = False) -> ModelResult:
+    def apply(
+        self, spec: ModelSpec, *, dry_run: bool = False, progress: ProgressCallback | None = None
+    ) -> ModelResult:
+        """Acquire one model. ``progress`` is forwarded to the Downloader as-is.
+
+        It fires only for a real, in-flight HTTP transfer: a dry run returns
+        before touching the network, an Ollama pull has no byte-level source to
+        report, and an already-satisfied file is a SKIP, never a transfer.
+        """
         plan = self.plan(spec)
         if plan.is_noop:
             return ModelResult(
@@ -273,11 +282,15 @@ class ModelInstaller:
                 detail=plan.steps[0].summary,
             )
         if isinstance(spec.source, FileModelSource):
-            return self._acquire_file(spec, spec.source, plan)
+            return self._acquire_file(spec, spec.source, plan, progress)
         return self._acquire_ollama(spec, spec.source, plan)
 
     def _acquire_file(
-        self, spec: ModelSpec, source: FileModelSource, plan: ModelPlan
+        self,
+        spec: ModelSpec,
+        source: FileModelSource,
+        plan: ModelPlan,
+        progress: ProgressCallback | None,
     ) -> ModelResult:
         destination = self.paths.destination_for(spec)
         download = DownloadSpec(
@@ -287,7 +300,7 @@ class ModelInstaller:
             size_bytes=source.artifact.size_bytes,
         )
         try:
-            self.downloader.fetch(download)
+            self.downloader.fetch(download, progress=progress)
         except ChecksumMismatchError as exc:
             return self._failed(spec, plan, ModelFailure.CHECKSUM, str(exc))
         except DownloadError as exc:
@@ -299,6 +312,9 @@ class ModelInstaller:
     def _acquire_ollama(
         self, spec: ModelSpec, source: OllamaModelSource, plan: ModelPlan
     ) -> ModelResult:
+        # No `progress` parameter here: a pull has no Downloader-shaped byte
+        # stream to report on (see HttpOllamaClient.pull), so acquisition stays
+        # logical for this source, same as it always has.
         if self.ollama is None:
             return self._failed(
                 spec,

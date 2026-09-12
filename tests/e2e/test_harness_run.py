@@ -1109,8 +1109,8 @@ def test_a_failed_result_during_the_second_pass_is_not_idempotence(monkeypatch):
 
     original = ControlledModelInstaller.apply
 
-    def fail_when_dry(self, spec, *, dry_run=False):
-        result = original(self, spec, dry_run=dry_run)
+    def fail_when_dry(self, spec, *, dry_run=False, progress=None):
+        result = original(self, spec, dry_run=dry_run, progress=progress)
         if dry_run:
             return ModelResult(
                 model_id=result.model_id,

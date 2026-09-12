@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from .components import ComponentId
+from .download import DownloadProgress
 from .execution import ExecutionReport
 from .operation_contracts import (
     OperationDiagnostic,
@@ -40,6 +41,7 @@ from .operations import OperationStream, diagnostic, safe_text
 from .planning import InstallPlan, PlanAction, PlanStep
 from .profiles import Profile
 from .services import ServiceState
+from .transfer_progress import TransferSampler
 
 if TYPE_CHECKING:
     from .stack_application import StackApplication
@@ -227,13 +229,42 @@ class FirstRunCoordinator:
         self.report.started.append(service_id)
 
     def _acquire_models(self, plan: InstallPlan) -> None:
-        executor = self.app.executor(self.profile)
         steps = [step for step in plan.steps if step.action is PlanAction.ACQUIRE_MODEL]
         if not steps:
             return
         self.stream.advance(OperationState.RUNNING, OperationPhase.EXECUTION, "Baixando modelos")
         for index, step in enumerate(steps, start=1):
             self.stream.progress(index - 1, len(steps), f"Baixando modelos ({index}/{len(steps)})")
+            report = self._acquire_one(plan, step)
+            for action in report.action_results:
+                (self.report.acquired if action.changed else self.report.already_available).append(
+                    action.target
+                )
+        self.stream.progress(len(steps), len(steps), "Modelos prontos")
+
+    def _acquire_one(self, plan: InstallPlan, step: PlanStep) -> ExecutionReport:
+        """Run one ACQUIRE_MODEL step with the transfer sink wired for its duration.
+
+        The executor is rebuilt here, after the sink is set, because
+        :meth:`StackApplication.install_actions` binds ``on_transfer`` at
+        construction time -- a sink set after the executor exists would never
+        reach the handler. The sampler's own final sample is only ever emitted
+        once execution has actually succeeded: a step that fails, or a model
+        already available (no callback ever fires), publishes nothing here.
+        """
+        sampler = TransferSampler()
+        last_raw: DownloadProgress | None = None
+
+        def on_transfer(target: str, raw: DownloadProgress) -> None:
+            nonlocal last_raw
+            last_raw = raw
+            update = sampler.sample(raw.downloaded_bytes, raw.total_bytes)
+            if update is not None:
+                self.stream.transfer(update, f"Baixando {target}")
+
+        self.app._transfer_sink = on_transfer
+        try:
+            executor = self.app.executor(self.profile)
             report = self._execute(
                 executor,
                 _only(
@@ -244,11 +275,12 @@ class FirstRunCoordinator:
                 ),
                 "Falha ao baixar modelos",
             )
-            for action in report.action_results:
-                (self.report.acquired if action.changed else self.report.already_available).append(
-                    action.target
-                )
-        self.stream.progress(len(steps), len(steps), "Modelos prontos")
+        finally:
+            self.app._transfer_sink = None
+        if last_raw is not None:
+            final = sampler.finish(last_raw.downloaded_bytes, last_raw.total_bytes)
+            self.stream.transfer(final, f"Baixando {step.target}")
+        return report
 
     def _configure(self, plan: InstallPlan) -> None:
         """Materialise each workflow, then generate and verify the configuration.

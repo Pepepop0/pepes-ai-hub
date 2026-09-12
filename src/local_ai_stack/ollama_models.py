@@ -126,7 +126,15 @@ class HttpOllamaClient:
         return tuple(entries)
 
     def pull(self, reference: str) -> None:
-        """Add a model to the store. Never removes or replaces anything else."""
+        """Add a model to the store. Never removes or replaces anything else.
+
+        Requests ``"stream": False`` and blocks until Ollama answers once, so
+        there is no byte-level observation to bridge to a transfer contract.
+        Ollama's streaming NDJSON pull does report ``completed``/``total``
+        per layer, but adopting it is a client redesign, not an instrumentation
+        seam; until then a pull's progress stays logical ("pulling
+        <reference>"), never invented bytes.
+        """
         try:
             with self._client(self.pull_timeout) as client:
                 response = client.post(

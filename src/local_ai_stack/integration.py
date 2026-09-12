@@ -48,6 +48,7 @@ from .comfyui import provisioner_from_pin as comfyui_provisioner
 from .compatibility import CompatibilityReport, evaluate_compatibility
 from .components import CANONICAL_IDS
 from .controller import ServiceController, ServiceControlSpec
+from .download import DownloadProgress
 from .endpoints import DEFAULT_HOST, StackEndpoints
 from .execution import PlanExecutor, ProvisionerRegistry
 from .install_actions import InstallActionHandlers
@@ -427,6 +428,7 @@ def default_install_actions(
     installer_factory: Callable[[Profile], ModelInstaller] | None = None,
     config_writer: ManagedConfigWriter | None = None,
     options: IntegrationOptions | None = None,
+    on_transfer: Callable[[str, DownloadProgress], None] | None = None,
 ) -> InstallActionHandlers:
     """Bind the shipped profiles/manifests to the three executable domains."""
     root = Path(repo_root) if repo_root is not None else detect_repo_root()
@@ -458,6 +460,7 @@ def default_install_actions(
         layout=context.layout,
         config_writer=config_writer or ManagedConfigWriter(),
         endpoints_for=resolved_options.endpoints_for,
+        on_transfer=on_transfer,
     )
 
 

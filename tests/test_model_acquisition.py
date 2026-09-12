@@ -237,6 +237,80 @@ def test_a_partial_download_never_becomes_available(tmp_path):
     assert installer.detect(spec).state is ModelState.NOT_INSTALLED
 
 
+def test_apply_reports_progress_with_a_known_content_length(tmp_path):
+    installer = installer_for(tmp_path)
+    spec = file_spec()
+    seen = []
+
+    result = installer.apply(spec, progress=seen.append)
+
+    assert result.outcome is ModelOutcome.ACQUIRED
+    assert seen
+    assert seen[0].total_bytes == len(WEIGHTS)
+    assert seen[-1].downloaded_bytes == len(WEIGHTS)
+    assert seen[-1].total_bytes == len(WEIGHTS)
+
+
+def test_apply_reports_progress_with_no_content_length(tmp_path):
+    """A chunked response with no size hint reports a growing count and no total."""
+
+    def chunked(request: httpx.Request) -> httpx.Response:
+        def body():
+            yield WEIGHTS[: len(WEIGHTS) // 2]
+            yield WEIGHTS[len(WEIGHTS) // 2 :]
+
+        return httpx.Response(200, content=body())
+
+    downloader = Downloader(
+        client_factory=lambda: httpx.Client(transport=httpx.MockTransport(chunked))
+    )
+    installer = installer_for(tmp_path, downloader=downloader)
+    spec = file_spec()
+    assert spec.source.artifact.size_bytes is None
+    seen = []
+
+    result = installer.apply(spec, progress=seen.append)
+
+    assert result.outcome is ModelOutcome.ACQUIRED
+    assert seen
+    assert all(item.total_bytes is None for item in seen)
+    assert seen[-1].downloaded_bytes == len(WEIGHTS)
+
+
+def test_a_skipped_acquisition_never_calls_progress(tmp_path):
+    installer = installer_for(tmp_path)
+    spec = file_spec()
+    installer.apply(spec)
+    seen = []
+
+    result = installer.apply(spec, progress=seen.append)
+
+    assert result.outcome is ModelOutcome.SKIPPED
+    assert seen == []
+
+
+def test_a_dry_run_never_calls_progress(tmp_path):
+    installer = installer_for(tmp_path)
+    seen = []
+
+    result = installer.apply(file_spec(), dry_run=True, progress=seen.append)
+
+    assert result.outcome is ModelOutcome.DRY_RUN
+    assert seen == []
+
+
+def test_an_ollama_pull_never_calls_the_byte_progress_callback(tmp_path):
+    """Ollama acquisition has no HTTP transfer of its own to report on."""
+    store = FakeOllama()
+    installer = installer_for(tmp_path, ollama=store)
+    seen = []
+
+    result = installer.apply(ollama_spec(), progress=seen.append)
+
+    assert result.outcome is ModelOutcome.ACQUIRED
+    assert seen == []
+
+
 def test_dry_run_writes_nothing(tmp_path):
     calls: list[str] = []
 

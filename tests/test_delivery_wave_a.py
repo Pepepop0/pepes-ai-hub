@@ -447,7 +447,7 @@ def test_real_unknown_total_stays_indeterminate_in_the_real_wizard(composition):
             assert current.transfer.eta_seconds is None
             rendered = str(app.screen.query_one("#wizard-step-progress", Static).content)
             plain = Text.from_markup(rendered).plain
-            assert "Baixando..." in plain
+            assert "transferidos" in plain
             assert "KiB" in plain and "1.56 MiB/s" in plain
             assert "%" not in plain and "restantes" not in plain
             assert "[#" not in plain and "[-" not in plain

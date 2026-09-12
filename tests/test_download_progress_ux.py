@@ -370,8 +370,7 @@ def test_one_hundred_percent_shows_a_full_bar():
 
 def test_unknown_total_is_indeterminate_never_a_fake_percentage():
     rendered = render_with_transfer(TransferProgress(int(1.73 * GiB), None, int(24.8 * MiB)))
-    assert "Baixando..." in rendered
-    assert "1.73 GiB" in rendered
+    assert "1.73 GiB transferidos" in rendered
     assert "24.8 MiB/s" in rendered
     for forbidden in ("0%", "100%", "?%", "[#", "[-"):
         assert forbidden not in rendered.replace("\\[", "[")
@@ -379,8 +378,7 @@ def test_unknown_total_is_indeterminate_never_a_fake_percentage():
 
 def test_unknown_total_without_speed_shows_no_placeholder():
     rendered = render_with_transfer(TransferProgress(int(1.73 * GiB), None, None))
-    assert "Baixando..." in rendered
-    assert "1.73 GiB" in rendered
+    assert "1.73 GiB transferidos" in rendered
     assert "/s" not in rendered
 
 

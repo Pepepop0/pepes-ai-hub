@@ -16,14 +16,20 @@ from ..external_conflict_contracts import (
     ExternalServiceConflict,
 )
 from ..integration import ComponentIntegration
-from ..operation_contracts import TransferProgress
+from ..operation_contracts import (
+    OperationActivity,
+    OperationActivityCategory,
+    OperationState,
+    OperationTimelineEntry,
+    TransferProgress,
+)
 from ..planning import InstallPlan, build_install_plan
 from ..profiles import MIB_PER_GIB, Profile
 from ..provisioning import LaunchAvailability
 from ..runtime import ServiceRuntime
 from ..system import SystemFacts
 from .application import InstallationView
-from .operations import OperationView
+from .operations import STATE_HEADLINES, OperationView
 
 
 def mask_home(value: str) -> str:
@@ -495,8 +501,7 @@ def render_transfer(transfer: TransferProgress, *, label: str, width: int) -> li
     if label:
         lines.append(escape(label))
     if transfer.total_bytes is None:
-        lines.append("Baixando...")
-        lines.append(f"[dim]{escape(format_bytes(transfer.completed_bytes))}[/dim]")
+        lines.append(f"[dim]{escape(format_bytes(transfer.completed_bytes))} transferidos[/dim]")
         if transfer.bytes_per_second is not None:
             lines.append(f"[dim]{escape(format_speed(transfer.bytes_per_second))}[/dim]")
         return lines
@@ -557,6 +562,213 @@ def render_operation(
         for diagnostic in view.diagnostics:
             lines.append(f"[red]{escape(diagnostic.message)}[/red]")
             lines.append(f"[dim]Código: {escape(diagnostic.code)}[/dim]")
+    return "\n".join(lines)
+
+
+# --- semantic activity: what a step is doing right now, in plain words --------
+#
+# ``action`` is a short producer-chosen identifier (contract example: creating,
+# installing, checking, waiting), never a display string. This is the one place
+# that turns it into Portuguese; an action this table does not know still shows
+# something readable instead of failing, since the contract only allowlists the
+# *shape* of an action, not an exhaustive vocabulary of every one a provisioner
+# might someday emit.
+
+_ACTIVITY_VERBS: dict[str, str] = {
+    "creating": "Criando",
+    "installing": "Instalando",
+    "installed": "Instalado",
+    "checking": "Verificando",
+    "verifying": "Verificando",
+    "waiting": "Aguardando",
+    "configuring": "Configurando",
+    "starting": "Iniciando",
+    "downloading": "Baixando",
+    "preparing": "Preparando",
+    "resolving": "Resolvendo",
+    "cloning": "Clonando",
+    "extracting": "Extraindo",
+}
+
+# The noun a category names when the specific item belongs on its own line
+# below the headline (there can be many, one after another: many packages,
+# many models), rather than folded into one sentence.
+_ACTIVITY_NOUNS: dict[OperationActivityCategory, str] = {
+    OperationActivityCategory.DEPENDENCY: "dependências",
+    OperationActivityCategory.MODEL: "modelo",
+    OperationActivityCategory.WORKFLOW: "workflow",
+}
+
+
+def _activity_verb(action: str) -> str:
+    return _ACTIVITY_VERBS.get(action, action.replace("_", " ").replace("-", " ").capitalize())
+
+
+def activity_headline(activity: OperationActivity) -> tuple[str, str]:
+    """(headline, item-or-empty). The item is its own line only when useful."""
+    verb = _activity_verb(activity.action)
+    category = activity.category
+    if category is OperationActivityCategory.READINESS:
+        return f"{verb} {activity.item} responder", ""
+    if category is OperationActivityCategory.TRANSFER:
+        return activity.item, ""
+    noun = _ACTIVITY_NOUNS.get(category)
+    if noun is not None:
+        return f"{verb} {noun}", activity.item
+    return f"{verb} {activity.item}", ""
+
+
+def format_elapsed(seconds: float) -> str:
+    """``00:18``, ``02:41`` or ``1:04:12``. No milliseconds, ever."""
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def render_activity(activity: OperationActivity) -> list[str]:
+    """The current semantic activity: headline, item and optional note.
+
+    Elapsed time is not part of this: it is the last line of the *combined*
+    activity-and-transfer block (see :func:`render_install_progress`), after
+    whatever bytes or speed a transfer contributed - not a property of the
+    activity headline alone.
+    """
+    headline, item = activity_headline(activity)
+    lines = [escape(headline)]
+    if item:
+        lines.append(escape(item))
+    if activity.detail:
+        lines.append(f"[dim]{escape(activity.detail)}[/dim]")
+    return lines
+
+
+def render_timeline(
+    history: tuple[OperationTimelineEntry, ...], *, current: OperationActivity | None = None
+) -> list[str]:
+    """The bounded detail history as a checklist. Never a step nobody observed yet.
+
+    The frozen history is retained newest-last; the newest entries are what a
+    person just did, so they stay at the bottom, next to whatever is current.
+    """
+    lines = ["[b]Detalhes[/b]", ""]
+    for entry in history:
+        headline, item = activity_headline(entry.detail)
+        text = f"{headline} - {item}" if item else headline
+        lines.append(f"[green]{escape('[x]')}[/green] {escape(text)}")
+    if current is not None:
+        headline, item = activity_headline(current)
+        text = f"{headline} - {item}" if item else headline
+        lines.append(f"[yellow]{escape('[>]')}[/yellow] {escape(text)}")
+    if len(lines) == 2:
+        lines.append("[dim]Nenhum detalhe registrado ainda.[/dim]")
+    return lines
+
+
+def render_install_progress(
+    view: OperationView | None,
+    *,
+    idle_text: str = "",
+    heading: str | None = None,
+    active_heading: str = "Instalando",
+    width: int = DEFAULT_TRANSFER_WIDTH,
+    expanded: bool = False,
+) -> str:
+    """The wizard's granular install view: checklist, activity, transfer, history.
+
+    Separate from :func:`render_operation`, which the Dashboard's compact
+    operation panels keep using for any lifecycle command. An install
+    specifically wants a step counter, a current activity set apart from the
+    checklist, and an optional expandable timeline - detail this contract adds
+    that a plain start/stop/restart view has no use for.
+
+    Every number here is read from the view, never invented: the step counter
+    only appears when a real ``OperationProgress`` total is known, the transfer
+    bar only when a real total is known, and the timeline only lists detail
+    entries this operation actually reported.
+    """
+    if view is None:
+        return escape(idle_text)
+
+    lines: list[str] = []
+    if view.terminal:
+        title = heading if heading is not None else view.headline
+        lines.append(f"[b]{escape(title)}[/b]")
+        if view.succeeded:
+            lines.append(escape(STATE_HEADLINES[OperationState.SUCCEEDED]))
+    else:
+        lines.append(f"[b]{escape(active_heading)}[/b]")
+    lines.append("")
+
+    # The step counter names *where in the plan* the current step sits, so it
+    # only makes sense while a step is actually in progress. A terminal event's
+    # own message is a result ("Não foi possível concluir"), not a step name -
+    # pairing it with the last-known step count would misstate which step that
+    # sentence is about. Success and failure say what they need to elsewhere.
+    if not view.terminal and view.progress is not None and view.progress.total is not None:
+        # The step's own name, not the latest event's message: an activity or
+        # transfer event refining this step reuses ``message`` for its own
+        # label (an item, a filename), which is not what step the count is of.
+        current_step = view.steps[-1] if view.steps else view.message
+        lines.append(
+            f"Etapa {view.progress.completed} de {view.progress.total} — {escape(current_step)}"
+        )
+        lines.append("")
+
+    steps = list(view.steps)
+    for index, step in enumerate(steps):
+        last = index == len(steps) - 1
+        if not last or view.succeeded:
+            marker, colour = "[x]", "green"
+        elif view.failed:
+            marker, colour = "[!]", "red"
+        else:
+            marker, colour = "[>]", "yellow"
+        suffix = f"  {view.progress_text}" if last and view.progress_text else ""
+        lines.append(f"[{colour}]{escape(marker)}[/{colour}] {escape(step)}{escape(suffix)}")
+
+    block: list[str] = []
+    if view.activity is not None:
+        if view.failed:
+            block.append("[b]Última atividade:[/b]")
+        block.extend(render_activity(view.activity))
+    if view.transfer is not None:
+        if block:
+            block.append("")
+        # An activity already names what is being transferred; fall back to
+        # the bare event message only when no activity supplied that label.
+        label = ""
+        if view.activity is None and steps and view.message != steps[-1]:
+            label = view.message
+        block.extend(render_transfer(view.transfer, label=label, width=width))
+    if view.activity is not None and view.activity.elapsed_seconds is not None:
+        # Elapsed is the last word on the whole block, after any transfer
+        # bytes or speed it reported - not a property of the activity alone.
+        block.append(f"[dim]Tempo: {escape(format_elapsed(view.activity.elapsed_seconds))}[/dim]")
+    if block:
+        lines.append("")
+        lines.extend(block)
+
+    if view.failed:
+        lines.append("")
+        lines.append("Motivo:")
+        for diagnostic in view.diagnostics:
+            lines.append(f"[red]{escape(diagnostic.message)}[/red]")
+            lines.append(f"[dim]Código: {escape(diagnostic.code)}[/dim]")
+
+    if view.succeeded and view.history:
+        lines.append("")
+        for entry in view.history:
+            headline, item = activity_headline(entry.detail)
+            text = f"{headline} - {item}" if item else headline
+            lines.append(escape(text))
+
+    if expanded:
+        lines.append("")
+        lines.extend(render_timeline(view.history, current=view.activity))
+
     return "\n".join(lines)
 
 

@@ -163,6 +163,108 @@ class ControlledRunner(CommandRunner):
         return any(needle in " ".join(call) for call in self.calls)
 
 
+class ControlledToolchain(ControlledRunner):
+    """The command seam with git, venv and pip behind it.
+
+    ComfyUI and Open WebUI are provisioned through commands: clone a checkout,
+    create an environment, install pinned requirements, read versions back.
+    This runner answers those commands and materialises exactly what each one
+    would leave on disk -- a checkout with its entry point, an environment with
+    its interpreter, a console script, a recorded distribution version -- so
+    the real provisioners drive the whole install and their own ``verify``
+    decides whether it holds. Nothing about provisioning is faked: the seam is
+    the command runner, which the product already declares.
+
+    What it will not do is invent a commit. ``heads`` maps a repository URL to
+    the commit ``rev-parse HEAD`` reports, and a test supplies it from the
+    provisioner's own pin.
+    """
+
+    def __init__(self, *, heads: Mapping[str, str] | None = None, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.heads = dict(heads or {})
+        self.checkouts: dict[str, str] = {}
+        self.environments: set[str] = set()
+        self.installed: dict[str, dict[str, str]] = {}
+        self.commands: list[tuple[str, ...]] = []
+
+    def which(self, name: str, extra_env: Mapping[str, str] | None = None) -> str | None:
+        found = super().which(name, extra_env)
+        if found is not None:
+            return found
+        if name in ("git", "py", "python", "python3"):
+            return str(Path("C:/Controlled") / f"{name}.exe")
+        return None
+
+    def run(self, argv: Sequence[str], **kwargs: object) -> CommandResult:
+        items = tuple(str(part) for part in argv)
+        self.commands.append(items)
+        cwd = kwargs.get("cwd")
+        answer = self._answer(items, Path(str(cwd)) if cwd else None)
+        if answer is not None:
+            return answer
+        return super().run(argv, **kwargs)
+
+    def _answer(self, items: tuple[str, ...], cwd: Path | None) -> CommandResult | None:
+        def ok(stdout: str = "") -> CommandResult:
+            return CommandResult(argv=items, returncode=0, stdout=stdout)
+
+        def fail(stderr: str) -> CommandResult:
+            return CommandResult(argv=items, returncode=1, stderr=stderr)
+
+        if len(items) >= 3 and items[-2] == "-c" and "sys.version_info" in items[-1]:
+            return ok("3.11" + "\n")
+        if len(items) >= 3 and items[-2] == "-c" and "importlib.metadata" in items[-1]:
+            env_root = str(Path(items[0]).parent.parent)
+            distribution = items[-1].split("m.version(", 1)[1].split(")", 1)[0].strip("'\"")
+            version = self.installed.get(env_root, {}).get(distribution)
+            return ok(version + "\n" if version else "")
+        if "-m" in items and "venv" in items:
+            root = Path(items[items.index("venv") + 1])
+            scripts = root / "Scripts"
+            scripts.mkdir(parents=True, exist_ok=True)
+            (scripts / "python.exe").write_bytes(b"controlled interpreter")
+            self.environments.add(str(root))
+            return ok()
+        if "-m" in items and "pip" in items and "install" in items:
+            env_root = str(Path(items[0]).parent.parent)
+            record = self.installed.setdefault(env_root, {})
+            for requirement in items[items.index("install") + 1 :]:
+                if requirement.startswith("-") or "==" not in requirement:
+                    continue
+                name, version = requirement.split("==", 1)
+                record[name] = version
+                script = Path(env_root) / "Scripts" / f"{name}.exe"
+                script.write_bytes(b"controlled console script")
+            return ok()
+        if Path(items[0]).name in ("git", "git.exe"):
+            return self._git(items[1:], cwd, ok, fail)
+        return None
+
+    def _git(self, args: tuple[str, ...], cwd: Path | None, ok, fail) -> CommandResult:
+        if not args:
+            return fail("no git command")
+        if args[0] == "--version":
+            return ok("git version 2.45.0" + "\n")
+        if args[0] == "clone":
+            url, destination = args[-2], Path(args[-1])
+            head = self.heads.get(url)
+            if head is None:
+                return fail(f"controlled toolchain has no checkout for {url}")
+            (destination / ".git").mkdir(parents=True, exist_ok=True)
+            (destination / "main.py").write_text("# controlled checkout", encoding="utf-8")
+            (destination / "requirements.txt").write_text("", encoding="utf-8")
+            self.checkouts[str(destination)] = head
+            return ok()
+        if args[0] == "rev-parse" and "--is-inside-work-tree" in args:
+            inside = cwd is not None and (cwd / ".git").is_dir()
+            return ok("true") if inside else fail("not a git repository")
+        if args[0] == "rev-parse" and "HEAD" in args:
+            head = self.checkouts.get(str(cwd)) if cwd else None
+            return ok(head + "\n") if head else fail("not a git repository")
+        return ok()
+
+
 # --- HTTP transport --------------------------------------------------------
 
 
@@ -472,7 +574,11 @@ class ControlledEndpoints:
             return ProbeResult(ProbeOutcome.REFUSED, detail="controlled: nothing listening")
         import json as _json
 
-        body = self.payloads.get(url, {"status": True, "version": "controlled"})
+        # One body that satisfies every shipped health spec's expected keys:
+        # Ollama reads "version", Open WebUI "status", ComfyUI "system".
+        body = self.payloads.get(
+            url, {"status": True, "version": "controlled", "system": {"os": "controlled"}}
+        )
         return ProbeResult(
             ProbeOutcome.OK,
             latency_ms=1.0,
@@ -590,12 +696,18 @@ class ControlledLauncher:
         ready_port: int | None = None,
         endpoints: ControlledEndpoints | None = None,
         descendants: int = 1,
+        ready_ports: Mapping[str, int] | None = None,
     ) -> None:
         self.registry = registry
         self.inventory = inventory
         self.plan = plan or InjectionPlan.none()
         self.pid = pid
         self.ready_port = ready_port
+        # Per-service ready ports, for a run that starts more than one service.
+        # The single ``ready_port`` stays for the first service started, which
+        # is how every existing scenario is written.
+        self.ready_ports = dict(ready_ports or {})
+        self._pids: dict[str, int] = {}
         self.endpoints = endpoints
         self.descendants = descendants
         self.starts: list[str] = []
@@ -622,21 +734,23 @@ class ControlledLauncher:
         service_id = getattr(spec, "service_id", "unknown")
         executable = getattr(spec, "executable", "controlled.exe")
         self.starts.append(service_id)
-        self.inventory.spawn(self.pid, executable, self.ready_port)
-        tree = [self.pid]
+        root_pid = self._pid_for(service_id)
+        port = self.ready_ports.get(service_id, self.ready_port if root_pid == self.pid else None)
+        self.inventory.spawn(root_pid, executable, port)
+        tree = [root_pid]
         for offset in range(1, self.descendants + 1):
-            child = self.pid + offset
+            child = root_pid + offset
             self.inventory.spawn(child, f"{executable}-worker-{offset}")
             tree.append(child)
         self.members[service_id] = tuple(tree)
         self.started_trees[service_id] = tuple(tree)
         self.spawned.update(tree)
         create_time = next(
-            (item.create_time for item in self.inventory.processes if item.pid == self.pid), None
+            (item.create_time for item in self.inventory.processes if item.pid == root_pid), None
         )
         entry = ManagedProcess(
             service_id=service_id,
-            pid=self.pid,
+            pid=root_pid,
             executable=str(executable),
             argv=tuple(getattr(spec, "argv", ()) or (str(executable),)),
             started_at=1.0,
@@ -646,11 +760,11 @@ class ControlledLauncher:
         if self.plan.active(Injection.SERVICE_CRASH) and self.endpoints is not None:
             # It really starts and really becomes ready. It dies on the next
             # observation, which is the case a start report alone cannot catch.
-            self.endpoints.arm_crash(self.ready_port, lambda: self.inventory.kill(self.pid))
+            self.endpoints.arm_crash(port, lambda: self.inventory.kill(root_pid))
         return LaunchResult(
             outcome=LaunchOutcome.STARTED,
             service_id=service_id,
-            pid=self.pid,
+            pid=root_pid,
             detail="controlled start",
             entry=entry,
         )
@@ -670,7 +784,8 @@ class ControlledLauncher:
                 pid=self.pid,
                 detail="controlled stop refused",
             )
-        tree = self.members.get(service_id, (self.pid,))
+        root_pid = self._pids.get(service_id, self.pid)
+        tree = self.members.get(service_id, (root_pid,))
         for member in tree:
             self.inventory.kill(member)
         self.registry.unregister(service_id)
@@ -678,10 +793,17 @@ class ControlledLauncher:
         return StopResult(
             outcome=StopOutcome.STOPPED,
             service_id=service_id,
-            pid=self.pid,
+            pid=root_pid,
             detail=f"controlled stop of {len(tree)} process(es)",
             tree_pids=tree,
         )
+
+    def _pid_for(self, service_id: str) -> int:
+        """A stable root pid per service; the first service keeps ``pid``."""
+        if service_id not in self._pids:
+            # Leave room for each tree's descendants between roots.
+            self._pids[service_id] = self.pid + 100 * len(self._pids)
+        return self._pids[service_id]
 
     def forget_job(self, service_id: str) -> None:
         """Give up the proof. Members keep running, as in the real launcher."""
@@ -844,6 +966,7 @@ __all__ = [
     "ControlledModelInstaller",
     "ControlledOllama",
     "ControlledRunner",
+    "ControlledToolchain",
     "ControlledViolation",
     "ImageJob",
     "StepClock",

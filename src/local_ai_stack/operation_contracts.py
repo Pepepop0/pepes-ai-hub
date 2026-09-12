@@ -92,6 +92,39 @@ class OperationProgress:
 
 
 @dataclass(frozen=True)
+class TransferProgress:
+    """Observed transfer bytes. Unknown total means no fraction or ETA."""
+
+    completed_bytes: int
+    total_bytes: int | None = None
+    bytes_per_second: float | None = None
+
+    def __post_init__(self) -> None:
+        _integer(self.completed_bytes)
+        if self.total_bytes is not None:
+            _integer(self.total_bytes, minimum=1)
+            if self.completed_bytes > self.total_bytes:
+                raise ValueError("completed bytes exceed total bytes")
+        if self.bytes_per_second is not None and (
+            isinstance(self.bytes_per_second, bool)
+            or not isinstance(self.bytes_per_second, (int, float))
+            or not math.isfinite(self.bytes_per_second)
+            or self.bytes_per_second < 0
+        ):
+            raise ValueError("transfer speed must be finite and non-negative")
+
+    @property
+    def fraction(self) -> float | None:
+        return None if self.total_bytes is None else self.completed_bytes / self.total_bytes
+
+    @property
+    def eta_seconds(self) -> float | None:
+        if self.total_bytes is None or not self.bytes_per_second:
+            return None
+        return (self.total_bytes - self.completed_bytes) / self.bytes_per_second
+
+
+@dataclass(frozen=True)
 class OperationDiagnostic:
     code: str
     message: str
@@ -149,6 +182,7 @@ class OperationEvent:
     progress: OperationProgress | None = None
     diagnostic: OperationDiagnostic | None = None
     result: OperationResult | None = None
+    transfer: TransferProgress | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.operation_id)
@@ -164,10 +198,16 @@ class OperationEvent:
                 raise TypeError("event kind, state and phase must be typed enums")
         if self.progress is not None and not isinstance(self.progress, OperationProgress):
             raise ValueError("invalid progress")
+        if self.transfer is not None and not isinstance(self.transfer, TransferProgress):
+            raise ValueError("invalid transfer progress")
         if self.diagnostic is not None and not isinstance(self.diagnostic, OperationDiagnostic):
             raise ValueError("invalid diagnostic")
-        if self.kind is OperationEventKind.PROGRESS and self.progress is None:
-            raise ValueError("a progress event requires progress")
+        if (
+            self.kind is OperationEventKind.PROGRESS
+            and self.progress is None
+            and self.transfer is None
+        ):
+            raise ValueError("a progress event requires logical or transfer progress")
         terminal_event = self.kind is OperationEventKind.RESULT
         if terminal_event != self.state.terminal or terminal_event != (self.result is not None):
             raise ValueError("terminal state, RESULT kind and result must occur together")

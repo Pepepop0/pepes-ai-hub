@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import FrozenInstanceError, fields, replace
+from dataclasses import FrozenInstanceError, asdict, fields, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import get_args
@@ -36,6 +36,7 @@ from local_ai_stack.operation_contracts import (
     OperationResult,
     OperationSnapshot,
     OperationState,
+    TransferProgress,
     advance_operation,
 )
 
@@ -72,6 +73,129 @@ def terminal(state=OperationState.SUCCEEDED, *, sequence=2):
 @pytest.mark.parametrize("state", list(OperationState))
 def test_only_success_and_failure_are_terminal(state):
     assert state.terminal == (state in {OperationState.SUCCEEDED, OperationState.FAILED})
+
+
+def test_old_event_without_transfer_progress_remains_valid():
+    old_event = OperationEvent(
+        "operation-1",
+        1,
+        OperationEventKind.STATE,
+        OperationState.PREPARING,
+        NOW,
+        OperationPhase.PREPARATION,
+        "Preparing generation",
+    )
+
+    assert old_event.transfer is None
+    assert advance_operation(None, old_event).last_event is old_event
+
+
+def test_determinate_transfer_derives_fraction_and_eta():
+    completed_bytes = int(2.77 * 1024**3)
+    total_bytes = int(4.07 * 1024**3)
+    bytes_per_second = 24.8 * 1024**2
+    transfer = TransferProgress(
+        completed_bytes=completed_bytes,
+        total_bytes=total_bytes,
+        bytes_per_second=bytes_per_second,
+    )
+
+    assert transfer.fraction == pytest.approx(completed_bytes / total_bytes)
+    assert round(transfer.fraction * 100) == 68
+    assert transfer.eta_seconds == pytest.approx((total_bytes - completed_bytes) / bytes_per_second)
+
+
+def test_transfer_without_total_stays_indeterminate_and_retains_observations():
+    transfer = TransferProgress(
+        completed_bytes=1_730_000_000,
+        bytes_per_second=26_004_684.8,
+    )
+
+    assert transfer.completed_bytes == 1_730_000_000
+    assert transfer.bytes_per_second == 26_004_684.8
+    assert transfer.fraction is None
+    assert transfer.eta_seconds is None
+
+
+@pytest.mark.parametrize("speed", [None, 0, 0.0])
+def test_transfer_speed_is_optional_and_zero_has_no_eta(speed):
+    transfer = TransferProgress(10, total_bytes=20, bytes_per_second=speed)
+
+    assert transfer.fraction == 0.5
+    assert transfer.eta_seconds is None
+
+
+def test_completed_transfer_has_zero_eta_when_positive_speed_is_known():
+    assert TransferProgress(20, 20, 5).eta_seconds == 0
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"completed_bytes": -1},
+        {"completed_bytes": True},
+        {"completed_bytes": 1.5},
+        {"completed_bytes": 1, "total_bytes": 0},
+        {"completed_bytes": 1, "total_bytes": -1},
+        {"completed_bytes": 1, "total_bytes": True},
+        {"completed_bytes": 1, "total_bytes": 1.5},
+        {"completed_bytes": 2, "total_bytes": 1},
+        {"completed_bytes": 1, "bytes_per_second": -1},
+        {"completed_bytes": 1, "bytes_per_second": float("nan")},
+        {"completed_bytes": 1, "bytes_per_second": float("inf")},
+        {"completed_bytes": 1, "bytes_per_second": float("-inf")},
+        {"completed_bytes": 1, "bytes_per_second": True},
+        {"completed_bytes": 1, "bytes_per_second": "fast"},
+    ],
+)
+def test_transfer_rejects_invalid_invariants(values):
+    with pytest.raises(ValueError):
+        TransferProgress(**values)
+
+
+def test_transfer_only_progress_is_independent_from_logical_progress():
+    current = advance_operation(None, event())
+    update = event(
+        sequence=2,
+        kind=OperationEventKind.PROGRESS,
+        transfer=TransferProgress(10, 20),
+    )
+
+    current = advance_operation(current, update)
+
+    assert current.last_event.progress is None
+    assert current.last_event.transfer.fraction == 0.5
+
+
+def test_transfer_serialization_has_only_source_observations():
+    update = event(
+        sequence=2,
+        kind=OperationEventKind.PROGRESS,
+        progress=OperationProgress(2, 5),
+        transfer=TransferProgress(10, 20, 2),
+    )
+
+    serialized = asdict(update)
+
+    assert serialized["progress"] == {"completed": 2, "total": 5}
+    assert serialized["transfer"] == {
+        "completed_bytes": 10,
+        "total_bytes": 20,
+        "bytes_per_second": 2,
+    }
+    assert "percentage" not in serialized["transfer"]
+    assert "eta_seconds" not in serialized["transfer"]
+
+
+def test_transfer_does_not_change_terminal_stream_semantics():
+    current = advance_operation(None, event())
+    final = replace(terminal(), transfer=TransferProgress(20, 20, 5))
+
+    current = advance_operation(current, final)
+
+    assert current.last_event.transfer.eta_seconds == 0
+    with pytest.raises(ValueError, match="already terminal"):
+        advance_operation(current, event(sequence=3))
 
 
 @pytest.mark.parametrize("state", [OperationState.SUCCEEDED, OperationState.FAILED])
@@ -447,5 +571,11 @@ def test_foundation_has_no_ui_provider_or_transport_dependency():
         "progress",
         "diagnostic",
         "result",
+        "transfer",
+    }
+    assert {field.name for field in fields(TransferProgress)} == {
+        "completed_bytes",
+        "total_bytes",
+        "bytes_per_second",
     }
     assert {field.name for field in fields(OperationSnapshot)} == {"started_at", "last_event"}

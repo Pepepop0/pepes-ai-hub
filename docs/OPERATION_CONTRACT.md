@@ -4,6 +4,9 @@ Status: frozen for Wave A under Codex authority. Base: master
 `a0fa19741ae1049863d905f846e3026d9e93a89d` / `checkpoint-test-infra`.
 The checkpoint remains unchanged. This foundation adds values, protocols and a
 pure event reducer. It does not connect new behavior to the MVP entry point.
+The additive transfer-progress extension is based on master
+`740ec74c3e0d279e911542fcbae36a070cab7082` /
+`checkpoint-external-conflict-fix`; it remains a contract-only change.
 
 ## Authority and dependencies
 
@@ -81,6 +84,35 @@ exceed it and `fraction` is available. With unknown total, `fraction` is `None`;
 with no reliable count, omit progress entirely. Counts may restart for a new
 piece of phase work; they are not an overall monotonic percentage. Consumers
 must not invent a percentage from phases, queue position, node count or timers.
+
+`TransferProgress(completed_bytes, total_bytes=None, bytes_per_second=None)` is
+an independent, optional observation for byte transfers. `OperationEvent` adds
+it as its last optional field, so existing positional and keyword producers do
+not need to change. A `PROGRESS` event may contain logical progress, transfer
+progress or both. It must contain at least one of them. Existing consumers may
+ignore transfer progress and continue to use the same reducer and terminal
+semantics.
+
+Completed bytes are a nonnegative integer. A present total is a positive integer
+and cannot be smaller than completed bytes. A present speed is finite and
+nonnegative. Percentage is not stored: consumers derive it from `fraction` only
+when a total is present. ETA is also derived, as remaining bytes divided by speed,
+only when a total and a positive speed are available. Zero or absent speed, or an
+unknown total, yields no ETA. Logical work units and transfer bytes must never be
+substituted for one another, and neither supplies a fabricated overall install
+percentage.
+
+Future UI consumers render these observations as follows; this foundation does
+not implement that UI:
+
+- Known total: a determinate bar and derived percentage, followed by transferred
+  and total bytes, for example `68%`, `2.77 GiB / 4.07 GiB`; show an observed
+  speed such as `24.8 MiB/s` and derived ETA such as `~53 s` only when available.
+- Completed bytes without a total: indeterminate `Baixando...`, the transferred
+  amount such as `1.73 GiB`, and speed only when available. Never show a bar,
+  percentage or ETA for this case.
+- No transfer observation: an indeterminate activity indicator such as
+  `[>] Instalando dependências...`. Never infer a percentage from elapsed time.
 
 `OperationResult` requires `SUCCEEDED` or `FAILED`, operation ID, optional opaque
 output references, at most eight diagnostics and optional duration.

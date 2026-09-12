@@ -63,6 +63,7 @@ from .integration import (
     IntegrationOptions,
     IntegrationSnapshot,
     ManagedPlanPhases,
+    ManagedPreflightCode,
     ManagedPreflightReport,
     build_service_controller,
     default_install_actions,
@@ -73,7 +74,13 @@ from .integration import (
     provision_context,
     stage_managed_plan,
 )
-from .inventory import ListenerReport, ProcessReport, list_listeners, list_processes
+from .inventory import (
+    ListenerReport,
+    ProcessReport,
+    ScanOutcome,
+    list_listeners,
+    list_processes,
+)
 from .inventory import lookup_process as default_lookup_process
 from .launcher import ProcessLauncher
 from .managed_config import ManagedConfigWriter
@@ -113,6 +120,20 @@ START_ORDER: tuple[str, ...] = (
 # Hosts a launch target may point at. The endpoint domain derives the URL; this
 # is the last check before handing it to something that will open it.
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _external_endpoint_occupants(
+    report: ManagedPreflightReport,
+    component_id: str,
+    listeners: ListenerReport,
+    managed_pids: frozenset[int],
+):
+    spec = report.endpoints.spec(component_id)
+    return tuple(
+        listener
+        for listener in listeners.on_port(spec.port, spec.host)
+        if listener.pid is None or listener.pid not in managed_pids
+    )
 
 
 class OperationBusy(RuntimeError):
@@ -271,6 +292,7 @@ class StackApplication:
         self._conflicts = ExternalConflictSession(
             lookup_process=lambda pid: self.deps.lookup_process(pid),
             list_listeners=lambda: self.deps.list_listeners(),
+            external_path=self._external_install_path,
             terminate_process=lambda pid, create_time: self.deps.terminate_process(
                 pid, create_time
             ),
@@ -485,10 +507,18 @@ class StackApplication:
             managed_pids=managed,
         )
 
+    def _external_install_path(self, component_id: str) -> Path | None:
+        provisioner = self.provisioners().get(component_id)
+        if provisioner is None:
+            return None
+        detection = provisioner.detect(self.provision_context())
+        return detection.path if detection.is_external else None
+
     def check_conflicts(self, profile_id: str) -> ConflictPreflightReport | None:
         """A typed, resolvable view of any external conflict blocking this profile.
 
-        Read-only, and safe to call as often as needed. Returns ``None`` when
+        Performs no filesystem or process mutation and is safe to call as often
+        as needed. Returns ``None`` when
         there is nothing a policy could resolve here -- including when the
         profile is simply not installable for an unrelated reason (incompatible
         hardware, low disk, an unrelated port squatter), which stays a normal
@@ -503,6 +533,25 @@ class StackApplication:
             if self.layout.root.exists()
             else frozenset()
         )
+        if listeners.outcome is ScanOutcome.OK:
+            passive = {
+                issue.component_id
+                for issue in raw.issues
+                if issue.code is ManagedPreflightCode.ALONGSIDE_REQUIRED
+                and issue.component_id is not None
+                and not _external_endpoint_occupants(
+                    raw, issue.component_id, listeners, managed_pids
+                )
+            }
+            if passive:
+                self.options = IntegrationOptions(
+                    host=self.options.host,
+                    port_overrides=self.options.port_overrides,
+                    alongside_external=frozenset(self.options.alongside_external | passive),
+                )
+                self._installers.clear()
+                raw = self.preflight(profile)
+                listeners = self.deps.list_listeners()
         return self._conflicts.observe(
             profile=profile,
             options=self.options,

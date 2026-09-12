@@ -21,7 +21,6 @@ from .config import InstalledConfig
 from .execution import PlanExecutor
 from .external_conflict_contracts import (
     ConflictPolicySelection,
-    ConflictPreflightDisposition,
     ConflictPreflightReport,
     ConflictResolutionResult,
     ConflictResolutionStatus,
@@ -41,6 +40,7 @@ from .runtime import StackRuntime, stack_runtime
 from .system import SystemFacts, detect_system
 from .tui.appearance import TuiAppearance, resolve_tui_appearance, textual_theme
 from .tui.application import (
+    ConflictResolutionRequired,
     HubApplication,
     HubError,
     HubUnavailable,
@@ -253,6 +253,7 @@ class LocalAIStackApp(App):
         # an install gets the frozen installation heading; a lifecycle command
         # that fails is not "an installation that did not conclude".
         self._operation_kind: str | None = None
+        self._pending_install_selection: InstallSelection | None = None
 
         installation = self._installation()
         installed_profile = installation.profile_id if installation.ready else None
@@ -380,19 +381,37 @@ class LocalAIStackApp(App):
         self.push_screen(WizardScreen(choices, preselect=SUGGESTED_PROFILE))
 
     def on_wizard_screen_install_requested(self, message: WizardScreen.InstallRequested) -> None:
-        wizard = self.wizard
         self.select_profile(message.selection.profile_id)
+        self._pending_install_selection = message.selection
+        self._start_install(message.selection)
+
+    def _start_install(self, selection: InstallSelection) -> None:
+        """Run preflight synchronously; an operation exists only after it accepts."""
+        wizard = self.wizard
         try:
             self._operation_kind = "install"
-            self.application.install(message.selection)
+            self.application.install(selection)
             self._set_installation(
                 InstallLocation(
-                    message.selection.mode,
-                    Path(message.selection.custom_root) if message.selection.custom_root else None,
+                    selection.mode,
+                    Path(selection.custom_root) if selection.custom_root else None,
                 )
             )
-        except HubError as error:
+        except ConflictResolutionRequired as conflict:
+            self._operation_kind = None
+            report = conflict.report
+            checker = getattr(self.application, "current_conflict_preflight", None)
+            if checker is not None:
+                try:
+                    report = checker() or report
+                except HubUnavailable:
+                    pass
             if wizard is not None:
+                wizard.show_conflict(report)
+        except HubError as error:
+            self._operation_kind = None
+            if wizard is not None:
+                wizard.go_to(WizardStep.REVIEW)
                 wizard.show_refusal(str(error))
             self._notice(str(error), error=True)
 
@@ -419,35 +438,8 @@ class LocalAIStackApp(App):
         wizard = self.wizard
         if wizard is not None:
             wizard.show_operation(view)
-        if view is not None and not view.terminal:
-            self._check_conflict()
         if view is not None and view.terminal:
             self.refresh_projections()
-
-    def _check_conflict(self) -> None:
-        """The application pauses before mutating anything; ask if it has.
-
-        Checked after every non-terminal event of a watched install, which is
-        cheap and catches the pause regardless of which phase it happens in.
-        A lifecycle command never watches for this: only an install can hit an
-        external runtime conflict during first-run provisioning.
-        """
-        wizard = self.wizard
-        if wizard is None or self._operation_kind != "install":
-            return
-        if wizard.state.step not in (WizardStep.PROGRESS, WizardStep.CONFLICT):
-            return
-        # An application built before conflict resolution landed simply has no
-        # such method; that is "never a conflict", not an error.
-        checker = getattr(self.application, "current_conflict_preflight", None)
-        if checker is None:
-            return
-        try:
-            report = checker()
-        except HubUnavailable:
-            return
-        if report is not None and report.disposition is not ConflictPreflightDisposition.READY:
-            wizard.show_conflict(report)
 
     def on_wizard_screen_conflict_policy_chosen(
         self, message: WizardScreen.ConflictPolicyChosen
@@ -478,10 +470,36 @@ class LocalAIStackApp(App):
 
     def on_conflict_resolved(self, message: ConflictResolved) -> None:
         wizard = self.wizard
+        if message.result.status is ConflictResolutionStatus.FAILED and wizard is not None:
+            checker = getattr(self.application, "current_conflict_preflight", None)
+            if checker is not None:
+                try:
+                    report = checker()
+                except HubUnavailable:
+                    report = None
+                if report is not None:
+                    wizard.show_conflict(report)
+            wizard.apply_resolution(message.result)
+            return
         if wizard is not None:
             wizard.apply_resolution(message.result)
         if message.result.status is ConflictResolutionStatus.ABORTED:
             self._operation_kind = None
+            self._pending_install_selection = None
+        elif message.result.status is ConflictResolutionStatus.PROCEED:
+            selection = self._pending_install_selection
+            if selection is None:
+                if wizard is not None:
+                    wizard.apply_resolution(
+                        ConflictResolutionResult(
+                            message.result.preflight_id,
+                            message.result.policy,
+                            ConflictResolutionStatus.FAILED,
+                            "A seleção de instalação não está mais disponível.",
+                        )
+                    )
+                return
+            self._start_install(selection)
 
     def refresh_projections(self) -> None:
         """Ask the application again and repaint whatever repeats its answers."""

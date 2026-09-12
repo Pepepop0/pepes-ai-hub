@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from ..application_contracts import ApplicationReadModel
+from ..external_conflict_contracts import ConflictPreflightReport
 from ..installation import InstallLocationMode
 
 
@@ -32,6 +33,14 @@ class HubUnavailable(HubError):
 
 class OperationBusy(HubError):
     """Another operation is still running; the request was not started."""
+
+
+class ConflictResolutionRequired(HubError):
+    """Preflight needs a policy choice; no installation operation exists yet."""
+
+    def __init__(self, report: ConflictPreflightReport) -> None:
+        super().__init__("Serviços externos conflitantes foram encontrados.")
+        self.report = report
 
 
 @dataclass(frozen=True)
@@ -124,6 +133,7 @@ class HubApplication(ApplicationReadModel, Protocol):
 
 
 __all__ = [
+    "ConflictResolutionRequired",
     "HubApplication",
     "HubError",
     "HubUnavailable",

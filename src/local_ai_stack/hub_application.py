@@ -14,7 +14,11 @@ from uuid import uuid4
 
 from .compatibility import evaluate_compatibility
 from .config import InstalledConfig, config_path, dumps, loads
-from .external_conflict_contracts import ConflictPolicySelection, ConflictResolutionResult
+from .external_conflict_contracts import (
+    ConflictPolicySelection,
+    ConflictResolutionResult,
+    ConflictResolutionStatus,
+)
 from .external_conflicts import ConflictResolutionRequired as _BackendConflictRequired
 from .installation import (
     InstallLocation,
@@ -25,6 +29,7 @@ from .operation_contracts import OperationEvent, OperationEventSink, OperationSn
 from .profiles import Profile, load_profiles
 from .stack_application import StackApplication, StackDependencies
 from .tui.application import (
+    ConflictResolutionRequired,
     HubError,
     HubUnavailable,
     InstallationView,
@@ -34,20 +39,6 @@ from .tui.application import (
     OperationBusy,
     ProfileChoice,
 )
-
-
-class ConflictResolutionRequired(HubError):
-    """An external service conflicts with this profile; nothing was started.
-
-    Safe to show like any :class:`HubError`. ``report`` carries what a chooser
-    needs: :attr:`~ConflictPreflightReport.available_policies` and
-    :attr:`~ConflictPreflightReport.recommended_policy`. Resolve it with
-    :meth:`HubApplicationAdapter.resolve_conflict`, then call ``install`` again.
-    """
-
-    def __init__(self, report) -> None:
-        super().__init__("Serviços externos conflitantes foram encontrados.")
-        self.report = report
 
 
 class HubApplicationAdapter:
@@ -218,14 +209,23 @@ class HubApplicationAdapter:
                 "Não foi possível verificar conflitos com serviços externos."
             ) from exc
 
-    def resolve_conflict(self, selection: ConflictPolicySelection) -> ConflictResolutionResult:
-        """Authorize one policy for the pending conflict. Call before ``install`` again."""
+    def resolve_external_conflicts(
+        self, selection: ConflictPolicySelection
+    ) -> ConflictResolutionResult:
+        """Bridge the frozen consumer command to the bound backend session."""
         try:
-            return self.backend.resolve_conflict(selection)
+            result = self.backend.resolve_conflict(selection)
+            if result.status is ConflictResolutionStatus.FAILED:
+                self.backend.check_conflicts(self._profile_id())
+            return result
         except Exception as exc:
             raise HubUnavailable(
                 "Não foi possível processar a decisão sobre os serviços externos."
             ) from exc
+
+    def resolve_conflict(self, selection: ConflictPolicySelection) -> ConflictResolutionResult:
+        """Compatibility alias for callers predating the consumer protocol name."""
+        return self.resolve_external_conflicts(selection)
 
     def _command(self, name: str) -> str:
         with self._lock:

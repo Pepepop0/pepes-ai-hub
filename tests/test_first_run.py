@@ -678,6 +678,25 @@ def test_d_scenario_custom_root_beside_an_external_elsewhere_has_no_filesystem_c
         ollama_ext.release()
 
 
+def test_external_installation_without_a_runtime_listener_is_observation_only():
+    """An external path alone enables managed provisioning without asking a policy."""
+    built = controlled_stack(ready_ports=(11434, 8080, 8188))
+    ollama_ext = external_install("ollama")
+    try:
+        built.runner.on_path.update(ollama_ext.on_path)
+        built.runner.fake_env.update(ollama_ext.env)
+
+        result = built.app.first_run("op-1", CAPELLA)
+
+        assert result.state is OperationState.SUCCEEDED
+        assert built.app.options.allows_alongside("ollama")
+        assert "ollama" not in built.app.options.port_overrides
+        assert built.app.current_conflict_preflight() is None
+    finally:
+        built.release()
+        ollama_ext.release()
+
+
 def test_e_scenario_the_alternate_endpoint_being_occupied_blocks_with_a_diagnostic():
     """E) Alt endpoint also occupied and identity unprovable: BLOCKED, not a choice."""
     from local_ai_stack.inventory import Listener
@@ -804,14 +823,15 @@ def test_hub_application_surfaces_the_conflict_and_resumes_after_resolution():
             with pytest.raises(HubConflictRequired) as excinfo:
                 adapter.install(InstallSelection(CAPELLA))
             assert not adapter._busy
+            assert adapter.current_operation() is None
             report = excinfo.value.report
             assert adapter.current_conflict_preflight() is not None
 
-            resolution = adapter.resolve_conflict(
-                ConflictPolicySelection(
-                    report.preflight_id, ExternalConflictPolicy.INSTALL_ALONGSIDE
-                )
+            selection = ConflictPolicySelection(
+                report.preflight_id, ExternalConflictPolicy.INSTALL_ALONGSIDE
             )
+            assert set(vars(selection)) == {"preflight_id", "policy"}
+            resolution = adapter.resolve_external_conflicts(selection)
             assert resolution.status.value == "proceed"
             assert adapter.current_conflict_preflight() is None
 

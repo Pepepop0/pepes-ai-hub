@@ -26,9 +26,11 @@ name search, never a bare caller-supplied pid, never a second escalation.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import uuid4
 
 try:
@@ -146,6 +148,23 @@ def _hard_blocker(issue) -> ConflictHardBlocker:
     return ConflictHardBlocker(str(issue.code), safe_text(issue.detail))
 
 
+def _matches_external_install(executable: str | None, detected_path: Path | None) -> bool:
+    """Bind process evidence to the external installation detected for its service."""
+    if executable is None or detected_path is None:
+        return False
+    executable_path = Path(executable)
+    detected = Path(detected_path)
+    if detected.is_dir():
+        try:
+            executable_path.resolve(strict=False).relative_to(detected.resolve(strict=False))
+            return True
+        except ValueError:
+            return False
+    return os.path.normcase(os.path.abspath(executable_path)) == os.path.normcase(
+        os.path.abspath(detected)
+    )
+
+
 def terminate_by_pid(pid: int, create_time: float) -> bool:
     """Ask one already identity-confirmed process to end. No tree, no retry.
 
@@ -190,6 +209,7 @@ class ExternalConflictSession:
         lookup_process: Callable[[int], object] = default_lookup_process,
         list_listeners: Callable[[], ListenerReport] = default_list_listeners,
         alongside_ports: Mapping[str, int] = ALONGSIDE_PORTS,
+        external_path: Callable[[str], Path | None] = lambda _service_id: None,
         terminate_process: Callable[[int, float], bool] = terminate_by_pid,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
@@ -197,6 +217,7 @@ class ExternalConflictSession:
         self._lookup_process = lookup_process
         self._list_listeners = list_listeners
         self._alongside_ports = dict(alongside_ports)
+        self._external_path = external_path
         self._terminate = terminate_process
         self._monotonic = monotonic
         self._sleep = sleep
@@ -307,6 +328,8 @@ class ExternalConflictSession:
             return None
         if lookup.process.create_time is None:
             return None
+        if not _matches_external_install(lookup.process.exe, self._external_path(component_id)):
+            return None
         return _ConflictEvidence(
             component_id, host, port, pid, lookup.process.exe, lookup.process.create_time
         )
@@ -347,9 +370,9 @@ class ExternalConflictSession:
         if selection.preflight_id in self._consumed:
             raise ValueError("this preflight has already been resolved")
         report.validate_selection(selection)
-        self._consumed.add(selection.preflight_id)
 
         if selection.policy is ExternalConflictPolicy.ABORT:
+            self._consumed.add(selection.preflight_id)
             return ConflictResolutionResult(
                 selection.preflight_id,
                 selection.policy,
@@ -357,13 +380,39 @@ class ExternalConflictSession:
                 "Instalação cancelada.",
             )
         if selection.policy is ExternalConflictPolicy.INSTALL_ALONGSIDE:
+            failure = self._recheck_alongside(report, selection)
+            if failure is not None:
+                return failure
+            self._consumed.add(selection.preflight_id)
             return ConflictResolutionResult(
                 selection.preflight_id,
                 selection.policy,
                 ConflictResolutionStatus.PROCEED,
                 "Instalando ao lado das instalações existentes.",
             )
+        self._consumed.add(selection.preflight_id)
         return self._stop_conflicts(report, selection)
+
+    def _recheck_alongside(
+        self, report: ConflictPreflightReport, selection: ConflictPolicySelection
+    ) -> ConflictResolutionResult | None:
+        """Confirm every fixed managed endpoint is still free before accepting it."""
+        listeners = self._list_listeners()
+        if listeners.outcome is not ScanOutcome.OK:
+            return self._stop_failed(
+                selection, "Não foi possível confirmar que os endpoints isolados estão livres."
+            )
+        for conflict in report.conflicts:
+            endpoint = conflict.managed_endpoint
+            if endpoint is None or _occupants(
+                listeners, endpoint.host, endpoint.port, self._managed_pids
+            ):
+                return self._stop_failed(
+                    selection,
+                    f"O endpoint isolado de {_DISPLAY.get(str(conflict.service_id), str(conflict.service_id))} "
+                    "não está mais livre.",
+                )
+        return None
 
     def _stop_conflicts(
         self, report: ConflictPreflightReport, selection: ConflictPolicySelection
@@ -374,6 +423,13 @@ class ExternalConflictSession:
         a mismatch on re-check, or a port that never clears, and this reports
         FAILED without touching anything further.
         """
+        listeners = self._list_listeners()
+        if listeners.outcome is not ScanOutcome.OK:
+            return self._stop_failed(
+                selection, "Não foi possível reconfirmar os conflitos externos; nada foi encerrado."
+            )
+
+        verified: list[tuple[str, _ConflictEvidence]] = []
         for conflict in report.conflicts:
             service_id = str(conflict.service_id)
             name = _DISPLAY.get(service_id, service_id)
@@ -383,6 +439,14 @@ class ExternalConflictSession:
                     selection,
                     f"Não há identidade suficiente para parar {name} com segurança; "
                     "nada foi encerrado.",
+                )
+            still_listening = any(
+                item.pid == proof.pid for item in listeners.on_port(proof.port, proof.host)
+            )
+            if not still_listening:
+                return self._stop_failed(
+                    selection,
+                    f"{name} não ocupa mais o endpoint observado; nada foi encerrado.",
                 )
             fresh = self._lookup_process(proof.pid)
             if fresh.outcome is not LookupOutcome.FOUND or fresh.process is None:
@@ -394,6 +458,9 @@ class ExternalConflictSession:
                     selection,
                     f"O processo em {name} mudou desde a verificação; nada foi encerrado.",
                 )
+            verified.append((name, proof))
+
+        for name, proof in verified:
             if not self._terminate(proof.pid, proof.create_time):
                 return self._stop_failed(selection, f"Não foi possível parar {name}.")
             if not self._wait_for_free(proof):

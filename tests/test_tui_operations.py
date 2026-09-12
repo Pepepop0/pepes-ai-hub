@@ -946,18 +946,18 @@ def test_the_frozen_contracts_were_not_edited_here():
 
 # --- external conflict UX ---------------------------------------------------
 #
-# The application pauses an install before mutating anything and reports a
-# ConflictPreflightReport; the wizard shows a choice, confirms a stop, and
-# resumes the same operation rather than restarting the wizard from scratch.
+# Preflight reports a ConflictPreflightReport before an operation exists. The
+# wizard resolves it, then submits the preserved selection as a real install.
 
 
 async def walk_to_conflict(
     pilot, fake: FakeHubApplication, *, profile: str = "capella", mode: str = "default"
 ) -> None:
-    """Reach REVIEW, install, and let the paused first event surface the conflict."""
+    """Reach REVIEW and surface preflight conflict without creating an operation."""
     await walk_to_review(pilot, profile=profile, mode=mode)
     await click(pilot, "#wizard-next")
-    await pump(pilot, fake, 1)
+    assert fake.current_operation() is None
+    assert fake.emitted == []
 
 
 def test_no_conflicts_is_the_ordinary_flow_untouched():
@@ -1013,7 +1013,7 @@ def test_an_alongside_conflict_shows_the_choice_screen():
     run(exercise)
 
 
-def test_install_alongside_resumes_the_same_operation_without_restarting_the_wizard():
+def test_install_alongside_starts_the_first_real_operation_after_preflight():
     async def exercise() -> None:
         report = conflict_report(alongside_conflict())
         app, fake, opened = hub(FakeHubApplication(conflict_report=report))
@@ -1021,9 +1021,10 @@ def test_install_alongside_resumes_the_same_operation_without_restarting_the_wiz
             await pilot.pause()
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
-            operation_before = app.operation_view.operation_id
+            assert app.operation_view is None
 
             await click(pilot, "#wizard-conflict-alongside")
+            await app.workers.wait_for_complete()
             await pilot.pause()
 
             assert len(fake.resolutions) == 1
@@ -1036,9 +1037,10 @@ def test_install_alongside_resumes_the_same_operation_without_restarting_the_wiz
             await pump(pilot, fake)
 
             assert screen.state.step is WizardStep.DONE
-            assert app.operation_view.operation_id == operation_before, "same operation resumed"
+            assert app.operation_view.operation_id == "install-1"
             assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
-            assert len(fake.calls) == 1, "the wizard was never restarted"
+            assert len(fake.calls) == 2, "preflight attempt plus the accepted install"
+            assert {event.operation_id for event in fake.emitted} == {"install-1"}
 
             await click(pilot, "#wizard-open-webui")
             assert opened == ["http://127.0.0.1:8080/"]
@@ -1084,6 +1086,7 @@ def test_confirming_stop_sends_only_the_frozen_selection_and_resumes():
             await walk_to_conflict(pilot, fake)
             await click(pilot, "#wizard-conflict-stop")
             await click(pilot, "#wizard-confirm-stop")
+            await app.workers.wait_for_complete()
             await pilot.pause()
 
             assert len(fake.resolutions) == 1
@@ -1116,6 +1119,7 @@ def test_an_unsafe_conflict_never_offers_stop_but_alongside_still_works():
             assert "Este serviço não pode ser encerrado com segurança pelo Hub." in pane
 
             await click(pilot, "#wizard-conflict-alongside")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             assert screen.state.step is WizardStep.PROGRESS
             await pump(pilot, fake)
@@ -1222,6 +1226,7 @@ def test_custom_path_stays_correct_through_a_conflict_and_is_not_confused_for_in
             assert "inválid" not in text(app, "#wizard-conflict-report").lower()
 
             await click(pilot, "#wizard-conflict-alongside")
+            await app.workers.wait_for_complete()
             await pilot.pause()
             await pump(pilot, fake)
 

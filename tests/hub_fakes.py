@@ -41,6 +41,7 @@ from local_ai_stack.operation_contracts import (
     advance_operation,
 )
 from local_ai_stack.tui.application import (
+    ConflictResolutionRequired,
     HubUnavailable,
     InstallationView,
     InstallSelection,
@@ -356,7 +357,6 @@ class FakeHubApplication:
     def __post_init__(self) -> None:
         self._snapshot: OperationSnapshot | None = None
         self._pending: list[OperationEvent] = []
-        self._post_conflict: list[OperationEvent] = []
         self._active_conflict: ConflictPreflightReport | None = None
         self._sinks: list[_Subscription] = []
         self._operation_kind: str | None = None
@@ -400,20 +400,14 @@ class FakeHubApplication:
 
     def install(self, selection: InstallSelection) -> str:
         self._check_available()
-        operation_id = self._begin("install")
         self.calls.append(("install", selection))
         self._selection = selection
-        script = install_script(operation_id, fail_at=self.install_fail_at)
         if self.conflict_report is not None:
-            # Paused before any mutation: only the first (PREPARING) event is
-            # released. The rest waits for resolve_external_conflicts.
             self._active_conflict = self.conflict_report
-            self._pending = script[:1]
-            self._post_conflict = script[1:]
-        else:
-            self._active_conflict = None
-            self._pending = script
-            self._post_conflict = []
+            raise ConflictResolutionRequired(self.conflict_report)
+        operation_id = self._begin("install")
+        self._active_conflict = None
+        self._pending = install_script(operation_id, fail_at=self.install_fail_at)
         return operation_id
 
     def current_conflict_preflight(self) -> ConflictPreflightReport | None:
@@ -432,9 +426,6 @@ class FakeHubApplication:
         if selection.policy is ExternalConflictPolicy.ABORT:
             self._active_conflict = None
             self._pending = []
-            self._post_conflict = []
-            self._snapshot = None
-            self._operation_kind = None
             return ConflictResolutionResult(
                 selection.preflight_id,
                 selection.policy,
@@ -449,8 +440,7 @@ class FakeHubApplication:
                 "Não foi possível aplicar a política escolhida.",
             )
         self._active_conflict = None
-        self._pending = self._post_conflict
-        self._post_conflict = []
+        self.conflict_report = None
         return ConflictResolutionResult(
             selection.preflight_id,
             selection.policy,

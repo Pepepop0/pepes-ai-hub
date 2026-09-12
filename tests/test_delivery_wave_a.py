@@ -12,15 +12,19 @@ from first_run_support import CHAT_REFERENCE, controlled_stack
 from textual.widgets import Button, Input, Static
 
 from local_ai_stack.app import LocalAIStackApp
+from local_ai_stack.components import ComponentId
 from local_ai_stack.config import config_path, loads
 from local_ai_stack.e2e import tracking
 from local_ai_stack.e2e.fixtures import external_install
-from local_ai_stack.e2e.providers import EXTERNAL_PID
+from local_ai_stack.e2e.providers import EXTERNAL_PID, UNRELATED_PID
 from local_ai_stack.e2e.seams import Injection, InjectionPlan
+from local_ai_stack.external_conflict_contracts import ExternalConflictPolicy
+from local_ai_stack.external_conflicts import ALONGSIDE_PORTS
 from local_ai_stack.first_run import FirstRunCoordinator
 from local_ai_stack.hub_application import create_hub_application
 from local_ai_stack.installation import InstallLocation, InstallLocationMode, resolve_installation
 from local_ai_stack.integration import IntegrationOptions
+from local_ai_stack.inventory import Listener
 from local_ai_stack.layout import ENV_ROOT
 from local_ai_stack.operation_contracts import OperationEventKind, OperationState, advance_operation
 from local_ai_stack.runtime import StackRuntime
@@ -84,7 +88,9 @@ def tui(adapter):
         runtime_snapshot=StackRuntime((), ServiceState.DOWN),
         installed_config=adapter.config,
         integration=adapter.backend._integration(),
-        executor_factory=lambda _: adapter.backend.executor(adapter.backend.profile("capella")),
+        executor_factory=lambda _: adapter.backend.executor(
+            adapter.backend.profile(adapter.profiles[0].id)
+        ),
         application=adapter,
         open_browser=lambda url: opened.append(url) or True,
     )
@@ -99,9 +105,9 @@ async def click(pilot, selector):
     await pilot.pause()
 
 
-async def review(pilot, *, mode="default", root=None):
+async def review(pilot, *, profile="capella", mode="default", root=None):
     await click(pilot, "#wizard-next")
-    await click(pilot, "#wizard-profile-capella")
+    await click(pilot, f"#wizard-profile-{profile}")
     await click(pilot, "#wizard-next")
     await click(pilot, f"#wizard-mode-{mode}")
     if root is not None:
@@ -126,6 +132,31 @@ def assert_streams(events):
         assert (
             sum(e.kind is OperationEventKind.RESULT for e in events if e.operation_id == op_id) == 1
         )
+
+
+def _test_profile_yaml() -> str:
+    """Resolved 12 GB fixture profile presented to the controlled UI as Test."""
+    source = (Path(__file__).resolve().parents[1] / "profiles" / "capella.yaml").read_text(
+        encoding="utf-8"
+    )
+    return (
+        source.replace("id: capella", "id: test", 1)
+        .replace("name: Capella", "name: Test", 1)
+        .replace("min_vram_gb: 32", "min_vram_gb: 8", 1)
+        .replace("recommended_vram_gb: 32", "recommended_vram_gb: 12", 1)
+    )
+
+
+def _use_isolated_launcher(world, *component_ids: str) -> None:
+    original = world.app.deps.launcher
+
+    def launcher(registry):
+        controlled = original(registry)
+        for component_id in component_ids:
+            controlled.ready_ports[component_id] = ALONGSIDE_PORTS[component_id]
+        return controlled
+
+    world.app.deps.launcher = launcher
 
 
 def test_capella_wizard_runs_the_real_coordinator_and_stream_without_blocking_ui(
@@ -462,6 +493,272 @@ def test_external_survives_real_adapter_lifecycle(composition):
             assert all(EXTERNAL_PID not in tree for tree in world.launcher.started_trees.values())
         assert world.launcher.registry.load().entries == {}
         assert world.launcher.members == {}
+    finally:
+        external.release()
+
+
+def test_real_tui_backend_alongside_custom_test_profile_and_second_run(composition):
+    """A/G/H/I: preflight choice starts one real operation on isolated endpoints."""
+    world, adapter, _ = composition(
+        profile_id="test",
+        profile_yaml=_test_profile_yaml(),
+        vram_mib=12227,
+        ready_ports=(11434, 8080, 8188, *ALONGSIDE_PORTS.values()),
+    )
+    ollama_external = external_install("ollama")
+    comfy_external = external_install("comfyui")
+    try:
+        world.runner.on_path.update(ollama_external.on_path)
+        world.runner.on_path.update(comfy_external.on_path)
+        world.runner.fake_env.update(ollama_external.env)
+        world.runner.fake_env.update(comfy_external.env)
+        world.inventory.add_external(11434, pid=9101, executable=str(ollama_external.path))
+        world.inventory.add_external(
+            8188, pid=9102, executable=str(comfy_external.path), name="comfyui"
+        )
+        _use_isolated_launcher(world, "ollama", "comfyui")
+        external_before = (ollama_external.snapshot(), comfy_external.snapshot())
+        custom_root = world.root.path / "loira-40k"
+        app, _ = tui(adapter)
+
+        async def exercise():
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await review(pilot, profile="test", mode="custom", root=custom_root)
+                await click(pilot, "#wizard-next")
+
+                assert app.screen.state.step is WizardStep.CONFLICT
+                assert app.operation_view is None
+                assert adapter.current_operation() is None
+                report = adapter.current_conflict_preflight()
+                assert report is not None
+                assert {str(item.service_id) for item in report.conflicts} == {
+                    str(ComponentId.OLLAMA),
+                    str(ComponentId.COMFYUI),
+                }
+                alongside = app.screen.query_one("#wizard-conflict-alongside", Button)
+                assert alongside.display and alongside.variant == "primary"
+
+                await click(pilot, "#wizard-conflict-alongside")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                await finish(pilot, adapter)
+
+                assert app.operation_view.succeeded
+                assert app.operation_view.operation_id is not None
+                assert app.screen.state.step is WizardStep.DONE
+                assert "Concluído" in str(app.screen.query_one("#wizard-title", Static).content)
+                assert "Tudo pronto" in str(
+                    app.screen.query_one("#wizard-step-done", Static).content
+                )
+                await click(pilot, "#wizard-finish")
+                assert not isinstance(app.screen, WizardScreen)
+                assert "Pronta" in str(app.query_one("#dashboard-overview", Static).content)
+
+        asyncio.run(exercise())
+
+        backend = adapter.backend
+        endpoints = backend.options.endpoints_for(backend.profile("test"))
+        assert endpoints.port(ComponentId.OLLAMA) == ALONGSIDE_PORTS["ollama"]
+        assert endpoints.port(ComponentId.COMFYUI) == ALONGSIDE_PORTS["comfyui"]
+        env_path = backend.layout.open_webui_data / "open-webui.env"
+        env_text = env_path.read_text(encoding="utf-8")
+        assert f"OLLAMA_BASE_URL=http://127.0.0.1:{ALONGSIDE_PORTS['ollama']}" in env_text
+        assert f"COMFYUI_BASE_URL=http://127.0.0.1:{ALONGSIDE_PORTS['comfyui']}" in env_text
+        assert {9101, 9102}.issubset(world.inventory.pids())
+        assert external_before == (ollama_external.snapshot(), comfy_external.snapshot())
+
+        stable_paths = (config_path(backend.layout), adapter.selection_path, env_path)
+        before_files = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in stable_paths}
+        before_work = (
+            len(world.artifacts.requests),
+            tuple(world.ollama.pulls),
+            tuple(world.launcher.starts),
+        )
+        adapter.install(InstallSelection("test", InstallLocationMode.CUSTOM, str(custom_root)))
+        adapter.wait(10)
+        assert adapter.current_operation().last_event.state is OperationState.SUCCEEDED
+        assert backend.last_first_run.did_nothing
+        assert before_work == (
+            len(world.artifacts.requests),
+            tuple(world.ollama.pulls),
+            tuple(world.launcher.starts),
+        )
+        assert before_files == {
+            path: (path.read_bytes(), path.stat().st_mtime_ns) for path in stable_paths
+        }
+        assert {9101, 9102}.issubset(world.inventory.pids())
+    finally:
+        ollama_external.release()
+        comfy_external.release()
+
+
+def test_real_tui_stop_confirmation_uses_only_adapter_preflight_authority(composition):
+    """B/F/I: confirmation forwards only the frozen selection and preserves strangers."""
+    world, adapter, _ = composition(
+        profile_id="test",
+        profile_yaml=_test_profile_yaml(),
+        vram_mib=12227,
+        ready_ports=(11434, 8080, 8188),
+    )
+    external = external_install("ollama")
+    try:
+        world.runner.on_path.update(external.on_path)
+        world.runner.fake_env.update(external.env)
+        world.inventory.add_external(11434, pid=9201, executable=str(external.path))
+        world.inventory.occupy(39999)
+        external_before = external.snapshot()
+        stopped: list[tuple[int, float]] = []
+
+        def terminate(pid: int, create_time: float) -> bool:
+            process = world.inventory.lookup_process(pid).process
+            if process is None or process.create_time != create_time:
+                return False
+            stopped.append((pid, create_time))
+            world.inventory.kill(pid)
+            return True
+
+        world.app.deps.terminate_process = terminate
+        selections = []
+        resolve = adapter.resolve_external_conflicts
+
+        def record_selection(selection):
+            selections.append(selection)
+            return resolve(selection)
+
+        adapter.resolve_external_conflicts = record_selection
+        app, _ = tui(adapter)
+
+        async def exercise():
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await review(pilot, profile="test")
+                await click(pilot, "#wizard-next")
+                assert app.screen.state.step is WizardStep.CONFLICT
+                assert adapter.current_operation() is None
+
+                await click(pilot, "#wizard-conflict-stop")
+                assert app.screen.state.step is WizardStep.CONFLICT_CONFIRM
+                assert selections == [] and stopped == []
+                await click(pilot, "#wizard-confirm-stop")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                await finish(pilot, adapter)
+                assert app.operation_view.succeeded
+                assert app.screen.state.step is WizardStep.DONE
+
+        asyncio.run(exercise())
+
+        assert len(selections) == 1
+        assert selections[0].policy is ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL
+        assert set(vars(selections[0])) == {"preflight_id", "policy"}
+        assert stopped == [(9201, 1.0)]
+        assert 9201 not in world.inventory.pids()
+        assert UNRELATED_PID in world.inventory.pids()
+        assert external.snapshot() == external_before
+
+        before_work = (len(world.artifacts.requests), tuple(world.ollama.pulls))
+        adapter.install(InstallSelection("test"))
+        adapter.wait(10)
+        assert adapter.backend.last_first_run.did_nothing
+        assert before_work == (len(world.artifacts.requests), tuple(world.ollama.pulls))
+        assert UNRELATED_PID in world.inventory.pids()
+    finally:
+        external.release()
+
+
+def test_real_tui_unsafe_external_hides_stop_and_allows_alongside(composition):
+    """C: ambiguous process identity never becomes stop authority in the UI."""
+    world, adapter, _ = composition(
+        profile_id="test",
+        profile_yaml=_test_profile_yaml(),
+        vram_mib=12227,
+        ready_ports=(11434, 8080, 8188, ALONGSIDE_PORTS["ollama"]),
+    )
+    external = external_install("ollama")
+    try:
+        world.runner.on_path.update(external.on_path)
+        world.runner.fake_env.update(external.env)
+        world.inventory.add_external(11434, pid=9301, executable=str(external.path))
+        world.inventory.listeners.append(Listener("127.0.0.1", 11434, 9302))
+        _use_isolated_launcher(world, "ollama")
+        app, _ = tui(adapter)
+
+        async def exercise():
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await review(pilot, profile="test")
+                await click(pilot, "#wizard-next")
+                report = adapter.current_conflict_preflight()
+                assert report is not None and not report.conflicts[0].can_stop_safely
+                assert not app.screen.query_one("#wizard-conflict-stop", Button).display
+                assert app.screen.query_one("#wizard-conflict-alongside", Button).display
+
+                await click(pilot, "#wizard-conflict-alongside")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                await finish(pilot, adapter)
+                assert app.operation_view.succeeded
+
+        asyncio.run(exercise())
+        assert 9301 in world.inventory.pids()
+    finally:
+        external.release()
+
+
+def test_real_tui_blocked_alternate_endpoint_cancels_without_mutation(composition):
+    """D/E: no safe policy means human BLOCKED UX, no operation and no third port."""
+    world, adapter, _ = composition(
+        profile_id="test",
+        profile_yaml=_test_profile_yaml(),
+        vram_mib=12227,
+        ready_ports=(11434, 8080, 8188),
+    )
+    external = external_install("ollama")
+    try:
+        world.runner.on_path.update(external.on_path)
+        world.runner.fake_env.update(external.env)
+        world.inventory.add_external(11434, pid=9401, executable=str(external.path))
+        world.inventory.listeners.append(Listener("127.0.0.1", 11434, 9402))
+        world.inventory.occupy(ALONGSIDE_PORTS["ollama"], pid=9403)
+        pids_before = world.inventory.pids()
+        files_before = external.snapshot()
+        custom_root = world.root.path / "blocked-custom"
+        app, _ = tui(adapter)
+
+        async def exercise():
+            async with app.run_test(size=(120, 40)) as pilot:
+                await pilot.pause()
+                await review(pilot, profile="test", mode="custom", root=custom_root)
+                await click(pilot, "#wizard-next")
+                report = adapter.current_conflict_preflight()
+                assert report is not None and report.disposition.value == "blocked"
+                first_id = report.preflight_id
+                assert not app.screen.query_one("#wizard-conflict-alongside", Button).display
+                assert not app.screen.query_one("#wizard-conflict-stop", Button).display
+                shown = str(app.screen.query_one("#wizard-conflict-report", Static).content)
+                assert "nenhuma resolução segura" in shown
+                assert adapter.current_operation() is None
+
+                await click(pilot, "#wizard-conflict-abort")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app.screen.state.step is WizardStep.REVIEW
+                assert app.screen.state.custom_root == str(custom_root)
+                assert adapter.current_operation() is None
+
+                await click(pilot, "#wizard-next")
+                retry = adapter.current_conflict_preflight()
+                assert retry is not None and retry.preflight_id != first_id
+                assert app.screen.state.step is WizardStep.CONFLICT
+                assert adapter.current_operation() is None
+
+        asyncio.run(exercise())
+
+        assert world.inventory.pids() == pids_before
+        assert external.snapshot() == files_before
+        assert not custom_root.exists()
+        assert adapter.backend.options.port_overrides == {}
     finally:
         external.release()
 

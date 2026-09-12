@@ -286,8 +286,8 @@ class WizardScreen(Screen):
     def show_conflict(self, report: ConflictPreflightReport) -> None:
         """The application paused before mutating anything; present the choice.
 
-        Only reachable while an installation is in progress, so a decision here
-        never restarts the wizard - it resumes the same operation once resolved.
+        Preflight runs after the person requests installation but before an
+        operation id exists. A successful resolution starts the real operation.
         """
         if self.state.step not in (WizardStep.PROGRESS, WizardStep.CONFLICT):
             return
@@ -306,7 +306,7 @@ class WizardScreen(Screen):
             self._conflict_error = result.message
             self.go_to(WizardStep.CONFLICT)
             return
-        # PROCEED: the operation resumes on its own; only stop watching for it here.
+        # PROCEED: the app now submits the preserved install selection.
         self.conflict = None
         self._conflict_error = ""
         if self.state.step is not WizardStep.PROGRESS:

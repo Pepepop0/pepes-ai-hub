@@ -132,6 +132,9 @@ def session(inventory: FakeInventory, clock: FakeClock) -> ExternalConflictSessi
     return ExternalConflictSession(
         lookup_process=inventory.lookup_process,
         list_listeners=inventory.list_listeners,
+        external_path=lambda service_id: Path(
+            "comfyui.exe" if service_id == COMFYUI else "ollama.exe"
+        ),
         terminate_process=inventory.terminate,
         monotonic=clock.monotonic,
         sleep=clock.sleep,
@@ -311,6 +314,7 @@ def test_a_stop_that_never_frees_the_port_fails_without_a_second_attempt():
     backend = ExternalConflictSession(
         lookup_process=inventory.lookup_process,
         list_listeners=inventory.list_listeners,
+        external_path=lambda _service_id: Path("ollama.exe"),
         terminate_process=stubborn,
         monotonic=clock.monotonic,
         sleep=clock.sleep,
@@ -355,6 +359,70 @@ def test_ambiguous_identity_never_offers_stop_and_refuses_if_asked_anyway():
             )
         )
     assert not inventory.terminated
+    assert 4242 in inventory.processes
+
+
+def test_a_stable_unrelated_executable_on_the_port_is_not_safe_stop_authority():
+    inventory, clock = FakeInventory(), FakeClock()
+    inventory.add(11434, 4242, exe="unrelated.exe")
+    backend = session(inventory, clock)
+    report = backend.observe(
+        profile=PROFILE,
+        options=IntegrationOptions(),
+        raw_report=raw_report(alongside_issue(OLLAMA), collision_issue(OLLAMA, 11434, 4242)),
+        listeners=inventory.list_listeners(),
+        managed_pids=frozenset(),
+    )
+
+    assert not report.conflicts[0].can_stop_safely
+    assert ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL not in report.available_policies
+    assert inventory.terminated == []
+
+
+def test_alongside_rechecks_the_fixed_endpoint_before_accepting_the_policy():
+    inventory, clock = FakeInventory(), FakeClock()
+    inventory.add(11434, 4242)
+    backend = session(inventory, clock)
+    report = backend.observe(
+        profile=PROFILE,
+        options=IntegrationOptions(),
+        raw_report=raw_report(alongside_issue(OLLAMA), collision_issue(OLLAMA, 11434, 4242)),
+        listeners=inventory.list_listeners(),
+        managed_pids=frozenset(),
+    )
+    inventory.add(ALONGSIDE_PORTS[OLLAMA], 5555, exe="unrelated.exe")
+
+    result = backend.resolve_external_conflicts(
+        ConflictPolicySelection(report.preflight_id, ExternalConflictPolicy.INSTALL_ALONGSIDE)
+    )
+
+    assert result.status.value == "failed"
+    assert "não está mais livre" in result.message
+    assert inventory.terminated == []
+
+
+def test_stop_rechecks_that_the_proved_process_still_owns_the_conflicting_endpoint():
+    inventory, clock = FakeInventory(), FakeClock()
+    inventory.add(11434, 4242)
+    backend = session(inventory, clock)
+    report = backend.observe(
+        profile=PROFILE,
+        options=IntegrationOptions(),
+        raw_report=raw_report(alongside_issue(OLLAMA), collision_issue(OLLAMA, 11434, 4242)),
+        listeners=inventory.list_listeners(),
+        managed_pids=frozenset(),
+    )
+    inventory.listeners.clear()
+
+    result = backend.resolve_external_conflicts(
+        ConflictPolicySelection(
+            report.preflight_id, ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL
+        )
+    )
+
+    assert result.status.value == "failed"
+    assert "não ocupa mais" in result.message
+    assert inventory.terminated == []
     assert 4242 in inventory.processes
 
 

@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from .operation_contracts import (
+    OperationActivity,
     OperationDiagnostic,
     OperationEvent,
     OperationEventKind,
@@ -42,6 +43,10 @@ from .operation_contracts import (
 
 MESSAGE_LIMIT = 240
 MAX_DIAGNOSTICS = 8
+# Matches the transfer sampler's own cadence: frequent enough that a repeated
+# activity carrying a fresh byte or step observation does not look frozen,
+# sparse enough that a fast, chatty source cannot flood the stream.
+ACTIVITY_MIN_INTERVAL_SECONDS = 0.15
 
 # Absolute paths are the most common thing a domain detail carries that an
 # event must not: they name the machine. Windows drives, UNC shares and POSIX
@@ -94,6 +99,8 @@ class OperationStream:
     observer_errors: list[str] = field(default_factory=list)
     _started: float | None = field(default=None, repr=False)
     _sequence: int = field(default=0, repr=False)
+    _last_activity: OperationActivity | None = field(default=None, repr=False)
+    _last_activity_time: float | None = field(default=None, repr=False)
 
     # --- estado ------------------------------------------------------------
 
@@ -159,24 +166,124 @@ class OperationStream:
         message: str,
         *,
         progress: OperationProgress | None = None,
+        activity: OperationActivity | None = None,
     ) -> OperationEvent:
         """Byte-transfer observation inside the current state and phase.
 
         Independent of :meth:`progress`: a coordinator downloading one model
         while reporting "step 2 of 5" logical progress emits both, and a
         consumer that only understands one of them still sees a valid event.
+
+        Never throttled or deduplicated here: a caller already decided this
+        exact observation is worth publishing (typically a
+        :class:`~local_ai_stack.transfer_progress.TransferSampler`, which has
+        its own byte/interval cadence and its own guarantee that the first and
+        the final sample are never dropped). Routing it through
+        :meth:`activity`'s dedupe instead would silently swallow a final
+        sample that repeats the same category/action/item as the one before
+        it -- exactly the case a real download's last chunk produces.
+        ``activity`` is additive, matching the frozen contract's own
+        allowance for a PROGRESS event to carry current semantic work
+        alongside its bytes.
         """
         if self.snapshot is None:
             raise OperationClosed("progress before the first event")
         last = self.snapshot.last_event
-        return self._publish(
+        event = self._publish(
             kind=OperationEventKind.PROGRESS,
             state=last.state,
             phase=last.phase,
             message=message,
             progress=progress,
             transfer=transfer,
+            activity=activity,
         )
+        if activity is not None:
+            # Bookkeeping only, not a throttling decision: transfer() never
+            # consults ``_last_activity_time`` itself, so it must not spend a
+            # read on a caller's monotonic clock. A producer that shares one
+            # stateful clock between its TransferSampler and this stream (as a
+            # real coordinator does) would otherwise have every sample's own
+            # timing silently shifted by this bookkeeping call.
+            self._last_activity = activity
+        return event
+
+    def activity(
+        self,
+        activity: OperationActivity,
+        message: str,
+        *,
+        progress: OperationProgress | None = None,
+        transfer: TransferProgress | None = None,
+    ) -> OperationEvent | None:
+        """Current semantic work inside the current state and phase.
+
+        Deduplicated at the source: a repeat of the same category/action/item/
+        detail is dropped unless it carries a fresh logical or transfer
+        observation, and even then only past a short throttle window -- a
+        chatty source (pip output, a readiness poll) cannot flood the stream,
+        while a real change of item is never delayed. Returns ``None`` for a
+        call this throttling dropped, so a caller never mistakes it for a
+        published event.
+        """
+        if self.snapshot is None:
+            raise OperationClosed("activity before the first event")
+        if not self._should_publish_activity(activity, progress, transfer):
+            return None
+        last = self.snapshot.last_event
+        event = self._publish(
+            kind=OperationEventKind.ACTIVITY,
+            state=last.state,
+            phase=last.phase,
+            message=message,
+            progress=progress,
+            transfer=transfer,
+            activity=activity,
+        )
+        self._last_activity = activity
+        self._last_activity_time = self.monotonic()
+        return event
+
+    def detail(self, detail: OperationActivity, message: str) -> OperationEvent:
+        """One completed or otherwise meaningful timeline entry.
+
+        Never throttled: unlike :meth:`activity`, a caller reaches this only
+        for a genuine milestone (a package installed, a checksum verified), so
+        each call is already a distinct fact, not a repeated sample.
+        """
+        if self.snapshot is None:
+            raise OperationClosed("detail before the first event")
+        last = self.snapshot.last_event
+        return self._publish(
+            kind=OperationEventKind.DETAIL,
+            state=last.state,
+            phase=last.phase,
+            message=message,
+            detail=detail,
+        )
+
+    def _should_publish_activity(
+        self,
+        activity: OperationActivity,
+        progress: OperationProgress | None,
+        transfer: TransferProgress | None,
+    ) -> bool:
+        previous = self._last_activity
+        if previous is None:
+            return True
+        changed = (
+            activity.category is not previous.category
+            or activity.action != previous.action
+            or activity.item != previous.item
+            or activity.detail != previous.detail
+        )
+        if changed:
+            return True
+        if progress is None and transfer is None:
+            return False
+        if self._last_activity_time is None:
+            return True
+        return self.monotonic() - self._last_activity_time >= ACTIVITY_MIN_INTERVAL_SECONDS
 
     def succeed(
         self,
@@ -243,6 +350,8 @@ class OperationStream:
         message: str,
         progress: OperationProgress | None = None,
         transfer: TransferProgress | None = None,
+        activity: OperationActivity | None = None,
+        detail: OperationActivity | None = None,
         diagnostic: OperationDiagnostic | None = None,
         result: OperationResult | None = None,
     ) -> OperationEvent:
@@ -258,6 +367,8 @@ class OperationStream:
             message=safe_text(message),
             progress=progress,
             transfer=transfer,
+            activity=activity,
+            detail=detail,
             diagnostic=diagnostic,
             result=result,
         )

@@ -116,7 +116,7 @@ class FakeGit(GitClient):
     def is_repository(self, path: Path) -> bool:
         return Path(path) in self.repositories
 
-    def clone(self, url, destination, *, revision=None, depth=None, dry_run=None):
+    def clone(self, url, destination, *, revision=None, depth=None, dry_run=None, on_output=None):
         if not self.clone_ok:
             raise GitError("clone refused")
         target = Path(destination)

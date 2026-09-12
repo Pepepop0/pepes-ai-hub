@@ -20,12 +20,13 @@ an install against an unsupported Python.
 from __future__ import annotations
 
 import os
+import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from .runner import CommandResult, CommandRunner
+from .runner import CommandResult, CommandRunner, OutputSink
 
 VENV_DIR_NAME = ".venv"
 PROBE_TIMEOUT = 30.0
@@ -133,12 +134,14 @@ def create_environment(
     *,
     dry_run: bool = False,
     timeout: float = VENV_TIMEOUT,
+    on_output: OutputSink | None = None,
 ) -> CommandResult:
     """Create the virtual environment. Idempotent: an existing one is reused."""
     result = runner.run(
         [*interpreter, "-m", "venv", str(environment.root)],
         timeout=timeout,
         dry_run=dry_run,
+        on_output=on_output,
     )
     if not dry_run and not result.ok:
         raise PythonEnvironmentError(
@@ -146,6 +149,113 @@ def create_environment(
             f"{result.stderr.strip() or result.stdout.strip()}"
         )
     return result
+
+
+# --- observacao de pip ------------------------------------------------------
+
+_SIZE_UNITS = {
+    "b": 1,
+    "kb": 1000,
+    "mb": 1000**2,
+    "gb": 1000**3,
+    "kib": 1024,
+    "mib": 1024**2,
+    "gib": 1024**3,
+}
+_COLLECTING_RE = re.compile(r"^Collecting\s+([A-Za-z0-9][A-Za-z0-9_.\-\[\],]*)")
+_DOWNLOADING_SIZE_RE = re.compile(r"^\s*Downloading\s+\S+\s+\(([\d.]+)\s*([kKmMgG]i?B)\)")
+_PROGRESS_TICK_RE = re.compile(
+    r"([\d.]+)\s*/\s*([\d.]+)\s*([kKmMgG]i?B)\s+([\d.]+)\s*([kKmMgG]i?B)/s"
+)
+_INSTALLING_RE = re.compile(r"^Installing collected packages:\s*(.+)$")
+_SUCCESS_RE = re.compile(r"^Successfully installed\s+(.+)$")
+
+
+def _size_to_bytes(value: str, unit: str) -> int | None:
+    scale = _SIZE_UNITS.get(unit.lower())
+    if scale is None:
+        return None
+    try:
+        return round(float(value) * scale)
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class PipEvent:
+    """One sanitized fact parsed from a pip invocation's own output.
+
+    Deliberately not an operation-contract type: this module has no reason to
+    know about ``OperationActivity``. It is a plain domain fact; the caller
+    decides how, or whether, to publish it.
+    """
+
+    action: str  # "resolving" | "downloading" | "installing" | "installed"
+    package: str
+    completed_bytes: int | None = None
+    total_bytes: int | None = None
+    bytes_per_second: float | None = None
+
+
+PipObserver = Callable[[PipEvent], None]
+
+
+class PipOutputParser:
+    """Turns one pip invocation's line-by-line output into :class:`PipEvent`.
+
+    Stateful only across one call: it remembers which package the most recent
+    ``Collecting`` line named, since a progress tick or a download-size line
+    does not repeat it. Unrecognized lines (pip's own warnings, resolver
+    chatter) are silently ignored rather than forwarded -- nothing here ever
+    hands raw pip text to its observer.
+    """
+
+    def __init__(self, on_event: PipObserver) -> None:
+        self._on_event = on_event
+        self._current: str | None = None
+
+    def feed(self, _stream: str, line: str) -> None:
+        text = line.strip()
+        if not text:
+            return
+        match = _COLLECTING_RE.match(text)
+        if match:
+            self._current = match.group(1)
+            self._on_event(PipEvent("resolving", self._current))
+            return
+        match = _DOWNLOADING_SIZE_RE.match(text)
+        if match and self._current:
+            total = _size_to_bytes(match.group(1), match.group(2))
+            self._on_event(PipEvent("downloading", self._current, total_bytes=total))
+            return
+        match = _PROGRESS_TICK_RE.search(text)
+        if match and self._current:
+            completed = _size_to_bytes(match.group(1), match.group(3))
+            total = _size_to_bytes(match.group(2), match.group(3))
+            speed = _size_to_bytes(match.group(4), match.group(5))
+            self._on_event(
+                PipEvent(
+                    "downloading",
+                    self._current,
+                    completed_bytes=completed,
+                    total_bytes=total,
+                    bytes_per_second=float(speed) if speed is not None else None,
+                )
+            )
+            return
+        match = _INSTALLING_RE.match(text)
+        if match:
+            for name in _split_names(match.group(1)):
+                self._on_event(PipEvent("installing", name))
+            return
+        match = _SUCCESS_RE.match(text)
+        if match:
+            for token in match.group(1).split():
+                self._on_event(PipEvent("installed", token.rsplit("-", 1)[0]))
+
+
+def _split_names(joined: str) -> list[str]:
+    return [name.strip() for name in joined.split(",") if name.strip()]
 
 
 def pip_install(
@@ -156,6 +266,7 @@ def pip_install(
     dry_run: bool = False,
     timeout: float = PIP_TIMEOUT,
     extra_args: Sequence[str] = (),
+    on_output: OutputSink | None = None,
 ) -> CommandResult:
     """Install pinned requirements into the environment.
 
@@ -172,11 +283,14 @@ def pip_install(
             "install",
             "--disable-pip-version-check",
             "--no-input",
+            "--progress-bar",
+            "ascii",
             *extra_args,
             *requirements,
         ],
         timeout=timeout,
         dry_run=dry_run,
+        on_output=on_output,
     )
     if not dry_run and not result.ok:
         raise PythonEnvironmentError(

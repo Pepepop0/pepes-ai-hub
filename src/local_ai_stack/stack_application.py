@@ -102,7 +102,7 @@ from .planning import InstallPlan, PlanAction, build_install_plan
 from .probes import http_probe, tcp_probe
 from .processes import ProcessOrigin, RuntimeProcessState
 from .profiles import Profile, load_profiles
-from .provisioning import ProvisionContext, ProvisionOutcome
+from .provisioning import ProvisionContext, ProvisionEvent, ProvisionOutcome
 from .registry import ManagedProcessRegistry
 from .runner import CommandRunner
 from .service_config import StackConfiguration
@@ -290,6 +290,11 @@ class StackApplication:
         # first_run._acquire_models); None means nobody is listening, so
         # install_actions never even builds a progress callback.
         self._transfer_sink: Callable[[str, DownloadProgress], None] | None = None
+        # Set only for the duration of a provisioning step (see
+        # first_run.FirstRunCoordinator); None means nobody is listening, so
+        # a provisioner's context.emit() only logs, same as before this seam
+        # existed.
+        self._activity_sink: Callable[[ProvisionEvent], None] | None = None
         # Indirected through ``self.deps`` at call time, not captured now: a
         # test that reassigns a dependency after construction (as several
         # already do for the launcher) must still reach the session.
@@ -424,7 +429,12 @@ class StackApplication:
     # --- composição ----------------------------------------------------------
 
     def provision_context(self) -> ProvisionContext:
-        return provision_context(self.installation, runner=self.deps.runner)
+        return provision_context(
+            self.installation,
+            runner=self.deps.runner,
+            events=self._activity_sink,
+            monotonic=self.deps.monotonic,
+        )
 
     def provisioners(self) -> Mapping[str, Any]:
         return self.deps.provisioners(self.options)

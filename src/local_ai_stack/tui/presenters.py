@@ -588,6 +588,12 @@ _ACTIVITY_VERBS: dict[str, str] = {
     "resolving": "Resolvendo",
     "cloning": "Clonando",
     "extracting": "Extraindo",
+    "validating": "Validando",
+    "verified": "Verificado",
+    "ready": "Pronto",
+    "available": "Disponível",
+    "applied": "Aplicado",
+    "receiving": "Recebendo",
 }
 
 # The noun a category names when the specific item belongs on its own line
@@ -608,6 +614,10 @@ def activity_headline(activity: OperationActivity) -> tuple[str, str]:
     """(headline, item-or-empty). The item is its own line only when useful."""
     verb = _activity_verb(activity.action)
     category = activity.category
+    if activity.action == "ready":
+        return f"{activity.item} pronto", ""
+    if activity.action == "available":
+        return f"{activity.item} disponível", ""
     if category is OperationActivityCategory.READINESS:
         return f"{verb} {activity.item} responder", ""
     if category is OperationActivityCategory.TRANSFER:

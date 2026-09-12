@@ -356,6 +356,27 @@ class OpenWebUIProvisioner(Provisioner):
                 "Could not create the environment.",
                 str(exc),
             )
+        context.emit(
+            self.component_id,
+            "Validating the virtual environment",
+            activity=build_activity(
+                OperationActivityCategory.ENVIRONMENT, "validating", "ambiente virtual"
+            ),
+        )
+        if not environment.exists:
+            return self.failed(
+                detection,
+                FailureReason.FILESYSTEM,
+                "The virtual environment was not created.",
+            )
+        context.emit(
+            self.component_id,
+            "Virtual environment ready",
+            activity=build_activity(
+                OperationActivityCategory.ENVIRONMENT, "ready", "ambiente virtual"
+            ),
+            milestone=True,
+        )
 
         context.emit(
             self.component_id,

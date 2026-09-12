@@ -469,9 +469,11 @@ def test_a_full_install_publishes_activity_for_every_real_step(tmp_path):
     assert actions[:3] == ["checking", "locating", "preparing"]
     assert "cloning" in actions
     assert "creating" in actions
+    assert "validating" in actions
     assert "installing" in actions
     assert "verifying" in actions
     milestones = [e.activity.action for e in events if e.milestone]
+    assert "ready" in milestones
     assert "installed" in milestones
 
 

@@ -1037,7 +1037,11 @@ def _display(service_id: str) -> str:
 
 def execution_problems(report: ExecutionReport) -> list[str]:
     """Every failure an execution report carries, in the domain's own words."""
-    problems = [f"{item.component_id}: {item.detail}" for item in report.results if not item.ok]
+    problems = [
+        f"{item.component_id}: {item.failure.message if item.failure is not None else item.detail}"
+        for item in report.results
+        if not item.ok
+    ]
     problems += [
         f"{item.action}/{item.target}: {item.detail}"
         for item in report.action_results

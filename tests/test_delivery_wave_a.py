@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import socket
 import threading
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import httpx
@@ -33,8 +33,15 @@ from local_ai_stack.inventory import Listener
 from local_ai_stack.layout import ENV_ROOT
 from local_ai_stack.model_catalog import ModelCatalog
 from local_ai_stack.models import FileModelSource
-from local_ai_stack.operation_contracts import OperationEventKind, OperationState, advance_operation
+from local_ai_stack.operation_contracts import (
+    DETAIL_HISTORY_LIMIT,
+    OperationActivityCategory,
+    OperationEventKind,
+    OperationState,
+    advance_operation,
+)
 from local_ai_stack.pets import unsafe_characters
+from local_ai_stack.runner import CommandResult
 from local_ai_stack.runtime import StackRuntime
 from local_ai_stack.services import ServiceState
 from local_ai_stack.stack_application import StackApplication
@@ -179,6 +186,115 @@ class ControlledModelTransfer:
             self.final_ready.set()
             if not self.resume_final.wait(10):
                 raise AssertionError("test did not release the final transfer observation")
+
+
+class ControlledInstallOutput:
+    """Feed realistic command output through the real provisioner parsers.
+
+    The controlled toolchain still materializes the checkout, environments and
+    packages. This wrapper only supplies the line stream that a real
+    ``CommandRunner`` would pass to ``on_output`` and pauses after pip reports
+    158 MiB so the real TUI can be inspected before the command returns.
+    """
+
+    SECRET = "sk-0123456789abcdef0123456789"
+    PRIVATE_PATH = r"C:\Users\Private Person\AppData\Local\pip-cache"
+    EXTRA_INDEX = "https://private-user:private-pass@packages.invalid/simple"
+
+    def __init__(self, world, *, fail_comfy_pip: bool = False) -> None:
+        assert world.runner is not None
+        self.world = world
+        self.original_run = world.runner.run
+        self.fail_comfy_pip = fail_comfy_pip
+        self.pip_partial = threading.Event()
+        self.resume = threading.Event()
+        self.streamed_commands: list[tuple[str, ...]] = []
+
+    def bind(self) -> ControlledInstallOutput:
+        self.world.runner.run = self.run
+        return self
+
+    def release(self) -> None:
+        self.resume.set()
+
+    def _emit(self, sink, stream: str, line: str, *, seconds: float = 0.25) -> None:
+        self.world.clock.advance(seconds)
+        sink(stream, line)
+
+    def run(self, argv, **kwargs) -> CommandResult:
+        items = tuple(str(part) for part in argv)
+        sink = kwargs.get("on_output")
+        if sink is None:
+            return self.original_run(argv, **kwargs)
+        self.streamed_commands.append(items)
+
+        if Path(items[0]).name in ("git", "git.exe") and "clone" in items:
+            self._emit(
+                sink,
+                "stderr",
+                f"Cloning into '{self.PRIVATE_PATH}' from {self.EXTRA_INDEX}?token={self.SECRET}",
+            )
+            self._emit(sink, "stderr", "Receiving objects:  45% (450/1000), 12 MiB")
+            self._emit(sink, "stderr", "Resolving deltas: 100% (200/200), done.")
+            return self.original_run(argv, **kwargs)
+
+        if "-m" not in items or "pip" not in items or "install" not in items:
+            return self.original_run(argv, **kwargs)
+
+        requirements = tuple(
+            part
+            for part in items[items.index("install") + 1 :]
+            if "==" in part and not part.startswith("--")
+        )
+        is_comfy = any(part.startswith("torch==") for part in requirements)
+        package = "torch" if is_comfy else "open-webui"
+        version = next(
+            (part.split("==", 1)[1] for part in requirements if part.startswith(f"{package}==")),
+            "1.0",
+        )
+        self._emit(sink, "stdout", f"Collecting {package}")
+        self._emit(
+            sink,
+            "stdout",
+            f"Looking in indexes: {self.EXTRA_INDEX}?api_key={self.SECRET} {self.PRIVATE_PATH}",
+        )
+
+        if not is_comfy:
+            self._emit(sink, "stdout", "Downloading open_webui.whl (2.0 MiB)")
+            self._emit(sink, "stdout", "2.0/2.0 MiB 10.0 MiB/s eta 0:00:00")
+            self._emit(sink, "stdout", f"Installing collected packages: {package}")
+            self._emit(sink, "stdout", f"Successfully installed {package}-{version}")
+            return self.original_run(argv, **kwargs)
+
+        # A long real download can be active for many seconds before pip emits
+        # its next line. Advance only the injected monotonic clock.
+        self._emit(sink, "stdout", "Downloading torch.whl (259.0 MiB)", seconds=18)
+        self._emit(sink, "stdout", "158.0/259.0 MiB 22.4 MiB/s eta 0:00:05")
+        self._emit(
+            sink,
+            "stderr",
+            f"Traceback at {self.PRIVATE_PATH}; --extra-index-url {self.EXTRA_INDEX}; {self.SECRET}",
+        )
+        self.pip_partial.set()
+        if not self.resume.wait(10):
+            raise AssertionError("test did not release controlled pip output")
+        if self.fail_comfy_pip:
+            return CommandResult(
+                argv=items,
+                returncode=1,
+                stderr=(
+                    f"Traceback at {self.PRIVATE_PATH}; token={self.SECRET}; "
+                    f"--extra-index-url {self.EXTRA_INDEX}"
+                ),
+            )
+
+        self._emit(sink, "stdout", "259.0/259.0 MiB 22.4 MiB/s eta 0:00:00")
+        transitive = [f"controlled-dependency-{index:02d}" for index in range(24)]
+        installed = [*transitive, "torch"]
+        self._emit(sink, "stdout", f"Installing collected packages: {', '.join(installed)}")
+        versions = " ".join(f"{name}-1.0" for name in transitive)
+        self._emit(sink, "stdout", f"Successfully installed {versions} torch-{version}")
+        return self.original_run(argv, **kwargs)
 
 
 def instrument_model_downloads(world, *, known_total=True, **transport_options):
@@ -354,6 +470,291 @@ def test_capella_wizard_runs_the_real_coordinator_and_stream_without_blocking_ui
         asyncio.run(exercise())
     finally:
         resume.set()
+    assert_streams(events)
+
+
+def _public_event_text(events) -> str:
+    return repr([asdict(event) for event in events])
+
+
+def _semantic_facts(events, *, start: int = 0, stop: int | None = None):
+    return [
+        value
+        for event in events[start:stop]
+        for value in (event.activity, event.detail)
+        if value is not None
+    ]
+
+
+def _assert_actions_in_order(facts, expected: tuple[str, ...]) -> None:
+    actions = iter(fact.action for fact in facts)
+    for wanted in expected:
+        assert wanted in actions, f"missing ordered activity {wanted!r}"
+
+
+def test_real_provisioner_output_reaches_adapter_and_granular_tui(composition):
+    """Real domains and UI; only command/process/network seams are controlled."""
+    world, adapter, _ = composition()
+    output = ControlledInstallOutput(world).bind()
+    events = []
+    adapter.subscribe(events.append)
+    app, _ = tui(adapter)
+
+    async def exercise():
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await review(pilot)
+            await click(pilot, "#wizard-next")
+            await wait_for_observation(pilot, output.pip_partial)
+
+            view = app.operation_view
+            assert view is not None and not view.terminal
+            assert view.activity is not None
+            assert view.activity.category is OperationActivityCategory.DEPENDENCY
+            assert view.activity.action == "downloading"
+            assert view.activity.item == "torch"
+            assert view.transfer is not None
+            assert view.transfer.completed_bytes == 158 * 1024**2
+            assert view.transfer.total_bytes == 259 * 1024**2
+            assert view.transfer.bytes_per_second == pytest.approx(22.4 * 1024**2)
+            assert view.progress is not None and view.progress.total == 3
+
+            pane = Text.from_markup(
+                str(app.screen.query_one("#wizard-step-progress", Static).content)
+            ).plain
+            assert f"Etapa {view.progress.completed} de 3" in pane and "Instalando ComfyUI" in pane
+            assert "Baixando dependências" in pane and "torch" in pane
+            assert "61%" in pane and "158 MiB / 259 MiB" in pane
+            assert "22.4 MiB/s" in pane and "restantes" in pane
+            assert "Tempo: 00:18" in pane
+
+            snapshot_before = adapter.current_operation()
+            view_before = app.operation_view
+            transfer_before = view.transfer
+            progress_before = view.progress
+            await click(pilot, "#wizard-details-toggle")
+            assert adapter.current_operation() is snapshot_before
+            assert app.operation_view is view_before
+            assert app.operation_view.transfer is transfer_before
+            assert app.operation_view.progress is progress_before
+            assert (
+                "Detalhes"
+                in Text.from_markup(
+                    str(app.screen.query_one("#wizard-step-progress", Static).content)
+                ).plain
+            )
+            assert (
+                str(app.screen.query_one("#wizard-details-toggle", Button).label)
+                == "Ocultar detalhes"
+            )
+            await click(pilot, "#wizard-details-toggle")
+            assert (
+                str(app.screen.query_one("#wizard-details-toggle", Button).label)
+                == "Mostrar detalhes"
+            )
+
+            for width in (100, 80, 70, 120):
+                await pilot.resize_terminal(width, 40 if width >= 100 else 32)
+                await pilot.pause()
+                resized = Text.from_markup(
+                    str(app.screen.query_one("#wizard-step-progress", Static).content)
+                ).plain
+                assert "Baixando dependências" in resized
+                assert "158 MiB / 259 MiB" in resized
+                assert app.query_one(RightRail) is not None
+
+            output.resume.set()
+            await finish(pilot, adapter)
+            assert app.operation_view.succeeded
+            assert app.operation_view.activity is None
+            assert app.operation_view.transfer is None
+            assert len(app.operation_view.history) == DETAIL_HISTORY_LIMIT
+            snapshot = adapter.current_operation()
+            assert snapshot is not None and snapshot.activity is None
+            assert len(snapshot.details) == DETAIL_HISTORY_LIMIT
+            assert [entry.sequence for entry in snapshot.details] == sorted(
+                entry.sequence for entry in snapshot.details
+            )
+
+            done = Text.from_markup(
+                str(app.screen.query_one("#wizard-step-done", Static).content)
+            ).plain
+            assert "Concluído" in done and "Tudo pronto" in done
+            assert "[>]" not in done
+            await click(pilot, "#wizard-details-toggle")
+            expanded = Text.from_markup(
+                str(app.screen.query_one("#wizard-step-done", Static).content)
+            ).plain
+            assert "Detalhes" in expanded
+
+            first_streamed = tuple(output.streamed_commands)
+            first_event_count = len(events)
+            adapter.install(InstallSelection("capella"))
+            await finish(pilot, adapter)
+            second_events = events[first_event_count:]
+            assert adapter.backend.last_first_run.did_nothing
+            assert tuple(output.streamed_commands) == first_streamed
+            assert not any(event.transfer is not None for event in second_events)
+            assert not any(
+                event.activity is not None
+                and event.activity.action in {"cloning", "creating", "installing", "downloading"}
+                for event in second_events
+            )
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        output.release()
+
+    comfy_start = next(
+        index
+        for index, event in enumerate(events)
+        if event.kind is OperationEventKind.STATE and event.message == "Instalando ComfyUI"
+    )
+    comfy_stop = next(
+        index
+        for index, event in enumerate(events[comfy_start + 1 :], start=comfy_start + 1)
+        if event.kind is OperationEventKind.STATE and event.message != "Instalando ComfyUI"
+    )
+    comfy_facts = _semantic_facts(events, start=comfy_start, stop=comfy_stop)
+    _assert_actions_in_order(
+        comfy_facts,
+        (
+            "checking",
+            "locating",
+            "preparing",
+            "cloning",
+            "receiving",
+            "resolving",
+            "creating",
+            "validating",
+            "ready",
+            "installing",
+            "resolving",
+            "downloading",
+            "installing",
+            "installed",
+            "finalizing",
+            "verifying",
+            "installed",
+        ),
+    )
+    assert any(fact.item == "repositório ComfyUI" for fact in comfy_facts)
+
+    all_facts = _semantic_facts(events)
+    for action in ("checking", "preparing", "verifying", "installed"):
+        assert any(fact.item == "Ollama" and fact.action == action for fact in all_facts)
+    assert any(fact.action == "downloading" for fact in all_facts)
+    assert any(fact.action == "extracting" for fact in all_facts)
+    for action in ("checking", "preparing", "verifying", "installed"):
+        assert any(fact.item == "Open WebUI" and fact.action == action for fact in all_facts)
+    assert any(
+        fact.category is OperationActivityCategory.DEPENDENCY and fact.item == "open-webui"
+        for fact in all_facts
+    )
+    assert {
+        fact.item
+        for fact in all_facts
+        if fact.category is OperationActivityCategory.SERVICE and fact.action == "starting"
+    } >= {"Ollama", "Open WebUI", "ComfyUI"}
+    assert {
+        fact.item
+        for fact in all_facts
+        if fact.category is OperationActivityCategory.READINESS and fact.action == "waiting"
+    } >= {"Ollama", "Open WebUI", "ComfyUI"}
+    assert {
+        fact.item
+        for fact in all_facts
+        if fact.category is OperationActivityCategory.READINESS and fact.action == "ready"
+    } >= {"Ollama", "Open WebUI", "ComfyUI"}
+    assert any(
+        fact.category is OperationActivityCategory.WORKFLOW and fact.action == "applied"
+        for fact in all_facts
+    )
+    assert any(
+        fact.category is OperationActivityCategory.CONFIGURATION and fact.action == "verified"
+        for fact in all_facts
+    )
+    model_observation = next(
+        event
+        for event in events
+        if event.activity is not None
+        and event.activity.category is OperationActivityCategory.MODEL
+        and event.activity.action == "downloading"
+        and event.progress is not None
+        and event.transfer is not None
+    )
+    assert model_observation.transfer.total_bytes is not None
+    assert any(
+        fact.category is OperationActivityCategory.MODEL and fact.action == "verified"
+        for fact in all_facts
+    )
+    assert any(
+        fact.category is OperationActivityCategory.MODEL and fact.action == "installed"
+        for fact in all_facts
+    )
+    assert sum(event.kind is OperationEventKind.DETAIL for event in events) > DETAIL_HISTORY_LIMIT
+
+    public = _public_event_text(events)
+    for forbidden in (
+        output.SECRET,
+        "private-pass",
+        output.PRIVATE_PATH,
+        "--extra-index-url",
+        "Traceback",
+        "Looking in indexes",
+    ):
+        assert forbidden not in public
+    assert_streams(events)
+
+
+def test_real_pip_failure_keeps_sanitized_last_observations_in_tui(composition):
+    world, adapter, _ = composition()
+    output = ControlledInstallOutput(world, fail_comfy_pip=True).bind()
+    events = []
+    adapter.subscribe(events.append)
+    app, _ = tui(adapter)
+
+    async def exercise():
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await review(pilot)
+            await click(pilot, "#wizard-next")
+            await wait_for_observation(pilot, output.pip_partial)
+            partial = app.operation_view
+            assert partial is not None and partial.transfer is not None
+            output.resume.set()
+            await finish(pilot, adapter)
+            assert app.operation_view.failed
+            assert app.operation_view.activity == partial.activity
+            assert app.operation_view.progress == partial.progress
+            assert app.operation_view.transfer == partial.transfer
+            assert events[-1].kind is OperationEventKind.RESULT
+            assert events[-1].state is OperationState.FAILED
+            done = Text.from_markup(
+                str(app.screen.query_one("#wizard-step-done", Static).content)
+            ).plain
+            assert "Instalação não concluída" in done
+            assert "Última atividade:" in done
+            assert "Baixando dependências" in done and "torch" in done
+            assert "158 MiB / 259 MiB" in done
+            assert "Motivo:" in done and "Could not install dependencies" in done
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        output.release()
+
+    public = _public_event_text(events)
+    for forbidden in (
+        output.SECRET,
+        "private-pass",
+        output.PRIVATE_PATH,
+        "--extra-index-url",
+        "Traceback",
+        "Looking in indexes",
+    ):
+        assert forbidden not in public
     assert_streams(events)
 
 

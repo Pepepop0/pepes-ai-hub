@@ -430,6 +430,13 @@ def test_install_emits_progress_events(tmp_path):
     pinned().apply(context)
     assert seen
     assert all(event.component_id == "open-webui" for event in seen)
+    actions = [event.activity.action for event in seen if event.activity is not None]
+    assert actions[:3] == ["checking", "locating", "preparing"]
+    assert "creating" in actions
+    assert "validating" in actions
+    assert "installing" in actions
+    assert "verifying" in actions
+    assert "ready" in [event.activity.action for event in seen if event.milestone]
 
 
 # --- smoke real, somente leitura -------------------------------------------

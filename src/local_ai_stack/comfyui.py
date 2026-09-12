@@ -516,9 +516,11 @@ class ComfyUIProvisioner(Provisioner):
         repo_name = _repo_name(self.url)
         context.emit(
             self.component_id,
-            f"Preparing to install {self.display_name}",
+            f"Preparing the {self.display_name} repository",
             activity=build_activity(
-                OperationActivityCategory.PREPARATION, "preparing", self.display_name
+                OperationActivityCategory.PREPARATION,
+                "preparing",
+                f"repositório {self.display_name}",
             ),
         )
         try:
@@ -581,6 +583,27 @@ class ComfyUIProvisioner(Provisioner):
                 "Could not create the environment.",
                 str(exc),
             )
+        context.emit(
+            self.component_id,
+            "Validating the virtual environment",
+            activity=build_activity(
+                OperationActivityCategory.ENVIRONMENT, "validating", "ambiente virtual"
+            ),
+        )
+        if not environment.exists:
+            return self.failed(
+                detection,
+                FailureReason.FILESYSTEM,
+                "The virtual environment was not created.",
+            )
+        context.emit(
+            self.component_id,
+            "Virtual environment ready",
+            activity=build_activity(
+                OperationActivityCategory.ENVIRONMENT, "ready", "ambiente virtual"
+            ),
+            milestone=True,
+        )
 
         flags, requirements = self.dependencies.pip_arguments(directory)
         context.emit(

@@ -86,9 +86,16 @@ def test_events_are_delivered_to_the_sink(tmp_path):
 def test_events_are_sanitized(tmp_path):
     seen = []
     context = context_for(tmp_path, events=seen.append)
-    context.emit("toy", "downloading https://user:s3cr3t@host/x.zip?token=abcdef123456")
+    context.emit(
+        "toy",
+        "downloading https://user:s3cr3t@host/x.zip?token=abcdef123456 "
+        "from C:\\Users\\Private Person\\cache\n" + "x" * 300,
+    )
     assert "s3cr3t" not in seen[0].message
     assert "abcdef123456" not in seen[0].message
+    assert "Private Person" not in seen[0].message
+    assert "\n" not in seen[0].message
+    assert len(seen[0].message) <= 240
 
 
 def test_no_sink_is_fine(tmp_path):

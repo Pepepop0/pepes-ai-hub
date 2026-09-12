@@ -313,7 +313,12 @@ class ProvisionContext:
     ) -> None:
         """Publish a progress note. Sanitized before it leaves the backend."""
         event = ProvisionEvent(
-            component_id, level, sanitize(message), activity, transfer, milestone
+            component_id,
+            level,
+            safe_text(sanitize(message)),
+            activity,
+            transfer,
+            milestone,
         )
         self.log.log(
             {

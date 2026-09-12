@@ -929,8 +929,8 @@ class ControlledModelInstaller(ModelInstaller):
         # checks its invariants.
         self.after_tampering: dict[str, ModelStatus] = {}
 
-    def apply(self, spec, *, dry_run: bool = False):
-        result = super().apply(spec, dry_run=dry_run)
+    def apply(self, spec, *, dry_run: bool = False, progress=None):
+        result = super().apply(spec, dry_run=dry_run, progress=progress)
         if dry_run or not result.ok or not self.injections.active(Injection.MODEL_TAMPERED):
             return result
         if not isinstance(spec.source, FileModelSource):

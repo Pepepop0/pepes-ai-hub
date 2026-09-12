@@ -170,6 +170,102 @@ def test_a_second_first_run_does_nothing_and_still_ends_ready(stack):
     assert stack.app.status(CAPELLA).installation_ready
 
 
+# --- progresso de transferência ---------------------------------------------
+
+
+def _transfer_events(recorder: Recorder):
+    return [event for event in recorder.events if event.transfer is not None]
+
+
+def test_model_downloads_publish_transfer_progress_with_a_known_total(stack):
+    recorder = Recorder()
+    stack.app.first_run("op-1", CAPELLA, emit=recorder)
+
+    transfers = _transfer_events(recorder)
+    assert transfers, "no transfer progress was published for a run that really downloaded"
+    # Every controlled artifact is served as a plain byte body, so httpx always
+    # knows its length; nothing here should ever report an unknown total.
+    assert all(event.transfer.total_bytes is not None for event in transfers)
+    assert all(event.transfer.completed_bytes >= 0 for event in transfers)
+    # Grouped by which model each event's message names, the first and last
+    # observation for every downloaded artifact must be present, and the last
+    # one must show the transfer as complete.
+    by_target: dict[str, list] = {}
+    for event in transfers:
+        by_target.setdefault(event.message, []).append(event.transfer)
+    assert len(by_target) == 3, "Capella declares three file-backed image models"
+    for message, observations in by_target.items():
+        last = observations[-1]
+        assert last.completed_bytes == last.total_bytes, message
+        assert last.fraction == 1.0, message
+
+
+def test_transfer_progress_is_independent_from_the_logical_step_counter(stack):
+    """A model download reports bytes; the step counter still reports steps."""
+    recorder = Recorder()
+    stack.app.first_run("op-1", CAPELLA, emit=recorder)
+
+    logical = [event for event in recorder.events if event.progress is not None]
+    transfers = _transfer_events(recorder)
+    assert logical and transfers
+    assert all(event.progress is None for event in transfers)
+    assert all(event.transfer is None for event in logical)
+
+
+def test_a_second_run_publishes_no_transfer_progress_at_all(stack):
+    stack.app.first_run("op-1", CAPELLA)
+
+    recorder = Recorder()
+    result = stack.app.first_run("op-2", CAPELLA, emit=recorder)
+
+    assert result.state is OperationState.SUCCEEDED
+    assert recorder.events[-1].message == "Tudo pronto (nada a fazer)"
+    assert _transfer_events(recorder) == []
+
+
+def test_an_interrupted_download_ends_failed_with_no_transfer_event_after_the_result():
+    built = controlled_stack(injections=InjectionPlan.of(Injection.DOWNLOAD_INTERRUPTED))
+    try:
+        _result, recorder = _first_failed(built)
+        assert recorder.events[-1].message == "Falha ao baixar modelos"
+        # The reducer only ever accepts one terminal event; a stray publish
+        # after failure would have raised OperationClosed instead of quietly
+        # appearing after it, but the count is checked directly all the same.
+        terminal = [event for event in recorder.events if event.result is not None]
+        assert len(terminal) == 1
+        assert recorder.events.index(terminal[0]) == len(recorder.events) - 1
+        # The interrupted artifact really did deliver some bytes before dying,
+        # so this is not "no download was attempted" but "no invented total".
+        transfers = _transfer_events(recorder)
+        assert transfers
+        assert all(
+            event.transfer.completed_bytes < event.transfer.total_bytes for event in transfers
+        )
+    finally:
+        built.release()
+
+
+def test_a_checksum_failure_reports_no_transfer_event_after_the_result():
+    built = controlled_stack(injections=InjectionPlan.of(Injection.CHECKSUM_MISMATCH))
+    try:
+        _result, recorder = _first_failed(built)
+        terminal = [event for event in recorder.events if event.result is not None]
+        assert len(terminal) == 1
+        assert recorder.events.index(terminal[0]) == len(recorder.events) - 1
+    finally:
+        built.release()
+
+
+def test_ollama_pull_publishes_no_byte_transfer_progress(stack):
+    """Ollama's non-streaming pull has no byte-level source; it stays logical."""
+    recorder = Recorder()
+    stack.app.first_run("op-1", CAPELLA, emit=recorder)
+
+    transfers = _transfer_events(recorder)
+    assert not any(CHAT_REFERENCE in event.message for event in transfers)
+    assert not any("ollama/" in event.message for event in transfers)
+
+
 # --- perfis ---------------------------------------------------------------------
 
 

@@ -43,7 +43,7 @@ from .application_contracts import (
 )
 from .components import ComponentId
 from .controller import ServiceController
-from .download import Downloader
+from .download import Downloader, DownloadProgress
 from .execution import ExecutionReport, PlanExecutor
 from .external_conflict_contracts import (
     ConflictPolicySelection,
@@ -286,6 +286,10 @@ class StackApplication:
         self._registry: ManagedProcessRegistry | None = None
         self._launcher: ProcessLauncher | None = None
         self.last_first_run = None
+        # Set only for the duration of a download-bearing step (see
+        # first_run._acquire_models); None means nobody is listening, so
+        # install_actions never even builds a progress callback.
+        self._transfer_sink: Callable[[str, DownloadProgress], None] | None = None
         # Indirected through ``self.deps`` at call time, not captured now: a
         # test that reassigns a dependency after construction (as several
         # already do for the launcher) must still reach the session.
@@ -458,6 +462,7 @@ class StackApplication:
             catalog=self.catalog(),
             config_writer=self.deps.config_writer,
             options=self.options,
+            on_transfer=self._transfer_sink,
         )
 
     def executor(self, profile: Profile) -> PlanExecutor:

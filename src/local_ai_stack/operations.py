@@ -36,6 +36,7 @@ from .operation_contracts import (
     OperationResult,
     OperationSnapshot,
     OperationState,
+    TransferProgress,
     advance_operation,
 )
 
@@ -152,6 +153,24 @@ class OperationStream:
             progress=OperationProgress(completed=completed, total=total),
         )
 
+    def transfer(self, transfer: TransferProgress, message: str) -> OperationEvent:
+        """Byte-transfer observation inside the current state and phase.
+
+        Independent of :meth:`progress`: a coordinator downloading one model
+        while reporting "step 2 of 5" logical progress emits both, and a
+        consumer that only understands one of them still sees a valid event.
+        """
+        if self.snapshot is None:
+            raise OperationClosed("progress before the first event")
+        last = self.snapshot.last_event
+        return self._publish(
+            kind=OperationEventKind.PROGRESS,
+            state=last.state,
+            phase=last.phase,
+            message=message,
+            transfer=transfer,
+        )
+
     def succeed(
         self,
         phase: OperationPhase,
@@ -216,6 +235,7 @@ class OperationStream:
         phase: OperationPhase,
         message: str,
         progress: OperationProgress | None = None,
+        transfer: TransferProgress | None = None,
         diagnostic: OperationDiagnostic | None = None,
         result: OperationResult | None = None,
     ) -> OperationEvent:
@@ -230,6 +250,7 @@ class OperationStream:
             phase=phase,
             message=safe_text(message),
             progress=progress,
+            transfer=transfer,
             diagnostic=diagnostic,
             result=result,
         )

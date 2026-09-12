@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .download import DownloadProgress
 from .endpoints import StackEndpoints
 from .execution import ActionExecutionResult, PlanActionHandler
 from .layout import StackLayout
@@ -35,6 +36,7 @@ from .workflows import (
 
 ModelInstallerFactory = Callable[[Profile], ModelInstaller]
 EndpointFactory = Callable[[Profile], StackEndpoints]
+TransferSink = Callable[[str, DownloadProgress], None]
 
 
 @dataclass
@@ -49,6 +51,10 @@ class InstallActionHandlers:
     layout: StackLayout
     config_writer: ManagedConfigWriter = field(default_factory=ManagedConfigWriter)
     endpoints_for: EndpointFactory = StackEndpoints.from_profile
+    # Raw byte-level observations for one HTTP model download, keyed by the
+    # plan target that is transferring. None means nobody is listening: the
+    # Downloader's own progress hook is simply never given a callback.
+    on_transfer: TransferSink | None = None
     _installers: dict[str, ModelInstaller] = field(default_factory=dict, init=False, repr=False)
 
     def handlers(self) -> Mapping[PlanAction, PlanActionHandler]:
@@ -87,7 +93,14 @@ class InstallActionHandlers:
         except ModelCatalogError as exc:
             return self._failure(step, str(exc))
 
-        result = self._installer(profile).apply(spec, dry_run=dry_run)
+        on_progress = None
+        if self.on_transfer is not None:
+            sink, target = self.on_transfer, step.target
+
+            def on_progress(raw: DownloadProgress, sink=sink, target=target) -> None:
+                sink(target, raw)
+
+        result = self._installer(profile).apply(spec, dry_run=dry_run, progress=on_progress)
         detail = result.detail or f"model acquisition is {result.outcome.value}"
         return ActionExecutionResult(
             step.action,

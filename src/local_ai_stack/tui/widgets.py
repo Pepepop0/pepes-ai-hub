@@ -37,6 +37,7 @@ from .navigation import (
 )
 from .operations import OperationView
 from .presenters import (
+    DEFAULT_TRANSFER_WIDTH,
     display_path,
     placeholder,
     render_general_settings,
@@ -329,10 +330,23 @@ class OperationPanel(Static):
         super().__init__(render_operation(None, idle_text=idle_text), id=id)
         self.idle_text = idle_text
         self.view: OperationView | None = None
+        self.heading: str | None = None
 
     def show(self, view: OperationView | None, *, heading: str | None = None) -> None:
         self.view = view
-        self.update(render_operation(view, idle_text=self.idle_text, heading=heading))
+        self.heading = heading
+        self._repaint()
+
+    def _repaint(self) -> None:
+        # A transfer bar is sized to whatever this panel actually has, so a
+        # narrow Dashboard column shrinks the bar instead of overflowing it.
+        width = self.size.width or DEFAULT_TRANSFER_WIDTH
+        self.update(
+            render_operation(self.view, idle_text=self.idle_text, heading=self.heading, width=width)
+        )
+
+    def on_resize(self) -> None:
+        self._repaint()
 
 
 class DashboardPanel(VerticalScroll):

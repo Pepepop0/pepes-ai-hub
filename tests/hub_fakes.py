@@ -9,7 +9,7 @@ the TUI merely tolerates.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -38,6 +38,7 @@ from local_ai_stack.operation_contracts import (
     OperationResult,
     OperationSnapshot,
     OperationState,
+    TransferProgress,
     advance_operation,
 )
 from local_ai_stack.tui.application import (
@@ -151,6 +152,7 @@ def _event(
     message: str,
     *,
     progress: OperationProgress | None = None,
+    transfer: TransferProgress | None = None,
     diagnostic: OperationDiagnostic | None = None,
     result: OperationResult | None = None,
 ) -> OperationEvent:
@@ -163,6 +165,35 @@ def _event(
         phase=phase,
         message=message,
         progress=progress,
+        diagnostic=diagnostic,
+        result=result,
+        transfer=transfer,
+    )
+
+
+def transfer_event(
+    operation_id: str,
+    sequence: int,
+    state: OperationState,
+    phase: OperationPhase,
+    message: str,
+    transfer: TransferProgress,
+    *,
+    kind: OperationEventKind = OperationEventKind.PROGRESS,
+    progress: OperationProgress | None = None,
+    diagnostic: OperationDiagnostic | None = None,
+    result: OperationResult | None = None,
+) -> OperationEvent:
+    """A public constructor for byte-transfer events. Everything else uses ``_event``."""
+    return _event(
+        operation_id,
+        sequence,
+        kind,
+        state,
+        phase,
+        message,
+        progress=progress,
+        transfer=transfer,
         diagnostic=diagnostic,
         result=result,
     )
@@ -348,6 +379,11 @@ class FakeHubApplication:
     conflict_report: ConflictPreflightReport | None = None
     conflict_resolution_fails: bool = False
 
+    # Set before calling install() to replace the ordinary script with a
+    # hand-built one - the transfer-progress tests use this to inject events
+    # install_script() itself never produces.
+    custom_script: Callable[[str], list[OperationEvent]] | None = None
+
     # Test-facing record of everything that happened.
     calls: list[tuple[str, object]] = field(default_factory=list)
     emitted: list[OperationEvent] = field(default_factory=list)
@@ -407,7 +443,10 @@ class FakeHubApplication:
             raise ConflictResolutionRequired(self.conflict_report)
         operation_id = self._begin("install")
         self._active_conflict = None
-        self._pending = install_script(operation_id, fail_at=self.install_fail_at)
+        if self.custom_script is not None:
+            self._pending = self.custom_script(operation_id)
+        else:
+            self._pending = install_script(operation_id, fail_at=self.install_fail_at)
         return operation_id
 
     def current_conflict_preflight(self) -> ConflictPreflightReport | None:

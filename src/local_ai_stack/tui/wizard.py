@@ -33,6 +33,7 @@ from ..installation import InstallLocation, InstallLocationError, InstallLocatio
 from .application import InstallSelection, ProfileChoice
 from .operations import OperationView
 from .presenters import (
+    DEFAULT_TRANSFER_WIDTH,
     render_conflict_choices,
     render_conflict_report,
     render_operation,
@@ -241,6 +242,15 @@ class WizardScreen(Screen):
     def on_mount(self) -> None:
         self._repaint()
 
+    def on_resize(self) -> None:
+        # A transfer bar is sized to the pane it lives in, so a terminal
+        # resize has to redraw it rather than leave the old width in place.
+        self._repaint()
+
+    @staticmethod
+    def _pane_width(pane: Static) -> int:
+        return pane.size.width or DEFAULT_TRANSFER_WIDTH
+
     # --- state --------------------------------------------------------------
 
     def _set_state(self, state: WizardState) -> None:
@@ -394,17 +404,23 @@ class WizardScreen(Screen):
         self.query_one(step_pane_id(WizardStep.REVIEW, prefix="#"), Static).update(
             self._review_text()
         )
+        progress_pane = self.query_one(step_pane_id(WizardStep.PROGRESS, prefix="#"), Static)
         progress_text = render_operation(
-            self.operation, idle_text="Aguardando o início da instalação."
+            self.operation,
+            idle_text="Aguardando o início da instalação.",
+            width=self._pane_width(progress_pane),
         )
-        self.query_one(step_pane_id(WizardStep.PROGRESS, prefix="#"), Static).update(progress_text)
+        progress_pane.update(progress_text)
         done_heading = (
             installation_outcome_heading(self.operation.state)
             if self.operation is not None and self.operation.terminal
             else None
         )
-        done_text = render_operation(self.operation, heading=done_heading)
-        self.query_one(step_pane_id(WizardStep.DONE, prefix="#"), Static).update(done_text)
+        done_pane = self.query_one(step_pane_id(WizardStep.DONE, prefix="#"), Static)
+        done_text = render_operation(
+            self.operation, heading=done_heading, width=self._pane_width(done_pane)
+        )
+        done_pane.update(done_text)
 
         self._repaint_conflict()
         self._set_buttons()

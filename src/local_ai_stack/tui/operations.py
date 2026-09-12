@@ -20,6 +20,7 @@ from ..operation_contracts import (
     OperationPhase,
     OperationProgress,
     OperationState,
+    TransferProgress,
 )
 
 # What each lifecycle state reads as on screen. Short, and the same for every
@@ -45,6 +46,7 @@ class OperationView:
     message: str
     steps: tuple[str, ...] = ()
     progress: OperationProgress | None = None
+    transfer: TransferProgress | None = None
     diagnostics: tuple[OperationDiagnostic, ...] = ()
 
     @property
@@ -98,6 +100,18 @@ def observe(view: OperationView | None, event: OperationEvent) -> OperationView 
         event.result.diagnostics if event.result is not None else (),
     )
 
+    transfer = event.transfer
+    if (
+        transfer is None
+        and event.kind is OperationEventKind.RESULT
+        and event.state is OperationState.FAILED
+        and view is not None
+        and view.operation_id == event.operation_id
+    ):
+        # A failure ends the transfer without a closing observation of its own.
+        # The last real progress is what a person needs to see, not a blank.
+        transfer = view.transfer
+
     fresh = OperationView(
         operation_id=event.operation_id,
         sequence=event.sequence,
@@ -106,6 +120,7 @@ def observe(view: OperationView | None, event: OperationEvent) -> OperationView 
         message=event.message,
         steps=steps,
         progress=event.progress,
+        transfer=transfer,
         diagnostics=diagnostics,
     )
     if view is not None and view.operation_id == event.operation_id and view.diagnostics:

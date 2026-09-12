@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from ..external_conflict_contracts import (
     ExternalServiceConflict,
 )
 from ..integration import ComponentIntegration
+from ..operation_contracts import TransferProgress
 from ..planning import InstallPlan, build_install_plan
 from ..profiles import MIB_PER_GIB, Profile
 from ..provisioning import LaunchAvailability
@@ -403,8 +405,122 @@ def render_overview(
     return "\n".join(lines)
 
 
+# --- byte transfer: bar, sizes, speed, ETA -------------------------------------
+#
+# Every value here is derived at render time from one TransferProgress and
+# nothing else is stored. A percentage only exists when total_bytes is known;
+# an ETA only exists when total_bytes and a positive speed are both known
+# (TransferProgress.eta_seconds already encodes exactly that rule). Nothing
+# here estimates a percentage from elapsed time, phase count or guesswork.
+
+_BYTE_UNITS = ("B", "KiB", "MiB", "GiB", "TiB")
+
+DEFAULT_TRANSFER_WIDTH = 60
+MIN_BAR_WIDTH = 10
+MAX_BAR_WIDTH = 40
+# Room reserved for "[" + bar + "] " + "100%".
+_BAR_CHROME = len("[] ") + len("100%")
+
+
+def format_bytes(value: float) -> str:
+    """A human size: consistent two-decimal precision, no fake trailing zeros.
+
+    ``KiB``/``MiB``/``GiB``/``TiB`` show up to two decimals, trimmed to a whole
+    number when the value is exact (so ``812 MiB``, not ``812.00 MiB``); plain
+    ``B`` is always a whole number, since a fractional byte does not exist.
+    """
+    size = max(0.0, float(value))
+    index = 0
+    while size >= 1024 and index < len(_BYTE_UNITS) - 1:
+        size /= 1024
+        index += 1
+    text = f"{size:.2f}"
+    # A value that rounds up across a unit boundary (1023.997 -> "1024.00")
+    # belongs in the next unit instead.
+    if float(text) >= 1024 and index < len(_BYTE_UNITS) - 1:
+        index += 1
+        size /= 1024
+        text = f"{size:.2f}"
+    unit = _BYTE_UNITS[index]
+    if unit == "B":
+        return f"{int(size)} {unit}"
+    text = text.rstrip("0").rstrip(".")
+    return f"{text} {unit}"
+
+
+def format_speed(bytes_per_second: float) -> str:
+    return f"{format_bytes(bytes_per_second)}/s"
+
+
+def format_percentage(fraction: float) -> int:
+    """0-100, clamped. The only place a percentage is computed - never stored."""
+    return round(max(0.0, min(1.0, fraction)) * 100)
+
+
+def format_eta(seconds: float) -> str:
+    """``~42 s``, ``~2m 13s`` or ``~1h 04m``. Rounded up: time remaining, not passed."""
+    total = max(0, math.ceil(seconds))
+    if total < 60:
+        return f"~{total} s restantes"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"~{minutes}m {secs:02d}s restantes"
+    hours, minutes = divmod(minutes, 60)
+    return f"~{hours}h {minutes:02d}m restantes"
+
+
+def bar_width_for(available: int) -> int:
+    """The bar shrinks with the panel; it never overflows a narrow terminal."""
+    usable = available - _BAR_CHROME
+    return max(MIN_BAR_WIDTH, min(MAX_BAR_WIDTH, usable))
+
+
+def render_bar(fraction: float, width: int) -> str:
+    """A terminal-safe ``[####------]``. ASCII only: no font can fail to show it."""
+    width = max(1, width)
+    clamped = max(0.0, min(1.0, fraction))
+    filled = max(0, min(width, round(clamped * width)))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def render_transfer(transfer: TransferProgress, *, label: str, width: int) -> list[str]:
+    """The lines for one byte transfer: determinate bar or indeterminate label.
+
+    A known total gets a bar, a percentage and - when a total and a positive
+    speed both exist - an ETA. An unknown total never gets a bar, a percentage
+    or an ETA: those would all be invented. Speed is shown only when observed;
+    an absent speed shows nothing rather than a placeholder.
+    """
+    lines: list[str] = []
+    if label:
+        lines.append(escape(label))
+    if transfer.total_bytes is None:
+        lines.append("Baixando...")
+        lines.append(f"[dim]{escape(format_bytes(transfer.completed_bytes))}[/dim]")
+        if transfer.bytes_per_second is not None:
+            lines.append(f"[dim]{escape(format_speed(transfer.bytes_per_second))}[/dim]")
+        return lines
+    fraction = transfer.fraction or 0.0
+    bar = render_bar(fraction, bar_width_for(width))
+    lines.append(f"{escape(bar)} {format_percentage(fraction)}%")
+    lines.append(
+        f"[dim]{escape(format_bytes(transfer.completed_bytes))} / "
+        f"{escape(format_bytes(transfer.total_bytes))}[/dim]"
+    )
+    if transfer.bytes_per_second is not None:
+        lines.append(f"[dim]{escape(format_speed(transfer.bytes_per_second))}[/dim]")
+    eta = transfer.eta_seconds
+    if eta is not None:
+        lines.append(f"[dim]{escape(format_eta(eta))}[/dim]")
+    return lines
+
+
 def render_operation(
-    view: OperationView | None, *, idle_text: str = "", heading: str | None = None
+    view: OperationView | None,
+    *,
+    idle_text: str = "",
+    heading: str | None = None,
+    width: int = DEFAULT_TRANSFER_WIDTH,
 ) -> str:
     """One operation as a checklist: done steps, the current one, and how it ended.
 
@@ -412,6 +528,9 @@ def render_operation(
     this view is an installation's outcome passes the frozen, unambiguous
     heading from ``installation_outcome_heading`` instead of the shorter,
     generic wording every other operation shares.
+
+    ``width`` bounds the transfer bar for whatever panel is rendering this, so
+    a narrow terminal shrinks the bar instead of overflowing the layout.
     """
     if view is None:
         return escape(idle_text)
@@ -428,6 +547,11 @@ def render_operation(
         suffix = f"  {view.progress_text}" if last and view.progress_text else ""
         # The markers are literal brackets, not markup tags.
         lines.append(f"[{colour}]{escape(marker)}[/{colour}] {escape(step)}{escape(suffix)}")
+        if last and view.transfer is not None:
+            # A transfer event may repeat the step's own text as its message
+            # (nothing more specific to say); showing it twice would not help.
+            label = view.message if view.message != step else ""
+            lines.extend(render_transfer(view.transfer, label=label, width=width))
     if view.failed:
         lines.append("")
         for diagnostic in view.diagnostics:

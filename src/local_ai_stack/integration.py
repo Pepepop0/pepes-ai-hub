@@ -154,6 +154,12 @@ class ManagedPreflightIssue:
     code: ManagedPreflightCode
     detail: str
     reason: FailureReason = FailureReason.PRECONDITION
+    # The component this issue is about, when it is about exactly one. A
+    # machine-wide issue (incompatible hardware, low disk, an unusable listener
+    # scan) has none. This is how a caller distinguishes "this profile is not
+    # installable at all" from "this one external service is in the way",
+    # without parsing ``detail``.
+    component_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -311,6 +317,7 @@ def preflight_managed_stack(
                     ManagedPreflightCode.ALONGSIDE_REQUIRED,
                     f"{component_id} is external and alongside provisioning is not active "
                     "in both the integration request and provisioner",
+                    component_id=component_id,
                 )
             )
         if detection.path is not None and _paths_overlap(context.layout.root, detection.path):
@@ -318,6 +325,7 @@ def preflight_managed_stack(
                 ManagedPreflightIssue(
                     ManagedPreflightCode.PATH_OVERLAP,
                     f"managed root overlaps the external {component_id} path",
+                    component_id=component_id,
                 )
             )
 
@@ -362,6 +370,7 @@ def preflight_managed_stack(
                 ManagedPreflightIssue(
                     ManagedPreflightCode.ENDPOINT_COLLISION,
                     f"managed endpoint {spec.host}:{spec.port} for {spec.id} is occupied{suffix}",
+                    component_id=spec.id,
                 )
             )
 

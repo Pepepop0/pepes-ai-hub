@@ -375,3 +375,72 @@ def test_provider_root_is_the_model_tree_authority(tmp_path):
     paths = ManagedModelPaths((tmp_path / "models").resolve())
     assert paths.provider_root(ModelProvider.OLLAMA) == paths.root / "ollama"
     assert paths.provider_root(ModelProvider.COMFYUI) == paths.root / "comfyui"
+
+
+# --- component_id on preflight issues: the seam external_conflicts.py reads -
+
+
+def test_preflight_tags_alongside_and_collision_issues_with_their_component(tmp_path):
+    """This field is how the application distinguishes a per-service conflict
+    from a machine-wide failure, without parsing detail text."""
+    context = context_for(tmp_path)
+    report = preflight_managed_stack(
+        context,
+        PROFILE,
+        IntegrationOptions(port_overrides=MANAGED_PORTS),
+        facts=compatible_facts(),
+        listener_report=ListenerReport(
+            ScanOutcome.OK,
+            (Listener("127.0.0.1", MANAGED_PORTS["ollama"], 9001),),
+        ),
+    )
+    by_code = {issue.code: issue for issue in report.issues}
+    assert by_code["alongside-required"].component_id in ("ollama", "comfyui")
+    assert by_code["endpoint-collision"].component_id == "ollama"
+
+
+def test_machine_wide_issues_carry_no_component_id(tmp_path):
+    context = context_for(tmp_path)
+    report = preflight_managed_stack(
+        context,
+        PROFILE,
+        isolated_options(),
+        facts=compatible_facts(),
+        listener_report=ListenerReport(ScanOutcome.UNAVAILABLE, detail="access denied"),
+    )
+    issue = next(issue for issue in report.issues if issue.code == "listener-scan")
+    assert issue.component_id is None
+
+
+def test_path_overlap_is_tagged_with_the_overlapping_component(tmp_path):
+    context = context_for(tmp_path)
+    overlapping = ProvisionContext(
+        installation=resolve_installation(
+            InstallLocation.custom(context.runner.ollama.parent.parent)
+        ),
+        runner=context.runner,
+    )
+    report = preflight_managed_stack(
+        overlapping,
+        PROFILE,
+        isolated_options(),
+        facts=compatible_facts(),
+        listener_report=ListenerReport(ScanOutcome.OK),
+    )
+    overlap = next(issue for issue in report.issues if issue.code == "path-overlap")
+    assert overlap.component_id == "ollama"
+
+
+def test_a_mere_external_install_never_becomes_a_hard_stop_for_custom_root_isolation(tmp_path):
+    """DEFAULT/PORTABLE/CUSTOM decide only the layout; an external elsewhere on
+    disk, with nothing running to collide with, is never a path problem."""
+    context = context_for(tmp_path)
+    report = preflight_managed_stack(
+        context,
+        PROFILE,
+        isolated_options(),
+        facts=compatible_facts(),
+        listener_report=ListenerReport(ScanOutcome.OK),
+    )
+    assert not any(issue.code == "path-overlap" for issue in report.issues)
+    assert context.runner.ollama.is_file()  # the external install is untouched

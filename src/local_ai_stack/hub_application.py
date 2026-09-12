@@ -14,6 +14,8 @@ from uuid import uuid4
 
 from .compatibility import evaluate_compatibility
 from .config import InstalledConfig, config_path, dumps, loads
+from .external_conflict_contracts import ConflictPolicySelection, ConflictResolutionResult
+from .external_conflicts import ConflictResolutionRequired as _BackendConflictRequired
 from .installation import (
     InstallLocation,
     ResolvedInstallation,
@@ -32,6 +34,20 @@ from .tui.application import (
     OperationBusy,
     ProfileChoice,
 )
+
+
+class ConflictResolutionRequired(HubError):
+    """An external service conflicts with this profile; nothing was started.
+
+    Safe to show like any :class:`HubError`. ``report`` carries what a chooser
+    needs: :attr:`~ConflictPreflightReport.available_policies` and
+    :attr:`~ConflictPreflightReport.recommended_policy`. Resolve it with
+    :meth:`HubApplicationAdapter.resolve_conflict`, then call ``install`` again.
+    """
+
+    def __init__(self, report) -> None:
+        super().__init__("Serviços externos conflitantes foram encontrados.")
+        self.report = report
 
 
 class HubApplicationAdapter:
@@ -160,12 +176,22 @@ class HubApplicationAdapter:
                     profile_id=selection.profile_id,
                     installation=location,
                 )
+                # Bind the backend before checking for a conflict: a decision
+                # the caller makes next must land on this exact session, and a
+                # pending conflict is still "this selection", not a failure.
+                self.config, self.backend = config, backend
+                pending = backend.check_conflicts(selection.profile_id)
+                if pending is not None:
+                    raise _BackendConflictRequired(pending)
                 # Persist intent before accepting the operation. A failed first
                 # run reopens the wizard, since readiness still comes from domain.
                 _save_config(config_path(installation.layout), config)
                 _save_config(self.selection_path, config)
-                self.config, self.backend = config, backend
                 return self._schedule(operation_id, backend.first_run)
+            except _BackendConflictRequired as exc:
+                self._busy = False
+                self._idle.set()
+                raise ConflictResolutionRequired(exc.report) from exc
             except Exception as exc:
                 self._busy = False
                 self._idle.set()
@@ -174,6 +200,32 @@ class HubApplicationAdapter:
                 raise HubError(
                     "Não foi possível preparar a instalação. Verifique a pasta escolhida."
                 ) from exc
+
+    def current_conflict_preflight(self):
+        """The conflict ``install`` last raised, without scanning again.
+
+        Read-only; safe to poll while a decision is pending. Rescanning here
+        would mint a new preflight id and strand whatever choice the caller is
+        about to submit against the old one. ``None`` means there is nothing
+        to resolve -- including when nothing has been selected for install yet.
+        """
+        if self.config is None:
+            return None
+        try:
+            return self.backend.current_conflict_preflight()
+        except Exception as exc:
+            raise HubUnavailable(
+                "Não foi possível verificar conflitos com serviços externos."
+            ) from exc
+
+    def resolve_conflict(self, selection: ConflictPolicySelection) -> ConflictResolutionResult:
+        """Authorize one policy for the pending conflict. Call before ``install`` again."""
+        try:
+            return self.backend.resolve_conflict(selection)
+        except Exception as exc:
+            raise HubUnavailable(
+                "Não foi possível processar a decisão sobre os serviços externos."
+            ) from exc
 
     def _command(self, name: str) -> str:
         with self._lock:

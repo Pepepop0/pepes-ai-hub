@@ -624,7 +624,7 @@ class ControlledInventory:
         for process in self.processes:
             if process.pid == pid:
                 return ProcessLookup(LookupOutcome.FOUND, process)
-        return ProcessLookup(LookupOutcome.MISSING, None)
+        return ProcessLookup(LookupOutcome.NOT_FOUND, None)
 
     # --- mutação controlada -------------------------------------------------
 

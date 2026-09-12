@@ -45,6 +45,18 @@ from .components import ComponentId
 from .controller import ServiceController
 from .download import Downloader
 from .execution import ExecutionReport, PlanExecutor
+from .external_conflict_contracts import (
+    ConflictPolicySelection,
+    ConflictPreflightReport,
+    ConflictResolutionResult,
+    ConflictResolutionStatus,
+)
+from .external_conflicts import (
+    ConflictResolutionRequired,
+    ExternalConflictSession,
+    merged_options,
+    terminate_by_pid,
+)
 from .install_actions import InstallActionHandlers
 from .installation import ResolvedInstallation, detect_repo_root
 from .integration import (
@@ -135,6 +147,9 @@ class StackDependencies:
     list_processes: Callable[[], ProcessReport] = list_processes
     list_listeners: Callable[[], ListenerReport] = list_listeners
     lookup_process: Callable[[int], Any] = default_lookup_process
+    # Ends one already identity-confirmed external process; see
+    # external_conflicts.terminate_by_pid for why this is not launcher.py.
+    terminate_process: Callable[[int, float], bool] = terminate_by_pid
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], datetime] = utc_now
@@ -250,6 +265,18 @@ class StackApplication:
         self._registry: ManagedProcessRegistry | None = None
         self._launcher: ProcessLauncher | None = None
         self.last_first_run = None
+        # Indirected through ``self.deps`` at call time, not captured now: a
+        # test that reassigns a dependency after construction (as several
+        # already do for the launcher) must still reach the session.
+        self._conflicts = ExternalConflictSession(
+            lookup_process=lambda pid: self.deps.lookup_process(pid),
+            list_listeners=lambda: self.deps.list_listeners(),
+            terminate_process=lambda pid, create_time: self.deps.terminate_process(
+                pid, create_time
+            ),
+            monotonic=lambda: self.deps.monotonic(),
+            sleep=lambda seconds: self.deps.sleep(seconds),
+        )
 
     # --- leitura -------------------------------------------------------------
 
@@ -458,6 +485,57 @@ class StackApplication:
             managed_pids=managed,
         )
 
+    def check_conflicts(self, profile_id: str) -> ConflictPreflightReport | None:
+        """A typed, resolvable view of any external conflict blocking this profile.
+
+        Read-only, and safe to call as often as needed. Returns ``None`` when
+        there is nothing a policy could resolve here -- including when the
+        profile is simply not installable for an unrelated reason (incompatible
+        hardware, low disk, an unrelated port squatter), which stays a normal
+        preflight failure reported by :meth:`first_run` itself, exactly as
+        before this existed.
+        """
+        profile = self.profile(profile_id)
+        raw = self.preflight(profile)
+        listeners = self.deps.list_listeners()
+        managed_pids = (
+            self.registry().managed_pids(processes=self.deps.list_processes())
+            if self.layout.root.exists()
+            else frozenset()
+        )
+        return self._conflicts.observe(
+            profile=profile,
+            options=self.options,
+            raw_report=raw,
+            listeners=listeners,
+            managed_pids=managed_pids,
+        )
+
+    def current_conflict_preflight(self) -> ConflictPreflightReport | None:
+        """The most recently observed conflict, without scanning again.
+
+        Unlike :meth:`check_conflicts`, this never produces a new preflight id:
+        it is the read a chooser polls while a decision is pending, so it must
+        not invalidate the very id that decision is about to reference.
+        """
+        return self._conflicts.current_conflict_preflight()
+
+    def resolve_conflict(self, selection: ConflictPolicySelection) -> ConflictResolutionResult:
+        """Authorize -- and for STOP, execute -- one policy for the pending conflict.
+
+        On PROCEED this durably folds the resolution into this application's
+        own options, so a later :meth:`first_run` finds nothing left to
+        resolve and every later preflight sees the isolated endpoint or the
+        freed port, never the same conflict again.
+        """
+        report = self._conflicts.current_conflict_preflight()
+        result = self._conflicts.resolve_external_conflicts(selection)
+        if result.status is ConflictResolutionStatus.PROCEED and report is not None:
+            self.options = merged_options(self.options, report, result.policy)
+            self._installers.clear()  # an isolated endpoint may have just changed
+
+        return result
+
     def unresolved_models(self, profile: Profile) -> Mapping[str, str]:
         return unresolved_roles(profile, self.catalog())
 
@@ -534,10 +612,20 @@ class StackApplication:
     def first_run(
         self, operation_id: str, profile_id: str, *, emit: OperationEventSink | None = None
     ) -> OperationResult:
-        """Install, acquire, configure and start everything the profile needs."""
+        """Install, acquire, configure and start everything the profile needs.
+
+        Raises :class:`ConflictResolutionRequired` -- before anything is
+        created, no operation and no terminal result -- when an external
+        service conflicts with this profile and nobody has resolved it yet.
+        Call :meth:`resolve_conflict` first; once it reports PROCEED, this
+        proceeds exactly as it would with no conflict at all.
+        """
         from .first_run import FirstRunCoordinator
 
         profile = self.profile(profile_id)
+        pending = self.check_conflicts(profile.id)
+        if pending is not None:
+            raise ConflictResolutionRequired(pending)
         with self._operation_stream(operation_id, emit) as stream:
             self._active_profile = profile.id
             coordinator = FirstRunCoordinator(self, profile, stream)
@@ -899,6 +987,7 @@ __all__ = [
     "START_ORDER",
     "AppStatus",
     "ComponentStatus",
+    "ConflictResolutionRequired",
     "OpenWebUILaunch",
     "OpenWebUILaunchTarget",
     "OperationBusy",

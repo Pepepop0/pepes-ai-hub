@@ -494,3 +494,332 @@ def test_the_flow_leaves_no_temporary_directory_behind():
     built.app.first_run("op-1", CAPELLA)
     built.release()
     assert set(tracking.outstanding()) - before == set()
+
+
+# --- conflitos externos: resolução via first_run/hub_application ------------
+
+
+from local_ai_stack.e2e.fixtures import external_install
+from local_ai_stack.external_conflict_contracts import (
+    ConflictPolicySelection,
+    ConflictPreflightDisposition,
+    ExternalConflictPolicy,
+)
+from local_ai_stack.external_conflicts import ALONGSIDE_PORTS, ConflictResolutionRequired
+from local_ai_stack.installation import InstallLocation, resolve_installation
+
+
+def _isolate_launcher(built, components):
+    """Make the controlled launcher answer ready on each component's alt port."""
+    original = built.app.deps.launcher
+
+    def make(registry):
+        launcher = original(registry)
+        for component in components:
+            launcher.ready_ports[component] = ALONGSIDE_PORTS[component]
+        return launcher
+
+    built.app.deps.launcher = make
+
+
+def _fake_terminate(built):
+    """Route STOP's process-end seam through the controlled inventory."""
+
+    def terminate(pid, create_time):
+        if pid not in built.inventory.pids():
+            return False
+        built.inventory.kill(pid)
+        return True
+
+    built.app.deps.terminate_process = terminate
+
+
+def test_a_scenario_external_ollama_and_comfyui_install_alongside():
+    """A) Both externals running on their default ports; INSTALL_ALONGSIDE proceeds."""
+    ollama_ext = external_install("ollama")
+    comfy_ext = external_install("comfyui")
+    built = controlled_stack(ready_ports=(11434, 8080, 8188, *ALONGSIDE_PORTS.values()))
+    try:
+        built.runner.on_path.update(ollama_ext.on_path)
+        built.runner.on_path.update(comfy_ext.on_path)
+        built.runner.fake_env.update(ollama_ext.env)
+        built.runner.fake_env.update(comfy_ext.env)
+        built.inventory.add_external(11434, pid=9101, executable=str(ollama_ext.path))
+        built.inventory.add_external(8188, pid=9102, executable=str(comfy_ext.path), name="comfyui")
+        _isolate_launcher(built, ["ollama", "comfyui"])
+
+        with pytest.raises(ConflictResolutionRequired) as excinfo:
+            built.app.first_run("op-1", CAPELLA)
+        report = excinfo.value.report
+        assert report.disposition is ConflictPreflightDisposition.RESOLUTION_REQUIRED
+        assert {str(c.service_id) for c in report.conflicts} == {"ollama", "comfyui"}
+        assert report.recommended_policy is ExternalConflictPolicy.INSTALL_ALONGSIDE
+
+        resolution = built.app.resolve_conflict(
+            ConflictPolicySelection(report.preflight_id, ExternalConflictPolicy.INSTALL_ALONGSIDE)
+        )
+        assert resolution.status.value == "proceed"
+
+        result = built.app.first_run("op-2", CAPELLA)
+        assert result.state is OperationState.SUCCEEDED, [d.message for d in result.diagnostics]
+
+        status = built.app.status(CAPELLA)
+        assert status.component("ollama").endpoint == "http://127.0.0.1:" + str(
+            ALONGSIDE_PORTS["ollama"]
+        )
+        assert status.component("comfyui").endpoint == "http://127.0.0.1:" + str(
+            ALONGSIDE_PORTS["comfyui"]
+        )
+        assert status.stack_up
+
+        assert 9101 in built.inventory.pids()
+        assert 9102 in built.inventory.pids()
+        assert all(9101 not in tree for tree in built.launcher.started_trees.values())
+        assert all(9102 not in tree for tree in built.launcher.started_trees.values())
+    finally:
+        built.release()
+        ollama_ext.release()
+        comfy_ext.release()
+
+
+def test_b_scenario_stop_only_the_conflicting_external_survives_the_rest():
+    """B) Only the authorized conflict is stopped; an unrelated process lives."""
+    ollama_ext = external_install("ollama")
+    built = controlled_stack(ready_ports=(11434, 8080, 8188))
+    try:
+        built.runner.on_path.update(ollama_ext.on_path)
+        built.runner.fake_env.update(ollama_ext.env)
+        built.inventory.add_external(11434, pid=9201, executable=str(ollama_ext.path))
+        from local_ai_stack.e2e.providers import UNRELATED_PID
+
+        built.inventory.occupy(39999)  # a listener on this port, pid is UNRELATED_PID
+        _fake_terminate(built)
+
+        with pytest.raises(ConflictResolutionRequired) as excinfo:
+            built.app.first_run("op-1", CAPELLA)
+        report = excinfo.value.report
+        assert [str(c.service_id) for c in report.conflicts] == ["ollama"]
+
+        resolution = built.app.resolve_conflict(
+            ConflictPolicySelection(
+                report.preflight_id, ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL
+            )
+        )
+        assert resolution.status.value == "proceed"
+        assert 9201 not in built.inventory.pids()
+        assert UNRELATED_PID in built.inventory.pids()
+
+        result = built.app.first_run("op-2", CAPELLA)
+        assert result.state is OperationState.SUCCEEDED, [d.message for d in result.diagnostics]
+        status = built.app.status(CAPELLA)
+        assert status.component("ollama").endpoint == "http://127.0.0.1:11434"
+        assert status.stack_up
+        assert UNRELATED_PID in built.inventory.pids()
+    finally:
+        built.release()
+        ollama_ext.release()
+
+
+def test_c_scenario_unprovable_external_refuses_stop_and_leaves_it_running():
+    """C) Ambiguous identity: STOP is never offered, and forcing it changes nothing."""
+    from local_ai_stack.inventory import Listener
+
+    ollama_ext = external_install("ollama")
+    built = controlled_stack(ready_ports=(11434, 8080, 8188))
+    try:
+        built.runner.on_path.update(ollama_ext.on_path)
+        built.runner.fake_env.update(ollama_ext.env)
+        built.inventory.add_external(11434, pid=9301, executable=str(ollama_ext.path))
+        built.inventory.listeners.append(Listener("127.0.0.1", 11434, 9302))
+        _fake_terminate(built)
+
+        with pytest.raises(ConflictResolutionRequired) as excinfo:
+            built.app.first_run("op-1", CAPELLA)
+        report = excinfo.value.report
+        conflict = report.conflicts[0]
+        assert not conflict.can_stop_safely
+        assert ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL not in report.available_policies
+
+        with pytest.raises(ValueError, match="unavailable"):
+            built.app.resolve_conflict(
+                ConflictPolicySelection(
+                    report.preflight_id, ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL
+                )
+            )
+        assert 9301 in built.inventory.pids()
+
+        resolution = built.app.resolve_conflict(
+            ConflictPolicySelection(report.preflight_id, ExternalConflictPolicy.ABORT)
+        )
+        assert resolution.status.value == "aborted"
+        assert 9301 in built.inventory.pids()
+    finally:
+        built.release()
+        ollama_ext.release()
+
+
+def test_d_scenario_custom_root_beside_an_external_elsewhere_has_no_filesystem_collision():
+    """D) A CUSTOM root and an external installed at an unrelated path coexist."""
+    built = controlled_stack(ready_ports=(11434, 8080, 8188))
+    ollama_ext = external_install("ollama")
+    try:
+        built.runner.on_path.update(ollama_ext.on_path)
+        built.runner.fake_env.update(ollama_ext.env)
+        custom_root = built.root.path / "custom-loira-40k"
+        built.app.installation = resolve_installation(
+            InstallLocation.custom(custom_root), repo_root=built.fixture.path
+        )
+
+        raw = built.app.preflight(built.app.profile(CAPELLA))
+        assert not any(issue.code.value == "path-overlap" for issue in raw.issues)
+        assert str(ollama_ext.path).lower() not in str(custom_root).lower()
+    finally:
+        built.release()
+        ollama_ext.release()
+
+
+def test_e_scenario_the_alternate_endpoint_being_occupied_blocks_with_a_diagnostic():
+    """E) Alt endpoint also occupied and identity unprovable: BLOCKED, not a choice."""
+    from local_ai_stack.inventory import Listener
+
+    ollama_ext = external_install("ollama")
+    built = controlled_stack(ready_ports=(11434, 8080, 8188))
+    try:
+        built.runner.on_path.update(ollama_ext.on_path)
+        built.runner.fake_env.update(ollama_ext.env)
+        built.inventory.add_external(11434, pid=9401, executable=str(ollama_ext.path))
+        built.inventory.listeners.append(Listener("127.0.0.1", 11434, 9402))
+        built.inventory.occupy(ALONGSIDE_PORTS["ollama"], pid=9403)
+
+        with pytest.raises(ConflictResolutionRequired) as excinfo:
+            built.app.first_run("op-1", CAPELLA)
+        report = excinfo.value.report
+        assert report.disposition is ConflictPreflightDisposition.BLOCKED
+        assert report.available_policies == (ExternalConflictPolicy.ABORT,)
+        assert any(item.code == "managed-endpoint-occupied" for item in report.hard_blockers)
+        assert not built.app.status(CAPELLA).installation_ready
+    finally:
+        built.release()
+        ollama_ext.release()
+
+
+def test_f_scenario_second_run_after_alongside_does_not_ask_again():
+    """F) Idempotence: the resolved conflict is not rediscovered on a second run."""
+    ollama_ext = external_install("ollama")
+    built = controlled_stack(ready_ports=(11434, 8080, 8188, ALONGSIDE_PORTS["ollama"]))
+    try:
+        built.runner.on_path.update(ollama_ext.on_path)
+        built.runner.fake_env.update(ollama_ext.env)
+        built.inventory.add_external(11434, pid=9501, executable=str(ollama_ext.path))
+        _isolate_launcher(built, ["ollama"])
+
+        with pytest.raises(ConflictResolutionRequired) as excinfo:
+            built.app.first_run("op-1", CAPELLA)
+        report = excinfo.value.report
+        built.app.resolve_conflict(
+            ConflictPolicySelection(report.preflight_id, ExternalConflictPolicy.INSTALL_ALONGSIDE)
+        )
+        first = built.app.first_run("op-2", CAPELLA)
+        assert first.state is OperationState.SUCCEEDED, [d.message for d in first.diagnostics]
+
+        downloads = len(built.artifacts.requests)
+        pulls = list(built.ollama.pulls)
+
+        second = built.app.first_run("op-3", CAPELLA)
+        assert second.state is OperationState.SUCCEEDED
+        assert built.app.last_first_run.did_nothing
+        assert len(built.artifacts.requests) == downloads
+        assert built.ollama.pulls == pulls
+        assert 9501 in built.inventory.pids()
+    finally:
+        built.release()
+        ollama_ext.release()
+
+
+def test_f_scenario_second_run_after_stop_does_not_ask_again():
+    """F) The same, for STOP: nothing left to resolve once the port is free."""
+    ollama_ext = external_install("ollama")
+    built = controlled_stack(ready_ports=(11434, 8080, 8188))
+    try:
+        built.runner.on_path.update(ollama_ext.on_path)
+        built.runner.fake_env.update(ollama_ext.env)
+        built.inventory.add_external(11434, pid=9601, executable=str(ollama_ext.path))
+        _fake_terminate(built)
+
+        with pytest.raises(ConflictResolutionRequired) as excinfo:
+            built.app.first_run("op-1", CAPELLA)
+        report = excinfo.value.report
+        built.app.resolve_conflict(
+            ConflictPolicySelection(
+                report.preflight_id, ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL
+            )
+        )
+        first = built.app.first_run("op-2", CAPELLA)
+        assert first.state is OperationState.SUCCEEDED, [d.message for d in first.diagnostics]
+
+        second = built.app.first_run("op-3", CAPELLA)
+        assert second.state is OperationState.SUCCEEDED
+        assert built.app.last_first_run.did_nothing
+    finally:
+        built.release()
+        ollama_ext.release()
+
+
+def test_hub_application_surfaces_the_conflict_and_resumes_after_resolution():
+    """The bridge: hub.install() refuses synchronously, never starts an operation."""
+    from local_ai_stack.hub_application import ConflictResolutionRequired as HubConflictRequired
+    from local_ai_stack.hub_application import create_hub_application
+    from local_ai_stack.layout import ENV_ROOT
+    from local_ai_stack.stack_application import StackApplication
+    from local_ai_stack.tui.application import InstallSelection
+
+    ollama_ext = external_install("ollama")
+    built = controlled_stack(ready_ports=(11434, 8080, 8188, ALONGSIDE_PORTS["ollama"]))
+    try:
+        built.runner.on_path.update(ollama_ext.on_path)
+        built.runner.fake_env.update(ollama_ext.env)
+        built.inventory.add_external(11434, pid=9701, executable=str(ollama_ext.path))
+        _isolate_launcher(built, ["ollama"])
+
+        def resolve(location):
+            return resolve_installation(
+                location,
+                repo_root=built.fixture.path,
+                env={ENV_ROOT: str(built.root.path / "default")},
+            )
+
+        def backend(installation):
+            return StackApplication(
+                installation,
+                profiles=tuple(built.app.profiles.values()),
+                repo_root=built.fixture.path,
+                dependencies=built.app.deps,
+                options=built.app.options,
+            )
+
+        adapter = create_hub_application(
+            built.fixture.path, resolve=resolve, backend_factory=backend
+        )
+        try:
+            with pytest.raises(HubConflictRequired) as excinfo:
+                adapter.install(InstallSelection(CAPELLA))
+            assert not adapter._busy
+            report = excinfo.value.report
+            assert adapter.current_conflict_preflight() is not None
+
+            resolution = adapter.resolve_conflict(
+                ConflictPolicySelection(
+                    report.preflight_id, ExternalConflictPolicy.INSTALL_ALONGSIDE
+                )
+            )
+            assert resolution.status.value == "proceed"
+            assert adapter.current_conflict_preflight() is None
+
+            adapter.install(InstallSelection(CAPELLA))
+            adapter.wait(10)
+            assert adapter.current_operation().last_event.state is OperationState.SUCCEEDED
+        finally:
+            adapter.close()
+    finally:
+        built.release()
+        ollama_ext.release()

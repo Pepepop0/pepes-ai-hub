@@ -36,7 +36,7 @@ from .presenters import (
     DEFAULT_TRANSFER_WIDTH,
     render_conflict_choices,
     render_conflict_report,
-    render_operation,
+    render_install_progress,
     render_stop_confirmation,
 )
 
@@ -175,6 +175,7 @@ class WizardScreen(Screen):
         self.operation: OperationView | None = None
         self.conflict: ConflictPreflightReport | None = None
         self._conflict_error: str = ""
+        self.details_expanded: bool = False
 
     # --- composition --------------------------------------------------------
 
@@ -234,6 +235,7 @@ class WizardScreen(Screen):
                 yield Button("Pular por agora", id="wizard-skip")
                 yield Button("Voltar", id="wizard-back")
                 yield Button("Continuar", id="wizard-next", variant="primary")
+                yield Button("Mostrar detalhes", id="wizard-details-toggle")
                 yield Button("Abrir Open WebUI", id="wizard-open-webui", variant="primary")
                 yield Button("Ir para o Dashboard", id="wizard-finish")
                 yield Button("Tentar novamente", id="wizard-retry", variant="primary")
@@ -405,10 +407,11 @@ class WizardScreen(Screen):
             self._review_text()
         )
         progress_pane = self.query_one(step_pane_id(WizardStep.PROGRESS, prefix="#"), Static)
-        progress_text = render_operation(
+        progress_text = render_install_progress(
             self.operation,
             idle_text="Aguardando o início da instalação.",
             width=self._pane_width(progress_pane),
+            expanded=self.details_expanded,
         )
         progress_pane.update(progress_text)
         done_heading = (
@@ -417,10 +420,16 @@ class WizardScreen(Screen):
             else None
         )
         done_pane = self.query_one(step_pane_id(WizardStep.DONE, prefix="#"), Static)
-        done_text = render_operation(
-            self.operation, heading=done_heading, width=self._pane_width(done_pane)
+        done_text = render_install_progress(
+            self.operation,
+            heading=done_heading,
+            width=self._pane_width(done_pane),
+            expanded=self.details_expanded,
         )
         done_pane.update(done_text)
+        self.query_one("#wizard-details-toggle", Button).label = (
+            "Ocultar detalhes" if self.details_expanded else "Mostrar detalhes"
+        )
 
         self._repaint_conflict()
         self._set_buttons()
@@ -471,6 +480,8 @@ class WizardScreen(Screen):
             "wizard-skip": state.step is WizardStep.WELCOME,
             "wizard-back": state.step in (WizardStep.PROFILE, WizardStep.MODE, WizardStep.REVIEW),
             "wizard-next": state.step in CHOICE_STEPS,
+            "wizard-details-toggle": state.step in (WizardStep.PROGRESS, WizardStep.DONE)
+            and view is not None,
             "wizard-open-webui": state.step is WizardStep.DONE and bool(view and view.succeeded),
             "wizard-finish": state.step is WizardStep.DONE and bool(view and view.succeeded),
             "wizard-retry": state.step is WizardStep.DONE and bool(view and view.failed),
@@ -500,7 +511,11 @@ class WizardScreen(Screen):
             self.post_message(self.Finished())
         elif button_id == "wizard-retry":
             self.operation = None
+            self.details_expanded = False
             self.go_to(WizardStep.REVIEW)
+        elif button_id == "wizard-details-toggle":
+            self.details_expanded = not self.details_expanded
+            self._repaint()
         elif button_id == "wizard-conflict-alongside":
             self._choose_policy(ExternalConflictPolicy.INSTALL_ALONGSIDE)
         elif button_id == "wizard-conflict-stop":
@@ -552,6 +567,7 @@ class WizardScreen(Screen):
             # Disable before asking, so a second press while the app decides
             # cannot ask again.
             self.query_one("#wizard-next", Button).disabled = True
+            self.details_expanded = False
             self.go_to(WizardStep.PROGRESS)
             self.post_message(self.InstallRequested(selection))
             return

@@ -29,6 +29,7 @@ from local_ai_stack.external_conflict_contracts import (
 )
 from local_ai_stack.installation import InstallLocationMode
 from local_ai_stack.operation_contracts import (
+    OperationActivity,
     OperationDiagnostic,
     OperationEvent,
     OperationEventKind,
@@ -155,6 +156,8 @@ def _event(
     transfer: TransferProgress | None = None,
     diagnostic: OperationDiagnostic | None = None,
     result: OperationResult | None = None,
+    activity: OperationActivity | None = None,
+    detail: OperationActivity | None = None,
 ) -> OperationEvent:
     return OperationEvent(
         operation_id=operation_id,
@@ -168,6 +171,8 @@ def _event(
         diagnostic=diagnostic,
         result=result,
         transfer=transfer,
+        activity=activity,
+        detail=detail,
     )
 
 
@@ -183,6 +188,7 @@ def transfer_event(
     progress: OperationProgress | None = None,
     diagnostic: OperationDiagnostic | None = None,
     result: OperationResult | None = None,
+    activity: OperationActivity | None = None,
 ) -> OperationEvent:
     """A public constructor for byte-transfer events. Everything else uses ``_event``."""
     return _event(
@@ -196,6 +202,52 @@ def transfer_event(
         transfer=transfer,
         diagnostic=diagnostic,
         result=result,
+        activity=activity,
+    )
+
+
+def activity_event(
+    operation_id: str,
+    sequence: int,
+    state: OperationState,
+    phase: OperationPhase,
+    message: str,
+    activity: OperationActivity,
+    *,
+    transfer: TransferProgress | None = None,
+    progress: OperationProgress | None = None,
+) -> OperationEvent:
+    """A public constructor for current-activity events (what a step is doing now)."""
+    return _event(
+        operation_id,
+        sequence,
+        OperationEventKind.ACTIVITY,
+        state,
+        phase,
+        message,
+        progress=progress,
+        transfer=transfer,
+        activity=activity,
+    )
+
+
+def detail_event(
+    operation_id: str,
+    sequence: int,
+    state: OperationState,
+    phase: OperationPhase,
+    message: str,
+    detail: OperationActivity,
+) -> OperationEvent:
+    """A public constructor for timeline-detail events (one bounded history entry)."""
+    return _event(
+        operation_id,
+        sequence,
+        OperationEventKind.DETAIL,
+        state,
+        phase,
+        message,
+        detail=detail,
     )
 
 

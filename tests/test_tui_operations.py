@@ -346,7 +346,7 @@ def test_progress_within_a_stage_is_shown_as_a_count_not_a_percentage():
             pane = text(app, "#wizard-step-progress")
             assert "Baixando modelos  1/3" in pane
             assert "%" not in pane
-            assert "[b]Em andamento[/b]" in pane
+            assert "[b]Instalando[/b]" in pane
 
     run(exercise)
 
@@ -366,7 +366,7 @@ def test_a_successful_install_ends_on_done_with_open_webui():
             assert "[b]Concluído[/b]" in text(app, "#wizard-title")
             assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
             visible = [b.id for b in screen.query("#wizard-actions Button") if b.display]
-            assert visible == ["wizard-open-webui", "wizard-finish"]
+            assert visible == ["wizard-details-toggle", "wizard-open-webui", "wizard-finish"]
 
             await click(pilot, "#wizard-open-webui")
             assert opened == ["http://127.0.0.1:8080/"]
@@ -403,7 +403,7 @@ def test_a_failed_install_shows_a_short_reason_and_offers_a_retry():
             assert "Código: download-failed" in pane
             assert "Traceback" not in pane and "Exception" not in pane
             visible = [b.id for b in screen.query("#wizard-actions Button") if b.display]
-            assert visible == ["wizard-retry"]
+            assert visible == ["wizard-details-toggle", "wizard-retry"]
             assert not fake.ready
 
             fake.install_fail_at = None

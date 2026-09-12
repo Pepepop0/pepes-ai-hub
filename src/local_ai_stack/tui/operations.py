@@ -14,13 +14,22 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from ..operation_contracts import (
+    DETAIL_HISTORY_LIMIT,
+    OperationActivity,
     OperationDiagnostic,
     OperationEvent,
     OperationEventKind,
     OperationPhase,
     OperationProgress,
     OperationState,
+    OperationTimelineEntry,
     TransferProgress,
+)
+
+# Kinds that refine the current step rather than announce a new one. A
+# STATE or RESULT event names the step; these only add detail to it.
+_REFINING_KINDS = frozenset(
+    {OperationEventKind.PROGRESS, OperationEventKind.ACTIVITY, OperationEventKind.DETAIL}
 )
 
 # What each lifecycle state reads as on screen. Short, and the same for every
@@ -47,6 +56,8 @@ class OperationView:
     steps: tuple[str, ...] = ()
     progress: OperationProgress | None = None
     transfer: TransferProgress | None = None
+    activity: OperationActivity | None = None
+    history: tuple[OperationTimelineEntry, ...] = ()
     diagnostics: tuple[OperationDiagnostic, ...] = ()
 
     @property
@@ -90,27 +101,61 @@ def observe(view: OperationView | None, event: OperationEvent) -> OperationView 
     else:
         steps = ()
 
-    # A progress event refines the current step; it does not add one. The first
-    # event seen always names a step, since a replay may start mid-stream.
-    if not steps or (event.kind is not OperationEventKind.PROGRESS and steps[-1] != event.message):
+    same_operation = view is not None and view.operation_id == event.operation_id
+    steps_before = len(view.steps) if same_operation else 0
+
+    # A progress, activity or detail event refines the current step; it does
+    # not add one. The first event seen always names a step, since a replay
+    # may start mid-stream.
+    if not steps or (event.kind not in _REFINING_KINDS and steps[-1] != event.message):
         steps = (*steps, event.message)
+    new_step = len(steps) > steps_before
 
     diagnostics = _distinct(
         (event.diagnostic,) if event.diagnostic is not None else (),
         event.result.diagnostics if event.result is not None else (),
     )
 
-    transfer = event.transfer
-    if (
-        transfer is None
-        and event.kind is OperationEventKind.RESULT
+    failure_result = (
+        event.kind is OperationEventKind.RESULT
         and event.state is OperationState.FAILED
-        and view is not None
-        and view.operation_id == event.operation_id
-    ):
-        # A failure ends the transfer without a closing observation of its own.
-        # The last real progress is what a person needs to see, not a blank.
+        and same_operation
+    )
+    # Logical progress and transfer bytes are observations *of the current
+    # step*: several events can build up the same picture (activity, then
+    # transfer, then more activity) without repeating what an earlier one
+    # already said, so they carry forward within one step. A genuinely new
+    # step starts blank - a later, unrelated step must not keep showing a
+    # finished download's bar. Failure is the one exception: its result event
+    # names a new "step" of its own, but must still show what was interrupted.
+    sticky = (not new_step) or failure_result
+    progress = event.progress
+    if progress is None and sticky and same_operation:
+        progress = view.progress
+    transfer = event.transfer
+    if transfer is None and sticky and same_operation:
         transfer = view.transfer
+
+    # Current activity is sticky *within one step*, the same as progress and
+    # transfer: several observations of the same work accumulate into one
+    # picture, but a step that moves on to something else does not keep
+    # showing what a much earlier step was doing. Success always clears it -
+    # there is nothing "current" once done - and failure keeps whatever was
+    # last known, for the same reason progress and transfer do.
+    if event.state is OperationState.SUCCEEDED:
+        activity = None
+    elif event.activity is not None:
+        activity = event.activity
+    elif sticky and same_operation:
+        activity = view.activity
+    else:
+        activity = None
+
+    history = view.history if same_operation else ()
+    if event.detail is not None:
+        history = (*history, OperationTimelineEntry(event.sequence, event.phase, event.detail))[
+            -DETAIL_HISTORY_LIMIT:
+        ]
 
     fresh = OperationView(
         operation_id=event.operation_id,
@@ -119,11 +164,13 @@ def observe(view: OperationView | None, event: OperationEvent) -> OperationView 
         phase=event.phase,
         message=event.message,
         steps=steps,
-        progress=event.progress,
+        progress=progress,
         transfer=transfer,
+        activity=activity,
+        history=history,
         diagnostics=diagnostics,
     )
-    if view is not None and view.operation_id == event.operation_id and view.diagnostics:
+    if same_operation and view.diagnostics:
         # Keep earlier diagnostics a failure path may have reported on the way.
         fresh = replace(fresh, diagnostics=_distinct(view.diagnostics, fresh.diagnostics))
     return fresh

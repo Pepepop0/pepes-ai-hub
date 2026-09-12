@@ -61,6 +61,7 @@ from .provisioning import (
     ProvisionResult,
     ProvisionStep,
     build_activity,
+    reason_for_pip_failure,
 )
 from .pyenv import (
     PipEvent,
@@ -621,7 +622,10 @@ class ComfyUIProvisioner(Provisioner):
             )
         except PythonEnvironmentError as exc:
             return self.failed(
-                detection, FailureReason.COMMAND_FAILED, "Could not install dependencies.", str(exc)
+                detection,
+                reason_for_pip_failure(exc.failure),
+                "Could not install dependencies.",
+                exc.failure.summary if exc.failure is not None else str(exc),
             )
 
         if not self.entry_point(context).is_file():

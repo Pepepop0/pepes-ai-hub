@@ -19,7 +19,12 @@ from .application_contracts import ServicesSnapshot, ServiceView, VramSnapshot
 from .compatibility import evaluate_compatibility
 from .config import InstalledConfig
 from .execution import PlanExecutor
-from .installation import InstallLocationMode, ResolvedInstallation, resolve_installation
+from .installation import (
+    InstallLocation,
+    InstallLocationMode,
+    ResolvedInstallation,
+    resolve_installation,
+)
 from .integration import IntegrationSnapshot, detect_integration, plan_executor, provision_context
 from .operation_contracts import OperationEvent, OperationSnapshot
 from .profiles import Profile, load_profiles
@@ -89,6 +94,14 @@ class OperationObserved(Message):
     def __init__(self, event: OperationEvent) -> None:
         super().__init__()
         self.event = event
+
+
+class LaunchResolved(Message):
+    """A bounded backend readiness check finished outside the render thread."""
+
+    def __init__(self, target: LaunchTarget | LaunchRefusal) -> None:
+        super().__init__()
+        self.target = target
 
 
 @dataclass
@@ -342,6 +355,12 @@ class LocalAIStackApp(App):
         self.select_profile(message.selection.profile_id)
         try:
             self.application.install(message.selection)
+            self._set_installation(
+                InstallLocation(
+                    message.selection.mode,
+                    Path(message.selection.custom_root) if message.selection.custom_root else None,
+                )
+            )
         except HubError as error:
             if wizard is not None:
                 wizard.show_refusal(str(error))
@@ -398,29 +417,39 @@ class LocalAIStackApp(App):
     # --- Open WebUI ---------------------------------------------------------
 
     def open_webui(self) -> bool:
-        """Ask for a launch target and hand it to the browser. Never builds a URL."""
+        """Accept one launch request; readiness runs outside the render thread."""
         if self._launching:
             return False
         self._launching = True
         self._set_launching(True)
+        self.run_worker(self._resolve_launch, thread=True, group="open-webui")
+        return True
+
+    def _resolve_launch(self) -> None:
         try:
             target = self.application.open_webui_target()
         except HubError as error:
-            self._notice(str(error), error=True)
-            self._end_launch()
-            return False
+            target = LaunchRefusal(str(error))
+        except Exception:  # noqa: BLE001 -- provider errors must not escape into the UI
+            target = LaunchRefusal("Não foi possível preparar o Open WebUI. Tente novamente.")
+        self.post_message(LaunchResolved(target))
+
+    def on_launch_resolved(self, message: LaunchResolved) -> None:
+        target = message.target
         if isinstance(target, LaunchRefusal):
             self._notice(target.reason)
             self._end_launch()
-            return False
-        opened = bool(self.open_browser(target.url))
+            return
+        try:
+            opened = bool(self.open_browser(target.url))
+        except Exception:  # noqa: BLE001 -- browser launch failure is a user-facing refusal
+            opened = False
         if opened:
             self._notice(f"Abrindo {target.label} no navegador.")
             self.set_timer(LAUNCH_COOLDOWN_SECONDS, self._end_launch)
         else:
             self._notice(f"O navegador não abriu. Endereço: {target.url}", error=True)
             self._end_launch()
-        return opened
 
     def _set_launching(self, launching: bool) -> None:
         for panel in self.query(DashboardPanel):
@@ -547,4 +576,10 @@ class LocalAIStackApp(App):
 
 
 def run_tui() -> None:
-    LocalAIStackApp().run()
+    from .hub_application import create_hub_application
+
+    application = create_hub_application(project_root())
+    try:
+        LocalAIStackApp(application=application, installed_config=application.config).run()
+    finally:
+        application.close()

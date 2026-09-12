@@ -408,8 +408,8 @@ def test_a_profile_produces_a_complete_configuration(specs, layout, tmp_path):
 def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_path):
     """Nothing branches on a profile id; the differences come from the files.
 
-    Pepe has chosen a chat model, Capella has not yet (``primary: TBD``), and
-    Test has chosen nothing at all. Each configuration says exactly that.
+    Pepe and Capella select different chat models; Test selects none.
+    Each configuration uses the reference returned by this fixture's resolver.
     """
     stage_graph(tmp_path)
     built = {}
@@ -430,8 +430,8 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
     assert pepe.env[ENV_ENABLE_IMAGE_GENERATION] == "true"
 
     capella = built["capella"].service(ComponentId.OPEN_WEBUI)
-    assert ENV_DEFAULT_MODELS not in capella.env, "no chat model has been chosen yet"
-    assert any("no primary chat model" in problem for problem in capella.problems)
+    assert capella.env[ENV_DEFAULT_MODELS] == "qwen3-5-9b"
+    assert capella.problems == ()
     assert capella.env[ENV_ENABLE_IMAGE_GENERATION] == "true", "images still work"
 
     test = built["test"].service(ComponentId.OPEN_WEBUI)

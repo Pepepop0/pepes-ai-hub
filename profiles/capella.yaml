@@ -28,8 +28,8 @@ features:
 
 models:
   chat:
-    primary: TBD
-    status: unresolved
+    primary: ollama/qwen3_5_9b
+    status: candidate
     alternatives: []
   image:
     diffusion: comfyui/flux2_klein_fp8

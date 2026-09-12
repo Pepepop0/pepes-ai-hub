@@ -8,6 +8,7 @@ file touches the real Ollama on the host.
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 from pathlib import Path
 
 import httpx
@@ -474,8 +475,11 @@ def test_profile_roles_drive_resolution(tmp_path):
 
 
 def test_a_tbd_role_produces_no_requirement():
-    """Capella's chat model is undecided; it is absent, never a fake entry."""
+    """An explicitly unresolved fixture role is absent, never a fake entry."""
     profile = next(p for p in load_profiles(REPO / "profiles") if p.id == "capella")
+    data = deepcopy(profile.raw)
+    data["models"]["chat"]["primary"] = "TBD"
+    profile = validate_profile_data(data)
     roles = {requirement.role for requirement in profile.model_requirements}
     assert "chat.primary" not in roles
     assert "image.diffusion" in roles

@@ -63,6 +63,7 @@ def test_profiles_expose_only_active_canonical_model_requirements():
         ("image.vae", "comfyui/flux2_vae"),
     }
     assert {str(item.model_id) for item in profiles["capella"].model_requirements} == {
+        "ollama/qwen3_5_9b",
         "comfyui/flux2_klein_fp8",
         "comfyui/qwen_3_4b_encoder",
         "comfyui/flux2_vae",

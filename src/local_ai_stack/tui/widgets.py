@@ -356,6 +356,7 @@ class DashboardPanel(VerticalScroll):
         self.services = services
         self.vram = vram
         self.gpu_name = gpu_name
+        self.launching = False
 
     def compose(self) -> ComposeResult:
         yield Static(self._overview(), id="dashboard-overview")
@@ -400,10 +401,13 @@ class DashboardPanel(VerticalScroll):
         ready = self.installation.ready
         for button_id in ("dashboard-start", "dashboard-restart", "dashboard-stop"):
             self.query_one(f"#{button_id}", Button).disabled = busy or not ready
-        self.query_one("#dashboard-open-webui", Button).disabled = busy or not ready
+        self.query_one("#dashboard-open-webui", Button).disabled = (
+            busy or not ready or self.launching
+        )
 
     def set_launching(self, launching: bool) -> None:
-        self.query_one("#dashboard-open-webui", Button).disabled = launching
+        self.launching = launching
+        self.set_busy(self.query_one(OperationPanel).view)
 
     def show_notice(self, message: str, *, error: bool = False) -> None:
         colour = "red" if error else "yellow"

@@ -316,6 +316,35 @@ Screen {
     color: $error;
 }
 
+#wizard-conflict-report {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#wizard-conflict-choices {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#wizard-conflict-buttons,
+#wizard-confirm-buttons {
+    height: 3;
+    margin-bottom: 1;
+}
+
+#wizard-conflict-buttons Button,
+#wizard-confirm-buttons Button {
+    width: 1fr;
+    max-width: 32;
+    min-width: 12;
+    margin-right: 1;
+}
+
+#wizard-confirm-text {
+    height: auto;
+    margin-bottom: 1;
+}
+
 #wizard-actions {
     height: 3;
     margin-top: 1;

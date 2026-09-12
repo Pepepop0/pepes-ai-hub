@@ -14,6 +14,19 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from local_ai_stack.application_contracts import ServicesSnapshot, ServiceView, VramSnapshot
+from local_ai_stack.components import ComponentId
+from local_ai_stack.external_conflict_contracts import (
+    ConflictEndpoint,
+    ConflictHardBlocker,
+    ConflictPolicySelection,
+    ConflictPreflightReport,
+    ConflictResolutionResult,
+    ConflictResolutionStatus,
+    ExternalConflictKind,
+    ExternalConflictOrigin,
+    ExternalConflictPolicy,
+    ExternalServiceConflict,
+)
 from local_ai_stack.installation import InstallLocationMode
 from local_ai_stack.operation_contracts import (
     OperationDiagnostic,
@@ -61,6 +74,71 @@ EPOCH = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
 
 def _stamp(index: int) -> datetime:
     return EPOCH + timedelta(seconds=index)
+
+
+# --- external conflicts ------------------------------------------------------
+
+OLLAMA_ENDPOINT = ConflictEndpoint("127.0.0.1", 11434)
+OLLAMA_MANAGED_ENDPOINT = ConflictEndpoint("127.0.0.1", 21434)
+COMFYUI_ENDPOINT = ConflictEndpoint("127.0.0.1", 8188)
+COMFYUI_MANAGED_ENDPOINT = ConflictEndpoint("127.0.0.1", 28188)
+OPEN_WEBUI_ENDPOINT = ConflictEndpoint("127.0.0.1", 8080)
+OPEN_WEBUI_MANAGED_ENDPOINT = ConflictEndpoint("127.0.0.1", 28080)
+
+# Distinct endpoints per service, so combining conflicts in one report never
+# collides on a managed endpoint by accident.
+_DEFAULT_ENDPOINTS: dict[ComponentId, tuple[ConflictEndpoint, ConflictEndpoint]] = {
+    ComponentId.OLLAMA: (OLLAMA_ENDPOINT, OLLAMA_MANAGED_ENDPOINT),
+    ComponentId.COMFYUI: (COMFYUI_ENDPOINT, COMFYUI_MANAGED_ENDPOINT),
+    ComponentId.OPEN_WEBUI: (OPEN_WEBUI_ENDPOINT, OPEN_WEBUI_MANAGED_ENDPOINT),
+}
+
+
+def alongside_conflict(
+    service_id: ComponentId = ComponentId.OLLAMA,
+    *,
+    endpoint: ConflictEndpoint | None = None,
+    managed_endpoint: ConflictEndpoint | None = None,
+    can_stop_safely: bool = True,
+) -> ExternalServiceConflict:
+    """A conflict a real preflight would report: safe to stop, safe to work around."""
+    default_endpoint, default_managed = _DEFAULT_ENDPOINTS[service_id]
+    return ExternalServiceConflict(
+        service_id=service_id,
+        kind=ExternalConflictKind.ENDPOINT_OCCUPIED,
+        origin=ExternalConflictOrigin.EXTERNAL,
+        endpoint=endpoint or default_endpoint,
+        reason="Um serviço externo já ocupa este endereço.",
+        can_stop_safely=can_stop_safely,
+        managed_endpoint=managed_endpoint if managed_endpoint is not None else default_managed,
+    )
+
+
+def unsafe_conflict(
+    service_id: ComponentId = ComponentId.COMFYUI,
+    *,
+    endpoint: ConflictEndpoint | None = None,
+    managed_endpoint: ConflictEndpoint | None = None,
+) -> ExternalServiceConflict:
+    """Alongside remains possible; stopping it does not, for lack of proof."""
+    default_endpoint, default_managed = _DEFAULT_ENDPOINTS[service_id]
+    return ExternalServiceConflict(
+        service_id=service_id,
+        kind=ExternalConflictKind.ENDPOINT_OCCUPIED,
+        origin=ExternalConflictOrigin.EXTERNAL,
+        endpoint=endpoint or default_endpoint,
+        reason="Identidade do processo não pôde ser confirmada.",
+        can_stop_safely=False,
+        managed_endpoint=managed_endpoint if managed_endpoint is not None else default_managed,
+    )
+
+
+def conflict_report(
+    *conflicts: ExternalServiceConflict,
+    preflight_id: str = "preflight-1",
+    hard_blockers: tuple[ConflictHardBlocker, ...] = (),
+) -> ConflictPreflightReport:
+    return ConflictPreflightReport(preflight_id, conflicts, hard_blockers)
 
 
 def _event(
@@ -264,14 +342,22 @@ class FakeHubApplication:
     unavailable: bool = False
     profile_choices_value: tuple[ProfileChoice, ...] = PROFILE_CHOICES
 
+    # Set before calling install() to make the application pause with a
+    # resolvable (or blocked) preflight instead of running straight through.
+    conflict_report: ConflictPreflightReport | None = None
+    conflict_resolution_fails: bool = False
+
     # Test-facing record of everything that happened.
     calls: list[tuple[str, object]] = field(default_factory=list)
     emitted: list[OperationEvent] = field(default_factory=list)
     subscriber_errors: list[Exception] = field(default_factory=list)
+    resolutions: list[ConflictPolicySelection] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._snapshot: OperationSnapshot | None = None
         self._pending: list[OperationEvent] = []
+        self._post_conflict: list[OperationEvent] = []
+        self._active_conflict: ConflictPreflightReport | None = None
         self._sinks: list[_Subscription] = []
         self._operation_kind: str | None = None
         self._selection: InstallSelection | None = None
@@ -317,8 +403,60 @@ class FakeHubApplication:
         operation_id = self._begin("install")
         self.calls.append(("install", selection))
         self._selection = selection
-        self._pending = install_script(operation_id, fail_at=self.install_fail_at)
+        script = install_script(operation_id, fail_at=self.install_fail_at)
+        if self.conflict_report is not None:
+            # Paused before any mutation: only the first (PREPARING) event is
+            # released. The rest waits for resolve_external_conflicts.
+            self._active_conflict = self.conflict_report
+            self._pending = script[:1]
+            self._post_conflict = script[1:]
+        else:
+            self._active_conflict = None
+            self._pending = script
+            self._post_conflict = []
         return operation_id
+
+    def current_conflict_preflight(self) -> ConflictPreflightReport | None:
+        self._check_available()
+        return self._active_conflict
+
+    def resolve_external_conflicts(
+        self, selection: ConflictPolicySelection
+    ) -> ConflictResolutionResult:
+        self._check_available()
+        if self._active_conflict is None:
+            raise ValueError("no active conflict to resolve")
+        # Same validation a real resolver performs against its own snapshot.
+        self._active_conflict.validate_selection(selection)
+        self.resolutions.append(selection)
+        if selection.policy is ExternalConflictPolicy.ABORT:
+            self._active_conflict = None
+            self._pending = []
+            self._post_conflict = []
+            self._snapshot = None
+            self._operation_kind = None
+            return ConflictResolutionResult(
+                selection.preflight_id,
+                selection.policy,
+                ConflictResolutionStatus.ABORTED,
+                "Instalação cancelada.",
+            )
+        if self.conflict_resolution_fails:
+            return ConflictResolutionResult(
+                selection.preflight_id,
+                selection.policy,
+                ConflictResolutionStatus.FAILED,
+                "Não foi possível aplicar a política escolhida.",
+            )
+        self._active_conflict = None
+        self._pending = self._post_conflict
+        self._post_conflict = []
+        return ConflictResolutionResult(
+            selection.preflight_id,
+            selection.policy,
+            ConflictResolutionStatus.PROCEED,
+            "Continuando a instalação.",
+        )
 
     def start_stack(self) -> str:
         return self._lifecycle("start", "Iniciando")

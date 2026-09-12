@@ -21,10 +21,23 @@ from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Button, ContentSwitcher, Input, Static
 
+from ..external_conflict_contracts import (
+    ConflictPolicySelection,
+    ConflictPreflightReport,
+    ConflictResolutionResult,
+    ConflictResolutionStatus,
+    ExternalConflictPolicy,
+    installation_outcome_heading,
+)
 from ..installation import InstallLocation, InstallLocationError, InstallLocationMode
 from .application import InstallSelection, ProfileChoice
 from .operations import OperationView
-from .presenters import render_operation
+from .presenters import (
+    render_conflict_choices,
+    render_conflict_report,
+    render_operation,
+    render_stop_confirmation,
+)
 
 
 class WizardStep(StrEnum):
@@ -33,10 +46,14 @@ class WizardStep(StrEnum):
     MODE = "mode"
     REVIEW = "review"
     PROGRESS = "progress"
+    CONFLICT = "conflict"
+    CONFLICT_CONFIRM = "conflict-confirm"
     DONE = "done"
 
 
 # The steps a person walks through; PROGRESS and DONE follow from "Instalar".
+# CONFLICT and CONFLICT_CONFIRM are not numbered among them: they interrupt
+# PROGRESS rather than extending the count a person was told to expect.
 CHOICE_STEPS: tuple[WizardStep, ...] = (
     WizardStep.WELCOME,
     WizardStep.PROFILE,
@@ -131,6 +148,17 @@ class WizardScreen(Screen):
     class Finished(Message):
         pass
 
+    class ConflictPolicyChosen(Message):
+        """The entire outgoing command: an opaque preflight id and a policy.
+
+        Nothing else is ever attached - no PID, no executable, no path, no
+        host or port. The app forwards this unchanged to the application.
+        """
+
+        def __init__(self, selection: ConflictPolicySelection) -> None:
+            super().__init__()
+            self.selection = selection
+
     def __init__(
         self,
         choices: tuple[ProfileChoice, ...],
@@ -144,6 +172,8 @@ class WizardScreen(Screen):
         preferred = preselect if any(choice.id == preselect for choice in choices) else None
         self.state = WizardState(profile_id=preferred)
         self.operation: OperationView | None = None
+        self.conflict: ConflictPreflightReport | None = None
+        self._conflict_error: str = ""
 
     # --- composition --------------------------------------------------------
 
@@ -180,6 +210,24 @@ class WizardScreen(Screen):
                     yield Static("", id="wizard-custom-error")
                 yield Static("", id=step_pane_id(WizardStep.REVIEW), classes="wizard-pane")
                 yield Static("", id=step_pane_id(WizardStep.PROGRESS), classes="wizard-pane")
+                with VerticalScroll(id=step_pane_id(WizardStep.CONFLICT), classes="wizard-pane"):
+                    yield Static("", id="wizard-conflict-report")
+                    yield Static("", id="wizard-conflict-choices")
+                    with Horizontal(id="wizard-conflict-buttons"):
+                        yield Button(
+                            "Instalar ao lado", id="wizard-conflict-alongside", variant="primary"
+                        )
+                        yield Button("Parar conflitos e instalar", id="wizard-conflict-stop")
+                        yield Button("Cancelar", id="wizard-conflict-abort")
+                with VerticalScroll(
+                    id=step_pane_id(WizardStep.CONFLICT_CONFIRM), classes="wizard-pane"
+                ):
+                    yield Static("", id="wizard-confirm-text")
+                    with Horizontal(id="wizard-confirm-buttons"):
+                        yield Button(
+                            "Confirmar e continuar", id="wizard-confirm-stop", variant="primary"
+                        )
+                        yield Button("Voltar", id="wizard-confirm-back")
                 yield Static("", id=step_pane_id(WizardStep.DONE), classes="wizard-pane")
             with Horizontal(id="wizard-actions"):
                 yield Button("Pular por agora", id="wizard-skip")
@@ -224,8 +272,45 @@ class WizardScreen(Screen):
         self.operation = view
         if view is None:
             return
-        if view.terminal and self.state.step is WizardStep.PROGRESS:
-            self.go_to(WizardStep.DONE)
+        if view.terminal:
+            self.conflict = None
+            if self.state.step in (
+                WizardStep.PROGRESS,
+                WizardStep.CONFLICT,
+                WizardStep.CONFLICT_CONFIRM,
+            ):
+                self.go_to(WizardStep.DONE)
+                return
+        self._repaint()
+
+    def show_conflict(self, report: ConflictPreflightReport) -> None:
+        """The application paused before mutating anything; present the choice.
+
+        Only reachable while an installation is in progress, so a decision here
+        never restarts the wizard - it resumes the same operation once resolved.
+        """
+        if self.state.step not in (WizardStep.PROGRESS, WizardStep.CONFLICT):
+            return
+        self.conflict = report
+        self._conflict_error = ""
+        self.go_to(WizardStep.CONFLICT)
+
+    def apply_resolution(self, result: ConflictResolutionResult) -> None:
+        """What the application decided about the chosen policy."""
+        if result.status is ConflictResolutionStatus.ABORTED:
+            self.conflict = None
+            self._conflict_error = ""
+            self.go_to(WizardStep.REVIEW)
+            return
+        if result.status is ConflictResolutionStatus.FAILED:
+            self._conflict_error = result.message
+            self.go_to(WizardStep.CONFLICT)
+            return
+        # PROCEED: the operation resumes on its own; only stop watching for it here.
+        self.conflict = None
+        self._conflict_error = ""
+        if self.state.step is not WizardStep.PROGRESS:
+            self.go_to(WizardStep.PROGRESS)
         else:
             self._repaint()
 
@@ -267,14 +352,20 @@ class WizardScreen(Screen):
         position = (
             CHOICE_STEPS.index(state.step) + 1 if state.step in CHOICE_STEPS else len(CHOICE_STEPS)
         )
-        title = {
-            WizardStep.WELCOME: "Primeiro uso",
-            WizardStep.PROFILE: "Perfil",
-            WizardStep.MODE: "Local de instalação",
-            WizardStep.REVIEW: "Revisar",
-            WizardStep.PROGRESS: "Instalando",
-            WizardStep.DONE: "Concluído",
-        }[state.step]
+        if state.step is WizardStep.DONE and self.operation is not None and self.operation.terminal:
+            # The frozen, unambiguous heading: success and failure never share a title.
+            title = installation_outcome_heading(self.operation.state)
+        else:
+            title = {
+                WizardStep.WELCOME: "Primeiro uso",
+                WizardStep.PROFILE: "Perfil",
+                WizardStep.MODE: "Local de instalação",
+                WizardStep.REVIEW: "Revisar",
+                WizardStep.PROGRESS: "Instalando",
+                WizardStep.CONFLICT: "Conflito encontrado",
+                WizardStep.CONFLICT_CONFIRM: "Confirmar",
+                WizardStep.DONE: "Concluído",
+            }[state.step]
         if state.step in CHOICE_STEPS:
             title = f"{title}  -  passo {position} de {len(CHOICE_STEPS)}"
         self.query_one("#wizard-title", Static).update(f"[b]{escape(title)}[/b]")
@@ -303,12 +394,59 @@ class WizardScreen(Screen):
         self.query_one(step_pane_id(WizardStep.REVIEW, prefix="#"), Static).update(
             self._review_text()
         )
-        operation_text = render_operation(
+        progress_text = render_operation(
             self.operation, idle_text="Aguardando o início da instalação."
         )
-        self.query_one(step_pane_id(WizardStep.PROGRESS, prefix="#"), Static).update(operation_text)
-        self.query_one(step_pane_id(WizardStep.DONE, prefix="#"), Static).update(operation_text)
+        self.query_one(step_pane_id(WizardStep.PROGRESS, prefix="#"), Static).update(progress_text)
+        done_heading = (
+            installation_outcome_heading(self.operation.state)
+            if self.operation is not None and self.operation.terminal
+            else None
+        )
+        done_text = render_operation(self.operation, heading=done_heading)
+        self.query_one(step_pane_id(WizardStep.DONE, prefix="#"), Static).update(done_text)
+
+        self._repaint_conflict()
         self._set_buttons()
+
+    def _repaint_conflict(self) -> None:
+        for button_id in (
+            "wizard-conflict-alongside",
+            "wizard-conflict-stop",
+            "wizard-conflict-abort",
+            "wizard-confirm-stop",
+            "wizard-confirm-back",
+        ):
+            self.query_one(f"#{button_id}", Button).disabled = False
+        report = self.conflict
+        if report is None:
+            self.query_one("#wizard-conflict-report", Static).update("")
+            self.query_one("#wizard-conflict-choices", Static).update("")
+            self.query_one("#wizard-confirm-text", Static).update("")
+            return
+        report_text = render_conflict_report(report)
+        if self._conflict_error:
+            report_text = f"{report_text}\n\n[red]{escape(self._conflict_error)}[/red]"
+        self.query_one("#wizard-conflict-report", Static).update(report_text)
+        self.query_one("#wizard-conflict-choices", Static).update(render_conflict_choices(report))
+        self.query_one("#wizard-confirm-text", Static).update(render_stop_confirmation(report))
+
+        available = report.available_policies
+        recommended = report.recommended_policy
+        alongside = self.query_one("#wizard-conflict-alongside", Button)
+        alongside.display = ExternalConflictPolicy.INSTALL_ALONGSIDE in available
+        alongside.variant = (
+            "primary" if recommended is ExternalConflictPolicy.INSTALL_ALONGSIDE else "default"
+        )
+        stop = self.query_one("#wizard-conflict-stop", Button)
+        stop.display = ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL in available
+        stop.variant = (
+            "primary"
+            if recommended is ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL
+            else "default"
+        )
+        abort = self.query_one("#wizard-conflict-abort", Button)
+        abort.variant = "primary" if recommended is ExternalConflictPolicy.ABORT else "default"
 
     def _set_buttons(self, *, review_refused: bool = False) -> None:
         state = self.state
@@ -347,13 +485,43 @@ class WizardScreen(Screen):
         elif button_id == "wizard-retry":
             self.operation = None
             self.go_to(WizardStep.REVIEW)
+        elif button_id == "wizard-conflict-alongside":
+            self._choose_policy(ExternalConflictPolicy.INSTALL_ALONGSIDE)
+        elif button_id == "wizard-conflict-stop":
+            self.go_to(WizardStep.CONFLICT_CONFIRM)
+        elif button_id == "wizard-conflict-abort":
+            self._choose_policy(ExternalConflictPolicy.ABORT)
+        elif button_id == "wizard-confirm-stop":
+            self._choose_policy(ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL)
+        elif button_id == "wizard-confirm-back":
+            self.go_to(WizardStep.CONFLICT)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "wizard-custom-root":
             event.stop()
             self.set_custom_root(event.value)
 
+    def _choose_policy(self, policy: ExternalConflictPolicy) -> None:
+        """The whole outgoing command: an opaque preflight id and the policy."""
+        if self.conflict is None:
+            return
+        selection = ConflictPolicySelection(self.conflict.preflight_id, policy)
+        # Disable both action rows so a second click while the app decides
+        # cannot send a second, conflicting command.
+        for button_id in (
+            "wizard-conflict-alongside",
+            "wizard-conflict-stop",
+            "wizard-conflict-abort",
+            "wizard-confirm-stop",
+            "wizard-confirm-back",
+        ):
+            self.query_one(f"#{button_id}", Button).disabled = True
+        self.post_message(self.ConflictPolicyChosen(selection))
+
     def action_back(self) -> None:
+        if self.state.step is WizardStep.CONFLICT_CONFIRM:
+            self.go_to(WizardStep.CONFLICT)
+            return
         index = CHOICE_STEPS.index(self.state.step) if self.state.step in CHOICE_STEPS else -1
         if index > 0:
             self.go_to(CHOICE_STEPS[index - 1])

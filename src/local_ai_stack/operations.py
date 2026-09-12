@@ -153,7 +153,13 @@ class OperationStream:
             progress=OperationProgress(completed=completed, total=total),
         )
 
-    def transfer(self, transfer: TransferProgress, message: str) -> OperationEvent:
+    def transfer(
+        self,
+        transfer: TransferProgress,
+        message: str,
+        *,
+        progress: OperationProgress | None = None,
+    ) -> OperationEvent:
         """Byte-transfer observation inside the current state and phase.
 
         Independent of :meth:`progress`: a coordinator downloading one model
@@ -168,6 +174,7 @@ class OperationStream:
             state=last.state,
             phase=last.phase,
             message=message,
+            progress=progress,
             transfer=transfer,
         )
 

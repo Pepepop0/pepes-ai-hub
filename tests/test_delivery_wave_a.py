@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import socket
 import threading
+from dataclasses import replace
 from pathlib import Path
 
+import httpx
 import pytest
 from first_run_support import CHAT_REFERENCE, controlled_stack
+from rich.text import Text
 from textual.widgets import Button, Input, Static
 
 from local_ai_stack.app import LocalAIStackApp
 from local_ai_stack.components import ComponentId
 from local_ai_stack.config import config_path, loads
+from local_ai_stack.download import Downloader
 from local_ai_stack.e2e import tracking
 from local_ai_stack.e2e.fixtures import external_install
 from local_ai_stack.e2e.providers import EXTERNAL_PID, UNRELATED_PID
@@ -26,7 +31,10 @@ from local_ai_stack.installation import InstallLocation, InstallLocationMode, re
 from local_ai_stack.integration import IntegrationOptions
 from local_ai_stack.inventory import Listener
 from local_ai_stack.layout import ENV_ROOT
+from local_ai_stack.model_catalog import ModelCatalog
+from local_ai_stack.models import FileModelSource
 from local_ai_stack.operation_contracts import OperationEventKind, OperationState, advance_operation
+from local_ai_stack.pets import unsafe_characters
 from local_ai_stack.runtime import StackRuntime
 from local_ai_stack.services import ServiceState
 from local_ai_stack.stack_application import StackApplication
@@ -95,6 +103,140 @@ def tui(adapter):
         open_browser=lambda url: opened.append(url) or True,
     )
     return app, opened
+
+
+MODEL_CHUNK = 64 * 1024
+MODEL_BYTES = 1024 * 1024
+
+
+class TickingClock:
+    """A monotonic clock whose deterministic ticks make transfer speed observable."""
+
+    def __init__(self, step: float = 0.04) -> None:
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        current = self.now
+        self.now += self.step
+        return current
+
+
+class ControlledModelTransfer:
+    """A real HTTPX byte stream with deterministic observation points."""
+
+    def __init__(
+        self,
+        world,
+        *,
+        known_total: bool = True,
+        fail_mid_transfer: bool = False,
+        corrupt: bool = False,
+        pause_at_final: bool = False,
+    ) -> None:
+        self.world = world
+        self.known_total = known_total
+        self.fail_mid_transfer = fail_mid_transfer
+        self.corrupt = corrupt
+        self.pause_at_final = pause_at_final
+        self.intermediate_ready = threading.Event()
+        self.resume_intermediate = threading.Event()
+        self.final_ready = threading.Event()
+        self.resume_final = threading.Event()
+        self.chunks_delivered = 0
+        self._first_request = True
+
+    def client_factory(self) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(self._handle))
+
+    def release(self) -> None:
+        self.resume_intermediate.set()
+        self.resume_final.set()
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if self.world.artifacts.kinds.get(url) != "model":
+            raise AssertionError(f"unexpected controlled model request: {url}")
+        self.world.artifacts.requests.append(url)
+        payload = self.world.artifacts.payloads[url]
+        first, self._first_request = self._first_request, False
+        if first and self.corrupt:
+            payload = bytes((payload[0] ^ 1,)) + payload[1:]
+        headers = {"content-length": str(len(payload))} if self.known_total else {}
+        return httpx.Response(200, headers=headers, content=self._body(payload, first))
+
+    def _body(self, payload: bytes, first: bool):
+        for index, start in enumerate(range(0, len(payload), MODEL_CHUNK), start=1):
+            self.chunks_delivered += 1
+            yield payload[start : start + MODEL_CHUNK]
+            if first and index == 5:
+                self.intermediate_ready.set()
+                if not self.resume_intermediate.wait(10):
+                    raise AssertionError("test did not release the controlled transfer")
+                if self.fail_mid_transfer:
+                    raise httpx.ReadError("controlled transport closed mid-transfer")
+        if first and self.pause_at_final:
+            self.final_ready.set()
+            if not self.resume_final.wait(10):
+                raise AssertionError("test did not release the final transfer observation")
+
+
+def instrument_model_downloads(world, *, known_total=True, **transport_options):
+    """Expand fixture models and bind only their transport/clock seams."""
+    catalog = world.app.deps.catalog
+    assert catalog is not None
+    specs = dict(catalog.specs)
+    for model_id, spec in catalog.specs.items():
+        source = spec.source
+        if not isinstance(source, FileModelSource):
+            continue
+        url = source.artifact.url
+        if world.artifacts.kinds.get(url) != "model":
+            continue
+        seed = world.artifacts.payloads[url]
+        payload = (seed * (MODEL_BYTES // len(seed) + 1))[:MODEL_BYTES]
+        world.artifacts.payloads[url] = payload
+        artifact = replace(
+            source.artifact,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            size_bytes=len(payload) if known_total else None,
+        )
+        specs[model_id] = replace(spec, source=replace(source, artifact=artifact))
+    world.app.deps.catalog = ModelCatalog(
+        specs=specs,
+        unpinned=dict(catalog.unpinned),
+        aliases=dict(catalog.aliases),
+    )
+    transfer = ControlledModelTransfer(
+        world,
+        known_total=known_total,
+        **transport_options,
+    )
+    world.app.deps.monotonic = TickingClock()
+    world.app.deps.downloader = lambda: Downloader(
+        client_factory=transfer.client_factory,
+        max_attempts=1,
+        chunk_size=MODEL_CHUNK,
+    )
+    return transfer
+
+
+async def wait_for_observation(pilot, signal: threading.Event) -> None:
+    assert await asyncio.to_thread(signal.wait, 10), "controlled transfer observation timed out"
+    await pilot.pause()
+
+
+def transfer_events(events):
+    return [event for event in events if event.transfer is not None]
+
+
+def assert_transfer_bar_fits(app, width: int) -> str:
+    pane = app.screen.query_one("#wizard-step-progress", Static)
+    rendered = str(pane.content)
+    plain = Text.from_markup(rendered).plain
+    bar_line = next(line for line in plain.splitlines() if "%" in line and "[" in line)
+    assert len(bar_line) <= pane.size.width, (width, pane.size.width, bar_line)
+    return rendered
 
 
 async def click(pilot, selector):
@@ -212,6 +354,166 @@ def test_capella_wizard_runs_the_real_coordinator_and_stream_without_blocking_ui
         asyncio.run(exercise())
     finally:
         resume.set()
+    assert_streams(events)
+
+
+def test_real_model_download_reaches_the_real_wizard_and_second_run_is_quiet(composition):
+    world, adapter, _ = composition()
+    transfer = instrument_model_downloads(world, pause_at_final=True)
+    events = []
+    adapter.subscribe(events.append)
+    app, _ = tui(adapter)
+
+    async def exercise():
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await review(pilot)
+            await click(pilot, "#wizard-next")
+            await wait_for_observation(pilot, transfer.intermediate_ready)
+
+            observed = transfer_events(events)
+            assert len(observed) == 2
+            assert transfer.chunks_delivered == 5
+            assert observed[0].transfer.bytes_per_second is None
+            current = observed[-1]
+            assert current.transfer.completed_bytes > observed[0].transfer.completed_bytes
+            assert current.transfer.total_bytes == MODEL_BYTES
+            assert current.transfer.bytes_per_second == pytest.approx(1.5625 * 1024**2)
+            assert current.transfer.eta_seconds is not None
+            assert current.progress is not None and current.progress.total == 4
+            rendered = assert_transfer_bar_fits(app, 120)
+            assert f"{current.progress.completed}/4" in rendered
+            assert "%" in rendered and "KiB / 1 MiB" in rendered
+            assert "1.56 MiB/s" in rendered and "restantes" in rendered
+            assert unsafe_characters(rendered) == ()
+
+            for width in (80, 70):
+                await pilot.resize_terminal(width, 32)
+                await pilot.pause()
+                resized = assert_transfer_bar_fits(app, width)
+                assert "%" in resized and "1.56 MiB/s" in resized
+
+            transfer.resume_intermediate.set()
+            await wait_for_observation(pilot, transfer.final_ready)
+            final_transfer = transfer_events(events)[-1]
+            assert final_transfer.transfer.fraction == 1.0
+            assert app.operation_view.transfer.fraction == 1.0
+            assert "100%" in str(app.screen.query_one("#wizard-step-progress", Static).content)
+
+            transfer.resume_final.set()
+            await finish(pilot, adapter)
+            assert app.operation_view.succeeded
+            assert app.screen.state.step is WizardStep.DONE
+            done = str(app.screen.query_one("#wizard-step-done", Static).content)
+            assert "Concluído" in done
+            assert "100%" not in done
+            first_request_count = len(world.artifacts.requests)
+            first_event_count = len(events)
+
+            adapter.install(InstallSelection("capella"))
+            await finish(pilot, adapter)
+            second_events = events[first_event_count:]
+            assert adapter.backend.last_first_run.did_nothing
+            assert transfer_events(second_events) == []
+            assert len(world.artifacts.requests) == first_request_count
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        transfer.release()
+    assert_streams(events)
+
+
+def test_real_unknown_total_stays_indeterminate_in_the_real_wizard(composition):
+    world, adapter, _ = composition()
+    transfer = instrument_model_downloads(world, known_total=False)
+    events = []
+    adapter.subscribe(events.append)
+    app, _ = tui(adapter)
+
+    async def exercise():
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await review(pilot)
+            await click(pilot, "#wizard-next")
+            await wait_for_observation(pilot, transfer.intermediate_ready)
+
+            observed = transfer_events(events)
+            assert len(observed) == 2 < transfer.chunks_delivered
+            current = observed[-1]
+            assert current.transfer.completed_bytes > observed[0].transfer.completed_bytes
+            assert current.transfer.total_bytes is None
+            assert current.transfer.bytes_per_second == pytest.approx(1.5625 * 1024**2)
+            assert current.transfer.eta_seconds is None
+            rendered = str(app.screen.query_one("#wizard-step-progress", Static).content)
+            plain = Text.from_markup(rendered).plain
+            assert "Baixando..." in plain
+            assert "KiB" in plain and "1.56 MiB/s" in plain
+            assert "%" not in plain and "restantes" not in plain
+            assert "[#" not in plain and "[-" not in plain
+
+            transfer.resume_intermediate.set()
+            await finish(pilot, adapter)
+            assert app.operation_view.succeeded
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        transfer.release()
+    assert_streams(events)
+
+
+@pytest.mark.parametrize("failure", ["interrupted", "checksum"])
+def test_real_model_failure_preserves_last_transfer_in_the_real_wizard(composition, failure):
+    world, adapter, _ = composition()
+    transfer = instrument_model_downloads(
+        world,
+        fail_mid_transfer=failure == "interrupted",
+        corrupt=failure == "checksum",
+        pause_at_final=failure == "checksum",
+    )
+    events = []
+    adapter.subscribe(events.append)
+    app, _ = tui(adapter)
+
+    async def exercise():
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await review(pilot)
+            await click(pilot, "#wizard-next")
+            await wait_for_observation(pilot, transfer.intermediate_ready)
+            partial = transfer_events(events)[-1]
+            assert 0 < partial.transfer.completed_bytes < partial.transfer.total_bytes
+            assert partial.transfer.bytes_per_second is not None
+
+            transfer.resume_intermediate.set()
+            if failure == "checksum":
+                await wait_for_observation(pilot, transfer.final_ready)
+                at_checksum = transfer_events(events)[-1]
+                assert at_checksum.transfer.fraction == 1.0
+                assert "100%" in str(app.screen.query_one("#wizard-step-progress", Static).content)
+                transfer.resume_final.set()
+
+            await finish(pilot, adapter)
+            assert app.operation_view.failed
+            assert events[-1].kind is OperationEventKind.RESULT
+            assert events[-1].state is OperationState.FAILED
+            assert events.index(events[-1]) == len(events) - 1
+            assert app.operation_view.transfer == transfer_events(events)[-1].transfer
+            done = str(app.screen.query_one("#wizard-step-done", Static).content)
+            assert "Instalação não concluída" in done
+            if failure == "checksum":
+                assert "100%" in done
+            else:
+                assert "100%" not in done
+            assert not list(adapter.backend.layout.root.rglob("*.part"))
+            assert not list(adapter.backend.layout.root.rglob("*.safetensors"))
+            assert not adapter.backend.last_first_run.acquired
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        transfer.release()
     assert_streams(events)
 
 

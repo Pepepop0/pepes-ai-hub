@@ -12,8 +12,8 @@ negative or wildly wrong rate.
 Nothing here downloads, retries or touches a file. It has no opinion about
 HTTP, Ollama or any other source of bytes; it only turns
 ``(completed_bytes, total_bytes)`` observations into
-:class:`~local_ai_stack.operation_contracts.TransferProgress` values, at a
-bounded rate.
+:class:`~local_ai_stack.operation_contracts.TransferProgress` values at a
+controlled cadence.
 """
 
 from __future__ import annotations
@@ -28,9 +28,10 @@ from .operation_contracts import TransferProgress
 # consumers expect, without being so sparse that a fast local transfer looks
 # frozen between samples.
 DEFAULT_MIN_INTERVAL_SECONDS = 0.15
-# Emit early even before the interval elapses once this many bytes have moved,
-# so a burst of large chunks is not silently swallowed until the next tick.
-DEFAULT_MIN_DELTA_BYTES = 256 * 1024
+# Emit early even before the interval elapses after a substantial byte jump.
+# This remains well above Downloader's 256 KiB chunk, so the normal path cannot
+# accidentally publish one event for every chunk on a fast connection.
+DEFAULT_MIN_DELTA_BYTES = 4 * 1024 * 1024
 # Smoothing for the speed estimate: closer to 1 tracks the instantaneous rate
 # more closely, closer to 0 favors the running average. This is deliberately
 # simple -- the contract asks for "no sophisticated algorithm".
@@ -55,6 +56,7 @@ class TransferSampler:
     _first: bool = field(default=True, repr=False)
     _last_emit_time: float | None = field(default=None, repr=False)
     _last_emit_bytes: int = field(default=0, repr=False)
+    _last_emit_total: int | None = field(default=None, repr=False)
     _last_speed: float | None = field(default=None, repr=False)
     _done: bool = field(default=False, repr=False)
 
@@ -63,18 +65,27 @@ class TransferSampler:
         if self._done:
             return None
         now = self.monotonic()
-        if self._should_emit(now, completed_bytes):
+        if self._should_emit(now, completed_bytes, total_bytes):
             return self._emit(now, completed_bytes, total_bytes)
         return None
 
-    def finish(self, completed_bytes: int, total_bytes: int | None) -> TransferProgress:
-        """The final observation for this transfer. Always emitted, once.
+    def finish(self, completed_bytes: int, total_bytes: int | None) -> TransferProgress | None:
+        """Return a missing final observation once, without duplicating one.
 
         Speed is not recomputed here: the transfer has already ended, and a
         near-zero final interval would otherwise produce a meaningless spike.
         The last real sample's speed (or none, if there was only ever one) is
         what a consumer sees on completion.
         """
+        if self._done:
+            return None
+        if (
+            not self._first
+            and self._last_emit_bytes == completed_bytes
+            and self._last_emit_total == total_bytes
+        ):
+            self._done = True
+            return None
         result = TransferProgress(
             completed_bytes=completed_bytes,
             total_bytes=total_bytes,
@@ -85,8 +96,10 @@ class TransferSampler:
 
     # --- internals -----------------------------------------------------------
 
-    def _should_emit(self, now: float, completed_bytes: int) -> bool:
+    def _should_emit(self, now: float, completed_bytes: int, total_bytes: int | None) -> bool:
         if self._first:
+            return True
+        if total_bytes is not None and completed_bytes == total_bytes:
             return True
         assert self._last_emit_time is not None
         elapsed = now - self._last_emit_time
@@ -113,6 +126,7 @@ class TransferSampler:
         self._first = False
         self._last_emit_time = now
         self._last_emit_bytes = completed_bytes
+        self._last_emit_total = total_bytes
         return TransferProgress(
             completed_bytes=completed_bytes,
             total_bytes=total_bytes,

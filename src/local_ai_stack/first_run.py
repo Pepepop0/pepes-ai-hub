@@ -34,6 +34,7 @@ from .execution import ExecutionReport
 from .operation_contracts import (
     OperationDiagnostic,
     OperationPhase,
+    OperationProgress,
     OperationResult,
     OperationState,
 )
@@ -234,25 +235,32 @@ class FirstRunCoordinator:
             return
         self.stream.advance(OperationState.RUNNING, OperationPhase.EXECUTION, "Baixando modelos")
         for index, step in enumerate(steps, start=1):
-            self.stream.progress(index - 1, len(steps), f"Baixando modelos ({index}/{len(steps)})")
-            report = self._acquire_one(plan, step)
+            logical = OperationProgress(index - 1, len(steps))
+            self.stream.progress(
+                logical.completed,
+                logical.total,
+                "Baixando modelos",
+            )
+            report = self._acquire_one(plan, step, logical)
             for action in report.action_results:
                 (self.report.acquired if action.changed else self.report.already_available).append(
                     action.target
                 )
         self.stream.progress(len(steps), len(steps), "Modelos prontos")
 
-    def _acquire_one(self, plan: InstallPlan, step: PlanStep) -> ExecutionReport:
+    def _acquire_one(
+        self, plan: InstallPlan, step: PlanStep, logical: OperationProgress
+    ) -> ExecutionReport:
         """Run one ACQUIRE_MODEL step with the transfer sink wired for its duration.
 
         The executor is rebuilt here, after the sink is set, because
         :meth:`StackApplication.install_actions` binds ``on_transfer`` at
         construction time -- a sink set after the executor exists would never
-        reach the handler. The sampler's own final sample is only ever emitted
-        once execution has actually succeeded: a step that fails, or a model
-        already available (no callback ever fires), publishes nothing here.
+        reach the handler. A known byte total may reach 100% before checksum
+        verification and can therefore precede a failed result. ``finish``
+        supplies an otherwise throttled last observation only after success.
         """
-        sampler = TransferSampler()
+        sampler = TransferSampler(monotonic=self.app.deps.monotonic)
         last_raw: DownloadProgress | None = None
 
         def on_transfer(target: str, raw: DownloadProgress) -> None:
@@ -260,7 +268,11 @@ class FirstRunCoordinator:
             last_raw = raw
             update = sampler.sample(raw.downloaded_bytes, raw.total_bytes)
             if update is not None:
-                self.stream.transfer(update, f"Baixando {target}")
+                self.stream.transfer(
+                    update,
+                    f"Baixando {target}",
+                    progress=logical,
+                )
 
         self.app._transfer_sink = on_transfer
         try:
@@ -279,7 +291,12 @@ class FirstRunCoordinator:
             self.app._transfer_sink = None
         if last_raw is not None:
             final = sampler.finish(last_raw.downloaded_bytes, last_raw.total_bytes)
-            self.stream.transfer(final, f"Baixando {step.target}")
+            if final is not None:
+                self.stream.transfer(
+                    final,
+                    f"Baixando {step.target}",
+                    progress=logical,
+                )
         return report
 
     def _configure(self, plan: InstallPlan) -> None:

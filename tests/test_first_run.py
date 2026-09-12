@@ -200,16 +200,18 @@ def test_model_downloads_publish_transfer_progress_with_a_known_total(stack):
         assert last.fraction == 1.0, message
 
 
-def test_transfer_progress_is_independent_from_the_logical_step_counter(stack):
-    """A model download reports bytes; the step counter still reports steps."""
+def test_transfer_progress_coexists_with_the_logical_step_counter(stack):
+    """A model download reports bytes while retaining its separate step count."""
     recorder = Recorder()
     stack.app.first_run("op-1", CAPELLA, emit=recorder)
 
     logical = [event for event in recorder.events if event.progress is not None]
     transfers = _transfer_events(recorder)
     assert logical and transfers
-    assert all(event.progress is None for event in transfers)
-    assert all(event.transfer is None for event in logical)
+    assert all(event.progress is not None for event in transfers)
+    assert all(event.progress.total == 4 for event in transfers)
+    assert all(0 <= event.progress.completed < event.progress.total for event in transfers)
+    assert any(event.transfer is None for event in logical)
 
 
 def test_a_second_run_publishes_no_transfer_progress_at_all(stack):

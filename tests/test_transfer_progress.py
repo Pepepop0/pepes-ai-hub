@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from local_ai_stack.download import DEFAULT_CHUNK_SIZE
 from local_ai_stack.transfer_progress import TransferSampler
 
 
@@ -42,6 +43,16 @@ def test_a_sample_before_the_interval_and_below_the_delta_is_throttled_away():
     sampler.sample(0, None)
     clock.advance(0.01)
     assert sampler.sample(1024, None) is None
+
+
+def test_default_downloader_chunks_are_not_each_published_on_a_fast_connection():
+    sampler = TransferSampler(monotonic=FakeClock())
+    emitted = [sampler.sample(DEFAULT_CHUNK_SIZE, None)]
+
+    for index in range(2, 9):
+        emitted.append(sampler.sample(index * DEFAULT_CHUNK_SIZE, None))
+
+    assert sum(update is not None for update in emitted) == 1
 
 
 def test_elapsed_time_alone_forces_an_emission():
@@ -148,6 +159,22 @@ def test_finish_is_always_emitted_regardless_of_throttling():
     final = sampler.finish(100, 100)
     assert final.completed_bytes == 100
     assert final.total_bytes == 100
+
+
+def test_known_final_chunk_bypasses_throttling_and_finish_does_not_duplicate_it():
+    clock = FakeClock()
+    sampler = TransferSampler(
+        monotonic=clock,
+        min_interval=100.0,
+        min_delta_bytes=1_000_000_000,
+    )
+    sampler.sample(10, 100)
+
+    final_chunk = sampler.sample(100, 100)
+
+    assert final_chunk is not None
+    assert final_chunk.fraction == 1.0
+    assert sampler.finish(100, 100) is None
 
 
 def test_nothing_is_emitted_after_finish():

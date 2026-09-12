@@ -97,6 +97,15 @@ class HubApplication(ApplicationReadModel, Protocol):
     channel for outcomes. Commands raise :class:`OperationBusy` rather than
     queueing when one is already running, and :class:`HubUnavailable` when the
     application cannot be reached.
+
+    An implementation may additionally satisfy
+    :class:`~local_ai_stack.external_conflict_contracts.ExternalConflictResolver`
+    (``current_conflict_preflight`` / ``resolve_external_conflicts``). It is
+    deliberately not required here: this Protocol is used in ``isinstance``
+    checks against real application adapters, some of which predate conflict
+    resolution. The TUI calls those two methods defensively - see
+    ``LocalAIStackApp._check_conflict`` - so an adapter without them behaves
+    exactly as if no conflict were ever reported.
     """
 
     def installation(self) -> InstallationView: ...

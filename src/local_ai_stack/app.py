@@ -19,6 +19,15 @@ from .application_contracts import ServicesSnapshot, ServiceView, VramSnapshot
 from .compatibility import evaluate_compatibility
 from .config import InstalledConfig
 from .execution import PlanExecutor
+from .external_conflict_contracts import (
+    ConflictPolicySelection,
+    ConflictPreflightDisposition,
+    ConflictPreflightReport,
+    ConflictResolutionResult,
+    ConflictResolutionStatus,
+    ExternalConflictPolicy,
+    installation_outcome_heading,
+)
 from .installation import (
     InstallLocation,
     InstallLocationMode,
@@ -55,7 +64,7 @@ from .tui.widgets import (
     RightRail,
     TopNavigation,
 )
-from .tui.wizard import WizardScreen
+from .tui.wizard import WizardScreen, WizardStep
 
 __all__ = [
     "LocalAIStackApp",
@@ -102,6 +111,14 @@ class LaunchResolved(Message):
     def __init__(self, target: LaunchTarget | LaunchRefusal) -> None:
         super().__init__()
         self.target = target
+
+
+class ConflictResolved(Message):
+    """The application's answer to a chosen conflict policy, off the render thread."""
+
+    def __init__(self, result: ConflictResolutionResult) -> None:
+        super().__init__()
+        self.result = result
 
 
 @dataclass
@@ -167,6 +184,14 @@ class UnwiredHubApplication:
     def open_webui_target(self) -> LaunchTarget | LaunchRefusal:
         return LaunchRefusal(UNWIRED_MESSAGE, code="unwired")
 
+    def current_conflict_preflight(self) -> ConflictPreflightReport | None:
+        return None
+
+    def resolve_external_conflicts(
+        self, selection: ConflictPolicySelection
+    ) -> ConflictResolutionResult:
+        raise HubUnavailable(UNWIRED_MESSAGE)
+
 
 class _NoSubscription:
     def close(self) -> None:
@@ -224,6 +249,10 @@ class LocalAIStackApp(App):
         self.notices: list[str] = []
         self._subscription = None
         self._launching = False
+        # Which command started the operation currently being observed. Only
+        # an install gets the frozen installation heading; a lifecycle command
+        # that fails is not "an installation that did not conclude".
+        self._operation_kind: str | None = None
 
         installation = self._installation()
         installed_profile = installation.profile_id if installation.ready else None
@@ -354,6 +383,7 @@ class LocalAIStackApp(App):
         wizard = self.wizard
         self.select_profile(message.selection.profile_id)
         try:
+            self._operation_kind = "install"
             self.application.install(message.selection)
             self._set_installation(
                 InstallLocation(
@@ -382,12 +412,76 @@ class LocalAIStackApp(App):
         if view is self.operation_view:
             return
         self.operation_view = view
-        self.query_one(MainContent).show_operation(view)
+        heading = None
+        if view is not None and view.terminal and self._operation_kind == "install":
+            heading = installation_outcome_heading(view.state)
+        self.query_one(MainContent).show_operation(view, heading=heading)
         wizard = self.wizard
         if wizard is not None:
             wizard.show_operation(view)
+        if view is not None and not view.terminal:
+            self._check_conflict()
         if view is not None and view.terminal:
             self.refresh_projections()
+
+    def _check_conflict(self) -> None:
+        """The application pauses before mutating anything; ask if it has.
+
+        Checked after every non-terminal event of a watched install, which is
+        cheap and catches the pause regardless of which phase it happens in.
+        A lifecycle command never watches for this: only an install can hit an
+        external runtime conflict during first-run provisioning.
+        """
+        wizard = self.wizard
+        if wizard is None or self._operation_kind != "install":
+            return
+        if wizard.state.step not in (WizardStep.PROGRESS, WizardStep.CONFLICT):
+            return
+        # An application built before conflict resolution landed simply has no
+        # such method; that is "never a conflict", not an error.
+        checker = getattr(self.application, "current_conflict_preflight", None)
+        if checker is None:
+            return
+        try:
+            report = checker()
+        except HubUnavailable:
+            return
+        if report is not None and report.disposition is not ConflictPreflightDisposition.READY:
+            wizard.show_conflict(report)
+
+    def on_wizard_screen_conflict_policy_chosen(
+        self, message: WizardScreen.ConflictPolicyChosen
+    ) -> None:
+        self.run_worker(
+            lambda: self._resolve_conflict(message.selection), thread=True, group="conflict"
+        )
+
+    def _resolve_conflict(self, selection: ConflictPolicySelection) -> None:
+        try:
+            result = self.application.resolve_external_conflicts(selection)
+        except Exception:  # noqa: BLE001 -- a resolver failure must not escape into the UI
+            if selection.policy is ExternalConflictPolicy.ABORT:
+                result = ConflictResolutionResult(
+                    selection.preflight_id,
+                    selection.policy,
+                    ConflictResolutionStatus.ABORTED,
+                    "Instalação cancelada.",
+                )
+            else:
+                result = ConflictResolutionResult(
+                    selection.preflight_id,
+                    selection.policy,
+                    ConflictResolutionStatus.FAILED,
+                    "Não foi possível continuar. Tente novamente.",
+                )
+        self.post_message(ConflictResolved(result))
+
+    def on_conflict_resolved(self, message: ConflictResolved) -> None:
+        wizard = self.wizard
+        if wizard is not None:
+            wizard.apply_resolution(message.result)
+        if message.result.status is ConflictResolutionStatus.ABORTED:
+            self._operation_kind = None
 
     def refresh_projections(self) -> None:
         """Ask the application again and repaint whatever repeats its answers."""
@@ -406,6 +500,7 @@ class LocalAIStackApp(App):
             "restart": self.application.restart_stack,
         }[verb]
         try:
+            self._operation_kind = verb
             command()
         except OperationBusy as error:
             self._notice(str(error))

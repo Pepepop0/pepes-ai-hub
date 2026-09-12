@@ -11,12 +11,26 @@ from collections.abc import Callable, Coroutine
 from pathlib import Path
 
 import pytest
-from hub_fakes import INSTALL_STEPS, FakeHubApplication, install_script, ready_application
+from hub_fakes import (
+    INSTALL_STEPS,
+    SERVICE_IDS,
+    FakeHubApplication,
+    alongside_conflict,
+    conflict_report,
+    install_script,
+    ready_application,
+    unsafe_conflict,
+)
 from test_app import all_profiles, integration_snapshot, reference_facts, stopped_runtime
 from textual.widgets import Button, Input, Static
 
 from local_ai_stack.app import LocalAIStackApp, OperationObserved, UnwiredHubApplication
+from local_ai_stack.components import ComponentId
 from local_ai_stack.config import GeneralConfig, InstalledConfig, UiConfig
+from local_ai_stack.external_conflict_contracts import (
+    ConflictHardBlocker,
+    ExternalConflictPolicy,
+)
 from local_ai_stack.installation import InstallLocationMode
 from local_ai_stack.operation_contracts import OperationEventKind, OperationState
 from local_ai_stack.pets import unsafe_characters
@@ -348,7 +362,9 @@ def test_a_successful_install_ends_on_done_with_open_webui():
             await pump(pilot, fake)
 
             assert screen.state.step is WizardStep.DONE
-            assert "[b]Tudo pronto[/b]" in text(app, "#wizard-step-done")
+            # The frozen installation heading, not the generic operation headline.
+            assert "[b]Concluído[/b]" in text(app, "#wizard-title")
+            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
             visible = [b.id for b in screen.query("#wizard-actions Button") if b.display]
             assert visible == ["wizard-open-webui", "wizard-finish"]
 
@@ -378,7 +394,10 @@ def test_a_failed_install_shows_a_short_reason_and_offers_a_retry():
 
             assert screen.state.step is WizardStep.DONE
             pane = text(app, "#wizard-step-done")
-            assert "[b]Não foi possível concluir[/b]" in pane
+            # The frozen heading: never "Concluído" on a failure.
+            assert "[b]Instalação não concluída[/b]" in text(app, "#wizard-title")
+            assert "[b]Instalação não concluída[/b]" in pane
+            assert "[b]Concluído[/b]" not in pane
             assert "[!]" in pane and "Instalando ComfyUI" in pane
             assert "Verifique a conexão" in pane
             assert "Código: download-failed" in pane
@@ -393,7 +412,7 @@ def test_a_failed_install_shows_a_short_reason_and_offers_a_retry():
             await click(pilot, "#wizard-next")
             await pump(pilot, fake)
             assert screen.state.step is WizardStep.DONE
-            assert "[b]Tudo pronto[/b]" in text(app, "#wizard-step-done")
+            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
             assert len(fake.calls) == 2, "a retry is a new operation, not a reopened one"
 
     run(exercise)
@@ -920,5 +939,409 @@ def test_the_frozen_contracts_were_not_edited_here():
         "src/local_ai_stack/operation_contracts.py",
         "src/local_ai_stack/image_generation_contracts.py",
         "src/local_ai_stack/application_contracts.py",
+        "src/local_ai_stack/external_conflict_contracts.py",
     }
     assert not (frozen & set(changed))
+
+
+# --- external conflict UX ---------------------------------------------------
+#
+# The application pauses an install before mutating anything and reports a
+# ConflictPreflightReport; the wizard shows a choice, confirms a stop, and
+# resumes the same operation rather than restarting the wizard from scratch.
+
+
+async def walk_to_conflict(
+    pilot, fake: FakeHubApplication, *, profile: str = "capella", mode: str = "default"
+) -> None:
+    """Reach REVIEW, install, and let the paused first event surface the conflict."""
+    await walk_to_review(pilot, profile=profile, mode=mode)
+    await click(pilot, "#wizard-next")
+    await pump(pilot, fake, 1)
+
+
+def test_no_conflicts_is_the_ordinary_flow_untouched():
+    """The blocker: a machine with nothing else running never sees a conflict step."""
+
+    async def exercise() -> None:
+        app, fake, opened = hub()
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_review(pilot)
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake)
+
+            assert screen.state.step is WizardStep.DONE
+            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+            await click(pilot, "#wizard-open-webui")
+            assert opened == ["http://127.0.0.1:8080/"]
+
+    run(exercise)
+
+
+def test_an_alongside_conflict_shows_the_choice_screen():
+    async def exercise() -> None:
+        report = conflict_report(alongside_conflict(), alongside_conflict(ComponentId.COMFYUI))
+        app, fake, _ = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+
+            assert screen.state.step is WizardStep.CONFLICT
+            pane = text(app, "#wizard-conflict-report")
+            assert "Encontramos serviços de IA já em execução." in pane
+            assert "Ollama" in pane and "127.0.0.1:11434" in pane
+            assert "ComfyUI" in pane and "127.0.0.1:8188" in pane
+            # Only useful information: no internals, no technical error codes here.
+            assert "preflight-alongside-required" not in pane
+            assert "preflight-endpoint-collision" not in pane
+            assert "Traceback" not in pane
+
+            choices = text(app, "#wizard-conflict-choices")
+            assert "Instalar ao lado" in choices
+            assert "Mantém os programas atuais em execução e instala uma cópia isolada" in choices
+            assert "Parar conflitos e instalar" in choices
+            assert "Encerra somente os serviços externos que impedem a instalação" in choices
+
+            alongside_button = screen.query_one("#wizard-conflict-alongside", Button)
+            assert alongside_button.display and alongside_button.variant == "primary"
+            assert screen.query_one("#wizard-conflict-stop", Button).display
+            assert screen.query_one("#wizard-conflict-abort", Button).display
+
+    run(exercise)
+
+
+def test_install_alongside_resumes_the_same_operation_without_restarting_the_wizard():
+    async def exercise() -> None:
+        report = conflict_report(alongside_conflict())
+        app, fake, opened = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+            operation_before = app.operation_view.operation_id
+
+            await click(pilot, "#wizard-conflict-alongside")
+            await pilot.pause()
+
+            assert len(fake.resolutions) == 1
+            assert fake.resolutions[0].policy is ExternalConflictPolicy.INSTALL_ALONGSIDE
+            # Only the opaque id and the policy: nothing the resolver could act
+            # on beyond that was ever constructed.
+            assert set(vars(fake.resolutions[0])) == {"preflight_id", "policy"}
+
+            assert screen.state.step is WizardStep.PROGRESS
+            await pump(pilot, fake)
+
+            assert screen.state.step is WizardStep.DONE
+            assert app.operation_view.operation_id == operation_before, "same operation resumed"
+            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+            assert len(fake.calls) == 1, "the wizard was never restarted"
+
+            await click(pilot, "#wizard-open-webui")
+            assert opened == ["http://127.0.0.1:8080/"]
+
+    run(exercise)
+
+
+def test_stop_requires_confirmation_naming_exactly_what_the_application_can_stop():
+    async def exercise() -> None:
+        report = conflict_report(
+            alongside_conflict(ComponentId.OLLAMA), alongside_conflict(ComponentId.COMFYUI)
+        )
+        app, fake, _ = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+
+            await click(pilot, "#wizard-conflict-stop")
+            assert screen.state.step is WizardStep.CONFLICT_CONFIRM
+            assert fake.resolutions == [], "nothing is sent until confirmed"
+
+            confirm_text = text(app, "#wizard-confirm-text")
+            assert "O Pepito vai parar temporariamente:" in confirm_text
+            assert "- Ollama externo" in confirm_text
+            assert "- ComfyUI externo" in confirm_text
+            assert "Nenhum arquivo será removido." in confirm_text
+
+            await click(pilot, "#wizard-confirm-back")
+            assert screen.state.step is WizardStep.CONFLICT
+            assert fake.resolutions == []
+
+    run(exercise)
+
+
+def test_confirming_stop_sends_only_the_frozen_selection_and_resumes():
+    async def exercise() -> None:
+        report = conflict_report(alongside_conflict())
+        app, fake, _ = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+            await click(pilot, "#wizard-conflict-stop")
+            await click(pilot, "#wizard-confirm-stop")
+            await pilot.pause()
+
+            assert len(fake.resolutions) == 1
+            selection = fake.resolutions[0]
+            assert selection.policy is ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL
+            assert selection.preflight_id == report.preflight_id
+            assert set(vars(selection)) == {"preflight_id", "policy"}
+
+            assert screen.state.step is WizardStep.PROGRESS
+            await pump(pilot, fake)
+            assert screen.state.step is WizardStep.DONE
+            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+
+    run(exercise)
+
+
+def test_an_unsafe_conflict_never_offers_stop_but_alongside_still_works():
+    async def exercise() -> None:
+        report = conflict_report(alongside_conflict(ComponentId.OLLAMA), unsafe_conflict())
+        app, fake, _ = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+
+            assert not screen.query_one("#wizard-conflict-stop", Button).display
+            assert screen.query_one("#wizard-conflict-alongside", Button).display
+
+            pane = text(app, "#wizard-conflict-report")
+            assert "Este serviço não pode ser encerrado com segurança pelo Hub." in pane
+
+            await click(pilot, "#wizard-conflict-alongside")
+            await pilot.pause()
+            assert screen.state.step is WizardStep.PROGRESS
+            await pump(pilot, fake)
+            assert screen.state.step is WizardStep.DONE
+
+    run(exercise)
+
+
+def test_abort_returns_to_review_without_installing_anything():
+    async def exercise() -> None:
+        report = conflict_report(alongside_conflict())
+        app, fake, _ = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+
+            await click(pilot, "#wizard-conflict-abort")
+
+            assert screen.state.step is WizardStep.REVIEW
+            assert len(fake.resolutions) == 1
+            assert fake.resolutions[0].policy is ExternalConflictPolicy.ABORT
+            assert not fake.ready
+            assert fake.health == dict.fromkeys(SERVICE_IDS, "DOWN")
+            # The choice was preserved; nothing about the wizard was reset.
+            assert screen.state.profile_id == "capella"
+            assert screen.state.mode is InstallLocationMode.DEFAULT
+            assert "Perfil: [b]Capella[/b]" in text(app, "#wizard-step-review")
+
+    run(exercise)
+
+
+def test_abort_can_be_followed_by_a_normal_install():
+    async def exercise() -> None:
+        report = conflict_report(alongside_conflict())
+        app, fake, _ = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+            await click(pilot, "#wizard-conflict-abort")
+
+            fake.conflict_report = None
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake)
+
+            assert screen.state.step is WizardStep.DONE
+            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+            assert fake.ready
+
+    run(exercise)
+
+
+def test_a_conflict_that_fails_to_resolve_stays_on_the_conflict_step():
+    async def exercise() -> None:
+        report = conflict_report(alongside_conflict())
+        app, fake, _ = hub(
+            FakeHubApplication(conflict_report=report, conflict_resolution_fails=True)
+        )
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+
+            await click(pilot, "#wizard-conflict-alongside")
+            await pilot.pause()
+
+            assert screen.state.step is WizardStep.CONFLICT
+            assert "Não foi possível aplicar a política escolhida." in text(
+                app, "#wizard-conflict-report"
+            )
+            assert not fake.ready
+
+    run(exercise)
+
+
+def test_custom_path_stays_correct_through_a_conflict_and_is_not_confused_for_invalid():
+    async def exercise() -> None:
+        report = conflict_report(alongside_conflict())
+        app, fake, _ = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await click(pilot, "#wizard-next")
+            await click(pilot, "#wizard-profile-test")
+            await click(pilot, "#wizard-next")
+            await click(pilot, "#wizard-mode-custom")
+            screen.set_custom_root(r"C:\Users\Pedro\Desktop\loira-40k")
+            await pilot.pause()
+            assert text(app, "#wizard-custom-error") == ""
+            await click(pilot, "#wizard-next")
+
+            review = text(app, "#wizard-step-review")
+            assert "Perfil: [b]Test[/b]" in review
+            assert "Local: [b]Personalizado[/b]" in review
+            assert r"Pasta: C:\Users\Pedro\Desktop\loira-40k" in review
+
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake, 1)
+
+            assert screen.state.step is WizardStep.CONFLICT
+            # A runtime conflict must never look like the chosen folder was rejected.
+            assert text(app, "#wizard-custom-error") == ""
+            assert "inválid" not in text(app, "#wizard-conflict-report").lower()
+
+            await click(pilot, "#wizard-conflict-alongside")
+            await pilot.pause()
+            await pump(pilot, fake)
+
+            assert screen.state.step is WizardStep.DONE
+            assert fake.mode is InstallLocationMode.CUSTOM
+            assert fake.root_display == r"C:\Users\Pedro\Desktop\loira-40k"
+
+            await click(pilot, "#wizard-finish")
+            assert not isinstance(app.screen, WizardScreen)
+            install_summary = str(app.query_one("#install-summary", Static).content)
+            assert InstallLocationMode.CUSTOM.value in install_summary
+            assert r"C:\Users\Pedro\Desktop\loira-40k" in install_summary
+
+    run(exercise)
+
+
+def test_a_hard_blocker_offers_only_cancel():
+    async def exercise() -> None:
+        report = conflict_report(
+            hard_blockers=(ConflictHardBlocker("space-low", "Espaço em disco insuficiente."),)
+        )
+        app, fake, _ = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+
+            assert screen.state.step is WizardStep.CONFLICT
+            assert not screen.query_one("#wizard-conflict-alongside", Button).display
+            assert not screen.query_one("#wizard-conflict-stop", Button).display
+            pane = text(app, "#wizard-conflict-report")
+            assert "Espaço em disco insuficiente." in pane
+            assert "Código: space-low" in pane
+
+            await click(pilot, "#wizard-conflict-abort")
+            assert screen.state.step is WizardStep.REVIEW
+
+    run(exercise)
+
+
+def test_a_pressed_conflict_button_cannot_be_pressed_twice():
+    async def exercise() -> None:
+        report = conflict_report(alongside_conflict())
+        app, fake, _ = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+
+            button = screen.query_one("#wizard-conflict-alongside", Button)
+            button.active_effect_duration = 0
+            await pilot.click("#wizard-conflict-alongside")
+            await pilot.click("#wizard-conflict-alongside")
+            await pilot.pause()
+
+            assert len(fake.resolutions) == 1
+
+    run(exercise)
+
+
+class _NoConflictSupport:
+    """Delegates everything except conflict resolution, which it never had."""
+
+    def __init__(self, inner: FakeHubApplication) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str):
+        if name in ("current_conflict_preflight", "resolve_external_conflicts"):
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
+def test_an_application_without_conflict_support_behaves_as_before():
+    """An adapter predating this feature has no such method; that is not a conflict."""
+
+    async def exercise() -> None:
+        inner = FakeHubApplication()
+        fake = _NoConflictSupport(inner)
+        assert not hasattr(fake, "current_conflict_preflight")
+        assert isinstance(fake, HubApplication)
+
+        app, _, _ = hub(fake)
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_review(pilot)
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake)
+            assert screen.state.step is WizardStep.DONE
+            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+
+    run(exercise)
+
+
+def test_the_ui_command_carries_no_process_or_endpoint_authority():
+    """AST proof: the wizard never references PID, executable, path or arbitrary host/port."""
+    import ast
+
+    import local_ai_stack.tui.wizard as wizard_module
+
+    tree = ast.parse(Path(wizard_module.__file__).read_text(encoding="utf-8"))
+    forbidden = {"pid", "executable", "subprocess", "psutil", "os"}
+    names = {node.id.lower() for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
+        node.attr.lower() for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+    assert not (forbidden & names)
+
+
+def test_zero_emoji_in_the_conflict_screens():
+    async def exercise() -> None:
+        report = conflict_report(alongside_conflict(), unsafe_conflict())
+        app, fake, _ = hub(FakeHubApplication(conflict_report=report))
+        async with app.run_test(size=(110, 36)) as pilot:
+            await pilot.pause()
+            screen = wizard(app)
+            await walk_to_conflict(pilot, fake)
+            shown = " ".join(str(w.content) for w in screen.query(Static))
+            shown += " ".join(str(b.label) for b in screen.query(Button))
+            await click(pilot, "#wizard-conflict-stop")
+            shown += text(app, "#wizard-confirm-text")
+            assert unsafe_characters(shown) == ()
+
+    run(exercise)

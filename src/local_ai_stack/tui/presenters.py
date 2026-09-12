@@ -9,6 +9,11 @@ from ..application_contracts import ServicesSnapshot, VramSnapshot
 from ..compatibility import evaluate_compatibility
 from ..config import InstalledConfig
 from ..execution import ExecutionReport, ExecutionStep
+from ..external_conflict_contracts import (
+    ConflictPreflightReport,
+    ExternalConflictPolicy,
+    ExternalServiceConflict,
+)
 from ..integration import ComponentIntegration
 from ..planning import InstallPlan, build_install_plan
 from ..profiles import MIB_PER_GIB, Profile
@@ -398,11 +403,19 @@ def render_overview(
     return "\n".join(lines)
 
 
-def render_operation(view: OperationView | None, *, idle_text: str = "") -> str:
-    """One operation as a checklist: done steps, the current one, and how it ended."""
+def render_operation(
+    view: OperationView | None, *, idle_text: str = "", heading: str | None = None
+) -> str:
+    """One operation as a checklist: done steps, the current one, and how it ended.
+
+    ``heading`` overrides the generic per-state headline. A caller that knows
+    this view is an installation's outcome passes the frozen, unambiguous
+    heading from ``installation_outcome_heading`` instead of the shorter,
+    generic wording every other operation shares.
+    """
     if view is None:
         return escape(idle_text)
-    lines = [f"[b]{escape(view.headline)}[/b]", ""]
+    lines = [f"[b]{escape(heading if heading is not None else view.headline)}[/b]", ""]
     steps = list(view.steps)
     for index, step in enumerate(steps):
         last = index == len(steps) - 1
@@ -420,4 +433,73 @@ def render_operation(view: OperationView | None, *, idle_text: str = "") -> str:
         for diagnostic in view.diagnostics:
             lines.append(f"[red]{escape(diagnostic.message)}[/red]")
             lines.append(f"[dim]Código: {escape(diagnostic.code)}[/dim]")
+    return "\n".join(lines)
+
+
+# --- external conflict, first-run wizard ---------------------------------------
+
+CONFLICT_HEADING = "Encontramos serviços de IA já em execução."
+BLOCKED_HEADING = "Não foi possível continuar agora."
+
+ALONGSIDE_DESCRIPTION = (
+    "Mantém os programas atuais em execução e instala uma cópia isolada "
+    "do Pepito usando endpoints separados."
+)
+STOP_DESCRIPTION = (
+    "Encerra somente os serviços externos que impedem a instalação. "
+    "Nenhum programa ou arquivo será removido."
+)
+UNSAFE_STOP_NOTE = "Este serviço não pode ser encerrado com segurança pelo Hub."
+
+
+def conflict_service_name(conflict: ExternalServiceConflict) -> str:
+    return SERVICE_NAMES.get(conflict.service_id, str(conflict.service_id))
+
+
+def render_conflict_report(report: ConflictPreflightReport) -> str:
+    """The conflict/blocker list only: names, origin, endpoint, nothing internal."""
+    lines: list[str] = []
+    if report.hard_blockers:
+        lines.append(f"[b]{escape(BLOCKED_HEADING)}[/b]")
+        lines.append("")
+        for blocker in report.hard_blockers:
+            lines.append(f"[red]{escape(blocker.message)}[/red]")
+            lines.append(f"[dim]Código: {escape(blocker.code)}[/dim]")
+        if report.conflicts:
+            lines.append("")
+    if report.conflicts:
+        lines.append(f"[b]{escape(CONFLICT_HEADING)}[/b]")
+        lines.append("")
+        for conflict in report.conflicts:
+            lines.append(f"[b]{escape(conflict_service_name(conflict))}[/b]")
+            lines.append(f"Externo — {escape(conflict.endpoint.display)}")
+            if not conflict.can_stop_safely:
+                lines.append(f"[dim]{escape(UNSAFE_STOP_NOTE)}[/dim]")
+            lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def render_conflict_choices(report: ConflictPreflightReport) -> str:
+    """The description under each available action. Buttons decide visibility."""
+    recommended = report.recommended_policy
+    lines: list[str] = []
+    if ExternalConflictPolicy.INSTALL_ALONGSIDE in report.available_policies:
+        suffix = " (recomendado)" if recommended is ExternalConflictPolicy.INSTALL_ALONGSIDE else ""
+        lines.append(f"[b]Instalar ao lado{suffix}[/b]")
+        lines.append(escape(ALONGSIDE_DESCRIPTION))
+        lines.append("")
+    if ExternalConflictPolicy.STOP_CONFLICTING_EXTERNAL in report.available_policies:
+        lines.append("[b]Parar conflitos e instalar[/b]")
+        lines.append(escape(STOP_DESCRIPTION))
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def render_stop_confirmation(report: ConflictPreflightReport) -> str:
+    """Exactly the services the application said it can stop. Nothing else."""
+    lines = ["[b]O Pepito vai parar temporariamente:[/b]", ""]
+    lines.extend(
+        f"- {escape(conflict_service_name(conflict))} externo" for conflict in report.conflicts
+    )
+    lines.extend(["", "Nenhum arquivo será removido."])
     return "\n".join(lines)

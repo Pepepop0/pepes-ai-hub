@@ -330,9 +330,9 @@ class OperationPanel(Static):
         self.idle_text = idle_text
         self.view: OperationView | None = None
 
-    def show(self, view: OperationView | None) -> None:
+    def show(self, view: OperationView | None, *, heading: str | None = None) -> None:
         self.view = view
-        self.update(render_operation(view, idle_text=self.idle_text))
+        self.update(render_operation(view, idle_text=self.idle_text, heading=heading))
 
 
 class DashboardPanel(VerticalScroll):
@@ -391,8 +391,8 @@ class DashboardPanel(VerticalScroll):
         self.query_one("#dashboard-overview", Static).update(self._overview())
         self.set_busy(self.query_one(OperationPanel).view)
 
-    def show_operation(self, view: OperationView | None) -> None:
-        self.query_one(OperationPanel).show(view)
+    def show_operation(self, view: OperationView | None, *, heading: str | None = None) -> None:
+        self.query_one(OperationPanel).show(view, heading=heading)
         self.set_busy(view)
 
     def set_busy(self, view: OperationView | None) -> None:
@@ -451,8 +451,8 @@ class InstallPanel(VerticalScroll):
         self.query_one("#install-summary", Static).update(self._summary())
         self.query_one("#install-open-wizard", Button).label = self._button_label()
 
-    def show_operation(self, view: OperationView | None) -> None:
-        self.query_one(OperationPanel).show(view)
+    def show_operation(self, view: OperationView | None, *, heading: str | None = None) -> None:
+        self.query_one(OperationPanel).show(view, heading=heading)
         busy = view is not None and not view.terminal
         self.query_one("#install-open-wizard", Button).disabled = busy
 
@@ -580,9 +580,9 @@ class MainContent(ContentSwitcher):
         self.query_one(DashboardPanel).refresh_overview(installation, name, services, vram)
         self.query_one(InstallPanel).refresh_installation(installation, name)
 
-    def show_operation(self, view: OperationView | None) -> None:
-        self.query_one(DashboardPanel).show_operation(view)
-        self.query_one(InstallPanel).show_operation(view)
+    def show_operation(self, view: OperationView | None, *, heading: str | None = None) -> None:
+        self.query_one(DashboardPanel).show_operation(view, heading=heading)
+        self.query_one(InstallPanel).show_operation(view, heading=heading)
 
     def run_plan_dry_run(self) -> ExecutionReport | None:
         return self.query_one(InstallPlanPanel).run_dry_run()

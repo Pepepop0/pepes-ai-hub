@@ -113,6 +113,8 @@ def make_app(
     installed_config: InstalledConfig | None = None,
     integration: IntegrationSnapshot | None = None,
     executor_factory=fake_executor_factory,
+    application=None,
+    first_run_wizard: bool = False,
 ) -> LocalAIStackApp:
     return LocalAIStackApp(
         facts=facts or reference_facts(),
@@ -121,6 +123,8 @@ def make_app(
         installed_config=installed_config,
         integration=integration if integration is not None else integration_snapshot(),
         executor_factory=executor_factory,
+        application=application,
+        first_run_wizard=first_run_wizard,
     )
 
 
@@ -165,7 +169,7 @@ def test_section_change_updates_contextual_sidebar_and_default_view():
             assert sidebar.active is Section.INSTALLATION
             assert app.query_one("#sidebar-installation").display
             assert not app.query_one("#sidebar-dashboard").display
-            assert app.query_one(MainContent).current == route_id(Section.INSTALLATION, "profile")
+            assert app.query_one(MainContent).current == route_id(Section.INSTALLATION, "install")
             labels = [
                 str(button.label) for button in app.query_one("#sidebar-installation").query(Button)
             ]
@@ -214,18 +218,37 @@ def test_right_rail_is_persistent_and_can_collapse():
     asyncio.run(exercise())
 
 
-def test_dashboard_renders_existing_hardware_and_runtime_contracts():
+def test_dashboard_without_an_installation_says_so_and_points_at_installation():
+    """The unwired composition reads this machine and refuses to pretend otherwise."""
+
     async def exercise() -> None:
         app = make_app()
         async with app.run_test() as pilot:
             await pilot.pause()
-            dashboard = str(app.query_one("#view-dashboard-status", Static).content)
-            assert "NVIDIA GeForce RTX 5070" in dashboard
-            assert "VRAM 12227 MiB" in dashboard
+            dashboard = str(app.query_one("#dashboard-overview", Static).content)
+            assert "Profile: [b]Pepe[/b]" in dashboard
+            assert "Nenhuma stack instalada ainda" in dashboard
+            assert "Instalação" in dashboard
+            for button_id in ("dashboard-open-webui", "dashboard-start", "dashboard-stop"):
+                assert app.query_one(f"#{button_id}", Button).disabled
+
+    asyncio.run(exercise())
+
+
+def test_services_view_renders_existing_hardware_and_runtime_contracts():
+    async def exercise() -> None:
+        app = make_app()
+        async with app.run_test() as pilot:
+            await pilot.click("#side-dashboard-services")
+            await pilot.pause()
+            cards = " ".join(str(card.content) for card in app.query(".service-card"))
             for service in ("Ollama", "Open WebUI", "ComfyUI"):
-                assert service in dashboard
-            assert dashboard.count("DOWN") >= 3
-            assert dashboard.count("STOPPED") == 3
+                assert service in cards
+            assert cards.count("DOWN") >= 3
+            assert cards.count("STOPPED") == 3
+            rail = str(app.query_one("#rail-gpu", Static).content)
+            assert "NVIDIA GeForce RTX 5070" in rail
+            assert "12227 MiB" in rail
 
     asyncio.run(exercise())
 
@@ -235,6 +258,7 @@ def test_profile_selection_updates_compatibility_plan_and_right_rail():
         app = make_app()
         async with app.run_test() as pilot:
             await pilot.click("#nav-installation")
+            await pilot.click("#side-installation-profile")
             await pilot.click("#profile-capella")
             await pilot.pause()
             details = str(app.query_one("#profile-details", Static).content)
@@ -393,6 +417,7 @@ def test_capella_shows_hello_kitty_instead_of_the_unavailable_notice():
         app = make_app()
         async with app.run_test() as pilot:
             await pilot.press("2")
+            await pilot.click("#side-installation-profile")
             await pilot.click("#profile-capella")
             await pilot.pause()
             pet = app.query_one(PetSlot)
@@ -417,6 +442,7 @@ def test_switching_profiles_hands_over_the_pet_without_leaking_behavior():
             assert claw.pet.id == "claw"
 
             await pilot.press("2")
+            await pilot.click("#side-installation-profile")
             await pilot.click("#profile-capella")
             await pilot.pause()
             kitty = pet.animator
@@ -445,6 +471,7 @@ def test_hello_kitty_keeps_the_rail_the_same_size_while_it_moves():
         app = make_app()
         async with app.run_test() as pilot:
             await pilot.press("2")
+            await pilot.click("#side-installation-profile")
             await pilot.click("#profile-capella")
             await pilot.pause()
             pet = app.query_one(PetSlot)
@@ -464,6 +491,7 @@ def test_the_rail_gives_width_back_on_a_narrow_terminal():
         app = make_app()
         async with app.run_test(size=(80, 24)) as pilot:
             await pilot.press("2")
+            await pilot.click("#side-installation-profile")
             await pilot.click("#profile-capella")
             await pilot.pause()
             rail = app.query_one(RightRail)
@@ -484,6 +512,7 @@ def test_a_wide_terminal_gets_the_full_size_pet():
         app = make_app()
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
+            await pilot.click("#side-installation-profile")
             await pilot.click("#profile-capella")
             await pilot.pause()
             rail = app.query_one(RightRail)
@@ -503,6 +532,7 @@ def test_the_pet_box_keeps_one_size_whatever_the_pet_is():
             pet = app.query_one(PetSlot)
             claw_box = pet.size
             await pilot.press("2")
+            await pilot.click("#side-installation-profile")
             await pilot.click("#profile-capella")
             await pilot.pause()
             assert pet.size == claw_box
@@ -519,6 +549,7 @@ def test_hello_kitty_survives_rail_collapse_and_expand():
         app = make_app()
         async with app.run_test() as pilot:
             await pilot.press("2")
+            await pilot.click("#side-installation-profile")
             await pilot.click("#profile-capella")
             await pilot.pause()
             pet = app.query_one(PetSlot)
@@ -619,7 +650,7 @@ def managed_snapshot(executable: Path) -> IntegrationSnapshot:
 
 
 def ollama_view(app: LocalAIStackApp) -> str:
-    return str(app.query_one(f"#{route_id(Section.DASHBOARD, 'ollama')}", Static).content)
+    return str(app.query_one("#service-ollama", Static).content)
 
 
 def test_external_ollama_is_shown_as_external_and_not_controllable():
@@ -627,7 +658,7 @@ def test_external_ollama_is_shown_as_external_and_not_controllable():
         app = make_app(integration=external_snapshot())
         async with app.run_test() as pilot:
             await pilot.press("1")
-            await pilot.click("#side-dashboard-ollama")
+            await pilot.click("#side-dashboard-services")
             await pilot.pause()
             view = ollama_view(app)
             assert "Install ownership: [yellow]EXTERNAL[/yellow]" in view
@@ -648,7 +679,7 @@ def test_managed_ollama_is_shown_as_controllable(tmp_path):
         app = make_app(integration=managed_snapshot(executable))
         async with app.run_test() as pilot:
             await pilot.press("1")
-            await pilot.click("#side-dashboard-ollama")
+            await pilot.click("#side-dashboard-services")
             await pilot.pause()
             view = ollama_view(app)
             assert "Install ownership: [green]MANAGED[/green]" in view
@@ -662,9 +693,9 @@ def test_service_without_a_provisioner_reports_unknown_ownership():
         app = make_app(integration=external_snapshot())
         async with app.run_test() as pilot:
             await pilot.press("1")
-            await pilot.click("#side-dashboard-comfyui")
+            await pilot.click("#side-dashboard-services")
             await pilot.pause()
-            view = str(app.query_one(f"#{route_id(Section.DASHBOARD, 'comfyui')}", Static).content)
+            view = str(app.query_one("#service-comfyui", Static).content)
             assert "Install ownership: [dim]UNKNOWN[/dim]" in view
             assert "No provisioner owns this component yet" in view
 

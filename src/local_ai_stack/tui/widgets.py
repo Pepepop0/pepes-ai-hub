@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, ContentSwitcher, Input, Label, Select, Static
 
+from ..application_contracts import ServicesSnapshot, VramSnapshot
 from ..config import InstalledConfig, UiConfig
 from ..execution import ExecutionReport, PlanExecutor
 from ..installation import (
@@ -24,6 +26,7 @@ from ..renderer import PetRenderer
 from ..runtime import StackRuntime
 from ..system import SystemFacts
 from .appearance import TuiAppearance
+from .application import InstallationView
 from .navigation import (
     DEFAULT_ITEM,
     SECTION_ITEMS,
@@ -32,17 +35,20 @@ from .navigation import (
     route_id,
     sidebar_button_id,
 )
+from .operations import OperationView
 from .presenters import (
     display_path,
     placeholder,
-    render_dashboard,
     render_general_settings,
     render_install_plan,
-    render_install_stack,
     render_interface_settings,
+    render_operation,
+    render_overview,
     render_plan_execution,
     render_profile_details,
     render_service,
+    render_vram,
+    stack_summary,
 )
 
 PlanExecutorFactory = Callable[[ResolvedInstallation], PlanExecutor]
@@ -316,6 +322,162 @@ class ProfilePanel(VerticalScroll):
             )
 
 
+class OperationPanel(Static):
+    """One operation as a checklist. Fed by the app; never subscribes itself."""
+
+    def __init__(self, idle_text: str, *, id: str | None = None) -> None:
+        super().__init__(render_operation(None, idle_text=idle_text), id=id)
+        self.idle_text = idle_text
+        self.view: OperationView | None = None
+
+    def show(self, view: OperationView | None) -> None:
+        self.view = view
+        self.update(render_operation(view, idle_text=self.idle_text))
+
+
+class DashboardPanel(VerticalScroll):
+    """What a person sees every day: the profile, whether it runs, and one button.
+
+    The overview is rebuilt from application projections whenever the app asks.
+    The buttons only ask the app; the app decides whether anything happens.
+    """
+
+    def __init__(
+        self,
+        installation: InstallationView,
+        profile_name: str,
+        services: ServicesSnapshot,
+        vram: VramSnapshot,
+        gpu_name: str | None,
+    ) -> None:
+        super().__init__(id=route_id(Section.DASHBOARD, "overview"), classes="route-view")
+        self.installation = installation
+        self.profile_name = profile_name
+        self.services = services
+        self.vram = vram
+        self.gpu_name = gpu_name
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._overview(), id="dashboard-overview")
+        with Horizontal(id="dashboard-primary"):
+            yield Button("Abrir Open WebUI", id="dashboard-open-webui", variant="primary")
+        with Horizontal(id="dashboard-secondary"):
+            yield Button("Iniciar stack", id="dashboard-start")
+            yield Button("Reiniciar", id="dashboard-restart")
+            yield Button("Parar stack", id="dashboard-stop")
+        yield OperationPanel("", id="dashboard-operation")
+        yield Static("", id="dashboard-notice")
+
+    def on_mount(self) -> None:
+        self.set_busy(None)
+
+    def _overview(self) -> str:
+        return render_overview(
+            self.installation, self.profile_name, self.services, self.vram, self.gpu_name
+        )
+
+    def refresh_overview(
+        self,
+        installation: InstallationView,
+        profile_name: str,
+        services: ServicesSnapshot,
+        vram: VramSnapshot,
+    ) -> None:
+        self.installation = installation
+        self.profile_name = profile_name
+        self.services = services
+        self.vram = vram
+        self.query_one("#dashboard-overview", Static).update(self._overview())
+        self.set_busy(self.query_one(OperationPanel).view)
+
+    def show_operation(self, view: OperationView | None) -> None:
+        self.query_one(OperationPanel).show(view)
+        self.set_busy(view)
+
+    def set_busy(self, view: OperationView | None) -> None:
+        """While an operation runs, nothing else may be asked for."""
+        busy = view is not None and not view.terminal
+        ready = self.installation.ready
+        for button_id in ("dashboard-start", "dashboard-restart", "dashboard-stop"):
+            self.query_one(f"#{button_id}", Button).disabled = busy or not ready
+        self.query_one("#dashboard-open-webui", Button).disabled = busy or not ready
+
+    def set_launching(self, launching: bool) -> None:
+        self.query_one("#dashboard-open-webui", Button).disabled = launching
+
+    def show_notice(self, message: str, *, error: bool = False) -> None:
+        colour = "red" if error else "yellow"
+        text = f"[{colour}]{escape(message)}[/{colour}]" if message else ""
+        self.query_one("#dashboard-notice", Static).update(text)
+
+
+class InstallPanel(VerticalScroll):
+    """The Installation section's front door: reopen the wizard, watch the last install."""
+
+    def __init__(self, installation: InstallationView, profile_name: str) -> None:
+        super().__init__(id=route_id(Section.INSTALLATION, "install"), classes="route-view")
+        self.installation = installation
+        self.profile_name = profile_name
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._summary(), id="install-summary")
+        yield Button(self._button_label(), id="install-open-wizard", variant="primary")
+        yield OperationPanel("Nenhuma instalação em andamento.", id="install-operation")
+
+    def _button_label(self) -> str:
+        return "Reinstalar" if self.installation.ready else "Instalar"
+
+    def _summary(self) -> str:
+        if not self.installation.ready:
+            return (
+                "[b]Instalação[/b]\n\n"
+                "Nenhuma stack instalada nesta máquina.\n"
+                "O assistente escolhe o perfil e o local e cuida do resto."
+            )
+        lines = ["[b]Instalação[/b]", "", f"Perfil: [b]{escape(self.profile_name)}[/b]"]
+        if self.installation.mode is not None:
+            lines.append(f"Local: {escape(self.installation.mode.value)}")
+        if self.installation.root_display:
+            lines.append(f"Pasta: {escape(self.installation.root_display)}")
+        return "\n".join(lines)
+
+    def refresh_installation(self, installation: InstallationView, profile_name: str) -> None:
+        self.installation = installation
+        self.profile_name = profile_name
+        self.query_one("#install-summary", Static).update(self._summary())
+        self.query_one("#install-open-wizard", Button).label = self._button_label()
+
+    def show_operation(self, view: OperationView | None) -> None:
+        self.query_one(OperationPanel).show(view)
+        busy = view is not None and not view.terminal
+        self.query_one("#install-open-wizard", Button).disabled = busy
+
+
+class ServicesPanel(VerticalScroll):
+    """The three services in detail. Read-only, for when the overview is not enough."""
+
+    def __init__(self, runtime: StackRuntime, integration: IntegrationSnapshot) -> None:
+        super().__init__(id=route_id(Section.DASHBOARD, "services"), classes="route-view")
+        self.runtime_snapshot = runtime
+        self.integration = integration
+
+    def compose(self) -> ComposeResult:
+        for title, service_id in (
+            ("Ollama", "ollama"),
+            ("Open WebUI", "open-webui"),
+            ("ComfyUI", "comfyui"),
+        ):
+            yield Static(
+                render_service(
+                    self.runtime_snapshot.by_id(service_id),
+                    title,
+                    self.integration.by_service(service_id),
+                ),
+                id=f"service-{service_id}",
+                classes="service-card",
+            )
+
+
 class MainContent(ContentSwitcher):
     def __init__(
         self,
@@ -325,6 +487,9 @@ class MainContent(ContentSwitcher):
         selected: Profile,
         config: InstalledConfig,
         repo_root: Path,
+        installation: InstallationView,
+        services: ServicesSnapshot,
+        vram: VramSnapshot,
         integration: IntegrationSnapshot | None = None,
         executor_factory: PlanExecutorFactory | None = None,
     ) -> None:
@@ -338,44 +503,29 @@ class MainContent(ContentSwitcher):
         self.selected_profile = selected
         self.config = config
         self.repo_root = repo_root
+        self.installation = installation
+        self.services = services
+        self.vram = vram
         self.integration = integration or IntegrationSnapshot()
         self.executor_factory = executor_factory
 
-    def compose(self) -> ComposeResult:
-        yield Static(
-            render_dashboard(self.facts, self.runtime_snapshot, self.selected_profile),
-            id=route_id(Section.DASHBOARD, "status"),
-            classes="route-view",
-        )
-        yield Static(
-            placeholder(
-                "Logs",
-                "Log aggregation is not connected yet. Runtime data remains read-only.",
-            ),
-            id=route_id(Section.DASHBOARD, "logs"),
-            classes="route-view",
-        )
-        for item_id, title, service_id in (
-            ("ollama", "Ollama", "ollama"),
-            ("open-webui", "Open WebUI", "open-webui"),
-            ("comfyui", "ComfyUI", "comfyui"),
-        ):
-            yield Static(
-                render_service(
-                    self.runtime_snapshot.by_id(service_id),
-                    title,
-                    self.integration.by_service(service_id),
-                ),
-                id=route_id(Section.DASHBOARD, item_id),
-                classes="route-view",
-            )
+    def _gpu_name(self) -> str | None:
+        if not self.facts.gpus:
+            return None
+        return max(self.facts.gpus, key=lambda item: item.vram_total_mib).name
 
-        yield ProfilePanel(self.profiles, self.selected_profile, self.facts)
-        yield Static(
-            render_install_stack(self.selected_profile),
-            id=route_id(Section.INSTALLATION, "stack"),
-            classes="route-view",
+    def compose(self) -> ComposeResult:
+        yield DashboardPanel(
+            self.installation,
+            self.selected_profile.name,
+            self.services,
+            self.vram,
+            self._gpu_name(),
         )
+        yield ServicesPanel(self.runtime_snapshot, self.integration)
+
+        yield InstallPanel(self.installation, self.selected_profile.name)
+        yield ProfilePanel(self.profiles, self.selected_profile, self.facts)
         yield InstallationLocationPanel(self.config.installation, self.repo_root)
         yield InstallPlanPanel(
             self.selected_profile,
@@ -394,15 +544,6 @@ class MainContent(ContentSwitcher):
             id=route_id(Section.SETTINGS, "interface"),
             classes="route-view",
         )
-        for item_id, title, message in (
-            ("runtime", "Runtime settings", "Runtime controls are not available in this round."),
-            ("advanced", "Advanced settings", "No advanced settings are exposed yet."),
-        ):
-            yield Static(
-                placeholder(title, message),
-                id=route_id(Section.SETTINGS, item_id),
-                classes="route-view",
-            )
 
     def show_route(self, section: Section, item_id: str) -> None:
         self.current = route_id(section, item_id)
@@ -410,13 +551,8 @@ class MainContent(ContentSwitcher):
     def select_profile(self, profile: Profile) -> None:
         self.selected_profile = profile
         self.query_one(ProfilePanel).select_profile(profile)
-        self.query_one(f"#{route_id(Section.INSTALLATION, 'stack')}", Static).update(
-            render_install_stack(profile)
-        )
         self.query_one(InstallPlanPanel).refresh_plan(profile=profile)
-        self.query_one(f"#{route_id(Section.DASHBOARD, 'status')}", Static).update(
-            render_dashboard(self.facts, self.runtime_snapshot, profile)
-        )
+        self.refresh_overview(self.installation, self.services, self.vram)
 
     def update_config(self, config: InstalledConfig) -> None:
         self.config = config
@@ -429,6 +565,20 @@ class MainContent(ContentSwitcher):
         # The plan states where the work would land, so a new install location
         # is a new plan.
         self.query_one(InstallPlanPanel).refresh_plan(config=config)
+
+    def refresh_overview(
+        self, installation: InstallationView, services: ServicesSnapshot, vram: VramSnapshot
+    ) -> None:
+        self.installation = installation
+        self.services = services
+        self.vram = vram
+        name = self.selected_profile.name
+        self.query_one(DashboardPanel).refresh_overview(installation, name, services, vram)
+        self.query_one(InstallPanel).refresh_installation(installation, name)
+
+    def show_operation(self, view: OperationView | None) -> None:
+        self.query_one(DashboardPanel).show_operation(view)
+        self.query_one(InstallPanel).show_operation(view)
 
     def run_plan_dry_run(self) -> ExecutionReport | None:
         return self.query_one(InstallPlanPanel).run_dry_run()
@@ -498,6 +648,8 @@ class RightRail(Vertical):
         runtime: StackRuntime,
         ui: UiConfig,
         appearance: TuiAppearance,
+        services: ServicesSnapshot | None = None,
+        vram: VramSnapshot | None = None,
     ) -> None:
         classes = []
         if not ui.right_rail_visible:
@@ -509,12 +661,25 @@ class RightRail(Vertical):
         self.facts = facts
         self.runtime_snapshot = runtime
         self.appearance = appearance
+        self.services = services
+        self.vram = vram
+
+    def _gpu_text(self) -> str:
+        gpu = (
+            max(self.facts.gpus, key=lambda item: item.vram_total_mib) if self.facts.gpus else None
+        )
+        if self.vram is not None and (gpu is not None or self.vram.total_mib is not None):
+            return render_vram(self.vram, gpu.name if gpu else None)
+        if gpu is None:
+            return "No NVIDIA GPU"
+        return f"{gpu.name}\nVRAM {gpu.vram_total_mib} MiB"
+
+    def _stack_text(self) -> str:
+        if self.services is not None:
+            return stack_summary(self.services)
+        return self.runtime_snapshot.state.value
 
     def compose(self) -> ComposeResult:
-        gpu_text = "No NVIDIA GPU"
-        if self.facts.gpus:
-            gpu = max(self.facts.gpus, key=lambda item: item.vram_total_mib)
-            gpu_text = f"{gpu.name}\nVRAM {gpu.vram_total_mib} MiB"
         with Vertical(classes="rail-content"):
             yield Static("Profile", classes="rail-heading")
             yield Static(self.profile.name, id="rail-profile", classes="rail-value")
@@ -524,10 +689,17 @@ class RightRail(Vertical):
                 id="pet-slot",
             )
             yield Static("GPU / VRAM", classes="rail-heading")
-            yield Static(gpu_text, id="rail-gpu")
+            yield Static(self._gpu_text(), id="rail-gpu")
             yield Static("Stack", classes="rail-heading")
-            yield Static(self.runtime_snapshot.state.value, id="rail-stack", classes="rail-value")
+            yield Static(self._stack_text(), id="rail-stack", classes="rail-value")
         yield Button("Expand" if self.is_collapsed else "Collapse", id="right-rail-toggle")
+
+    def update_status(self, services: ServicesSnapshot, vram: VramSnapshot) -> None:
+        """Fresh projections from the application; the rail only repeats them."""
+        self.services = services
+        self.vram = vram
+        self.query_one("#rail-gpu", Static).update(self._gpu_text())
+        self.query_one("#rail-stack", Static).update(self._stack_text())
 
     @property
     def is_collapsed(self) -> bool:

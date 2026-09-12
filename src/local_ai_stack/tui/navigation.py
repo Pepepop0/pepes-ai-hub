@@ -24,29 +24,24 @@ SECTION_LABELS: dict[Section, str] = {
 
 SECTION_ITEMS: dict[Section, tuple[NavigationItem, ...]] = {
     Section.DASHBOARD: (
-        NavigationItem("status", "Status"),
-        NavigationItem("logs", "Logs"),
-        NavigationItem("ollama", "Ollama"),
-        NavigationItem("open-webui", "Open WebUI"),
-        NavigationItem("comfyui", "ComfyUI"),
+        NavigationItem("overview", "Visão geral"),
+        NavigationItem("services", "Serviços"),
     ),
     Section.INSTALLATION: (
+        NavigationItem("install", "Instalar"),
         NavigationItem("profile", "Perfil"),
-        NavigationItem("stack", "Stack"),
         NavigationItem("location", "Local"),
         NavigationItem("plan", "Plano"),
     ),
     Section.SETTINGS: (
         NavigationItem("general", "Geral"),
         NavigationItem("interface", "Interface"),
-        NavigationItem("runtime", "Runtime"),
-        NavigationItem("advanced", "Avançado"),
     ),
 }
 
 DEFAULT_ITEM: dict[Section, str] = {
-    Section.DASHBOARD: "status",
-    Section.INSTALLATION: "profile",
+    Section.DASHBOARD: "overview",
+    Section.INSTALLATION: "install",
     Section.SETTINGS: "general",
 }
 

@@ -1,36 +1,63 @@
 from __future__ import annotations
 
+import webbrowser
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.events import Resize
+from textual.message import Message
+from textual.screen import Screen
 from textual.widgets import Button, Input, Select
 
+from .application_contracts import ServicesSnapshot, ServiceView, VramSnapshot
+from .compatibility import evaluate_compatibility
 from .config import InstalledConfig
 from .execution import PlanExecutor
 from .installation import InstallLocationMode, ResolvedInstallation, resolve_installation
 from .integration import IntegrationSnapshot, detect_integration, plan_executor, provision_context
+from .operation_contracts import OperationEvent, OperationSnapshot
 from .profiles import Profile, load_profiles
 from .runtime import StackRuntime, stack_runtime
 from .system import SystemFacts, detect_system
 from .tui.appearance import TuiAppearance, resolve_tui_appearance, textual_theme
+from .tui.application import (
+    HubApplication,
+    HubError,
+    HubUnavailable,
+    InstallationView,
+    InstallSelection,
+    LaunchRefusal,
+    LaunchTarget,
+    OperationBusy,
+    ProfileChoice,
+)
 from .tui.navigation import DEFAULT_ITEM, SIDEBAR_ROUTES, Section
+from .tui.operations import OperationView, observe
 from .tui.presenters import render_profile_details
 from .tui.styles import APP_CSS
 from .tui.widgets import (
     ContextSidebar,
+    DashboardPanel,
     FooterBar,
     InstallationLocationPanel,
     MainContent,
     RightRail,
     TopNavigation,
 )
+from .tui.wizard import WizardScreen
 
-__all__ = ["LocalAIStackApp", "render_profile_details", "run_tui"]
+__all__ = [
+    "LocalAIStackApp",
+    "UnwiredHubApplication",
+    "render_profile_details",
+    "run_tui",
+]
 
 
 def project_root() -> Path:
@@ -44,6 +71,100 @@ def default_executor_factory(installation: ResolvedInstallation) -> PlanExecutor
 
 # Below this many columns the right rail gives its width back to the content.
 WIDE_TERMINAL_COLUMNS = 90
+
+# After the browser is asked to open, the button stays down this long so a
+# second press does not open a second tab.
+LAUNCH_COOLDOWN_SECONDS = 2.0
+
+# The wizard highlights this profile when it is offered, because it is the
+# path the first-run flow is built around. It is a suggestion, not a choice.
+SUGGESTED_PROFILE = "capella"
+
+UNWIRED_MESSAGE = "A instalação ainda não está conectada nesta versão do Hub."
+
+
+class OperationObserved(Message):
+    """An event from the application, carried onto the UI thread."""
+
+    def __init__(self, event: OperationEvent) -> None:
+        super().__init__()
+        self.event = event
+
+
+@dataclass
+class UnwiredHubApplication:
+    """What the composition layer has until the application lands.
+
+    It reads what this machine already knows - detected services and GPU - and
+    refuses every command with the same sentence, so the screens are truthful
+    without pretending anything can be installed or started from here yet.
+    """
+
+    facts: SystemFacts
+    runtime_snapshot: StackRuntime
+    profiles: tuple[Profile, ...]
+
+    def current_operation(self) -> OperationSnapshot | None:
+        return None
+
+    def subscribe(self, sink):
+        return _NoSubscription()
+
+    def services_snapshot(self) -> ServicesSnapshot:
+        return ServicesSnapshot(
+            datetime.now(UTC),
+            tuple(
+                ServiceView(service.spec.id, service.health.state.value)
+                for service in self.runtime_snapshot.services
+            ),
+        )
+
+    def vram_snapshot(self) -> VramSnapshot:
+        total = None
+        if self.facts.gpus:
+            total = max(gpu.vram_total_mib for gpu in self.facts.gpus)
+        return VramSnapshot(datetime.now(UTC), total, None)
+
+    def installation(self) -> InstallationView:
+        return InstallationView(ready=False)
+
+    def profile_choices(self) -> tuple[ProfileChoice, ...]:
+        return tuple(
+            ProfileChoice(
+                profile.id,
+                profile.name,
+                profile.description,
+                evaluate_compatibility(self.facts, profile).compatible,
+            )
+            for profile in self.profiles
+        )
+
+    def install(self, selection: InstallSelection) -> str:
+        raise HubUnavailable(UNWIRED_MESSAGE)
+
+    def start_stack(self) -> str:
+        raise HubUnavailable(UNWIRED_MESSAGE)
+
+    def stop_stack(self) -> str:
+        raise HubUnavailable(UNWIRED_MESSAGE)
+
+    def restart_stack(self) -> str:
+        raise HubUnavailable(UNWIRED_MESSAGE)
+
+    def open_webui_target(self) -> LaunchTarget | LaunchRefusal:
+        return LaunchRefusal(UNWIRED_MESSAGE, code="unwired")
+
+
+class _NoSubscription:
+    def close(self) -> None:
+        return None
+
+
+class HubScreen(Screen):
+    """The main screen. It is the one thing that is told when the terminal resizes."""
+
+    def on_resize(self, event: Resize) -> None:
+        self.app.fit_to_width(event.size.width)  # type: ignore[attr-defined]
 
 
 class LocalAIStackApp(App):
@@ -67,6 +188,9 @@ class LocalAIStackApp(App):
         installed_config: InstalledConfig | None = None,
         integration: IntegrationSnapshot | None = None,
         executor_factory: Callable[[ResolvedInstallation], PlanExecutor] | None = None,
+        application: HubApplication | None = None,
+        open_browser: Callable[[str], bool] | None = None,
+        first_run_wizard: bool = True,
     ) -> None:
         super().__init__()
         self.profiles = tuple(
@@ -78,10 +202,24 @@ class LocalAIStackApp(App):
         self.runtime_snapshot = (
             runtime_snapshot if runtime_snapshot is not None else stack_runtime()
         )
+        self.application: HubApplication = application or UnwiredHubApplication(
+            self.facts, self.runtime_snapshot, self.profiles
+        )
+        self.open_browser = open_browser or webbrowser.open
+        self.first_run_wizard = first_run_wizard
+        self.operation_view: OperationView | None = None
+        self.notices: list[str] = []
+        self._subscription = None
+        self._launching = False
+
+        installation = self._installation()
+        installed_profile = installation.profile_id if installation.ready else None
         default_profile = next(
             (profile for profile in self.profiles if profile.id == "pepe"), self.profiles[0]
         )
-        self.installed_config = installed_config or InstalledConfig(profile_id=default_profile.id)
+        self.installed_config = installed_config or InstalledConfig(
+            profile_id=installed_profile or default_profile.id
+        )
         self.selected_profile = next(
             (
                 profile
@@ -101,13 +239,36 @@ class LocalAIStackApp(App):
         # creates no directory and starts nothing.
         self.integration = integration if integration is not None else self._detect_integration()
 
+    # --- projections, with the application possibly absent -----------------
+
+    def _installation(self) -> InstallationView:
+        try:
+            return self.application.installation()
+        except HubUnavailable:
+            return InstallationView(ready=False)
+
+    def _services(self) -> ServicesSnapshot:
+        try:
+            return self.application.services_snapshot()
+        except HubUnavailable:
+            return ServicesSnapshot(datetime.now(UTC), ())
+
+    def _vram(self) -> VramSnapshot:
+        try:
+            return self.application.vram_snapshot()
+        except HubUnavailable:
+            return VramSnapshot(datetime.now(UTC), None, None)
+
     def _resolved_installation(self) -> ResolvedInstallation:
         return resolve_installation(self.installed_config.installation, repo_root=project_root())
 
     def _detect_integration(self) -> IntegrationSnapshot:
         return detect_integration(provision_context(self._resolved_installation()))
 
+    # --- composition --------------------------------------------------------
+
     def compose(self) -> ComposeResult:
+        services, vram = self._services(), self._vram()
         yield TopNavigation(self.active_section)
         with Horizontal(id="workspace"):
             yield ContextSidebar(self.active_section)
@@ -118,6 +279,9 @@ class LocalAIStackApp(App):
                 self.selected_profile,
                 self.installed_config,
                 project_root(),
+                self._installation(),
+                services,
+                vram,
                 self.integration,
                 self.executor_factory,
             )
@@ -127,11 +291,157 @@ class LocalAIStackApp(App):
                 self.runtime_snapshot,
                 self.installed_config.general.ui,
                 self.current_appearance,
+                services,
+                vram,
             )
         yield FooterBar()
 
     def on_mount(self) -> None:
         self._activate_theme(self.current_appearance)
+        self._subscribe()
+        if self.first_run_wizard and not self._installation().ready:
+            self.open_wizard()
+
+    def on_unmount(self) -> None:
+        self._unsubscribe()
+
+    def _subscribe(self) -> None:
+        try:
+            self._subscription = self.application.subscribe(
+                lambda event: self.post_message(OperationObserved(event))
+            )
+        except HubUnavailable:
+            self._subscription = None
+
+    def _unsubscribe(self) -> None:
+        subscription, self._subscription = self._subscription, None
+        if subscription is not None:
+            subscription.close()
+
+    # --- the wizard ---------------------------------------------------------
+
+    @property
+    def wizard(self) -> WizardScreen | None:
+        screen = self.screen
+        return screen if isinstance(screen, WizardScreen) else None
+
+    def open_wizard(self) -> None:
+        if self.wizard is not None:
+            return
+        try:
+            choices = self.application.profile_choices()
+        except HubUnavailable:
+            choices = tuple(
+                ProfileChoice(profile.id, profile.name, profile.description)
+                for profile in self.profiles
+            )
+        self.push_screen(WizardScreen(choices, preselect=SUGGESTED_PROFILE))
+
+    def on_wizard_screen_install_requested(self, message: WizardScreen.InstallRequested) -> None:
+        wizard = self.wizard
+        self.select_profile(message.selection.profile_id)
+        try:
+            self.application.install(message.selection)
+        except HubError as error:
+            if wizard is not None:
+                wizard.show_refusal(str(error))
+            self._notice(str(error), error=True)
+
+    def on_wizard_screen_open_web_ui_requested(self, _: WizardScreen.OpenWebUiRequested) -> None:
+        self.open_webui()
+
+    def on_wizard_screen_finished(self, _: WizardScreen.Finished) -> None:
+        if self.wizard is not None:
+            self.pop_screen()
+        self.refresh_projections()
+        self.show_section(Section.DASHBOARD)
+
+    # --- operations ---------------------------------------------------------
+
+    def on_operation_observed(self, message: OperationObserved) -> None:
+        view = observe(self.operation_view, message.event)
+        if view is self.operation_view:
+            return
+        self.operation_view = view
+        self.query_one(MainContent).show_operation(view)
+        wizard = self.wizard
+        if wizard is not None:
+            wizard.show_operation(view)
+        if view is not None and view.terminal:
+            self.refresh_projections()
+
+    def refresh_projections(self) -> None:
+        """Ask the application again and repaint whatever repeats its answers."""
+        installation = self._installation()
+        if installation.ready and installation.profile_id:
+            self.select_profile(installation.profile_id)
+        services, vram = self._services(), self._vram()
+        self.query_one(MainContent).refresh_overview(installation, services, vram)
+        self.query_one(RightRail).update_status(services, vram)
+
+    def run_stack_command(self, verb: str) -> None:
+        """Start, stop or restart, if the application will have it."""
+        command = {
+            "start": self.application.start_stack,
+            "stop": self.application.stop_stack,
+            "restart": self.application.restart_stack,
+        }[verb]
+        try:
+            command()
+        except OperationBusy as error:
+            self._notice(str(error))
+        except HubError as error:
+            self._notice(str(error), error=True)
+        else:
+            self._notice("")
+
+    # --- Open WebUI ---------------------------------------------------------
+
+    def open_webui(self) -> bool:
+        """Ask for a launch target and hand it to the browser. Never builds a URL."""
+        if self._launching:
+            return False
+        self._launching = True
+        self._set_launching(True)
+        try:
+            target = self.application.open_webui_target()
+        except HubError as error:
+            self._notice(str(error), error=True)
+            self._end_launch()
+            return False
+        if isinstance(target, LaunchRefusal):
+            self._notice(target.reason)
+            self._end_launch()
+            return False
+        opened = bool(self.open_browser(target.url))
+        if opened:
+            self._notice(f"Abrindo {target.label} no navegador.")
+            self.set_timer(LAUNCH_COOLDOWN_SECONDS, self._end_launch)
+        else:
+            self._notice(f"O navegador não abriu. Endereço: {target.url}", error=True)
+            self._end_launch()
+        return opened
+
+    def _set_launching(self, launching: bool) -> None:
+        for panel in self.query(DashboardPanel):
+            panel.set_launching(launching)
+            if not launching:
+                panel.set_busy(self.operation_view)
+        wizard = self.wizard
+        if wizard is not None:
+            wizard.query_one("#wizard-open-webui", Button).disabled = launching
+
+    def _end_launch(self) -> None:
+        self._launching = False
+        self._set_launching(False)
+
+    def _notice(self, message: str, *, error: bool = False) -> None:
+        if message:
+            self.notices.append(message)
+        for panel in self.query(DashboardPanel):
+            panel.show_notice(message, error=error)
+
+    # --- navigation ---------------------------------------------------------
 
     def show_section(self, section: Section) -> None:
         self.active_section = section
@@ -189,9 +499,13 @@ class LocalAIStackApp(App):
         self.installed_config = self.installed_config.with_installation(location)
         self.query_one(MainContent).update_config(self.installed_config)
 
-    def on_resize(self) -> None:
+    def get_default_screen(self) -> Screen:
+        return HubScreen()
+
+    def fit_to_width(self, width: int) -> None:
         """Narrow terminals get a narrow rail; the pet scales itself to match."""
-        self.query_one(RightRail).set_narrow(self.size.width < WIDE_TERMINAL_COLUMNS)
+        for rail in self.query(RightRail):
+            rail.set_narrow(width < WIDE_TERMINAL_COLUMNS)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
@@ -207,6 +521,12 @@ class LocalAIStackApp(App):
             # Preview only: every step runs with dry_run=True, so nothing is
             # created, downloaded or installed.
             self.query_one(MainContent).run_plan_dry_run()
+        elif button_id == "dashboard-open-webui":
+            self.open_webui()
+        elif button_id in ("dashboard-start", "dashboard-stop", "dashboard-restart"):
+            self.run_stack_command(button_id.removeprefix("dashboard-"))
+        elif button_id == "install-open-wizard":
+            self.open_wizard()
         event.stop()
 
     def on_select_changed(self, event: Select.Changed) -> None:

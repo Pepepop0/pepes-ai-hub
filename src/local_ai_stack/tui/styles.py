@@ -191,4 +191,146 @@ Screen {
     width: auto;
     text-align: right;
 }
+
+/* --- Dashboard ------------------------------------------------------------- */
+
+#dashboard-overview {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#dashboard-primary {
+    height: 3;
+    margin-bottom: 1;
+}
+
+#dashboard-primary Button {
+    width: 100%;
+    max-width: 40;
+    min-width: 20;
+}
+
+#dashboard-secondary {
+    height: 3;
+    margin-bottom: 1;
+}
+
+#dashboard-secondary Button {
+    width: 1fr;
+    max-width: 20;
+    min-width: 12;
+    margin-right: 1;
+}
+
+#dashboard-operation,
+#install-operation {
+    height: auto;
+    margin-top: 1;
+}
+
+#dashboard-notice {
+    height: auto;
+    min-height: 1;
+    margin-top: 1;
+}
+
+#install-summary {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#install-open-wizard {
+    width: 100%;
+    max-width: 40;
+    min-width: 16;
+}
+
+.service-card {
+    height: auto;
+    margin-bottom: 1;
+    padding: 1;
+    border: round $secondary;
+}
+
+/* --- Wizard ---------------------------------------------------------------- */
+
+#wizard {
+    layout: vertical;
+    background: $surface;
+    color: $text;
+}
+
+#wizard-frame {
+    width: 100%;
+    max-width: 96;
+    height: 1fr;
+    padding: 1 2;
+}
+
+#wizard-title {
+    height: 2;
+    color: $text-muted;
+}
+
+#wizard-steps {
+    height: 1fr;
+}
+
+.wizard-pane {
+    width: 100%;
+    height: 100%;
+    padding: 1;
+}
+
+.wizard-question {
+    height: 2;
+}
+
+#wizard-profile-buttons,
+#wizard-mode-buttons {
+    height: 3;
+    margin-bottom: 1;
+}
+
+.wizard-choice {
+    width: 1fr;
+    max-width: 24;
+    min-width: 10;
+    margin-right: 1;
+}
+
+#wizard-profile-summary,
+#wizard-mode-summary {
+    height: auto;
+    min-height: 2;
+    margin-bottom: 1;
+}
+
+#wizard-custom-root {
+    width: 100%;
+    max-width: 80;
+}
+
+#wizard-custom-error {
+    min-height: 1;
+    color: $error;
+}
+
+#wizard-actions {
+    height: 3;
+    margin-top: 1;
+}
+
+#wizard-actions Button {
+    min-width: 16;
+    margin-right: 1;
+}
+
+#wizard-footer {
+    height: 1;
+    width: 100%;
+    padding: 0 1;
+    background: $primary-background;
+    color: $text;
+}
 """

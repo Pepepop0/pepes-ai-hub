@@ -210,7 +210,7 @@ _DOWNLOADING_SIZE_RE = re.compile(
 # normalized the way pip itself prints it back in "Installing collected
 # packages". A metadata fetch is resolver chatter about a package already
 # reported as `Collecting`, and its size is not the package's, so it is skipped.
-_ARTIFACT_NAME_RE = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9_.]*?)-\d")
+_ARTIFACT_NAME_RE = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*?)-\d")
 _PROGRESS_TICK_RE = re.compile(
     r"([\d.]+)\s*/\s*([\d.]+)\s*([kKmMgG]i?B)\s+([\d.]+)\s*([kKmMgG]i?B)/s"
 )
@@ -278,10 +278,14 @@ class PipOutputParser:
         match = _DOWNLOADING_SIZE_RE.match(text)
         if match:
             artifact = match.group("artifact")
-            if artifact.endswith(".metadata"):
+            if _artifact_filename(artifact).endswith(".metadata"):
                 return
-            package = _package_of(artifact) or self._current
+            package = _package_of(artifact)
             if package is None:
+                # The last Collecting line belongs to resolver order, not
+                # necessarily to this payload. Clear it so a following bare
+                # progress tick cannot inherit the wrong package either.
+                self._current = None
                 return
             self._current = package
             total = _size_to_bytes(match.group(2), match.group(3))
@@ -317,12 +321,17 @@ def _package_of(artifact: str) -> str | None:
     """The distribution an artifact filename belongs to, or None if unclear.
 
     A URL is reduced to its last segment first, since pip prints a full index
-    URL when it is fetching from one; an unparseable name yields None rather
-    than a guess, and the caller keeps whatever it already knew.
+    URL when it is fetching from one; query and fragment data are excluded
+    before parsing. An unparseable name yields None rather than a guess.
     """
-    name = artifact.rsplit("/", 1)[-1]
+    name = _artifact_filename(artifact)
     match = _ARTIFACT_NAME_RE.match(name)
     return match.group("name").replace("_", "-").lower() if match else None
+
+
+def _artifact_filename(artifact: str) -> str:
+    """A URL/path's filename, without query or fragment data."""
+    return artifact.rsplit("/", 1)[-1].split("?", 1)[0].split("#", 1)[0]
 
 
 def _split_names(joined: str) -> list[str]:
@@ -393,7 +402,12 @@ def pip_install_argv(
 _PIP_SIGNALS: tuple[tuple[PipFailureKind, re.Pattern[str], str], ...] = (
     (
         PipFailureKind.INVALID_INVOCATION,
-        re.compile(r"(?:invalid choice|no such option|unrecognized arguments)", re.IGNORECASE),
+        re.compile(
+            r"(?:option\s+--[A-Za-z0-9][A-Za-z0-9-]*:\s+invalid choice"
+            r"|no such option:\s+--[A-Za-z0-9][A-Za-z0-9-]*"
+            r"|unrecognized arguments?:\s+--[A-Za-z0-9][A-Za-z0-9-]*)",
+            re.IGNORECASE,
+        ),
         "pip refused the install options; the installer asked for something this pip does not accept",
     ),
     (
@@ -446,7 +460,10 @@ _PIP_SIGNALS: tuple[tuple[PipFailureKind, re.Pattern[str], str], ...] = (
 # optional version specifier and extras. Anything else a capture group picks up
 # -- a path, a URL, an index with credentials in it -- does not match, and is
 # dropped rather than repeated, so no part of pip's output can ride along.
-_REQUIREMENT_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+\-\[\]]{0,59}(?:[=<>!~]=?[^\s]{0,31})?$")
+_REQUIREMENT_TOKEN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._+\-\[\]]{0,59}"
+    r"(?:[=<>!~]=?[A-Za-z0-9.*+!_\-]{1,31})?$"
+)
 
 # What an unclassified failure says. Pip's own last line is deliberately not
 # here: on a real failure it is as likely to be a traceback, a cache path or

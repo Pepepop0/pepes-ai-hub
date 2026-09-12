@@ -1036,20 +1036,10 @@ def _display(service_id: str) -> str:
 
 
 def _provision_problem(item) -> str:
-    """One component failure, with the cause the domain classified, if any.
-
-    The message alone says *what* step failed ("Could not install
-    dependencies."); the detail is where the provisioner put *why*. Dropping it
-    is what left a real failure looking like a generic refusal, so both travel
-    together -- still bounded and sanitized by the event layer above.
-    """
+    """One component failure using only the domain's public-safe message."""
     if item.failure is None:
         return f"{item.component_id}: {item.detail}"
-    cause = item.failure.detail.strip()
-    text = item.failure.message
-    if cause and cause not in text:
-        text = f"{text} {cause}"
-    return f"{item.component_id}: {text}"
+    return f"{item.component_id}: {item.failure.message}"
 
 
 def execution_problems(report: ExecutionReport) -> list[str]:

@@ -391,11 +391,13 @@ class OpenWebUIProvisioner(Provisioner):
         try:
             pip_install(context.runner, environment, [requirement], on_output=on_pip_output)
         except PythonEnvironmentError as exc:
+            message = f"Could not install {requirement}."
+            if exc.failure is not None:
+                message = f"{message} {exc.failure.summary}"
             return self.failed(
                 detection,
                 reason_for_pip_failure(exc.failure),
-                f"Could not install {requirement}.",
-                exc.failure.summary if exc.failure is not None else str(exc),
+                message,
             )
 
         if not self.managed_executable(context).is_file():

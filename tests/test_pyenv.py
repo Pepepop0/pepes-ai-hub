@@ -189,14 +189,30 @@ def test_a_full_index_url_is_reduced_to_the_artifact_it_points_at():
     assert events[0].total_bytes == 1_915_200_000
 
 
-def test_an_unparseable_artifact_keeps_the_package_already_being_collected():
-    events = events_for("Collecting spandrel", "  Downloading somefile.tar.gz (4.0 MB)")
-    downloads = [e for e in events if e.action == "downloading"]
-    assert [e.package for e in downloads] == ["spandrel"]
+def test_an_unparseable_artifact_does_not_inherit_the_last_collected_package():
+    events = events_for(
+        "Collecting spandrel",
+        "  Downloading somefile.tar.gz (4.0 MB)",
+        "     2.0/4.0 MB 1.0 MB/s eta 0:00:02",
+    )
+    assert events == [PipEvent("resolving", "spandrel")]
 
 
 def test_a_download_with_no_package_context_at_all_is_ignored():
     assert events_for("  Downloading somefile.tar.gz (4.0 MB)") == []
+
+
+def test_a_hyphenated_sdist_name_is_inferred_from_its_artifact():
+    events = events_for("Downloading my-package-1.2.0.tar.gz (4.0 MB)")
+    assert events == [PipEvent("downloading", "my-package", total_bytes=4_000_000)]
+
+
+def test_metadata_with_a_query_string_is_ignored_without_exposing_the_query():
+    events = events_for(
+        "Collecting torch==2.11.0+cu130",
+        "Downloading https://packages.invalid/torch-2.11.0.whl.metadata?token=secret (29 kB)",
+    )
+    assert events == [PipEvent("resolving", "torch")]
 
 
 def test_unrecognized_lines_are_silently_ignored_never_forwarded_raw():
@@ -316,6 +332,12 @@ def test_an_invalid_option_is_classified_as_an_invalid_invocation():
     assert "options" in failure.summary
 
 
+def test_invalid_choice_from_a_build_subprocess_is_not_called_a_pip_invocation_error():
+    failure = failure_for(stderr="setup.py: error: invalid choice: 'native'")
+    assert failure.kind is PipFailureKind.UNKNOWN
+    assert failure.summary == UNCLASSIFIED_SUMMARY
+
+
 def test_a_missing_distribution_is_classified_and_names_the_requirement():
     failure = failure_for(stderr="ERROR: No matching distribution found for torch==2.11.0+cu130\n")
     assert failure.kind is PipFailureKind.NO_MATCHING_DISTRIBUTION
@@ -391,6 +413,19 @@ def test_a_classified_failure_drops_a_captured_value_that_is_not_a_requirement()
         stderr=(
             "ERROR: No matching distribution found for "
             r"https://private-user:private-pass@packages.invalid/simple"
+        )
+    )
+    assert failure.kind is PipFailureKind.NO_MATCHING_DISTRIBUTION
+    assert "private-pass" not in failure.summary
+    assert "packages.invalid" not in failure.summary
+    assert "it" in failure.summary
+
+
+def test_a_direct_url_disguised_as_a_version_is_not_repeated():
+    failure = failure_for(
+        stderr=(
+            "ERROR: No matching distribution found for "
+            "torch==https://private-user:private-pass@packages.invalid/wheel"
         )
     )
     assert failure.kind is PipFailureKind.NO_MATCHING_DISTRIBUTION

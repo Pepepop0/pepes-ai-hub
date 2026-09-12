@@ -13,12 +13,16 @@ from local_ai_stack.profiles import load_profile
 from local_ai_stack.provisioning import (
     ComponentState,
     Detection,
+    FailureReason,
     Ownership,
     ProvisionContext,
     Provisioner,
+    ProvisionFailure,
     ProvisionOutcome,
+    ProvisionResult,
     ProvisionStep,
 )
+from local_ai_stack.stack_application import execution_problems
 from local_ai_stack.stacks import STANDARD_STACK
 
 REPO = Path(__file__).resolve().parents[1]
@@ -190,6 +194,34 @@ def test_report_shape(profile, tmp_path):
     assert isinstance(report, ExecutionReport)
     assert report.plan_profile_id == "pepe"
     assert report.failures == ()
+
+
+def test_execution_problem_never_promotes_arbitrary_failure_detail():
+    secret_detail = (
+        r"Traceback at C:\Users\Private Person\pip-cache; "
+        "token=sk-0123456789abcdef0123456789; "
+        "https://private-user:private-pass@packages.invalid/simple"
+    )
+    result = ProvisionResult(
+        component_id="comfyui",
+        outcome=ProvisionOutcome.FAILED,
+        detection=Detection("comfyui", ComponentState.INVALID, Ownership.MANAGED),
+        failure=ProvisionFailure(
+            FailureReason.COMMAND_FAILED,
+            "Could not install dependencies. pip failed without a cause it stated plainly",
+            secret_detail,
+        ),
+    )
+
+    problems = execution_problems(
+        ExecutionReport(plan_profile_id="test", dry_run=False, results=(result,))
+    )
+
+    assert problems == [
+        "comfyui: Could not install dependencies. pip failed without a cause it stated plainly"
+    ]
+    for forbidden in ("Traceback", "pip-cache", "sk-0123", "private-pass"):
+        assert forbidden not in problems[0]
 
 
 def test_executor_without_provisioners_still_prepares_the_layout(profile, tmp_path):

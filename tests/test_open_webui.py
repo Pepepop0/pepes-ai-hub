@@ -27,7 +27,7 @@ from local_ai_stack.provisioning import (
     ProvisionContext,
     ProvisionOutcome,
 )
-from local_ai_stack.pyenv import PythonEnvironment
+from local_ai_stack.pyenv import PythonEnvironment, pip_install_argv
 from local_ai_stack.runner import CommandResult, CommandRunner
 
 VERSION = "0.11.3"
@@ -346,12 +346,14 @@ def test_apply_is_idempotent(tmp_path):
 
 def test_pip_is_never_asked_for_a_floating_version(tmp_path):
     runner = FakeRunner()
-    pinned().apply(context_for(tmp_path, runner))
+    context = context_for(tmp_path, runner)
+    pinned().apply(context)
     pip_calls = [c for c in runner.calls if "pip" in c]
-    assert pip_calls
-    for call in pip_calls:
-        assert not any(arg == DISTRIBUTION for arg in call)
-        assert "--upgrade" not in call
+    environment = PythonEnvironment.inside(context.layout.open_webui_app)
+    assert pip_calls == [tuple(pip_install_argv(environment, [f"{DISTRIBUTION}=={VERSION}"]))]
+    assert DISTRIBUTION not in pip_calls[0]
+    assert "--upgrade" not in pip_calls[0]
+    assert "--progress-bar" not in pip_calls[0]
 
 
 def test_failed_venv_creation_leaves_no_marker(tmp_path):

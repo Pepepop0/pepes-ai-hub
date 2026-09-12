@@ -621,11 +621,13 @@ class ComfyUIProvisioner(Provisioner):
                 context.runner, environment, requirements, extra_args=flags, on_output=on_pip_output
             )
         except PythonEnvironmentError as exc:
+            message = "Could not install dependencies."
+            if exc.failure is not None:
+                message = f"{message} {exc.failure.summary}"
             return self.failed(
                 detection,
                 reason_for_pip_failure(exc.failure),
-                "Could not install dependencies.",
-                exc.failure.summary if exc.failure is not None else str(exc),
+                message,
             )
 
         if not self.entry_point(context).is_file():

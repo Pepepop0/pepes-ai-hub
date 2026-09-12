@@ -49,11 +49,13 @@ class FakeRunner(CommandRunner):
         *,
         env: Mapping[str, str] | None = None,
         pip_ok: bool = True,
+        pip_error: str = "boom",
         pip_lines: Sequence[str] = (),
     ):
         super().__init__()
         self.fake_env = dict(env or {})
         self.pip_ok = pip_ok
+        self.pip_error = pip_error
         self.pip_lines = tuple(pip_lines)
         self.calls: list[tuple[str, ...]] = []
 
@@ -77,7 +79,11 @@ class FakeRunner(CommandRunner):
                 for line in self.pip_lines:
                     on_output("stdout", line)
             code = 0 if self.pip_ok else 1
-            return CommandResult(argv=items, returncode=code, stderr="" if self.pip_ok else "boom")
+            return CommandResult(
+                argv=items,
+                returncode=code,
+                stderr="" if self.pip_ok else self.pip_error,
+            )
         if "-c" in items and "version_info" in items[items.index("-c") + 1]:
             return CommandResult(argv=items, returncode=0, stdout="3.12\n")
         return CommandResult(argv=items, returncode=0)
@@ -427,6 +433,52 @@ def test_failed_dependency_install_leaves_no_marker(tmp_path):
     assert result.outcome is ProvisionOutcome.FAILED
     assert not (context.layout.comfyui_app / MARKER_NAME).exists()
     assert pinned().detect(context).state is not ComponentState.INSTALLED
+
+
+def test_a_classified_pip_cause_crosses_the_failure_bridge_as_safe_message(tmp_path):
+    runner = FakeRunner(
+        pip_ok=False,
+        pip_error="ERROR: No matching distribution found for torch==2.9.0",
+    )
+    result = pinned(git=FakeGit()).apply(context_for(tmp_path, runner))
+
+    assert result.failure is not None
+    assert result.failure.reason is FailureReason.PRECONDITION
+    assert result.failure.message == (
+        "Could not install dependencies. no distribution matches torch==2.9.0 for this Python"
+    )
+    assert result.failure.detail == ""
+
+
+def test_an_interrupted_dependency_install_reuses_partial_checkout_and_environment(tmp_path):
+    git = FakeGit()
+    runner = FakeRunner(pip_ok=False)
+    context = context_for(tmp_path, runner)
+    provisioner = pinned(git=git)
+
+    first = provisioner.apply(context)
+    environment = provisioner.environment(context)
+    sentinel = environment.root / "keep-from-partial-install.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    assert first.outcome is ProvisionOutcome.FAILED
+    assert provisioner.detect(context).state is ComponentState.INVALID
+    assert len(git.clones) == 1
+    assert environment.exists
+    assert not provisioner.marker_path(context).exists()
+
+    runner.pip_ok = True
+    recovered = provisioner.apply(context)
+
+    assert recovered.outcome is ProvisionOutcome.INSTALLED
+    assert len(git.clones) == 1
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert provisioner.marker_path(context).is_file()
+    assert provisioner.verify(context).is_usable
+
+    pip_calls_before_skip = sum("pip" in call for call in runner.calls)
+    assert provisioner.apply(context).outcome is ProvisionOutcome.SKIPPED
+    assert sum("pip" in call for call in runner.calls) == pip_calls_before_skip
 
 
 def test_failed_clone_is_reported_structurally(tmp_path):

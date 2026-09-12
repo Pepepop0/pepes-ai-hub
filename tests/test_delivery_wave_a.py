@@ -260,7 +260,11 @@ class ControlledInstallOutput:
         )
 
         if not is_comfy:
-            self._emit(sink, "stdout", "Downloading open_webui.whl (2.0 MiB)")
+            self._emit(
+                sink,
+                "stdout",
+                f"Downloading open_webui-{version}-py3-none-any.whl (2.0 MiB)",
+            )
             self._emit(sink, "stdout", "2.0/2.0 MiB 10.0 MiB/s eta 0:00:00")
             self._emit(sink, "stdout", f"Installing collected packages: {package}")
             self._emit(sink, "stdout", f"Successfully installed {package}-{version}")
@@ -268,7 +272,12 @@ class ControlledInstallOutput:
 
         # A long real download can be active for many seconds before pip emits
         # its next line. Advance only the injected monotonic clock.
-        self._emit(sink, "stdout", "Downloading torch.whl (259.0 MiB)", seconds=18)
+        self._emit(
+            sink,
+            "stdout",
+            f"Downloading torch-{version}-cp311-cp311-win_amd64.whl (259.0 MiB)",
+            seconds=18,
+        )
         self._emit(sink, "stdout", "158.0/259.0 MiB 22.4 MiB/s eta 0:00:05")
         self._emit(
             sink,
@@ -739,6 +748,7 @@ def test_real_pip_failure_keeps_sanitized_last_observations_in_tui(composition):
             assert "Baixando dependências" in done and "torch" in done
             assert "158 MiB / 259 MiB" in done
             assert "Motivo:" in done and "Could not install dependencies" in done
+            assert "pip failed without a cause it stated plainly" in done
 
     try:
         asyncio.run(exercise())

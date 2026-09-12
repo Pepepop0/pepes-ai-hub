@@ -69,7 +69,47 @@ class OperationPhase(StrEnum):
 class OperationEventKind(StrEnum):
     STATE = "state"
     PROGRESS = "progress"
+    ACTIVITY = "activity"
+    DETAIL = "detail"
     RESULT = "result"
+
+
+class OperationActivityCategory(StrEnum):
+    PREPARATION = "preparation"
+    TRANSFER = "transfer"
+    ENVIRONMENT = "environment"
+    DEPENDENCY = "dependency"
+    CONFIGURATION = "configuration"
+    SERVICE = "service"
+    READINESS = "readiness"
+    MODEL = "model"
+    WORKFLOW = "workflow"
+
+
+@dataclass(frozen=True)
+class OperationActivity:
+    """Sanitized semantic activity emitted by a domain-specific observer."""
+
+    category: OperationActivityCategory
+    action: str
+    item: str
+    detail: str | None = None
+    elapsed_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.category, OperationActivityCategory):
+            raise TypeError("activity category must be a typed enum")
+        _identifier(self.action)
+        _message(self.item)
+        if self.detail is not None:
+            _message(self.detail)
+        if self.elapsed_seconds is not None and (
+            isinstance(self.elapsed_seconds, bool)
+            or not isinstance(self.elapsed_seconds, (int, float))
+            or not math.isfinite(self.elapsed_seconds)
+            or self.elapsed_seconds < 0
+        ):
+            raise ValueError("elapsed time must be finite and non-negative")
 
 
 @dataclass(frozen=True)
@@ -183,6 +223,8 @@ class OperationEvent:
     diagnostic: OperationDiagnostic | None = None
     result: OperationResult | None = None
     transfer: TransferProgress | None = None
+    activity: OperationActivity | None = None
+    detail: OperationActivity | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.operation_id)
@@ -200,6 +242,10 @@ class OperationEvent:
             raise ValueError("invalid progress")
         if self.transfer is not None and not isinstance(self.transfer, TransferProgress):
             raise ValueError("invalid transfer progress")
+        if self.activity is not None and not isinstance(self.activity, OperationActivity):
+            raise ValueError("invalid activity")
+        if self.detail is not None and not isinstance(self.detail, OperationActivity):
+            raise ValueError("invalid detail")
         if self.diagnostic is not None and not isinstance(self.diagnostic, OperationDiagnostic):
             raise ValueError("invalid diagnostic")
         if (
@@ -208,6 +254,10 @@ class OperationEvent:
             and self.transfer is None
         ):
             raise ValueError("a progress event requires logical or transfer progress")
+        if self.kind is OperationEventKind.ACTIVITY and self.activity is None:
+            raise ValueError("an activity event requires current activity")
+        if self.kind is OperationEventKind.DETAIL and self.detail is None:
+            raise ValueError("a detail event requires timeline detail")
         terminal_event = self.kind is OperationEventKind.RESULT
         if terminal_event != self.state.terminal or terminal_event != (self.result is not None):
             raise ValueError("terminal state, RESULT kind and result must occur together")
@@ -217,9 +267,27 @@ class OperationEvent:
             or self.result.state is not self.state
         ):
             raise ValueError("event and result identity/state disagree")
+        if self.state is OperationState.SUCCEEDED and self.activity is not None:
+            raise ValueError("successful completion clears current activity")
 
 
 OperationEventSink = Callable[[OperationEvent], None]
+
+DETAIL_HISTORY_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class OperationTimelineEntry:
+    sequence: int
+    phase: OperationPhase
+    detail: OperationActivity
+
+    def __post_init__(self) -> None:
+        _integer(self.sequence, minimum=1)
+        if not isinstance(self.phase, OperationPhase):
+            raise TypeError("timeline phase must be a typed enum")
+        if not isinstance(self.detail, OperationActivity):
+            raise TypeError("timeline detail must be an activity")
 
 
 @dataclass(frozen=True)
@@ -228,11 +296,55 @@ class OperationSnapshot:
 
     started_at: datetime
     last_event: OperationEvent
+    activity: OperationActivity | None = None
+    details: tuple[OperationTimelineEntry, ...] = ()
+    last_progress: OperationProgress | None = None
+    last_transfer: TransferProgress | None = None
 
     def __post_init__(self) -> None:
         _timestamp(self.started_at)
         if not isinstance(self.last_event, OperationEvent):
             raise TypeError("snapshot requires an operation event")
+        if self.activity is not None and not isinstance(self.activity, OperationActivity):
+            raise TypeError("snapshot activity must be typed")
+        if self.last_progress is not None and not isinstance(self.last_progress, OperationProgress):
+            raise TypeError("snapshot progress must be typed")
+        if self.last_transfer is not None and not isinstance(self.last_transfer, TransferProgress):
+            raise TypeError("snapshot transfer must be typed")
+        if isinstance(self.details, (str, bytes)):
+            raise TypeError("snapshot details must be timeline entries")
+        object.__setattr__(self, "details", tuple(self.details))
+        if len(self.details) > DETAIL_HISTORY_LIMIT or any(
+            not isinstance(item, OperationTimelineEntry) for item in self.details
+        ):
+            raise ValueError(f"at most {DETAIL_HISTORY_LIMIT} timeline details are retained")
+        sequences = tuple(item.sequence for item in self.details)
+        if sequences != tuple(sorted(set(sequences))) or any(
+            sequence > self.last_event.sequence for sequence in sequences
+        ):
+            raise ValueError("timeline detail sequences must be unique, ordered and observed")
+        if self.last_event.state is OperationState.SUCCEEDED and self.activity is not None:
+            raise ValueError("successful snapshots have no current activity")
+
+
+def _snapshot_after(current: OperationSnapshot | None, event: OperationEvent) -> OperationSnapshot:
+    details = () if current is None else current.details
+    if event.detail is not None:
+        details = (*details, OperationTimelineEntry(event.sequence, event.phase, event.detail))[
+            -DETAIL_HISTORY_LIMIT:
+        ]
+    if event.state is OperationState.SUCCEEDED:
+        activity = None
+    elif event.activity is not None:
+        activity = event.activity
+    else:
+        activity = None if current is None else current.activity
+    previous_progress = None if current is None else current.last_progress
+    previous_transfer = None if current is None else current.last_transfer
+    last_progress = event.progress if event.progress is not None else previous_progress
+    last_transfer = event.transfer if event.transfer is not None else previous_transfer
+    started_at = event.timestamp if current is None else current.started_at
+    return OperationSnapshot(started_at, event, activity, details, last_progress, last_transfer)
 
 
 def advance_operation(
@@ -252,7 +364,7 @@ def advance_operation(
             or event.phase is not OperationPhase.PREPARATION
         ):
             raise ValueError("first event must be sequence 1, STATE/PREPARING/PREPARATION")
-        return OperationSnapshot(event.timestamp, event)
+        return _snapshot_after(None, event)
     previous = current.last_event
     if previous.state.terminal:
         raise ValueError("operation already terminal")
@@ -261,8 +373,10 @@ def advance_operation(
     states = tuple(OperationState)
     if states.index(event.state) < states.index(previous.state):
         raise ValueError("operation state cannot regress")
-    if event.kind is OperationEventKind.PROGRESS and (
-        event.state is not previous.state or event.phase is not previous.phase
-    ):
-        raise ValueError("progress cannot change state or phase")
-    return OperationSnapshot(current.started_at, event)
+    if event.kind in {
+        OperationEventKind.PROGRESS,
+        OperationEventKind.ACTIVITY,
+        OperationEventKind.DETAIL,
+    } and (event.state is not previous.state or event.phase is not previous.phase):
+        raise ValueError("observation cannot change state or phase")
+    return _snapshot_after(current, event)

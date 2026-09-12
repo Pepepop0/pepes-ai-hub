@@ -7,6 +7,10 @@ pure event reducer. It does not connect new behavior to the MVP entry point.
 The additive transfer-progress extension is based on master
 `740ec74c3e0d279e911542fcbae36a070cab7082` /
 `checkpoint-external-conflict-fix`; it remains a contract-only change.
+The additive install-observability extension is based on master
+`6dcc8807e798fc4bf96ff1a660fc83c5cdbb3dd7` /
+`checkpoint-download-progress`. It freezes values and reducer behavior only;
+provisioner parsers and TUI rendering remain parallel implementation work.
 
 ## Authority and dependencies
 
@@ -51,9 +55,14 @@ or completion inferred from an elapsed timer.
 | FAILED / phase of failure | Não foi possível concluir a geração |
 
 `OperationEvent` contains operation ID, sequence, kind (`STATE`, `PROGRESS`,
-`RESULT`), state, UTC timestamp, phase, message, optional progress, optional
-diagnostic and optional final result. Each event is a complete current
-observation; absent progress means indeterminate, not retained stale progress.
+`ACTIVITY`, `DETAIL`, `RESULT`), state, UTC timestamp, phase, message, optional
+logical progress, diagnostic, final result, transfer progress, current activity
+and timeline detail. The activity and detail fields are appended after every
+previous field, preserving positional construction and old producers. Existing
+consumers may ignore the additions. Absent progress in an active event means
+the current observation is indeterminate; the snapshot's explicitly named
+`last_progress` and `last_transfer` remain historical observations and must not
+be presented as fresh progress.
 
 The reducer enforces these rules:
 
@@ -63,8 +72,9 @@ The reducer enforces these rules:
    serializes producers. This reducer provides no locking or worker scheduling.
 3. Nonterminal lifecycle states can repeat or advance, including skipping a
    stage not observed by the provider; they cannot regress. Failure is possible
-   from any active state. `PROGRESS` cannot change state or phase: emit `STATE`
-   for that change first. Phases describe work, not a second ordered lifecycle.
+   from any active state. `PROGRESS`, `ACTIVITY` and `DETAIL` cannot change state
+   or phase: emit `STATE` for that change first. Phases describe work, not a
+   second ordered lifecycle.
 4. Exactly one `RESULT` event contains a terminal state and matching result
    identity/state. Neither a terminal state without result nor a premature
    result is valid. Reject **every** event after terminal, including another
@@ -73,7 +83,9 @@ The reducer enforces these rules:
 
 Sequence, not wall-clock time, orders events. Timestamps must be timezone-aware
 UTC and may go backwards after a clock adjustment. `OperationSnapshot` retains
-the first timestamp and latest complete event. Duration, when supplied, is a
+the first timestamp, latest event, current activity, last bounded details and
+the explicitly named `last_progress` / `last_transfer` observations required by
+failure presentation. Duration, when supplied, is a
 finite nonnegative number measured with a producer's monotonic clock. A consumer
 can measure local elapsed time, but must not infer trustworthy duration by
 subtracting adjusted wall-clock timestamps.
@@ -113,6 +125,80 @@ not implement that UI:
   percentage or ETA for this case.
 - No transfer observation: an indeterminate activity indicator such as
   `[>] Instalando dependências...`. Never infer a percentage from elapsed time.
+
+## Install activity and detail timeline
+
+`OperationActivity` is an immutable semantic observation with these fields:
+
+- `category`: one typed `OperationActivityCategory` value;
+- `action`: a short identifier such as `creating`, `installing`, `checking` or
+  `waiting`;
+- `item`: a sanitized display label such as `torch` or `ComfyUI`;
+- optional `detail`: one sanitized, printable semantic summary;
+- optional `elapsed_seconds`: finite nonnegative elapsed time already measured
+  by the producer from a monotonic clock.
+
+The minimum categories are `PREPARATION`, `TRANSFER`, `ENVIRONMENT`,
+`DEPENDENCY`, `CONFIGURATION`, `SERVICE`, `READINESS`, `MODEL` and `WORKFLOW`.
+They group stable user-facing work; actions remain small semantic identifiers,
+not an enum containing every executable command. Together they cover directory
+setup, repository preparation, virtual environments, dependencies and the
+current package, observable bytes, model acquisition, configuration, service
+initialization and readiness.
+
+`activity` is the current item. `detail` is a completed or meaningful timeline
+observation and uses the same safe value shape. `ACTIVITY` requires current
+activity, and `DETAIL` requires detail. An activity event may also carry logical
+progress, transfer progress or both; those observations remain independent and
+retain their existing meaning. A `PROGRESS` event still requires logical or
+transfer progress, so activity cannot disguise a progress event. No field stores
+or derives an overall installation percentage.
+
+`OperationSnapshot.details` is the ordered timeline read model. The reducer adds
+`OperationTimelineEntry(sequence, phase, detail)` and retains only the last
+`DETAIL_HISTORY_LIMIT = 20` entries. Sequence is the ordering source; wall-clock
+timestamps do not determine detail order. The current activity persists until
+replaced. `SUCCEEDED` clears it while the bounded detail history may remain.
+`FAILED` retains current activity and the last logical and transfer observations
+when its result event has no replacements, plus a sanitized typed diagnostic.
+Raw traceback text is never a diagnostic or detail.
+
+Elapsed time has one authority: a producer samples its monotonic clock and emits
+the resulting `elapsed_seconds`. A UI may instead maintain its own local
+monotonic timer when the value is absent. Neither producer nor consumer derives
+elapsed time from event wall-clock timestamps.
+
+The future producer boundary is explicit:
+
+`raw command output -> provisioner-specific parser/observer -> sanitized
+OperationActivity/detail -> OperationEvent`
+
+Only the provisioner-specific adapter sees subprocess output. It maps allowlisted
+facts to categories, action identifiers, display labels and short summaries. It
+must not forward secrets, tokens, sensitive absolute paths, full shell commands,
+raw tracebacks or unbounded stdout. Shape validation bounds strings but cannot
+recognize secrets; sanitization belongs at this adapter boundary. Events retain
+no arbitrary payload or stdout collection.
+
+Future TUI consumers implement this frozen presentation contract. Collapsed
+installation shows the operation and current semantic work without inventing an
+overall percentage, for example:
+
+```text
+[>] Instalando ComfyUI 1/3
+Instalando dependências
+torch
+158 MiB transferidos
+22.4 MiB/s
+Tempo: 00:18
+```
+
+An expanded view renders the bounded semantic details as a checklist/timeline,
+never raw stdout. Logical progress, transfer progress, indeterminate activity
+and timeline details may appear together according to the observations actually
+available. On success the active activity disappears and history may remain. On
+failure the last activity and progress stay visible with the sanitized
+diagnostic; no traceback is rendered.
 
 `OperationResult` requires `SUCCEEDED` or `FAILED`, operation ID, optional opaque
 output references, at most eight diagnostics and optional duration.

@@ -28,6 +28,9 @@ from local_ai_stack.image_generation_contracts import (
     ImageJobState,
 )
 from local_ai_stack.operation_contracts import (
+    DETAIL_HISTORY_LIMIT,
+    OperationActivity,
+    OperationActivityCategory,
     OperationDiagnostic,
     OperationEvent,
     OperationEventKind,
@@ -36,12 +39,26 @@ from local_ai_stack.operation_contracts import (
     OperationResult,
     OperationSnapshot,
     OperationState,
+    OperationTimelineEntry,
     TransferProgress,
     advance_operation,
 )
 
 NOW = datetime(2026, 9, 11, tzinfo=UTC)
 FAILURE = OperationDiagnostic("generation-failed", "Generation could not finish", "diagnostic-1")
+
+
+def activity(**changes):
+    return replace(
+        OperationActivity(
+            OperationActivityCategory.DEPENDENCY,
+            "installing",
+            "torch",
+            "Resolving package",
+            18.0,
+        ),
+        **changes,
+    )
 
 
 def event(**changes):
@@ -75,7 +92,7 @@ def test_only_success_and_failure_are_terminal(state):
     assert state.terminal == (state in {OperationState.SUCCEEDED, OperationState.FAILED})
 
 
-def test_old_event_without_transfer_progress_remains_valid():
+def test_old_event_without_observability_extensions_remains_valid():
     old_event = OperationEvent(
         "operation-1",
         1,
@@ -87,7 +104,228 @@ def test_old_event_without_transfer_progress_remains_valid():
     )
 
     assert old_event.transfer is None
-    assert advance_operation(None, old_event).last_event is old_event
+    assert old_event.activity is None
+    assert old_event.detail is None
+    snapshot = advance_operation(None, old_event)
+    assert snapshot.last_event is old_event
+    assert snapshot.activity is None
+    assert snapshot.details == ()
+    assert snapshot.last_progress is None
+    assert snapshot.last_transfer is None
+
+
+def test_isolated_activity_updates_current_semantic_work():
+    current = advance_operation(None, event())
+    observed = activity()
+
+    current = advance_operation(
+        current,
+        event(sequence=2, kind=OperationEventKind.ACTIVITY, activity=observed),
+    )
+
+    assert current.activity is observed
+    assert current.last_event.progress is None
+    assert current.last_event.transfer is None
+
+
+@pytest.mark.parametrize(
+    ("progress", "transfer"),
+    [
+        (OperationProgress(1, 3), None),
+        (None, TransferProgress(158 * 1024**2)),
+        (OperationProgress(1, 3), TransferProgress(158 * 1024**2, 400 * 1024**2)),
+    ],
+)
+def test_activity_coexists_with_logical_and_transfer_observations(progress, transfer):
+    current = advance_operation(None, event())
+    observed = activity(elapsed_seconds=18.25)
+    update = event(
+        sequence=2,
+        kind=OperationEventKind.ACTIVITY,
+        progress=progress,
+        transfer=transfer,
+        activity=observed,
+    )
+
+    current = advance_operation(current, update)
+
+    assert current.last_event.progress is progress
+    assert current.last_event.transfer is transfer
+    assert current.last_progress is progress
+    assert current.last_transfer is transfer
+    assert current.activity is observed
+    assert current.activity.elapsed_seconds == 18.25
+
+
+def test_detail_is_typed_sanitized_semantic_history():
+    current = advance_operation(None, event())
+    observed = activity(action="installed", detail="Package ready", elapsed_seconds=20)
+
+    current = advance_operation(
+        current,
+        event(sequence=2, kind=OperationEventKind.DETAIL, detail=observed),
+    )
+
+    assert current.details == (OperationTimelineEntry(2, OperationPhase.PREPARATION, observed),)
+    assert {field.name for field in fields(OperationActivity)} == {
+        "category",
+        "action",
+        "item",
+        "detail",
+        "elapsed_seconds",
+    }
+    assert set(OperationActivityCategory) == {
+        OperationActivityCategory.PREPARATION,
+        OperationActivityCategory.TRANSFER,
+        OperationActivityCategory.ENVIRONMENT,
+        OperationActivityCategory.DEPENDENCY,
+        OperationActivityCategory.CONFIGURATION,
+        OperationActivityCategory.SERVICE,
+        OperationActivityCategory.READINESS,
+        OperationActivityCategory.MODEL,
+        OperationActivityCategory.WORKFLOW,
+    }
+
+
+@pytest.mark.parametrize("elapsed", [0, 0.0, 18, 18.25])
+def test_activity_accepts_elapsed_already_measured_by_monotonic_producer(elapsed):
+    assert activity(elapsed_seconds=elapsed).elapsed_seconds == elapsed
+
+
+@pytest.mark.parametrize(
+    "elapsed",
+    [-1, float("nan"), float("inf"), float("-inf"), True, "18"],
+)
+def test_activity_rejects_invalid_elapsed(elapsed):
+    with pytest.raises(ValueError, match="elapsed"):
+        activity(elapsed_seconds=elapsed)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"category": "dependency"},
+        {"action": ""},
+        {"action": "pip install torch"},
+        {"item": "token\nsecret"},
+        {"detail": "\x1b[31mraw output"},
+        {"detail": "x" * 241},
+    ],
+)
+def test_activity_rejects_untyped_or_unsafe_shapes(changes):
+    with pytest.raises((TypeError, ValueError)):
+        activity(**changes)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"kind": OperationEventKind.ACTIVITY},
+        {"kind": OperationEventKind.DETAIL},
+        {"activity": {}},
+        {"detail": {}},
+        {
+            "kind": OperationEventKind.RESULT,
+            "state": OperationState.SUCCEEDED,
+            "result": OperationResult("operation-1", OperationState.SUCCEEDED),
+            "activity": activity(),
+        },
+    ],
+)
+def test_event_rejects_ambiguous_activity_and_detail(changes):
+    with pytest.raises((TypeError, ValueError)):
+        event(**changes)
+
+
+@pytest.mark.parametrize("kind", [OperationEventKind.ACTIVITY, OperationEventKind.DETAIL])
+def test_activity_and_detail_cannot_implicitly_change_lifecycle(kind):
+    current = advance_operation(None, event())
+    changes = (
+        {"activity": activity()} if kind is OperationEventKind.ACTIVITY else {"detail": activity()}
+    )
+    with pytest.raises(ValueError, match="cannot change"):
+        advance_operation(
+            current,
+            event(
+                sequence=2,
+                kind=kind,
+                state=OperationState.RUNNING,
+                phase=OperationPhase.EXECUTION,
+                **changes,
+            ),
+        )
+
+
+def test_terminal_semantics_clear_success_and_preserve_failure_observations():
+    def active_snapshot():
+        current = advance_operation(None, event())
+        observed = activity()
+        current = advance_operation(
+            current,
+            event(
+                sequence=2,
+                kind=OperationEventKind.ACTIVITY,
+                activity=observed,
+                progress=OperationProgress(1, 3),
+                transfer=TransferProgress(158 * 1024**2),
+            ),
+        )
+        current = advance_operation(
+            current,
+            event(sequence=3, kind=OperationEventKind.DETAIL, detail=observed),
+        )
+        return current, observed
+
+    succeeded, observed = active_snapshot()
+    succeeded = advance_operation(succeeded, terminal(sequence=4))
+    assert succeeded.activity is None
+    assert succeeded.details[-1].detail is observed
+    assert succeeded.last_progress == OperationProgress(1, 3)
+    assert succeeded.last_transfer == TransferProgress(158 * 1024**2)
+
+    failed, observed = active_snapshot()
+    failed = advance_operation(failed, terminal(OperationState.FAILED, sequence=4))
+    assert failed.activity is observed
+    assert failed.details[-1].detail is observed
+    assert failed.last_progress == OperationProgress(1, 3)
+    assert failed.last_transfer == TransferProgress(158 * 1024**2)
+    assert failed.last_event.result.diagnostics == (FAILURE,)
+
+
+def test_detail_history_is_bounded_to_last_entries_by_sequence():
+    current = advance_operation(None, event())
+    for sequence in range(2, DETAIL_HISTORY_LIMIT + 7):
+        current = advance_operation(
+            current,
+            event(
+                sequence=sequence,
+                kind=OperationEventKind.DETAIL,
+                detail=activity(item=f"package-{sequence}", elapsed_seconds=sequence),
+            ),
+        )
+
+    assert len(current.details) == DETAIL_HISTORY_LIMIT
+    assert [entry.sequence for entry in current.details] == list(range(7, DETAIL_HISTORY_LIMIT + 7))
+
+
+def test_observability_values_are_immutable_and_serialize_without_derived_percentages():
+    observed = activity()
+    update = event(
+        sequence=2,
+        kind=OperationEventKind.ACTIVITY,
+        progress=OperationProgress(1, 3),
+        transfer=TransferProgress(10, 20, 2),
+        activity=observed,
+        detail=observed,
+    )
+    serialized = asdict(update)
+
+    assert serialized["activity"]["category"] is OperationActivityCategory.DEPENDENCY
+    assert serialized["progress"] == {"completed": 1, "total": 3}
+    assert serialized["transfer"]["completed_bytes"] == 10
+    assert "percentage" not in serialized
+    with pytest.raises(FrozenInstanceError):
+        observed.item = "other"
 
 
 def test_determinate_transfer_derives_fraction_and_eta():
@@ -572,10 +810,31 @@ def test_foundation_has_no_ui_provider_or_transport_dependency():
         "diagnostic",
         "result",
         "transfer",
+        "activity",
+        "detail",
+    }
+    assert {field.name for field in fields(OperationActivity)} == {
+        "category",
+        "action",
+        "item",
+        "detail",
+        "elapsed_seconds",
+    }
+    assert {field.name for field in fields(OperationTimelineEntry)} == {
+        "sequence",
+        "phase",
+        "detail",
     }
     assert {field.name for field in fields(TransferProgress)} == {
         "completed_bytes",
         "total_bytes",
         "bytes_per_second",
     }
-    assert {field.name for field in fields(OperationSnapshot)} == {"started_at", "last_event"}
+    assert {field.name for field in fields(OperationSnapshot)} == {
+        "started_at",
+        "last_event",
+        "activity",
+        "details",
+        "last_progress",
+        "last_transfer",
+    }

@@ -44,6 +44,13 @@ from local_ai_stack.stack_application import (
 CHAT_SPEC = model_catalog().get(ModelId("ollama/qwen3_5_9b"))
 CHAT_REFERENCE = CHAT_SPEC.source.reference
 CHAT_DIGEST = CHAT_SPEC.source.digest
+# What the controlled Ollama store serves for every catalogued Ollama model:
+# the digest the catalog pins, so a pull of any profile's chat model verifies.
+OLLAMA_PINS = {
+    spec.source.reference: spec.source.digest
+    for spec in model_catalog().specs.values()
+    if getattr(spec.source, "reference", None) and getattr(spec.source, "digest", None)
+}
 CAPELLA = "capella"
 CAPELLA_PORTS = {"ollama": 11434, "open-webui": 8080, "comfyui": 8188}
 RTX_5090_MIB = 32768
@@ -96,11 +103,7 @@ def controlled_stack(
     root = allocate_root()
     artifacts = ControlledArtifacts()
     catalog = fixture_model_catalog(artifacts.register_model, SHIPPED_IMAGE_MODELS)
-    ollama = ControlledOllama(
-        installed=list(ollama_models),
-        plan=plan,
-        pinned={CHAT_REFERENCE: CHAT_DIGEST},
-    )
+    ollama = ControlledOllama(installed=list(ollama_models), plan=plan, pinned=OLLAMA_PINS)
     inventory = ControlledInventory()
     endpoints = ControlledEndpoints(ready=set(ready_ports), plan=plan)
     clock = StepClock()

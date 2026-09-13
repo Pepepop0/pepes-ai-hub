@@ -45,7 +45,7 @@ from .processes import (
     RuntimeProcessStatus,
     discover_process,
 )
-from .registry import ManagedProcess, ManagedProcessRegistry
+from .registry import ManagedProcess, ManagedProcessRegistry, proven_descendants
 from .runtime import combine_state
 from .services import (
     HttpProbe,
@@ -220,11 +220,19 @@ class ServiceController:
         process_report = self._list_processes() if processes is None else processes
         listener_report = self._list_listeners() if listeners is None else listeners
         entry_status = self.registry.status(service_id, processes=process_report)
-        managed_pids = (
-            frozenset({entry_status.entry.pid})
-            if entry_status is not None and entry_status.live
-            else frozenset()
-        )
+        managed_pids = frozenset()
+        if entry_status is not None and entry_status.live:
+            # The registered root and every process proved to be its tree --
+            # the kernel job while this session holds it, ancestry otherwise.
+            # The process on the port is usually a descendant, and a root that
+            # the process spec does not recognise by name would otherwise leave
+            # that listener looking external, with the stack then unstoppable.
+            root = entry_status.entry.pid
+            members = self.launcher.tree_pids(service_id, root) or ()
+            descendants: frozenset[int] = frozenset()
+            if entry_status.process is not None and process_report.usable:
+                descendants = proven_descendants(entry_status.process, process_report)
+            managed_pids = frozenset({root, *members, *descendants})
         runtime = discover_process(
             spec.process,
             processes=process_report,

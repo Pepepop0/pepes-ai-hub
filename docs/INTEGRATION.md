@@ -159,8 +159,11 @@ filho, e é recusado por isso. A caminhada é limitada (`MAX_DESCENT_DEPTH`) e
 para em ciclo. A raiz continua sendo a entrada do registry com identidade
 verificada por `create_time`; raiz reciclada não possui árvore nenhuma.
 `StackApplication.managed_pids` junta as duas provas: membros do job quando a
-sessão os tem, descendência quando não tem. O que nenhuma das duas prova é
-externo, seja qual for o nome ou a porta. Essa prova **nunca** autoriza um
+sessão os tem, descendência quando não tem; `ServiceController.status` aplica
+a mesma regra por serviço, para que um listener filho de uma raiz que o spec
+de processo não reconhece pelo nome continue sendo nosso — e, portanto,
+parável. O que nenhuma das duas prova é externo, seja qual for o nome ou a
+porta. Essa prova **nunca** autoriza um
 stop: encerrar continua agindo sobre a raiz verificada ou sobre o job.
 
 3. **Shim de venv.** Um `python.exe` de venv no Windows é um lançador que

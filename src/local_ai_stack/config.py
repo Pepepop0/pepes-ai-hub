@@ -32,7 +32,7 @@ from typing import Any
 
 import yaml
 
-from .installation import InstallLocation, InstallLocationError
+from .installation import InstallLocation, InstallLocationError, InstallLocationMode
 from .layout import StackLayout
 from .stacks import DEFAULT_STACK_ID
 
@@ -258,12 +258,25 @@ class InstalledConfig:
         except InstallLocationError as exc:
             raise ConfigError(str(exc)) from exc
 
+        raw_general = root.get("general", {})
+        general_section = _mapping(raw_general, source, "general")
+        general = GeneralConfig.from_dict(general_section, source)
+        if (
+            "recent_custom_roots" not in general_section
+            and installation.mode is InstallLocationMode.CUSTOM
+            and installation.root is not None
+        ):
+            # Schema v1 predates the recent-roots field. Its selected CUSTOM
+            # installation is already a proven install root, so expose it as
+            # the first migrated history entry without writing during load.
+            general = general.remembering_custom_root(installation.root)
+
         stack_id = _nested_id(root, source, "stack") if "stack" in root else DEFAULT_STACK_ID
         return cls(
             profile_id=_nested_id(root, source, "profile"),
             stack_id=stack_id,
             installation=installation,
-            general=GeneralConfig.from_dict(root.get("general", {}), source),
+            general=general,
             schema_version=raw_version,
         )
 

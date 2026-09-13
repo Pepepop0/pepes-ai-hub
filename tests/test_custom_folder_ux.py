@@ -30,9 +30,12 @@ from local_ai_stack.config import (
     dumps,
     loads,
 )
+from local_ai_stack.external_conflict_contracts import ConflictHardBlocker, ConflictPreflightReport
 from local_ai_stack.folder_picker import (
     NullFolderPicker,
     WindowsFolderPicker,
+    _hresult_cancelled,
+    _hresult_succeeded,
     default_folder_picker,
     starting_folder,
 )
@@ -40,7 +43,7 @@ from local_ai_stack.hub_application import create_hub_application
 from local_ai_stack.installation import InstallLocationMode, resolve_installation
 from local_ai_stack.layout import ENV_ROOT
 from local_ai_stack.pets import unsafe_characters
-from local_ai_stack.tui.application import InstallSelection
+from local_ai_stack.tui.application import ConflictResolutionRequired, InstallSelection
 from local_ai_stack.tui.wizard import (
     BROWSE_BUSY_LABEL,
     BROWSE_LABEL,
@@ -112,6 +115,17 @@ def test_an_older_config_without_recent_paths_still_loads():
     assert loads(text_without).general.recent_custom_roots == ()
 
 
+def test_an_older_custom_config_migrates_its_installed_root_into_history():
+    text_without = (
+        "schema_version: 1\nprofile: {id: test}\n"
+        "installation: {mode: custom, root: 'C:\\Users\\Pedro\\Desktop\\Capellah_gpt'}\n"
+        "general: {ui: {theme: null, pet: null}}\n"
+    )
+    loaded = loads(text_without)
+    assert loaded.general.recent_custom_roots == (r"C:\Users\Pedro\Desktop\Capellah_gpt",)
+    assert loads(dumps(loaded)).general.recent_custom_roots == loaded.general.recent_custom_roots
+
+
 @pytest.mark.parametrize("bad", ["not-a-list", [1, 2], ["", "C:\\ok"]])
 def test_a_malformed_recent_list_is_rejected(bad):
     with pytest.raises(ConfigError):
@@ -124,9 +138,10 @@ def test_a_malformed_recent_list_is_rejected(bad):
 class StubBackend:
     """Just enough of StackApplication for the adapter to accept an install."""
 
-    def __init__(self, installation, *, outcome: str = "failed") -> None:
+    def __init__(self, installation, *, outcome: str = "failed", conflict: bool = False) -> None:
         self.installation = installation
         self.outcome = outcome
+        self.conflict = conflict
         self.first_runs = 0
 
     def status(self, profile_id=None):
@@ -136,6 +151,11 @@ class StubBackend:
         return reference_facts()
 
     def check_conflicts(self, profile_id):
+        if self.conflict:
+            return ConflictPreflightReport(
+                "blocked-preflight",
+                hard_blockers=(ConflictHardBlocker("blocked", "A controlled blocker."),),
+            )
         return None
 
     def current_operation(self):
@@ -151,7 +171,7 @@ class StubBackend:
         pass
 
 
-def adapter_for(tmp_path: Path, *, outcome: str = "failed"):
+def adapter_for(tmp_path: Path, *, outcome: str = "failed", conflict: bool = False):
     def resolve(location):
         return resolve_installation(
             location, repo_root=tmp_path / "repo", env={ENV_ROOT: str(tmp_path / "default")}
@@ -160,7 +180,9 @@ def adapter_for(tmp_path: Path, *, outcome: str = "failed"):
     return create_hub_application(
         PROJECT_ROOT,
         resolve=resolve,
-        backend_factory=lambda installation: StubBackend(installation, outcome=outcome),
+        backend_factory=lambda installation: StubBackend(
+            installation, outcome=outcome, conflict=conflict
+        ),
     )
 
 
@@ -195,6 +217,23 @@ def test_a_failed_install_still_records_its_root(tmp_path):
         assert adapter.recent_custom_roots() == (str(root),)
     finally:
         adapter.close()
+
+
+def test_a_custom_root_cancelled_at_conflict_preflight_is_not_recorded(tmp_path):
+    root = tmp_path / "cancelled-before-install"
+    adapter = adapter_for(tmp_path, conflict=True)
+    try:
+        with pytest.raises(ConflictResolutionRequired):
+            adapter.install(InstallSelection("test", InstallLocationMode.CUSTOM, str(root)))
+        assert adapter.recent_custom_roots() == ()
+    finally:
+        adapter.close()
+
+    restarted = adapter_for(tmp_path)
+    try:
+        assert restarted.recent_custom_roots() == ()
+    finally:
+        restarted.close()
 
 
 def test_default_and_portable_attempts_never_register_and_keep_history(tmp_path):
@@ -246,6 +285,14 @@ def test_null_picker_returns_nothing_and_windows_is_the_default_here():
 
     expected = WindowsFolderPicker if sys.platform == "win32" else NullFolderPicker
     assert isinstance(default_folder_picker(), expected)
+
+
+def test_com_initialization_requires_a_success_hresult_and_cancel_is_explicit():
+    assert _hresult_succeeded(0)  # S_OK
+    assert _hresult_succeeded(1)  # S_FALSE; still balanced with CoUninitialize
+    assert not _hresult_succeeded(-2147417850)  # RPC_E_CHANGED_MODE
+    assert _hresult_cancelled(-2147023673)
+    assert not _hresult_cancelled(-1)
 
 
 def test_the_tui_package_never_touches_win32_directly():

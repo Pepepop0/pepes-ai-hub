@@ -466,12 +466,14 @@ def test_an_interrupted_dependency_install_reuses_partial_checkout_and_environme
     assert len(git.clones) == 1
     assert environment.exists
     assert not provisioner.marker_path(context).exists()
+    venv_calls_before_retry = sum("venv" in call for call in runner.calls)
 
     runner.pip_ok = True
     recovered = provisioner.apply(context)
 
     assert recovered.outcome is ProvisionOutcome.INSTALLED
     assert len(git.clones) == 1
+    assert sum("venv" in call for call in runner.calls) == venv_calls_before_retry
     assert sentinel.read_text(encoding="utf-8") == "keep"
     assert provisioner.marker_path(context).is_file()
     assert provisioner.verify(context).is_usable

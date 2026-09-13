@@ -168,16 +168,10 @@ class HubApplicationAdapter:
                     backend = self.backend_factory(installation)
                     self._backends[installation.root] = backend
                 base = self.config or InstalledConfig(selection.profile_id)
-                general = base.general
-                if location.mode is InstallLocationMode.CUSTOM:
-                    # Recorded on the attempt, persisted below with the intent:
-                    # a root a failed first run leaves behind must stay findable.
-                    general = general.remembering_custom_root(location.root)
                 config = replace(
                     base,
                     profile_id=selection.profile_id,
                     installation=location,
-                    general=general,
                 )
                 # Bind the backend before checking for a conflict: a decision
                 # the caller makes next must land on this exact session, and a
@@ -186,6 +180,15 @@ class HubApplicationAdapter:
                 pending = backend.check_conflicts(selection.profile_id)
                 if pending is not None:
                     raise _BackendConflictRequired(pending)
+                if location.mode is InstallLocationMode.CUSTOM:
+                    # The preflight accepted the attempt, so preserve its root
+                    # even if provisioning later fails. A selection cancelled
+                    # at conflict preflight never enters the history.
+                    config = replace(
+                        config,
+                        general=config.general.remembering_custom_root(location.root),
+                    )
+                    self.config = config
                 # Persist intent before accepting the operation. A failed first
                 # run reopens the wizard, since readiness still comes from domain.
                 _save_config(config_path(installation.layout), config)

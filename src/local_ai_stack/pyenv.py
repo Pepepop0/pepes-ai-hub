@@ -562,7 +562,7 @@ def _requirement(match: re.Match[str]) -> str:
 # inspected, never repeated.
 _DENIED_RE = re.compile(
     r"(?:\[Errno 13\] Permission denied|\[WinError 5\] Access is denied"
-    r"|\[WinError 32\][^\n]*)(?::\s*'(?P<path>[^']*)')?",
+    r"|\[WinError 32\][^:\r\n]*)(?::\s*['\"](?P<path>[^'\"]*)['\"])?",
     re.IGNORECASE,
 )
 _INTERPRETER_NAME_RE = re.compile(
@@ -592,10 +592,14 @@ def classify_environment_failure(result: CommandResult) -> EnvironmentFailure:
     denied = _DENIED_RE.search(combined)
     if denied is not None:
         path = denied.group("path") or ""
-        if _SHARING_VIOLATION_RE.search(denied.group(0)) or _INTERPRETER_NAME_RE.search(path):
+        if _INTERPRETER_NAME_RE.search(path):
             return EnvironmentFailure(
                 EnvironmentFailureKind.INTERPRETER_IN_USE,
                 "its Python is locked, usually by a process still running from it",
+            )
+        if _SHARING_VIOLATION_RE.search(denied.group(0)):
+            return EnvironmentFailure(
+                EnvironmentFailureKind.UNCLASSIFIED, UNCLASSIFIED_ENVIRONMENT_SUMMARY
             )
         return EnvironmentFailure(
             EnvironmentFailureKind.ACCESS_DENIED, "its directory could not be written to"

@@ -28,7 +28,7 @@ _IID_ISHELL_ITEM = "{43826D1E-E718-42EE-BC55-A1E261C37BFE}"
 
 _COINIT_APARTMENTTHREADED = 0x2
 _CLSCTX_INPROC_SERVER = 0x1
-_RPC_E_CHANGED_MODE = -2147417850  # 0x80010106: COM already initialized differently here
+_HRESULT_CANCELLED = -2147023673  # HRESULT_FROM_WIN32(ERROR_CANCELLED)
 
 _FOS_PICKFOLDERS = 0x00000020
 _FOS_FORCEFILESYSTEM = 0x00000040
@@ -44,6 +44,14 @@ _SET_FOLDER = 12
 _SET_TITLE = 17
 _GET_RESULT = 20
 _ITEM_GET_DISPLAY_NAME = 5  # IShellItem, after IUnknown
+
+
+def _hresult_succeeded(value: int) -> bool:
+    return value >= 0
+
+
+def _hresult_cancelled(value: int) -> bool:
+    return value == _HRESULT_CANCELLED
 
 
 class NullFolderPicker:
@@ -105,9 +113,31 @@ def _show_folder_dialog(initial_path: Path | None) -> Path | None:  # pragma: no
             ("Data4", ctypes.c_ubyte * 8),
         ]
 
+    ole32.CoInitializeEx.argtypes = (c_void_p, c_uint32)
+    ole32.CoInitializeEx.restype = c_long
+    ole32.CLSIDFromString.argtypes = (c_wchar_p, POINTER(GUID))
+    ole32.CLSIDFromString.restype = c_long
+    ole32.CoCreateInstance.argtypes = (
+        POINTER(GUID),
+        c_void_p,
+        c_uint32,
+        POINTER(GUID),
+        POINTER(c_void_p),
+    )
+    ole32.CoCreateInstance.restype = c_long
+    ole32.CoTaskMemFree.argtypes = (c_void_p,)
+    ole32.CoTaskMemFree.restype = None
+    shell32.SHCreateItemFromParsingName.argtypes = (
+        c_wchar_p,
+        c_void_p,
+        POINTER(GUID),
+        POINTER(c_void_p),
+    )
+    shell32.SHCreateItemFromParsingName.restype = c_long
+
     def guid(text: str) -> GUID:
         value = GUID()
-        if ole32.CLSIDFromString(c_wchar_p(text), byref(value)) < 0:
+        if not _hresult_succeeded(ole32.CLSIDFromString(c_wchar_p(text), byref(value))):
             raise OSError(f"invalid GUID {text}")
         return value
 
@@ -120,8 +150,10 @@ def _show_folder_dialog(initial_path: Path | None) -> Path | None:  # pragma: no
             method(pointer, _RELEASE)(pointer)
 
     initialized = ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
-    owns_com = initialized >= 0
-    if not owns_com and initialized != _RPC_E_CHANGED_MODE:
+    # RPC_E_CHANGED_MODE means this worker is in a different apartment. A
+    # successful initialization (S_OK or S_FALSE) is the only state in which
+    # this STA dialog may be created, and every success is balanced below.
+    if not _hresult_succeeded(initialized):
         return None
     dialog = c_void_p()
     try:
@@ -135,11 +167,17 @@ def _show_folder_dialog(initial_path: Path | None) -> Path | None:  # pragma: no
             return None
 
         options = c_uint32()
-        method(dialog, _GET_OPTIONS, POINTER(c_uint32))(dialog, byref(options))
-        method(dialog, _SET_OPTIONS, c_uint32)(
-            dialog,
-            options.value | _FOS_PICKFOLDERS | _FOS_FORCEFILESYSTEM | _FOS_PATHMUSTEXIST,
-        )
+        if not _hresult_succeeded(
+            method(dialog, _GET_OPTIONS, POINTER(c_uint32))(dialog, byref(options))
+        ):
+            return None
+        if not _hresult_succeeded(
+            method(dialog, _SET_OPTIONS, c_uint32)(
+                dialog,
+                options.value | _FOS_PICKFOLDERS | _FOS_FORCEFILESYSTEM | _FOS_PATHMUSTEXIST,
+            )
+        ):
+            return None
         method(dialog, _SET_TITLE, c_wchar_p)(dialog, DIALOG_TITLE)
 
         folder = starting_folder(initial_path)
@@ -157,8 +195,10 @@ def _show_folder_dialog(initial_path: Path | None) -> Path | None:  # pragma: no
                 finally:
                     release(item)
 
-        # Cancel returns HRESULT_FROM_WIN32(ERROR_CANCELLED); any failure means "no folder".
-        if method(dialog, _SHOW, c_void_p)(dialog, None) < 0:
+        shown = method(dialog, _SHOW, c_void_p)(dialog, None)
+        if _hresult_cancelled(shown):
+            return None
+        if not _hresult_succeeded(shown):
             return None
 
         result = c_void_p()
@@ -182,8 +222,9 @@ def _show_folder_dialog(initial_path: Path | None) -> Path | None:  # pragma: no
         finally:
             release(result)
     finally:
-        release(dialog)
-        if owns_com:
+        try:
+            release(dialog)
+        finally:
             ole32.CoUninitialize()
 
 

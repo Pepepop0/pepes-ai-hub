@@ -200,6 +200,15 @@ def test_a_sharing_violation_is_an_interpreter_in_use():
     assert failure.kind is EnvironmentFailureKind.INTERPRETER_IN_USE
 
 
+def test_a_sharing_violation_without_an_interpreter_path_stays_unclassified():
+    failure = failure_for(
+        "[WinError 32] The process cannot access the file because it is being used: "
+        "'C:\\x\\Lib\\site-packages\\partial.whl'"
+    )
+    assert failure.kind is EnvironmentFailureKind.UNCLASSIFIED
+    assert failure.summary == UNCLASSIFIED_ENVIRONMENT_SUMMARY
+
+
 def test_a_denied_directory_is_not_mistaken_for_a_locked_interpreter():
     failure = failure_for("Error: [Errno 13] Permission denied: 'C:\\\\Program Files\\\\stack'")
     assert failure.kind is EnvironmentFailureKind.ACCESS_DENIED

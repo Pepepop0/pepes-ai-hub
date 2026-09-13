@@ -316,6 +316,27 @@ Screen {
     color: $error;
 }
 
+#wizard-custom-label,
+#wizard-recent-label {
+    margin-top: 1;
+    color: $text-muted;
+}
+
+#wizard-custom-browse {
+    width: auto;
+    min-width: 20;
+    margin-top: 1;
+}
+
+#wizard-recent-roots {
+    width: 100%;
+    max-width: 80;
+}
+
+#wizard-recent-empty {
+    color: $text-muted;
+}
+
 #wizard-conflict-report {
     height: auto;
     margin-bottom: 1;

@@ -25,6 +25,7 @@ is persisted automatically at this stage.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from .stacks import DEFAULT_STACK_ID
 
 CONFIG_SCHEMA_VERSION = 1
 CONFIG_FILENAME = "config.yaml"
+RECENT_CUSTOM_ROOTS_LIMIT = 5
 
 
 class ConfigError(ValueError):
@@ -132,20 +134,68 @@ class UiConfig:
         )
 
 
+def _root_key(root: str) -> str:
+    """Identity of a recent root: same folder regardless of case, slashes or a trailing separator.
+
+    Symlinks and junctions are deliberately not resolved; two spellings of one
+    folder only count as the same entry when the text says so.
+    """
+    return os.path.normcase(os.path.normpath(root))
+
+
+def _recent_roots(roots: Any) -> tuple[str, ...]:
+    """Newest first, deduplicated by :func:`_root_key`, never more than the limit."""
+    kept: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = _root_key(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(os.path.normpath(root))
+        if len(kept) == RECENT_CUSTOM_ROOTS_LIMIT:
+            break
+    return tuple(kept)
+
+
 @dataclass(frozen=True)
 class GeneralConfig:
-    """Manager behaviour that does not depend on the selected profile."""
+    """Manager behaviour that does not depend on the selected profile.
+
+    ``recent_custom_roots`` is the machine's short history of custom install
+    folders, newest first. It is recorded when an installation is attempted,
+    not when one succeeds: a root left half-installed by a failed attempt is
+    exactly the one a person needs to find again.
+    """
 
     ui: UiConfig = field(default_factory=UiConfig)
+    recent_custom_roots: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "recent_custom_roots", _recent_roots(self.recent_custom_roots))
+
+    def remembering_custom_root(self, root: str | os.PathLike[str]) -> GeneralConfig:
+        """A copy with ``root`` at the top of the history, moved there if already present."""
+        return replace(self, recent_custom_roots=(os.fspath(root), *self.recent_custom_roots))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"ui": self.ui.to_dict()}
+        return {"ui": self.ui.to_dict(), "recent_custom_roots": list(self.recent_custom_roots)}
 
     @classmethod
     def from_dict(cls, data: Any, source: str = "<config>") -> GeneralConfig:
         section = _mapping(data, source, "general")
-        _reject_unknown(section, {"ui"}, source, "general")
-        return cls(ui=UiConfig.from_dict(section.get("ui", {}), source))
+        _reject_unknown(section, {"ui", "recent_custom_roots"}, source, "general")
+        raw_roots = section.get("recent_custom_roots", [])
+        if not isinstance(raw_roots, list) or not all(
+            isinstance(root, str) and root.strip() for root in raw_roots
+        ):
+            raise ConfigError(
+                f"{source}: general.recent_custom_roots must be a list of non-empty strings"
+            )
+        return cls(
+            ui=UiConfig.from_dict(section.get("ui", {}), source),
+            recent_custom_roots=tuple(raw_roots),
+        )
 
 
 @dataclass(frozen=True)

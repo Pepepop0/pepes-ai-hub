@@ -22,6 +22,7 @@ from .external_conflict_contracts import (
 from .external_conflicts import ConflictResolutionRequired as _BackendConflictRequired
 from .installation import (
     InstallLocation,
+    InstallLocationMode,
     ResolvedInstallation,
     resolve_installation,
 )
@@ -70,6 +71,10 @@ class HubApplicationAdapter:
 
     def _profile_id(self) -> str:
         return self.config.profile_id if self.config else self.profiles[0].id
+
+    def recent_custom_roots(self) -> tuple[str, ...]:
+        """Custom install folders this machine attempted, newest first. At most five."""
+        return self.config.general.recent_custom_roots if self.config else ()
 
     def installation(self) -> InstallationView:
         if self.config is None:
@@ -162,10 +167,17 @@ class HubApplicationAdapter:
                 if backend is None:
                     backend = self.backend_factory(installation)
                     self._backends[installation.root] = backend
+                base = self.config or InstalledConfig(selection.profile_id)
+                general = base.general
+                if location.mode is InstallLocationMode.CUSTOM:
+                    # Recorded on the attempt, persisted below with the intent:
+                    # a root a failed first run leaves behind must stay findable.
+                    general = general.remembering_custom_root(location.root)
                 config = replace(
-                    self.config or InstalledConfig(selection.profile_id),
+                    base,
                     profile_id=selection.profile_id,
                     installation=location,
+                    general=general,
                 )
                 # Bind the backend before checking for a conflict: a decision
                 # the caller makes next must land on this exact session, and a

@@ -11,15 +11,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from pathlib import Path
 from typing import ClassVar
 
 from rich.markup import escape
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import Screen
-from textual.widgets import Button, ContentSwitcher, Input, Static
+from textual.widgets import Button, ContentSwitcher, Input, Select, Static
 
 from ..external_conflict_contracts import (
     ConflictPolicySelection,
@@ -84,6 +86,12 @@ WELCOME_TEXT = (
     "Você vai escolher um perfil e onde instalar. O resto acontece sozinho, e "
     "ao final o Open WebUI abre no navegador."
 )
+
+
+BROWSE_LABEL = "Escolher pasta..."
+BROWSE_BUSY_LABEL = "Aguardando seletor..."
+RECENT_PROMPT = "Escolher um caminho recente"
+NO_RECENT_TEXT = "Nenhum caminho recente."
 
 
 def step_pane_id(step: WizardStep, *, prefix: str = "") -> str:
@@ -160,11 +168,20 @@ class WizardScreen(Screen):
             super().__init__()
             self.selection = selection
 
+    class FolderPickRequested(Message):
+        """Ask the app to open the system folder dialog. It answers with ``apply_picked_folder``."""
+
+        def __init__(self, initial_path: Path | None) -> None:
+            super().__init__()
+            self.initial_path = initial_path
+
     def __init__(
         self,
         choices: tuple[ProfileChoice, ...],
         *,
         preselect: str | None = None,
+        recent_roots: tuple[str, ...] = (),
+        can_pick_folder: bool = False,
     ) -> None:
         super().__init__(id="wizard")
         if not choices:
@@ -176,6 +193,13 @@ class WizardScreen(Screen):
         self.conflict: ConflictPreflightReport | None = None
         self._conflict_error: str = ""
         self.details_expanded: bool = False
+        self.recent_roots = tuple(recent_roots)
+        self.can_pick_folder = can_pick_folder
+        # True from the moment the dialog is requested until the app answers.
+        # While it is, the wizard neither asks twice nor lets the step change
+        # underneath the answer.
+        self.picker_busy: bool = False
+        self._browse_had_focus: bool = False
 
     # --- composition --------------------------------------------------------
 
@@ -208,8 +232,18 @@ class WizardScreen(Screen):
                                 classes="wizard-choice",
                             )
                     yield Static("", id="wizard-mode-summary")
+                    yield Static("Pasta de instalação", id="wizard-custom-label")
                     yield Input(placeholder=r"D:\PepitosAIHub", id="wizard-custom-root")
+                    yield Button(BROWSE_LABEL, id="wizard-custom-browse")
                     yield Static("", id="wizard-custom-error")
+                    yield Static("Recentes", id="wizard-recent-label")
+                    yield Select(
+                        [(Text(root), root) for root in self.recent_roots],
+                        prompt=RECENT_PROMPT,
+                        allow_blank=True,
+                        id="wizard-recent-roots",
+                    )
+                    yield Static(NO_RECENT_TEXT, id="wizard-recent-empty")
                 yield Static("", id=step_pane_id(WizardStep.REVIEW), classes="wizard-pane")
                 yield Static("", id=step_pane_id(WizardStep.PROGRESS), classes="wizard-pane")
                 with VerticalScroll(id=step_pane_id(WizardStep.CONFLICT), classes="wizard-pane"):
@@ -278,6 +312,65 @@ class WizardScreen(Screen):
         self._set_state(
             replace(self.state, custom_root=value, custom_error=validate_custom_root(value))
         )
+
+    def fill_custom_root(self, value: str) -> None:
+        """Put a path in the field as if typed: same validation, same state, same review.
+
+        The picker and the recents list both come through here, so neither can
+        reach the selection by a route the manual field does not also take.
+        """
+        field = self.query_one("#wizard-custom-root", Input)
+        if field.value != value:
+            field.value = value
+        self.set_custom_root(value)
+
+    def _picker_start(self) -> Path | None:
+        """The typed root, when it is one the dialog could meaningfully open near."""
+        root = self.state.custom_root.strip()
+        if not root or validate_custom_root(root):
+            return None
+        return Path(root)
+
+    def request_folder(self) -> None:
+        """Ask for the system dialog once. A second press while it is open does nothing."""
+        if self.picker_busy or not self.can_pick_folder:
+            return
+        if (
+            self.state.step is not WizardStep.MODE
+            or self.state.mode is not InstallLocationMode.CUSTOM
+        ):
+            return
+        browse = self.query_one("#wizard-custom-browse", Button)
+        # Disabling the button below drops its focus; a keyboard user gets it back.
+        self._browse_had_focus = self.focused is browse
+        self.picker_busy = True
+        self._repaint()
+        self.post_message(self.FolderPickRequested(self._picker_start()))
+
+    def update_recent_roots(self, roots: tuple[str, ...]) -> None:
+        """Replace the history offered, e.g. once an attempt has just recorded a root."""
+        roots = tuple(roots)
+        if roots == self.recent_roots:
+            return
+        self.recent_roots = roots
+        self.query_one("#wizard-recent-roots", Select).set_options(
+            [(Text(root), root) for root in roots]
+        )
+        self._repaint()
+
+    def apply_picked_folder(self, folder: Path | None) -> None:
+        """The dialog closed. ``None`` is a cancel: the previous path stays exactly as it was."""
+        self.picker_busy = False
+        on_custom = (
+            self.state.step is WizardStep.MODE and self.state.mode is InstallLocationMode.CUSTOM
+        )
+        if folder is not None and on_custom:
+            self.fill_custom_root(str(folder))
+        else:
+            self._repaint()
+        if on_custom and self._browse_had_focus:
+            self.call_after_refresh(self.query_one("#wizard-custom-browse", Button).focus)
+        self._browse_had_focus = False
 
     def show_operation(self, view: OperationView | None) -> None:
         """The app relays the installation here; the wizard only reads it."""
@@ -397,11 +490,20 @@ class WizardScreen(Screen):
             )
         self.query_one("#wizard-mode-summary", Static).update(escape(MODE_LABELS[state.mode][1]))
         custom = state.mode is InstallLocationMode.CUSTOM
+        self.query_one("#wizard-custom-label", Static).display = custom
         self.query_one("#wizard-custom-root", Input).display = custom
         self.query_one("#wizard-custom-error", Static).display = custom
         self.query_one("#wizard-custom-error", Static).update(
             f"[red]{escape(state.custom_error)}[/red]" if state.custom_error else ""
         )
+        browse = self.query_one("#wizard-custom-browse", Button)
+        browse.display = custom and self.can_pick_folder
+        browse.disabled = self.picker_busy
+        browse.label = BROWSE_BUSY_LABEL if self.picker_busy else BROWSE_LABEL
+        has_recent = bool(self.recent_roots)
+        self.query_one("#wizard-recent-label", Static).display = custom
+        self.query_one("#wizard-recent-roots", Select).display = custom and has_recent
+        self.query_one("#wizard-recent-empty", Static).display = custom and not has_recent
 
         self.query_one(step_pane_id(WizardStep.REVIEW, prefix="#"), Static).update(
             self._review_text()
@@ -490,7 +592,8 @@ class WizardScreen(Screen):
             self.query_one(f"#{button_id}", Button).display = visible
         nxt = self.query_one("#wizard-next", Button)
         nxt.label = "Instalar" if state.step is WizardStep.REVIEW else "Continuar"
-        nxt.disabled = not state.can_continue or review_refused
+        nxt.disabled = not state.can_continue or review_refused or self.picker_busy
+        self.query_one("#wizard-back", Button).disabled = self.picker_busy
 
     # --- input --------------------------------------------------------------
 
@@ -516,6 +619,8 @@ class WizardScreen(Screen):
         elif button_id == "wizard-details-toggle":
             self.details_expanded = not self.details_expanded
             self._repaint()
+        elif button_id == "wizard-custom-browse":
+            self.request_folder()
         elif button_id == "wizard-conflict-alongside":
             self._choose_policy(ExternalConflictPolicy.INSTALL_ALONGSIDE)
         elif button_id == "wizard-conflict-stop":
@@ -531,6 +636,16 @@ class WizardScreen(Screen):
         if event.input.id == "wizard-custom-root":
             event.stop()
             self.set_custom_root(event.value)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "wizard-recent-roots":
+            return
+        event.stop()
+        if not isinstance(event.value, str):
+            return  # back to the prompt: nothing chosen, nothing to fill
+        self.fill_custom_root(event.value)
+        # Return to the prompt so the same entry can be chosen again after an edit.
+        event.select.clear()
 
     def _choose_policy(self, policy: ExternalConflictPolicy) -> None:
         """The whole outgoing command: an opaque preflight id and the policy."""
@@ -550,6 +665,9 @@ class WizardScreen(Screen):
         self.post_message(self.ConflictPolicyChosen(selection))
 
     def action_back(self) -> None:
+        # Escape belongs to the open system dialog, not to this step.
+        if self.picker_busy:
+            return
         if self.state.step is WizardStep.CONFLICT_CONFIRM:
             self.go_to(WizardStep.CONFLICT)
             return
@@ -558,7 +676,7 @@ class WizardScreen(Screen):
             self.go_to(CHOICE_STEPS[index - 1])
 
     def action_next(self) -> None:
-        if not self.state.can_continue:
+        if not self.state.can_continue or self.picker_busy:
             return
         if self.state.step is WizardStep.REVIEW:
             selection = self.state.selection
@@ -575,8 +693,12 @@ class WizardScreen(Screen):
 
 
 __all__ = [
+    "BROWSE_BUSY_LABEL",
+    "BROWSE_LABEL",
     "CHOICE_STEPS",
     "MODE_LABELS",
+    "NO_RECENT_TEXT",
+    "RECENT_PROMPT",
     "WizardScreen",
     "WizardState",
     "WizardStep",

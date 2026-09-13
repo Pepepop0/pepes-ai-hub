@@ -41,6 +41,7 @@ from .system import SystemFacts, detect_system
 from .tui.appearance import TuiAppearance, resolve_tui_appearance, textual_theme
 from .tui.application import (
     ConflictResolutionRequired,
+    FolderPicker,
     HubApplication,
     HubError,
     HubUnavailable,
@@ -119,6 +120,14 @@ class ConflictResolved(Message):
     def __init__(self, result: ConflictResolutionResult) -> None:
         super().__init__()
         self.result = result
+
+
+class FolderPicked(Message):
+    """The system folder dialog closed. ``None`` is a cancel, or no dialog at all."""
+
+    def __init__(self, folder: Path | None) -> None:
+        super().__init__()
+        self.folder = folder
 
 
 @dataclass
@@ -229,6 +238,7 @@ class LocalAIStackApp(App):
         application: HubApplication | None = None,
         open_browser: Callable[[str], bool] | None = None,
         first_run_wizard: bool = True,
+        folder_picker: FolderPicker | None = None,
     ) -> None:
         super().__init__()
         self.profiles = tuple(
@@ -245,6 +255,10 @@ class LocalAIStackApp(App):
         )
         self.open_browser = open_browser or webbrowser.open
         self.first_run_wizard = first_run_wizard
+        # Injected, never constructed here: the TUI must not know which
+        # operating-system dialog, if any, stands behind it.
+        self.folder_picker = folder_picker
+        self._picking_folder = False
         self.operation_view: OperationView | None = None
         self.notices: list[str] = []
         self._subscription = None
@@ -378,7 +392,56 @@ class LocalAIStackApp(App):
                 ProfileChoice(profile.id, profile.name, profile.description)
                 for profile in self.profiles
             )
-        self.push_screen(WizardScreen(choices, preselect=SUGGESTED_PROFILE))
+        self.push_screen(
+            WizardScreen(
+                choices,
+                preselect=SUGGESTED_PROFILE,
+                recent_roots=self._recent_custom_roots(),
+                can_pick_folder=self.folder_picker is not None,
+            )
+        )
+
+    def _recent_custom_roots(self) -> tuple[str, ...]:
+        """Optional on the application, like conflict resolution: absent means no history."""
+        reader = getattr(self.application, "recent_custom_roots", None)
+        if reader is None:
+            return ()
+        try:
+            return tuple(reader())
+        except Exception:  # noqa: BLE001 -- a missing history must never block the wizard
+            return ()
+
+    # --- the folder picker --------------------------------------------------
+
+    def on_wizard_screen_folder_pick_requested(
+        self, message: WizardScreen.FolderPickRequested
+    ) -> None:
+        if self.folder_picker is None:
+            wizard = self.wizard
+            if wizard is not None:
+                wizard.apply_picked_folder(None)
+            return
+        if self._picking_folder:
+            return  # the dialog already open will answer
+        self._picking_folder = True
+        initial = message.initial_path
+        # The dialog is modal and blocks its thread until it closes; the event
+        # loop keeps drawing because the call lives on a worker thread.
+        self.run_worker(lambda: self._pick_folder(initial), thread=True, group="folder-picker")
+
+    def _pick_folder(self, initial: Path | None) -> None:
+        picker = self.folder_picker
+        try:
+            folder = picker.choose_folder(initial) if picker is not None else None
+        except Exception:  # noqa: BLE001 -- a dialog failure is a cancel, not a crash
+            folder = None
+        self.post_message(FolderPicked(folder))
+
+    def on_folder_picked(self, message: FolderPicked) -> None:
+        self._picking_folder = False
+        wizard = self.wizard
+        if wizard is not None:
+            wizard.apply_picked_folder(message.folder)
 
     def on_wizard_screen_install_requested(self, message: WizardScreen.InstallRequested) -> None:
         self.select_profile(message.selection.profile_id)
@@ -397,6 +460,9 @@ class LocalAIStackApp(App):
                     Path(selection.custom_root) if selection.custom_root else None,
                 )
             )
+            if wizard is not None:
+                # The attempt has just been recorded; a retry should already offer it.
+                wizard.update_recent_roots(self._recent_custom_roots())
         except ConflictResolutionRequired as conflict:
             self._operation_kind = None
             report = conflict.report
@@ -689,10 +755,15 @@ class LocalAIStackApp(App):
 
 
 def run_tui() -> None:
+    from .folder_picker import default_folder_picker
     from .hub_application import create_hub_application
 
     application = create_hub_application(project_root())
     try:
-        LocalAIStackApp(application=application, installed_config=application.config).run()
+        LocalAIStackApp(
+            application=application,
+            installed_config=application.config,
+            folder_picker=default_folder_picker(),
+        ).run()
     finally:
         application.close()

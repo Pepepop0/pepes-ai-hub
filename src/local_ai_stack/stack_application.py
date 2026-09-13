@@ -506,12 +506,39 @@ class StackApplication:
             )
         return self._launcher
 
+    def managed_pids(self) -> frozenset[int]:
+        """Every pid this manager can prove belongs to a service it started.
+
+        The roots are the registry's verified entries. The process serving a
+        port is usually a descendant of its root -- the interpreter behind
+        ``open-webui.exe``, the child of a venv ``python.exe`` -- so a root
+        alone would make the running stack look like a stranger on our port.
+        Descendants are proved two ways, and either suffices:
+
+        * the launcher's kernel job, when this session started the tree. The
+          kernel enumerates the members; nothing is inferred;
+        * ancestry within one process scan, creation-time ordered at every hop
+          (:func:`registry.proven_descendants`). This is what remains after
+          the Hub restarts and the job proof has died with its session.
+
+        Anything neither proves is not ours, whatever port it holds or name
+        it carries. This answers what may be *recognised* as the stack; what
+        may be stopped is decided by the launcher on its own proof.
+        """
+        if not self.layout.root.exists():
+            return frozenset()
+        processes = self.deps.list_processes()
+        registry = self.registry()
+        pids = set(registry.managed_pids(processes=processes))
+        launcher = self.launcher()
+        for status in registry.statuses(processes=processes).values():
+            if status.live:
+                pids.update(launcher.tree_pids(status.service_id, status.entry.pid) or ())
+        return frozenset(pids)
+
     def preflight(self, profile: Profile) -> ManagedPreflightReport:
-        # A managed port held by a process the registry proves is ours is the
-        # stack already running, not somebody else on our port.
-        managed = frozenset()
-        if self.layout.root.exists():
-            managed = self.registry().managed_pids(processes=self.deps.list_processes())
+        # A managed port held by a process proved to be ours is the stack
+        # already running, not somebody else on our port.
         return preflight_managed_stack(
             self.provision_context(),
             profile,
@@ -519,7 +546,7 @@ class StackApplication:
             provisioners=self.provisioners(),
             facts=self.facts(),
             listener_report=self.deps.list_listeners(),
-            managed_pids=managed,
+            managed_pids=self.managed_pids(),
         )
 
     def _external_install_path(self, component_id: str) -> Path | None:
@@ -543,11 +570,7 @@ class StackApplication:
         profile = self.profile(profile_id)
         raw = self.preflight(profile)
         listeners = self.deps.list_listeners()
-        managed_pids = (
-            self.registry().managed_pids(processes=self.deps.list_processes())
-            if self.layout.root.exists()
-            else frozenset()
-        )
+        managed_pids = self.managed_pids()
         if listeners.outcome is ScanOutcome.OK:
             passive = {
                 issue.component_id

@@ -44,6 +44,13 @@ from local_ai_stack.stack_application import (
 CHAT_SPEC = model_catalog().get(ModelId("ollama/qwen3_5_9b"))
 CHAT_REFERENCE = CHAT_SPEC.source.reference
 CHAT_DIGEST = CHAT_SPEC.source.digest
+# What the controlled Ollama store serves for every catalogued Ollama model:
+# the digest the catalog pins, so a pull of any profile's chat model verifies.
+OLLAMA_PINS = {
+    spec.source.reference: spec.source.digest
+    for spec in model_catalog().specs.values()
+    if getattr(spec.source, "reference", None) and getattr(spec.source, "digest", None)
+}
 CAPELLA = "capella"
 CAPELLA_PORTS = {"ollama": 11434, "open-webui": 8080, "comfyui": 8188}
 RTX_5090_MIB = 32768
@@ -89,17 +96,14 @@ def controlled_stack(
     ollama_models=(),
     injections: InjectionPlan | None = None,
     ready_ports=ALL_PORTS,
+    listener_depth: int = 0,
 ) -> ControlledStack:
     plan = injections or InjectionPlan.none()
     fixture = repo_fixture(profile_id, profile_yaml=profile_yaml or capella_yaml(), injections=plan)
     root = allocate_root()
     artifacts = ControlledArtifacts()
     catalog = fixture_model_catalog(artifacts.register_model, SHIPPED_IMAGE_MODELS)
-    ollama = ControlledOllama(
-        installed=list(ollama_models),
-        plan=plan,
-        pinned={CHAT_REFERENCE: CHAT_DIGEST},
-    )
+    ollama = ControlledOllama(installed=list(ollama_models), plan=plan, pinned=OLLAMA_PINS)
     inventory = ControlledInventory()
     endpoints = ControlledEndpoints(ready=set(ready_ports), plan=plan)
     clock = StepClock()
@@ -113,6 +117,10 @@ def controlled_stack(
             plan=plan,
             ready_ports=ports,
             endpoints=endpoints,
+            # Two descendants let the port sit two hops below the root, the
+            # shape of a real Open WebUI: launcher -> venv python -> server.
+            descendants=max(1, listener_depth),
+            listener_depth=listener_depth,
         )
         launchers.append(launcher)
         return launcher
@@ -190,3 +198,21 @@ def controlled_stack(
     )
     built.runner = runner
     return built
+
+
+def restarted_hub(built: ControlledStack) -> StackApplication:
+    """The same root, opened by a Hub that was started again.
+
+    Nothing about the machine changes: the processes the previous session
+    started are still in the inventory and still hold their ports. What is
+    gone is the session -- a new application gets a new launcher with no job
+    handles, so ownership can only be proved from the registry and the process
+    table, exactly as after a real restart.
+    """
+    return StackApplication(
+        built.root.installation,
+        profiles=load_profiles(built.fixture.path / "profiles"),
+        repo_root=built.fixture.path,
+        options=IntegrationOptions(),
+        dependencies=built.app.deps,
+    )

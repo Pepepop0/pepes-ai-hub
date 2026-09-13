@@ -16,6 +16,7 @@ URL, or a process it could signal. The Open WebUI button asks for a
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from ..application_contracts import ApplicationReadModel
@@ -97,6 +98,18 @@ class LaunchRefusal:
     code: str = "not-ready"
 
 
+class FolderPicker(Protocol):
+    """Asks the operating system for a folder. The TUI never sees how.
+
+    Blocking: the implementation shows a modal dialog and returns when it
+    closes, so the app calls it from a worker thread. ``initial_path`` is a
+    hint the dialog may open on; ``None`` back means the person cancelled or no
+    dialog exists on this platform - either way, nothing should change.
+    """
+
+    def choose_folder(self, initial_path: Path | None = None) -> Path | None: ...
+
+
 @runtime_checkable
 class HubApplication(ApplicationReadModel, Protocol):
     """The read model plus the five things a Hub screen can ask for.
@@ -115,6 +128,10 @@ class HubApplication(ApplicationReadModel, Protocol):
     resolution. The TUI calls those two methods defensively - see
     ``LocalAIStackApp._check_conflict`` - so an adapter without them behaves
     exactly as if no conflict were ever reported.
+
+    ``recent_custom_roots() -> tuple[str, ...]`` follows the same rule for the
+    same reason: optional, called defensively, and an adapter without it simply
+    has no history to offer.
     """
 
     def installation(self) -> InstallationView: ...
@@ -134,6 +151,7 @@ class HubApplication(ApplicationReadModel, Protocol):
 
 __all__ = [
     "ConflictResolutionRequired",
+    "FolderPicker",
     "HubApplication",
     "HubError",
     "HubUnavailable",

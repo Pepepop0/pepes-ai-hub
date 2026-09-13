@@ -9,12 +9,15 @@ the TUI merely tolerates.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from local_ai_stack.application_contracts import ServicesSnapshot, ServiceView, VramSnapshot
 from local_ai_stack.components import ComponentId
+from local_ai_stack.config import GeneralConfig
 from local_ai_stack.external_conflict_contracts import (
     ConflictEndpoint,
     ConflictHardBlocker,
@@ -436,6 +439,10 @@ class FakeHubApplication:
     # install_script() itself never produces.
     custom_script: Callable[[str], list[OperationEvent]] | None = None
 
+    # Custom roots attempted, newest first. Recorded exactly like the real
+    # adapter: on the attempt, through the same GeneralConfig policy.
+    recent_roots: tuple[str, ...] = ()
+
     # Test-facing record of everything that happened.
     calls: list[tuple[str, object]] = field(default_factory=list)
     emitted: list[OperationEvent] = field(default_factory=list)
@@ -486,6 +493,10 @@ class FakeHubApplication:
         self._check_available()
         return self.profile_choices_value
 
+    def recent_custom_roots(self) -> tuple[str, ...]:
+        self._check_available()
+        return self.recent_roots
+
     def install(self, selection: InstallSelection) -> str:
         self._check_available()
         self.calls.append(("install", selection))
@@ -494,6 +505,12 @@ class FakeHubApplication:
             self._active_conflict = self.conflict_report
             raise ConflictResolutionRequired(self.conflict_report)
         operation_id = self._begin("install")
+        if selection.mode is InstallLocationMode.CUSTOM and selection.custom_root:
+            self.recent_roots = (
+                GeneralConfig(recent_custom_roots=self.recent_roots)
+                .remembering_custom_root(selection.custom_root)
+                .recent_custom_roots
+            )
         self._active_conflict = None
         if self.custom_script is not None:
             self._pending = self.custom_script(operation_id)
@@ -631,3 +648,34 @@ def ready_application(**overrides: object) -> FakeHubApplication:
 
 def sequence_of(events: Sequence[OperationEvent]) -> list[int]:
     return [event.sequence for event in events]
+
+
+class FakeFolderPicker:
+    """A folder dialog the test controls. No COM, no window.
+
+    ``result`` is what the "dialog" returns (``None`` is a cancel). ``hold()``
+    makes ``choose_folder`` block like a real modal dialog until ``release()``,
+    so a test can prove the event loop keeps running while it is open.
+    """
+
+    def __init__(self, result: Path | None = None) -> None:
+        self.result = result
+        self.calls: list[Path | None] = []
+        self.threads: list[str] = []
+        self.entered = threading.Event()
+        self._gate: threading.Event | None = None
+
+    def hold(self) -> None:
+        self._gate = threading.Event()
+
+    def release(self) -> None:
+        if self._gate is not None:
+            self._gate.set()
+
+    def choose_folder(self, initial_path: Path | None = None) -> Path | None:
+        self.calls.append(initial_path)
+        self.threads.append(threading.current_thread().name)
+        self.entered.set()
+        if self._gate is not None and not self._gate.wait(10):
+            raise TimeoutError("FakeFolderPicker was never released")
+        return self.result

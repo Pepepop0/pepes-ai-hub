@@ -6,11 +6,35 @@ from typing import Any
 
 import yaml
 
-from .components import normalize_component_id
+from .components import ComponentId, normalize_component_id
 from .models import ModelContractError, ModelId, ModelRequirement
 
 PROFILE_SCHEMA_VERSION = 1
 MIB_PER_GIB = 1024
+
+# Capabilities a profile can switch on, and what each one needs declared to be
+# configurable at all. Enabled means "this profile has what it takes": a
+# capability that is on while the data behind it is TBD or absent is not a
+# softer kind of enabled, it is an incoherent profile, and it is refused here
+# rather than discovered after minutes of installation.
+FEATURE_CHAT = "chat"
+FEATURE_VISION = "vision"
+FEATURE_TOOLS = "tools"
+FEATURE_IMAGE_GENERATION = "image_generation"
+FEATURE_IMAGE_EDITING = "image_editing"
+
+CHAT_PRIMARY_ROLE = "chat.primary"
+TEXT_TO_IMAGE_WORKFLOW = "text_to_image"
+IMAGE_EDIT_WORKFLOW = "image_edit"
+
+# A capability that only refines another one: vision and tool calling are
+# things a chat model does, and editing an image is image generation plus an
+# input. Enabling the refinement without its base configures nothing.
+FEATURE_REFINES: dict[str, str] = {
+    FEATURE_VISION: FEATURE_CHAT,
+    FEATURE_TOOLS: FEATURE_CHAT,
+    FEATURE_IMAGE_EDITING: FEATURE_IMAGE_GENERATION,
+}
 
 
 @dataclass(frozen=True)
@@ -64,9 +88,56 @@ class Profile:
     runtime: dict[str, bool]
     raw: dict[str, Any]
 
+    def enables(self, feature: str) -> bool:
+        """Whether this profile switches ``feature`` on. Absent means off."""
+        return self.features.get(feature, False)
+
+    def enables_service(self, service_id: str) -> bool:
+        service = self.services.get(normalize_component_id(service_id))
+        return service is not None and service.enabled
+
+    def model_for(self, role: str) -> ModelId | None:
+        """The model a role names, or None when it is absent or TBD."""
+        return next((item.model_id for item in self.model_requirements if item.role == role), None)
+
 
 class ProfileError(ValueError):
     pass
+
+
+def capability_problems(profile: Profile) -> tuple[str, ...]:
+    """Every enabled capability the profile does not declare enough to configure.
+
+    Reads only what the profile itself says, so it can run the moment a
+    profile is loaded. Whether a declared workflow is mapped, or a declared
+    model is installable, depends on the manifests and is checked where they
+    are known; this is the part no manifest can rescue. No profile id is
+    looked at: the rule is the same for every profile.
+    """
+    problems: list[str] = []
+    for feature, base in FEATURE_REFINES.items():
+        if profile.enables(feature) and not profile.enables(base):
+            problems.append(f"features.{feature} is enabled but features.{base} is not")
+
+    if profile.enables(FEATURE_CHAT):
+        if not profile.enables_service(ComponentId.OLLAMA):
+            problems.append("features.chat is enabled but services.ollama is not")
+        if profile.model_for(CHAT_PRIMARY_ROLE) is None:
+            problems.append("features.chat is enabled but models.chat.primary names no model")
+
+    if profile.enables(FEATURE_IMAGE_GENERATION):
+        if not profile.enables_service(ComponentId.COMFYUI):
+            problems.append("features.image_generation is enabled but services.comfyui is not")
+        if TEXT_TO_IMAGE_WORKFLOW not in profile.workflows:
+            problems.append(
+                "features.image_generation is enabled but workflows.text_to_image is not declared"
+            )
+
+    if profile.enables(FEATURE_IMAGE_EDITING) and IMAGE_EDIT_WORKFLOW not in profile.workflows:
+        problems.append(
+            "features.image_editing is enabled but workflows.image_edit is not declared"
+        )
+    return tuple(problems)
 
 
 def _gib_value(vram_mib: int) -> int | float:
@@ -344,7 +415,7 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
         for key, value in runtime_data.items()
     }
 
-    return Profile(
+    profile = Profile(
         schema_version=schema_version,
         id=profile_id,
         name=_string(root["name"], source, "name"),
@@ -374,6 +445,10 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
         runtime=runtime,
         raw=root,
     )
+    problems = capability_problems(profile)
+    if problems:
+        raise _error(source, "features", "; ".join(problems))
+    return profile
 
 
 def load_profile(path: Path) -> Profile:

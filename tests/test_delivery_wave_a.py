@@ -588,7 +588,8 @@ def test_real_provisioner_output_reaches_adapter_and_granular_tui(composition):
             done = Text.from_markup(
                 str(app.screen.query_one("#wizard-step-done", Static).content)
             ).plain
-            assert "Concluído" in done and "Tudo pronto" in done
+            title = str(app.screen.query_one("#wizard-title", Static).content)
+            assert "Concluído" in title and "Tudo pronto" in done
             assert "[>]" not in done
             await click(pilot, "#wizard-details-toggle")
             expanded = Text.from_markup(
@@ -743,7 +744,9 @@ def test_real_pip_failure_keeps_sanitized_last_observations_in_tui(composition):
             done = Text.from_markup(
                 str(app.screen.query_one("#wizard-step-done", Static).content)
             ).plain
-            assert "Instalação não concluída" in done
+            title = str(app.screen.query_one("#wizard-title", Static).content)
+            assert "Instalação não concluída" in title
+            assert "Instalação não concluída" not in done, "shown once, in the title"
             assert "Última atividade:" in done
             assert "Baixando dependências" in done and "torch" in done
             assert "158 MiB / 259 MiB" in done
@@ -816,7 +819,9 @@ def test_real_model_download_reaches_the_real_wizard_and_second_run_is_quiet(com
             assert app.operation_view.succeeded
             assert app.screen.state.step is WizardStep.DONE
             done = str(app.screen.query_one("#wizard-step-done", Static).content)
-            assert "Concluído" in done
+            title = str(app.screen.query_one("#wizard-title", Static).content)
+            assert "Concluído" in title
+            assert "[b]Concluído[/b]" not in done, "shown once, in the title"
             assert "100%" not in done
             first_request_count = len(world.artifacts.requests)
             first_event_count = len(events)
@@ -912,7 +917,9 @@ def test_real_model_failure_preserves_last_transfer_in_the_real_wizard(compositi
             assert events.index(events[-1]) == len(events) - 1
             assert app.operation_view.transfer == transfer_events(events)[-1].transfer
             done = str(app.screen.query_one("#wizard-step-done", Static).content)
-            assert "Instalação não concluída" in done
+            title = str(app.screen.query_one("#wizard-title", Static).content)
+            assert "Instalação não concluída" in title
+            assert "Instalação não concluída" not in done, "shown once, in the title"
             if failure == "checksum":
                 assert "100%" in done
             else:

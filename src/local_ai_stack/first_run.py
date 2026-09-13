@@ -158,6 +158,16 @@ class FirstRunCoordinator:
                     for issue in preflight.issues
                 ],
             )
+        incoherent = self.app.capability_problems(self.profile)
+        if incoherent:
+            # An enabled capability with nothing to configure it with fails at
+            # "Aplicando configurações" -- after every component is installed.
+            # Nothing about installing changes that, so it is refused here.
+            raise FirstRunStopped(
+                OperationPhase.PREPARATION,
+                "O perfil habilita recursos que não consegue configurar",
+                [diagnostic("profile-capability", problem) for problem in incoherent],
+            )
         unresolved = self.app.unresolved_models(self.profile)
         if unresolved:
             # A profile that names a model nothing can install is not installable.

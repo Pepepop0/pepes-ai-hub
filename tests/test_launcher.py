@@ -221,6 +221,55 @@ def test_real_child_gets_the_declared_cwd_and_env(registry, tmp_path, reaper):
     assert "PEPITO_TEST" not in os.environ
 
 
+@pytest.mark.skipif(os.name != "nt", reason="console creation flags are a Windows concern")
+def test_a_managed_child_gets_a_windowless_console_not_a_detached_one():
+    import subprocess
+
+    flags = launcher_module._creation_flags()["creationflags"]
+    assert flags & subprocess.CREATE_NO_WINDOW
+    assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
+    # Windows ignores CREATE_NO_WINDOW next to DETACHED_PROCESS, and a detached
+    # root makes its first console grandchild open a visible window.
+    assert not flags & subprocess.DETACHED_PROCESS
+
+
+CONSOLE_PROCESS_LIST = (
+    "import ctypes, sys;"
+    "buf = (ctypes.c_ulong * 64)();"
+    "n = ctypes.windll.kernel32.GetConsoleProcessList(buf, 64);"
+    "sys.stdout.write('console:' + ' '.join(str(buf[i]) for i in range(min(n, 64))) + '\\n');"
+    "sys.stdout.flush()"
+)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="console inheritance is a Windows concern")
+def test_a_grandchild_shares_the_service_console_instead_of_opening_its_own(
+    registry, tmp_path, reaper
+):
+    # Services start through launchers (open-webui.exe, a venv python.exe) whose
+    # real interpreter is a grandchild. It must inherit the root's windowless
+    # console: a console of its own is a window the user can close, and closing
+    # it kills the service.
+    logs = LogFiles(tmp_path / "logs" / "fixture.log")
+    spawn_grandchild = (
+        f"import subprocess; subprocess.run([sys.executable, '-c', {CONSOLE_PROCESS_LIST!r}]);"
+    )
+    launcher = ProcessLauncher(registry)
+    result = launcher.start(
+        ProcessLaunchSpec("fixture", sleeper_argv(spawn_grandchild), cwd=tmp_path, logs=logs)
+    )
+    reaper.append(result.pid)
+    assert result.outcome is LaunchOutcome.STARTED
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and not read_log_tail(logs.stdout):
+        time.sleep(0.05)
+    (line,) = read_log_tail(logs.stdout)
+    sharing = {int(pid) for pid in line.removeprefix("console:").split()}
+    assert result.pid in sharing
+    assert os.getpid() not in sharing
+
+
 def test_stderr_can_be_a_separate_file(registry, tmp_path, reaper):
     logs = LogFiles(tmp_path / "logs" / "fixture.log", tmp_path / "logs" / "fixture-stderr.log")
     prelude = "sys.stderr.write('boom\\n'); sys.stderr.flush();"

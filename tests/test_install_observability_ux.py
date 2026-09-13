@@ -452,6 +452,33 @@ def test_failure_shows_last_known_activity_and_progress_with_the_reason():
     # "Etapa N de M" pairing it with the failure sentence.
     assert "Etapa" not in rendered
 
+    # A screen that already titles the outcome renders the same view without
+    # it: the heading appears once, and nothing else about the failure is lost.
+    body = render_install_progress(view, heading="Instalação não concluída", include_heading=False)
+    assert "Instalação não concluída" not in body
+    assert not body.startswith("\n")
+    assert "[!]" in body and "Última atividade:" in body and "Motivo:" in body
+    assert body == rendered.split("\n", 2)[2], "only the heading and its blank line differ"
+
+
+def test_the_wizard_shows_the_failure_heading_exactly_once():
+    """Regression: title and pane both printed "Instalação não concluída"."""
+
+    async def exercise() -> None:
+        app, fake, _ = hub(FakeHubApplication(install_fail_at="Instalando ComfyUI"))
+        async with app.run_test(size=(100, 32)) as pilot:
+            await pilot.pause()
+            await walk_to_review(pilot)
+            await click(pilot, "#wizard-next")
+            await pump(pilot, fake)
+
+            assert app.screen.state.step is WizardStep.DONE
+            screen_text = text(app, "#wizard-title") + "\n" + text(app, "#wizard-step-done")
+            assert screen_text.count("Instalação não concluída") == 1
+            assert "Última atividade:" in screen_text or "[!]" in screen_text
+
+    run(exercise)
+
 
 def test_legacy_event_without_activity_or_detail_still_folds_cleanly():
     """An event built the old way (no activity/detail kwargs at all) is valid input."""

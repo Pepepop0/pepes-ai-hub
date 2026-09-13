@@ -549,10 +549,15 @@ def test_profile_roles_drive_resolution(tmp_path):
 
 
 def test_a_tbd_role_produces_no_requirement():
-    """An explicitly unresolved fixture role is absent, never a fake entry."""
+    """An explicitly unresolved fixture role is absent, never a fake entry.
+
+    A TBD role is only coherent under a capability that is off, so chat is
+    switched off with it; enabled over TBD is refused when the profile loads.
+    """
     profile = next(p for p in load_profiles(REPO / "profiles") if p.id == "capella")
     data = deepcopy(profile.raw)
     data["models"]["chat"]["primary"] = "TBD"
+    data["features"].update(chat=False, vision=False, tools=False)
     profile = validate_profile_data(data)
     roles = {requirement.role for requirement in profile.model_requirements}
     assert "chat.primary" not in roles

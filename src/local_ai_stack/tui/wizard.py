@@ -508,25 +508,24 @@ class WizardScreen(Screen):
         self.query_one(step_pane_id(WizardStep.REVIEW, prefix="#"), Static).update(
             self._review_text()
         )
+        # The title above already names the step or the outcome, so the panes
+        # below render content only: passing the heading into them too is what
+        # printed "Instalação não concluída" twice.
         progress_pane = self.query_one(step_pane_id(WizardStep.PROGRESS, prefix="#"), Static)
         progress_text = render_install_progress(
             self.operation,
             idle_text="Aguardando o início da instalação.",
             width=self._pane_width(progress_pane),
             expanded=self.details_expanded,
+            include_heading=False,
         )
         progress_pane.update(progress_text)
-        done_heading = (
-            installation_outcome_heading(self.operation.state)
-            if self.operation is not None and self.operation.terminal
-            else None
-        )
         done_pane = self.query_one(step_pane_id(WizardStep.DONE, prefix="#"), Static)
         done_text = render_install_progress(
             self.operation,
-            heading=done_heading,
             width=self._pane_width(done_pane),
             expanded=self.details_expanded,
+            include_heading=False,
         )
         done_pane.update(done_text)
         self.query_one("#wizard-details-toggle", Button).label = (

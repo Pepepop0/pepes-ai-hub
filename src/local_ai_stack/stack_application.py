@@ -105,7 +105,7 @@ from .profiles import Profile, load_profiles
 from .provisioning import ProvisionContext, ProvisionEvent, ProvisionOutcome
 from .registry import ManagedProcessRegistry
 from .runner import CommandRunner
-from .service_config import StackConfiguration
+from .service_config import StackConfiguration, declared_capability_problems
 from .services import ServiceState
 from .system import SystemFacts, detect_system
 
@@ -602,6 +602,10 @@ class StackApplication:
 
     def unresolved_models(self, profile: Profile) -> Mapping[str, str]:
         return unresolved_roles(profile, self.catalog())
+
+    def capability_problems(self, profile: Profile) -> tuple[str, ...]:
+        """Enabled capabilities this profile cannot configure, before installing."""
+        return declared_capability_problems(profile, self.install_actions(profile).workflow_specs)
 
     def unmapped_workflows(self, profile: Profile) -> frozenset[str]:
         """Workflows the manifest itself declares as not mapped yet.

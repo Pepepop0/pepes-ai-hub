@@ -37,6 +37,7 @@ from local_ai_stack.service_config import (
     ENV_COMFYUI_WORKFLOW_NODES,
     ENV_DEFAULT_MODELS,
     ENV_ENABLE_IMAGE_GENERATION,
+    ENV_ENABLE_OLLAMA_API,
     ENV_IMAGE_GENERATION_MODEL,
     ENV_OLLAMA_BASE_URL,
     build_stack_configuration,
@@ -435,7 +436,13 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
     assert capella.env[ENV_ENABLE_IMAGE_GENERATION] == "true", "images still work"
 
     test = built["test"].service(ComponentId.OPEN_WEBUI)
-    assert test.env == {}, "a profile that has chosen nothing configures nothing"
+    # Chat is disabled, so no backend address and no model -- but not an empty
+    # env either: Open WebUI 0.11.3 defaults ENABLE_OLLAMA_API to true and the
+    # base URL to localhost:11434, which could be an Ollama this stack does not
+    # own. Disabled is said explicitly.
+    assert test.env == {ENV_ENABLE_OLLAMA_API: "false"}
+    assert test.problems == ()
+    assert built["test"].ok, built["test"].problems
     assert built["test"].service(ComponentId.COMFYUI).documents == ()
 
 

@@ -38,7 +38,14 @@ from .models import (
     OllamaModelLocation,
     ResolvedModel,
 )
-from .profiles import Profile
+from .profiles import (
+    CHAT_PRIMARY_ROLE,
+    FEATURE_CHAT,
+    FEATURE_IMAGE_GENERATION,
+    TEXT_TO_IMAGE_WORKFLOW,
+    Profile,
+    capability_problems,
+)
 from .workflows import (
     WorkflowParameter,
     WorkflowResolution,
@@ -65,7 +72,7 @@ ENV_IMAGE_SIZE = "IMAGE_SIZE"
 ENV_IMAGE_STEPS = "IMAGE_STEPS"
 ENV_DEFAULT_MODELS = "DEFAULT_MODELS"
 
-CHAT_ROLE = "chat.primary"
+CHAT_ROLE = CHAT_PRIMARY_ROLE
 
 # How Open WebUI names the workflow inputs it can drive. The node ids stay in
 # the workflow manifest; this only translates our vocabulary into theirs.
@@ -181,6 +188,17 @@ def open_webui_chat_configuration(
             ),
         )
     return ServiceConfiguration(ComponentId.OPEN_WEBUI, open_webui_ollama_env(endpoints, chat))
+
+
+def open_webui_chat_disabled_env() -> dict[str, str]:
+    """What Open WebUI gets from a profile that does not enable chat.
+
+    Not "nothing": left unset, Open WebUI connects to an Ollama on its default
+    address, which may well be one this stack does not own. Saying outright
+    that the Ollama API is off is the only value that configures exactly what
+    the profile asked for -- no chat -- without inventing an address or a model.
+    """
+    return {ENV_ENABLE_OLLAMA_API: "false"}
 
 
 # --- ComfyUI model visibility ----------------------------------------------
@@ -309,6 +327,47 @@ def open_webui_image_configuration(
 # --- the whole stack --------------------------------------------------------
 
 
+def declared_capability_problems(
+    profile: Profile, workflow_specs: Mapping[str, WorkflowSpec]
+) -> tuple[str, ...]:
+    """What would make configuration fail, known before anything is installed.
+
+    The profile's own coherence, plus what the workflow manifest settles: an
+    enabled image generation needs its text-to-image workflow to exist, to be
+    mapped, and to name only models the profile declares. None of this waits
+    for an install -- a workflow that is not mapped today is not mapped after
+    downloading twelve gigabytes either. Whether a declared model can actually
+    be installed is ``unresolved_roles``'s question, not this one.
+
+    An image-edit workflow still being mapped is deliberately not here: it
+    does not block configuration, and is reported as a warning when it runs.
+    """
+    problems = list(capability_problems(profile))
+    if not profile.enables(FEATURE_IMAGE_GENERATION):
+        return tuple(problems)
+    declared = profile.workflows.get(TEXT_TO_IMAGE_WORKFLOW)
+    if declared is None:
+        return tuple(problems)
+    spec = workflow_specs.get(declared.manifest_id)
+    if spec is None:
+        problems.append(
+            f"workflows.text_to_image names {declared.manifest_id!r}, "
+            "which the workflow manifest does not declare"
+        )
+    elif not spec.complete:
+        problems.append(
+            f"workflows.text_to_image names {spec.id!r}, which is not mapped yet "
+            f"({', '.join(spec.unresolved)})"
+        )
+    else:
+        missing = [role for role in spec.required_roles if profile.model_for(role) is None]
+        if missing:
+            problems.append(
+                f"workflow {spec.id!r} loads {', '.join(missing)}, which the profile does not name"
+            )
+    return tuple(problems)
+
+
 def build_stack_configuration(
     profile: Profile,
     resolver: ModelResolver,
@@ -323,8 +382,11 @@ def build_stack_configuration(
     """Generate every service configuration this profile implies.
 
     Deterministic: the same profile and the same resolver produce the same
-    documents, byte for byte. Fail closed: a model that is not AVAILABLE
-    removes the capability that needed it and says so, instead of being
+    documents, byte for byte. Each integration follows its capability, never
+    the mere presence of a service: an enabled capability whose requirements
+    are missing fails closed and says why, while a disabled one is simply not
+    configured, and its absent requirements are not a problem. A model that is
+    not AVAILABLE removes the capability that needed it, instead of being
     configured around.
     """
     endpoints = endpoints or StackEndpoints.from_profile(profile)
@@ -338,12 +400,14 @@ def build_stack_configuration(
     manual: list[str] = []
     open_webui_documents: list[ConfigDocument] = []
 
-    if endpoints.enabled(profile, ComponentId.OLLAMA):
+    if not profile.enables(FEATURE_CHAT):
+        env.update(open_webui_chat_disabled_env())
+    elif endpoints.enabled(profile, ComponentId.OLLAMA):
         chat = open_webui_chat_configuration(endpoints, resolved_models.get(CHAT_ROLE))
         env.update(chat.env)
         problems.extend(chat.problems)
     else:
-        problems.append("this profile does not enable Ollama, so chat cannot be configured")
+        problems.append("this profile enables chat but not Ollama, so chat cannot be configured")
 
     workflows: dict[str, WorkflowResolution] = {}
     if workflow_specs:
@@ -352,7 +416,13 @@ def build_stack_configuration(
             workflow_specs, profile, resolver, repo_root=repo_root, only=wanted
         )
 
-    if profile.features.get("image_generation") and endpoints.enabled(profile, ComponentId.COMFYUI):
+    image_enabled = profile.enables(FEATURE_IMAGE_GENERATION)
+    if image_enabled and not endpoints.enabled(profile, ComponentId.COMFYUI):
+        problems.append(
+            "this profile enables image generation but not ComfyUI, "
+            "so image generation cannot be configured"
+        )
+    elif image_enabled:
         declared = profile.workflows.get(image_workflow)
         resolution = workflows.get(declared.manifest_id) if declared else None
         if resolution is None:
@@ -391,7 +461,14 @@ def build_stack_configuration(
     models = list(resolved_models.values())
     comfyui_document = comfyui_search_paths_document(layout, models)
     comfyui_problems: tuple[str, ...] = ()
-    if comfyui_document is None and endpoints.enabled(profile, ComponentId.COMFYUI):
+    # Managed models are what ComfyUI is pointed at, and only image generation
+    # needs them. With it off, ComfyUI still runs on its own model tree; having
+    # nothing managed to point it at is then expected, not a failure.
+    if (
+        comfyui_document is None
+        and image_enabled
+        and endpoints.enabled(profile, ComponentId.COMFYUI)
+    ):
         unavailable = [
             f"{model.id} is {model.state.value}"
             for model in models
@@ -421,6 +498,7 @@ __all__: Sequence[str] = (
     "build_stack_configuration",
     "comfyui_search_paths",
     "comfyui_search_paths_document",
+    "declared_capability_problems",
     "open_webui_chat_configuration",
     "open_webui_image_configuration",
     "open_webui_ollama_env",

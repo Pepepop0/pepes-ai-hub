@@ -20,6 +20,7 @@ Resolving a location never creates a directory.
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -132,7 +133,15 @@ def detect_repo_root(start: str | os.PathLike[str] | None = None) -> Path:
 
     Used only by portable mode. `.git` is matched as a path, not a directory,
     so linked worktrees (where `.git` is a file) resolve correctly.
+
+    In a frozen build there is no checkout: "the workspace" is the folder the
+    executable was unpacked into, because that is what "portable" means to the
+    person who put the app on a removable disk. The stack then lives in a
+    ``stack/`` folder beside the executable, never inside the bundle's own
+    ``_internal`` data.
     """
+    if start is None and getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
     base = Path(start).expanduser() if start is not None else Path(__file__).resolve().parent
     base = Path(os.path.normpath(base if base.is_absolute() else base.resolve()))
     for candidate in (base, *base.parents):

@@ -23,6 +23,7 @@ from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Button, ContentSwitcher, Input, Select, Static
 
+from .. import product_title
 from ..external_conflict_contracts import (
     ConflictPolicySelection,
     ConflictPreflightReport,
@@ -273,7 +274,7 @@ class WizardScreen(Screen):
                 yield Button("Abrir Open WebUI", id="wizard-open-webui", variant="primary")
                 yield Button("Ir para o Dashboard", id="wizard-finish")
                 yield Button("Tentar novamente", id="wizard-retry", variant="primary")
-        yield Static("Pepito's AI Hub  v0.1", id="wizard-footer")
+        yield Static(product_title(), id="wizard-footer")
 
     def on_mount(self) -> None:
         self._repaint()

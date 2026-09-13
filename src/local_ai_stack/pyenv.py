@@ -158,6 +158,11 @@ def _in_range(version: tuple[int, int], minimum: tuple[int, int], below: tuple[i
     return minimum <= version < below
 
 
+def running_interpreter_is_usable() -> bool:
+    """False when ``sys.executable`` is a frozen application rather than a Python."""
+    return not getattr(sys, "frozen", False)
+
+
 def find_interpreter(
     runner: CommandRunner,
     *,
@@ -168,9 +173,18 @@ def find_interpreter(
 
     Returns an argv prefix rather than a path, because the Windows launcher
     selects a version through an argument (`py -3.12`).
+
+    The running interpreter is only a candidate when it *is* an interpreter.
+    Inside a frozen build ``sys.executable`` is the Hub itself, and
+    ``PepitosAIHub.exe -m venv`` would open another Hub, not build an
+    environment - so a frozen process never offers itself. The packaged
+    product resolves its interpreter through :mod:`python_runtime` instead;
+    this fallback exists so no other path can regress into that mistake.
     """
     running = (sys.version_info.major, sys.version_info.minor)
-    if _in_range(running, minimum, below):
+    if not running_interpreter_is_usable():
+        pass
+    elif _in_range(running, minimum, below):
         return (sys.executable,)
     for prefix in _CANDIDATE_PREFIXES:
         if runner.which(prefix[0]) is None:

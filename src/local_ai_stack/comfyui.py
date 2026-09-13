@@ -73,9 +73,9 @@ from .pyenv import (
     describe_range,
     distribution_version,
     environment_is_reusable,
-    find_interpreter,
     pip_install,
 )
+from .python_runtime import ManagedPythonRuntime, resolve_interpreter
 
 COMPONENT_ID = str(ComponentId.COMFYUI)
 ENTRY_POINT = "main.py"
@@ -149,6 +149,9 @@ class ComfyUIProvisioner(Provisioner):
     python_below: tuple[int, int] = PYTHON_BELOW
     install_alongside_external: bool = False
     git: GitClient | None = None
+    # The packaged product's own Python; None means "search the host", which
+    # is what a source checkout does. See python_runtime.py.
+    python_runtime: ManagedPythonRuntime | None = None
 
     component_id = COMPONENT_ID
     display_name = "ComfyUI"
@@ -490,16 +493,24 @@ class ComfyUIProvisioner(Provisioner):
             "Locating a supported Python interpreter",
             activity=build_activity(OperationActivityCategory.ENVIRONMENT, "locating", "Python"),
         )
-        interpreter = find_interpreter(
-            context.runner, minimum=self.python_minimum, below=self.python_below
+        resolution = resolve_interpreter(
+            context,
+            self.component_id,
+            minimum=self.python_minimum,
+            below=self.python_below,
+            runtime=self.python_runtime,
+            dry_run=dry_run,
         )
-        if interpreter is None:
+        if resolution.interpreter is None:
+            assert resolution.reason is not None
             return self.failed(
                 detection,
-                FailureReason.PRECONDITION,
-                "No supported Python interpreter was found.",
-                f"ComfyUI requires Python {describe_range(self.python_minimum, self.python_below)}.",
+                resolution.reason,
+                resolution.message,
+                resolution.detail
+                or f"ComfyUI requires Python {describe_range(self.python_minimum, self.python_below)}.",
             )
+        interpreter = resolution.interpreter
 
         if dry_run:
             intent = f"Would install ComfyUI {self.revision} into {self.managed_dir(context)}."
@@ -753,6 +764,7 @@ def provisioner_from_pin(
     dependencies: DependencyPin | None = None,
     requirements: Sequence[str] = (),
     install_alongside_external: bool = False,
+    python_runtime: ManagedPythonRuntime | None = None,
 ) -> ComfyUIProvisioner:
     """Build a provisioner from a catalog pin, or an unpinned one from None.
 
@@ -764,6 +776,7 @@ def provisioner_from_pin(
         return ComfyUIProvisioner(
             dependencies=resolved,
             install_alongside_external=install_alongside_external,
+            python_runtime=python_runtime,
         )
     if dependencies is not None:
         resolved = dependencies
@@ -779,6 +792,7 @@ def provisioner_from_pin(
         python_minimum=pin.python_minimum,
         python_below=pin.python_below,
         install_alongside_external=install_alongside_external,
+        python_runtime=python_runtime,
     )
 
 

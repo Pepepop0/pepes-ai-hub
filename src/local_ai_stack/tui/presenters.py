@@ -391,6 +391,9 @@ def render_overview(
 ) -> str:
     """The Dashboard as the first thing a person sees: what is there, and whether it runs."""
     lines = [f"Profile: [b]{escape(profile_name)}[/b]", ""]
+    if installation.checking:
+        lines.append("[dim]Verificando a instalação...[/dim]")
+        return "\n".join(lines)
     if not installation.ready:
         lines.append("[yellow]Nenhuma stack instalada ainda.[/yellow]")
         lines.append("Use Instalação para preparar esta máquina.")

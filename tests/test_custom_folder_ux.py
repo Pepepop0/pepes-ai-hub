@@ -322,6 +322,9 @@ def hub_with(application: FakeHubApplication | None = None, picker: FakeFolderPi
 
 
 async def to_custom(pilot) -> WizardScreen:
+    # The wizard opens once the shell's first projections say nothing is
+    # installed; that answer arrives from a worker, not from the constructor.
+    await settle(pilot)
     screen = wizard(pilot.app)
     await click(pilot, "#wizard-next")
     await click(pilot, "#wizard-profile-capella")

@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 
 import pytest
 from hub_fakes import FakeHubApplication
-from test_tui_operations import click, hub, pump, run, text, walk_to_review, wizard
+from test_tui_operations import click, hub, pump, run, settle, text, walk_to_review, wizard
 from textual.widgets import Static
 
 from local_ai_stack.operation_contracts import (
@@ -576,7 +576,7 @@ def test_the_wizard_shows_the_bar_percentage_bytes_speed_and_eta_live():
     async def exercise() -> None:
         app, fake, _ = hub(FakeHubApplication(custom_script=download_script))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             screen = wizard(app)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
@@ -605,7 +605,7 @@ def test_a_download_that_fails_keeps_the_last_progress_with_the_failure_heading(
     async def exercise() -> None:
         app, fake, _ = hub(FakeHubApplication(custom_script=failing_download_script))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             screen = wizard(app)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
@@ -627,7 +627,7 @@ def test_the_bar_fits_at_several_terminal_widths_without_overflowing(width):
     async def exercise() -> None:
         app, fake, _ = hub(FakeHubApplication(custom_script=download_script))
         async with app.run_test(size=(width, 32)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
             await pump(pilot, fake, 3)
@@ -647,7 +647,7 @@ def test_resizing_live_redraws_the_bar_at_the_new_width():
     async def exercise() -> None:
         app, fake, _ = hub(FakeHubApplication(custom_script=download_script))
         async with app.run_test(size=(120, 36)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
             await pump(pilot, fake, 3)

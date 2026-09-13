@@ -92,6 +92,18 @@ async def pump(pilot, fake: FakeHubApplication, count: int | None = None) -> Non
         await pilot.pause()
 
 
+async def settle(pilot) -> None:
+    """Let the shell finish its first background refresh and repaint.
+
+    The Hub draws before it asks the application anything; the answer -- and
+    the wizard it may open -- arrives from a worker. A test that looks at the
+    screen right after mounting waits for that answer here, as a person does.
+    """
+    await pilot.app.workers.wait_for_complete()
+    await pilot.pause()
+    await pilot.pause()
+
+
 def wizard(app: LocalAIStackApp) -> WizardScreen:
     screen = app.screen
     assert isinstance(screen, WizardScreen), type(screen).__name__

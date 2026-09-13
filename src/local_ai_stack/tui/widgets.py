@@ -6,6 +6,7 @@ from pathlib import Path
 from rich.markup import escape
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.widgets import Button, ContentSwitcher, Input, Label, Select, Static
 
 from .. import PRODUCT_NAME, display_version
@@ -147,10 +148,18 @@ class InstallPlanPanel(VerticalScroll):
     directory is created, no archive is downloaded and no provisioner mutates
     anything, because every step receives dry_run=True.
 
-    There is deliberately no control that performs a real install: no
-    production Ollama artifact is pinned yet, and a real apply must never
-    guess a URL.
+    Real installation remains in the installation wizard. Resolution and
+    dry-run provider calls run on workers, including when this hidden panel
+    is first composed behind the Dashboard.
     """
+
+    class Loaded(Message):
+        def __init__(self, generation: int, plan_text: str, report_text: str, report) -> None:
+            super().__init__()
+            self.generation = generation
+            self.plan_text = plan_text
+            self.report_text = report_text
+            self.report = report
 
     def __init__(
         self,
@@ -165,17 +174,22 @@ class InstallPlanPanel(VerticalScroll):
         self.repo_root = repo_root
         self.executor_factory = executor_factory
         self.report: ExecutionReport | None = None
+        self._generation = 0
+        self._loading = False
+        self._dry_run_requested = False
 
     def compose(self) -> ComposeResult:
         yield Static(self._plan_text(), id="install-plan-steps")
         yield Button("Preview dry-run", id="plan-dry-run", variant="primary")
         yield Static(render_plan_execution(None), id="install-plan-dry-run")
         yield Static(
-            "[dim]Real provisioning is unavailable: no pinned Ollama artifact "
-            "with a checksum is configured yet, and this hub never guesses a "
-            "download URL.[/dim]",
+            "[dim]Esta prévia não altera a instalação. Use o assistente de instalação "
+            "para aplicar o plano.[/dim]",
             id="install-plan-note",
         )
+
+    def on_mount(self) -> None:
+        self.call_after_refresh(self._request_plan)
 
     # --- estado ------------------------------------------------------------
 
@@ -188,9 +202,7 @@ class InstallPlanPanel(VerticalScroll):
     def _plan_text(self) -> str:
         installation = self._installation()
         plan = build_install_plan(self.profile, installation=installation)
-        executor = self._executor(installation)
-        resolution = None if executor is None else executor.resolve(plan)
-        return render_install_plan(plan, resolution)
+        return render_install_plan(plan)
 
     def _executor(self, installation: ResolvedInstallation | None) -> PlanExecutor | None:
         if installation is None or self.executor_factory is None:
@@ -209,23 +221,75 @@ class InstallPlanPanel(VerticalScroll):
         self.report = None
         self.query_one("#install-plan-steps", Static).update(self._plan_text())
         self.query_one("#install-plan-dry-run", Static).update(render_plan_execution(None))
+        self._request_plan()
 
     def run_dry_run(self) -> ExecutionReport | None:
-        """Execute the plan with dry_run=True. Creates nothing, downloads nothing."""
-        installation = self._installation()
+        """Queue a read-only preview while the screen continues processing input."""
+        self.query_one("#install-plan-dry-run", Static).update("Verificando o plano...")
+        self._request_plan(dry_run=True)
+        return None
+
+    def _request_plan(self, *, dry_run: bool = False) -> None:
+        self._generation += 1
+        self._dry_run_requested = dry_run
+        if not self._loading:
+            self._start_loading()
+
+    def _start_loading(self) -> None:
+        self._loading = True
+        generation, profile, config = self._generation, self.profile, self.config
+        dry_run = self._dry_run_requested
+        self.query_one("#plan-dry-run", Button).disabled = True
+        self.run_worker(
+            lambda: self._load_plan(generation, profile, config, dry_run),
+            thread=True,
+            group="install-plan",
+        )
+
+    def _load_plan(
+        self, generation: int, profile: Profile, config: InstalledConfig, dry_run: bool
+    ) -> None:
+        try:
+            installation = resolve_installation(config.installation, repo_root=self.repo_root)
+        except InstallLocationError:
+            installation = None
+        plan = build_install_plan(profile, installation=installation)
+        try:
+            plan_text, report_text, report = self._resolve_plan(plan, installation, dry_run)
+        except Exception:  # noqa: BLE001 -- provider failure must leave the TUI usable
+            plan_text = render_install_plan(plan)
+            report_text = "Não foi possível verificar o plano. Tente novamente."
+            report = None
+        self.post_message(self.Loaded(generation, plan_text, report_text, report))
+
+    def _resolve_plan(self, plan, installation, dry_run):
         executor = self._executor(installation)
+        resolution = None if executor is None else executor.resolve(plan)
+        plan_text = render_install_plan(plan, resolution)
+        if not dry_run:
+            return plan_text, render_plan_execution(None), None
         if executor is None or installation is None:
-            self.query_one("#install-plan-dry-run", Static).update(
+            return (
+                plan_text,
                 placeholder(
                     "Dry-run preview",
                     "The install location could not be resolved, so there is no plan to preview.",
-                )
+                ),
+                None,
             )
-            return None
-        plan = build_install_plan(self.profile, installation=installation)
-        self.report = executor.execute(plan, dry_run=True)
-        self.query_one("#install-plan-dry-run", Static).update(render_plan_execution(self.report))
-        return self.report
+        report = executor.execute(plan, dry_run=True)
+        return plan_text, render_plan_execution(report), report
+
+    def on_install_plan_panel_loaded(self, message: Loaded) -> None:
+        self._loading = False
+        if message.generation != self._generation:
+            self._start_loading()
+            return
+        self.report = message.report
+        self.query_one("#install-plan-steps", Static).update(message.plan_text)
+        self.query_one("#install-plan-dry-run", Static).update(message.report_text)
+        self.query_one("#plan-dry-run", Button).disabled = False
+        message.stop()
 
 
 class TopNavigation(Horizontal):
@@ -447,6 +511,8 @@ class InstallPanel(VerticalScroll):
         return "Reinstalar" if self.installation.ready else "Instalar"
 
     def _summary(self) -> str:
+        if self.installation.checking:
+            return "[b]Instalação[/b]\n\n[dim]Verificando a instalação...[/dim]"
         if not self.installation.ready:
             return (
                 "[b]Instalação[/b]\n\n"
@@ -480,21 +546,24 @@ class ServicesPanel(VerticalScroll):
         self.runtime_snapshot = runtime
         self.integration = integration
 
+    SERVICES = (("Ollama", "ollama"), ("Open WebUI", "open-webui"), ("ComfyUI", "comfyui"))
+
     def compose(self) -> ComposeResult:
-        for title, service_id in (
-            ("Ollama", "ollama"),
-            ("Open WebUI", "open-webui"),
-            ("ComfyUI", "comfyui"),
-        ):
+        for title, service_id in self.SERVICES:
             yield Static(
-                render_service(
-                    self.runtime_snapshot.by_id(service_id),
-                    title,
-                    self.integration.by_service(service_id),
-                ),
-                id=f"service-{service_id}",
-                classes="service-card",
+                self._card(title, service_id), id=f"service-{service_id}", classes="service-card"
             )
+
+    def _card(self, title: str, service_id: str) -> str:
+        return render_service(
+            self.runtime_snapshot.by_id(service_id), title, self.integration.by_service(service_id)
+        )
+
+    def refresh_runtime(self, runtime: StackRuntime) -> None:
+        """A fresh probe of the services, gathered off the render thread."""
+        self.runtime_snapshot = runtime
+        for title, service_id in self.SERVICES:
+            self.query_one(f"#service-{service_id}", Static).update(self._card(title, service_id))
 
 
 class MainContent(ContentSwitcher):
@@ -572,6 +641,13 @@ class MainContent(ContentSwitcher):
         self.query_one(ProfilePanel).select_profile(profile)
         self.query_one(InstallPlanPanel).refresh_plan(profile=profile)
         self.refresh_overview(self.installation, self.services, self.vram)
+
+    def refresh_facts(self, facts: SystemFacts) -> None:
+        self.facts = facts
+        profiles = self.query_one(ProfilePanel)
+        profiles.facts = facts
+        profiles.select_profile(self.selected_profile)
+        self.query_one(DashboardPanel).gpu_name = self._gpu_name()
 
     def update_config(self, config: InstalledConfig) -> None:
         self.config = config
@@ -742,6 +818,9 @@ class RightRail(Vertical):
 
     def set_pet_text(self, text: str) -> None:
         self.query_one(PetSlot).set_pet_text(text)
+
+    def set_pet_state(self, state: PetState) -> None:
+        self.query_one(PetSlot).set_state(state)
 
 
 class FooterBar(Horizontal):

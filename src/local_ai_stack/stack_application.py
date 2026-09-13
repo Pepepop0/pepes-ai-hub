@@ -26,9 +26,10 @@ providers to the same composition the product runs.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -349,14 +350,15 @@ class StackApplication:
 
     def services_snapshot(self, profile_id: str | None = None) -> ServicesSnapshot:
         profile = self.profile(profile_id or self._active_profile or self._default_profile())
-        controller = self._controller(profile)
-        return ServicesSnapshot(
-            observed_at=self.deps.clock(),
-            services=tuple(
-                ServiceView(service_id=service_id, health=status.health.state.value)
-                for service_id, status in controller.statuses().items()
-            ),
-        )
+        with self._detection_snapshot(profile):
+            controller = self._controller(profile)
+            return ServicesSnapshot(
+                observed_at=self.deps.clock(),
+                services=tuple(
+                    ServiceView(service_id=service_id, health=status.health.state.value)
+                    for service_id, status in controller.statuses().items()
+                ),
+            )
 
     def vram_snapshot(self) -> VramSnapshot:
         """The first GPU's capacity. Free memory is not observed by the domain yet."""
@@ -367,6 +369,10 @@ class StackApplication:
     def status(self, profile_id: str | None = None) -> AppStatus:
         """What is installed, what is running, what still needs doing."""
         profile = self.profile(profile_id or self._active_profile or self._default_profile())
+        with self._detection_snapshot(profile):
+            return self._status(profile)
+
+    def _status(self, profile: Profile) -> AppStatus:
         snapshot = self._integration()
         statuses = self._controller(profile, snapshot=snapshot).statuses()
         endpoints = self.options.endpoints_for(profile)
@@ -408,6 +414,10 @@ class StackApplication:
         """
         if not self.layout.root.exists():
             return ["installation root does not exist"]
+        with self._detection_snapshot(profile):
+            return self._pending_work(profile)
+
+    def _pending_work(self, profile: Profile) -> list[str]:
         plan = self.build_plan(profile)
         phases = stage_managed_plan(plan)
         executor = self.executor(profile)
@@ -466,6 +476,18 @@ class StackApplication:
 
     def resolver(self, profile: Profile) -> StackModelResolver:
         return StackModelResolver(installer=self.model_installer(profile), catalog=self.catalog())
+
+    @contextlib.contextmanager
+    def _detection_snapshot(self, profile: Profile) -> Iterator[None]:
+        """One model detection per model for the duration of a read-only pass.
+
+        A status pass resolves the same model from the workflow graph, the
+        service configuration and the plan's dry run. Inside this block the
+        installer answers each model once; outside it, every question reads
+        the world again. Operations that acquire models never run inside one.
+        """
+        with self.model_installer(profile).detection_snapshot():
+            yield
 
     def install_actions(self, profile: Profile) -> InstallActionHandlers:
         return default_install_actions(
@@ -660,6 +682,10 @@ class StackApplication:
         real apply produces. The controller needs it to know which managed
         services have verified configuration and may therefore be launched.
         """
+        with self._detection_snapshot(profile):
+            return self._stack_configuration(profile)
+
+    def _stack_configuration(self, profile: Profile) -> StackConfiguration | None:
         plan = self.build_plan(profile)
         step = next((item for item in plan.steps if item.action is PlanAction.CONFIGURE), None)
         if step is None:
@@ -731,7 +757,10 @@ class StackApplication:
         self, operation_id: str, profile_id: str, *, emit: OperationEventSink | None = None
     ) -> OperationResult:
         profile = self.profile(profile_id)
-        with self._operation_stream(operation_id, emit) as stream:
+        with (
+            self._operation_stream(operation_id, emit) as stream,
+            self._detection_snapshot(profile),
+        ):
             self._active_profile = profile.id
             stream.begin("Verificando serviços")
             self._start_services(stream, profile, START_ORDER)
@@ -741,7 +770,10 @@ class StackApplication:
         self, operation_id: str, profile_id: str, *, emit: OperationEventSink | None = None
     ) -> OperationResult:
         profile = self.profile(profile_id)
-        with self._operation_stream(operation_id, emit) as stream:
+        with (
+            self._operation_stream(operation_id, emit) as stream,
+            self._detection_snapshot(profile),
+        ):
             self._active_profile = profile.id
             stream.begin("Verificando serviços")
             self._stop_services(stream, profile)
@@ -751,7 +783,10 @@ class StackApplication:
         self, operation_id: str, profile_id: str, *, emit: OperationEventSink | None = None
     ) -> OperationResult:
         profile = self.profile(profile_id)
-        with self._operation_stream(operation_id, emit) as stream:
+        with (
+            self._operation_stream(operation_id, emit) as stream,
+            self._detection_snapshot(profile),
+        ):
             self._active_profile = profile.id
             stream.begin("Verificando serviços")
             stopped = self._stop_services(stream, profile, finish=False)
@@ -772,7 +807,10 @@ class StackApplication:
         profile = self.profile(profile_id)
         service_id = str(ComponentId.OPEN_WEBUI)
         launch: OpenWebUILaunch | None = None
-        with self._operation_stream(operation_id, emit) as stream:
+        with (
+            self._operation_stream(operation_id, emit) as stream,
+            self._detection_snapshot(profile),
+        ):
             self._active_profile = profile.id
             stream.begin("Verificando Open WebUI")
             launch = self._open_webui(stream, profile, service_id)

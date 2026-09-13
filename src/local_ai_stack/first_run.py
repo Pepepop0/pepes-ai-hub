@@ -285,6 +285,14 @@ class FirstRunCoordinator:
                 logical.total,
                 "Baixando modelos",
             )
+            # A model already on disk is checked before anything is fetched.
+            # When no verification record covers it that is a full read of the
+            # file, so the panel says so instead of standing still.
+            self.stream.activity(
+                OperationActivity(OperationActivityCategory.MODEL, "verifying", step.target),
+                f"Verificando {step.target}",
+                progress=logical,
+            )
             report = self._acquire_one(plan, step, logical)
             for action in report.action_results:
                 (self.report.acquired if action.changed else self.report.already_available).append(

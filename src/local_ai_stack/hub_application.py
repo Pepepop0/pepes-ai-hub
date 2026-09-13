@@ -12,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+from .application_contracts import ServicesSnapshot, ServiceView, VramSnapshot
 from .compatibility import evaluate_compatibility
 from .config import InstalledConfig, config_path, dumps, loads
 from .external_conflict_contracts import (
@@ -88,6 +89,27 @@ class HubApplicationAdapter:
         return InstallationView(
             status.installation_ready, self.config.profile_id, self.config.installation.mode
         )
+
+    def projections(self) -> tuple[InstallationView, ServicesSnapshot, VramSnapshot]:
+        """One authoritative observation for everything repeated by the Dashboard."""
+        try:
+            status = self.backend.status(self._profile_id())
+        except Exception as exc:
+            raise HubUnavailable(
+                "Não foi possível verificar a instalação. Tente novamente."
+            ) from exc
+        installation = (
+            InstallationView(False)
+            if self.config is None
+            else InstallationView(
+                status.installation_ready, self.config.profile_id, self.config.installation.mode
+            )
+        )
+        services = ServicesSnapshot(
+            status.observed_at,
+            tuple(ServiceView(item.service_id, item.health) for item in status.components),
+        )
+        return installation, services, status.gpu
 
     def profile_choices(self) -> tuple[ProfileChoice, ...]:
         return tuple(

@@ -10,11 +10,13 @@ from typing import ClassVar
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.css.query import NoMatches
 from textual.events import Resize
 from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Button, Input, Select
 
+from .appearance import pet_state_for_stack
 from .application_contracts import ServicesSnapshot, ServiceView, VramSnapshot
 from .compatibility import evaluate_compatibility
 from .config import InstalledConfig
@@ -39,6 +41,7 @@ from .operation_contracts import OperationEvent, OperationSnapshot
 from .profiles import Profile, load_profiles
 from .resources import resource_root
 from .runtime import StackRuntime, stack_runtime
+from .services import ServiceState
 from .system import SystemFacts, detect_system
 from .tui.appearance import TuiAppearance, resolve_tui_appearance, textual_theme
 from .tui.application import (
@@ -65,6 +68,7 @@ from .tui.widgets import (
     InstallationLocationPanel,
     MainContent,
     RightRail,
+    ServicesPanel,
     TopNavigation,
 )
 from .tui.wizard import WizardScreen, WizardStep
@@ -109,6 +113,13 @@ SUGGESTED_PROFILE = "capella"
 
 UNWIRED_MESSAGE = "A instalação ainda não está conectada nesta versão do Hub."
 
+# What the shell shows until the application has answered. A probe of the
+# stack can take as long as the services take to answer, and an installation
+# check reads the model tree; neither may run before the screen exists.
+CHECKING_INSTALLATION = InstallationView(ready=False, checking=True)
+UNPROBED_RUNTIME = StackRuntime((), ServiceState.UNKNOWN)
+UNPROBED_FACTS = SystemFacts("", "", "", False, False, ())
+
 
 class OperationObserved(Message):
     """An event from the application, carried onto the UI thread."""
@@ -118,12 +129,54 @@ class OperationObserved(Message):
         self.event = event
 
 
+class ProjectionsLoaded(Message):
+    """The application's read-only picture, gathered outside the render thread.
+
+    Everything the Dashboard repeats -- is there a stack, which services
+    answer, how much VRAM -- comes through here, so the shell is on screen
+    before the first probe and stays responsive while later ones run.
+    """
+
+    def __init__(
+        self,
+        installation: InstallationView,
+        services: ServicesSnapshot,
+        vram: VramSnapshot,
+        runtime: StackRuntime,
+        facts: SystemFacts,
+        integration: IntegrationSnapshot,
+        generation: int,
+    ) -> None:
+        super().__init__()
+        self.installation = installation
+        self.services = services
+        self.vram = vram
+        self.runtime = runtime
+        self.facts = facts
+        self.integration = integration
+        self.generation = generation
+
+
 class LaunchResolved(Message):
     """A bounded backend readiness check finished outside the render thread."""
 
-    def __init__(self, target: LaunchTarget | LaunchRefusal) -> None:
+    def __init__(self, target: LaunchTarget | LaunchRefusal, opened: bool = False) -> None:
         super().__init__()
         self.target = target
+        self.opened = opened
+
+
+class ProjectionsFailed(Message):
+    def __init__(self, generation: int) -> None:
+        super().__init__()
+        self.generation = generation
+
+
+class InstallSubmitted(Message):
+    def __init__(self, selection: InstallSelection, error: HubError | None) -> None:
+        super().__init__()
+        self.selection = selection
+        self.error = error
 
 
 class ConflictResolved(Message):
@@ -258,9 +311,13 @@ class LocalAIStackApp(App):
         )
         if not self.profiles:
             raise ValueError("at least one profile is required")
-        self.facts = facts if facts is not None else detect_system()
+        self._probe_facts = facts is None
+        self.facts = facts if facts is not None else UNPROBED_FACTS
+        # A caller that injected a runtime keeps it; otherwise the services are
+        # probed by the first background refresh, never here.
+        self._probe_runtime = runtime_snapshot is None
         self.runtime_snapshot = (
-            runtime_snapshot if runtime_snapshot is not None else stack_runtime()
+            runtime_snapshot if runtime_snapshot is not None else UNPROBED_RUNTIME
         )
         self.application: HubApplication = application or UnwiredHubApplication(
             self.facts, self.runtime_snapshot, self.profiles
@@ -280,15 +337,20 @@ class LocalAIStackApp(App):
         # that fails is not "an installation that did not conclude".
         self._operation_kind: str | None = None
         self._pending_install_selection: InstallSelection | None = None
+        self._submitting_install = False
 
-        installation = self._installation()
-        installed_profile = installation.profile_id if installation.ready else None
+        # The application is not asked anything yet: its answer can take as
+        # long as the stack takes to answer, and the shell must be on screen
+        # before then. The first refresh fills this in and picks the installed
+        # profile; until then the Dashboard says it is checking.
+        self._installation_view = CHECKING_INSTALLATION
+        self._first_projections_pending = True
+        self._projection_generation = 0
+        self._projection_running = False
         default_profile = next(
             (profile for profile in self.profiles if profile.id == "pepe"), self.profiles[0]
         )
-        self.installed_config = installed_config or InstalledConfig(
-            profile_id=installed_profile or default_profile.id
-        )
+        self.installed_config = installed_config or InstalledConfig(profile_id=default_profile.id)
         self.selected_profile = next(
             (
                 profile
@@ -304,9 +366,8 @@ class LocalAIStackApp(App):
         self.current_appearance = self._resolve_appearance(self.selected_profile)
         self.active_section = Section.DASHBOARD
         self.executor_factory = executor_factory or default_executor_factory
-        # Read-only: it detects what is installed and who owns it. Detection
-        # creates no directory and starts nothing.
-        self.integration = integration if integration is not None else self._detect_integration()
+        self._probe_integration = integration is None
+        self.integration = integration if integration is not None else IntegrationSnapshot()
 
     # --- projections, with the application possibly absent -----------------
 
@@ -337,7 +398,8 @@ class LocalAIStackApp(App):
     # --- composition --------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        services, vram = self._services(), self._vram()
+        now = datetime.now(UTC)
+        services, vram = ServicesSnapshot(now, ()), VramSnapshot(now, None, None)
         yield TopNavigation(self.active_section)
         with Horizontal(id="workspace"):
             yield ContextSidebar(self.active_section)
@@ -348,7 +410,7 @@ class LocalAIStackApp(App):
                 self.selected_profile,
                 self.installed_config,
                 workspace_root(),
-                self._installation(),
+                self._installation_view,
                 services,
                 vram,
                 self.integration,
@@ -368,8 +430,7 @@ class LocalAIStackApp(App):
     def on_mount(self) -> None:
         self._activate_theme(self.current_appearance)
         self._subscribe()
-        if self.first_run_wizard and not self._installation().ready:
-            self.open_wizard()
+        self.refresh_projections()
 
     def on_unmount(self) -> None:
         self._unsubscribe()
@@ -461,11 +522,30 @@ class LocalAIStackApp(App):
         self._start_install(message.selection)
 
     def _start_install(self, selection: InstallSelection) -> None:
-        """Run preflight synchronously; an operation exists only after it accepts."""
-        wizard = self.wizard
+        """Preflight may scan processes; only its answer returns to the UI thread."""
+        if self._submitting_install:
+            return
+        self._submitting_install = True
+        self._operation_kind = "install"
+        self.run_worker(lambda: self._submit_install(selection), thread=True, group="install")
+
+    def _submit_install(self, selection: InstallSelection) -> None:
+        error = None
         try:
-            self._operation_kind = "install"
             self.application.install(selection)
+        except HubError as exc:
+            error = exc
+        except Exception:  # noqa: BLE001 -- preflight provider errors must remain recoverable
+            error = HubError("Não foi possível preparar a instalação. Tente novamente.")
+        self.post_message(InstallSubmitted(selection, error))
+
+    def on_install_submitted(self, message: InstallSubmitted) -> None:
+        self._submitting_install = False
+        wizard = self.wizard
+        selection = message.selection
+        try:
+            if message.error is not None:
+                raise message.error
             self._set_installation(
                 InstallLocation(
                     selection.mode,
@@ -580,13 +660,81 @@ class LocalAIStackApp(App):
             self._start_install(selection)
 
     def refresh_projections(self) -> None:
-        """Ask the application again and repaint whatever repeats its answers."""
-        installation = self._installation()
+        """Coalesce refreshes without concurrent or stale backend observations."""
+        self._projection_generation += 1
+        if not self._projection_running:
+            self._start_projection_worker()
+
+    def _start_projection_worker(self) -> None:
+        self._projection_running = True
+        generation = self._projection_generation
+        self.run_worker(
+            lambda: self._load_projections(generation), thread=True, group="projections"
+        )
+
+    def _load_projections(self, generation: int) -> None:
+        try:
+            self._gather_projections(generation)
+        except Exception:  # noqa: BLE001 -- a status failure must not crash the shell
+            self.post_message(ProjectionsFailed(generation))
+
+    def _gather_projections(self, generation: int) -> None:
+        facts = detect_system() if self._probe_facts else self.facts
+        integration = self._detect_integration() if self._probe_integration else self.integration
+        runtime = stack_runtime() if self._probe_runtime else self.runtime_snapshot
+        if isinstance(self.application, UnwiredHubApplication):
+            self.application.facts = facts
+            self.application.runtime_snapshot = runtime
+        projections = getattr(self.application, "projections", None)
+        if projections is None:
+            installation = self._installation()
+            services, vram = self._services(), self._vram()
+        else:
+            installation, services, vram = projections()
+        self.post_message(
+            ProjectionsLoaded(installation, services, vram, runtime, facts, integration, generation)
+        )
+
+    def on_projections_failed(self, message: ProjectionsFailed) -> None:
+        self._projection_running = False
+        if message.generation != self._projection_generation:
+            self._start_projection_worker()
+            return
+        self._notice("Não foi possível verificar a instalação. Tente novamente.", error=True)
+
+    def on_projections_loaded(self, message: ProjectionsLoaded) -> None:
+        self._projection_running = False
+        if message.generation != self._projection_generation:
+            self._start_projection_worker()
+            return
+        installation = message.installation
+        self.facts = message.facts
+        self._probe_facts = False
+        self.integration = message.integration
+        self.runtime_snapshot = message.runtime
+        self._installation_view = installation
+        try:
+            main = self.query_one(MainContent)
+        except NoMatches:
+            # The answer arrived after the shell was taken down (the app is
+            # exiting); there is nothing left to repaint.
+            return
+        main.refresh_facts(message.facts)
         if installation.ready and installation.profile_id:
             self.select_profile(installation.profile_id)
-        services, vram = self._services(), self._vram()
-        self.query_one(MainContent).refresh_overview(installation, services, vram)
-        self.query_one(RightRail).update_status(services, vram)
+        main.refresh_overview(installation, message.services, message.vram)
+        services_panel = main.query_one(ServicesPanel)
+        services_panel.integration = message.integration
+        services_panel.refresh_runtime(message.runtime)
+        rail = self.query_one(RightRail)
+        rail.facts = message.facts
+        rail.runtime_snapshot = message.runtime
+        rail.update_status(message.services, message.vram)
+        rail.set_pet_state(pet_state_for_stack(message.runtime.state))
+        if self._first_projections_pending:
+            self._first_projections_pending = False
+            if self.first_run_wizard and not installation.ready and self.wizard is None:
+                self.open_wizard()
 
     def run_stack_command(self, verb: str) -> None:
         """Start, stop or restart, if the application will have it."""
@@ -623,7 +771,13 @@ class LocalAIStackApp(App):
             target = LaunchRefusal(str(error))
         except Exception:  # noqa: BLE001 -- provider errors must not escape into the UI
             target = LaunchRefusal("Não foi possível preparar o Open WebUI. Tente novamente.")
-        self.post_message(LaunchResolved(target))
+        opened = False
+        if isinstance(target, LaunchTarget):
+            try:
+                opened = bool(self.open_browser(target.url))
+            except Exception:  # noqa: BLE001 -- browser failures are shown without crashing
+                opened = False
+        self.post_message(LaunchResolved(target, opened))
 
     def on_launch_resolved(self, message: LaunchResolved) -> None:
         target = message.target
@@ -631,11 +785,7 @@ class LocalAIStackApp(App):
             self._notice(target.reason)
             self._end_launch()
             return
-        try:
-            opened = bool(self.open_browser(target.url))
-        except Exception:  # noqa: BLE001 -- browser launch failure is a user-facing refusal
-            opened = False
-        if opened:
+        if message.opened:
             self._notice(f"Abrindo {target.label} no navegador.")
             self.set_timer(LAUNCH_COOLDOWN_SECONDS, self._end_launch)
         else:

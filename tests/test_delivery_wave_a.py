@@ -364,6 +364,13 @@ def assert_transfer_bar_fits(app, width: int) -> str:
     return rendered
 
 
+async def settle(pilot):
+    """The shell repaints, and may open the wizard, once its first refresh answers."""
+    await pilot.app.workers.wait_for_complete()
+    await pilot.pause()
+    await pilot.pause()
+
+
 async def click(pilot, selector):
     button = pilot.app.screen.query_one(selector, Button)
     button.active_effect_duration = 0
@@ -446,12 +453,16 @@ def test_capella_wizard_runs_the_real_coordinator_and_stream_without_blocking_ui
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert isinstance(app.screen, WizardScreen)
             assert app.screen.state.profile_id == "capella"
             await review(pilot)
             await click(pilot, "#wizard-next")
-            assert entered.is_set()
+            # The submission itself runs off the render thread; the coordinator
+            # reaches the seam a moment after it is accepted.
+            await app.workers.wait_for_complete()
+            assert await asyncio.to_thread(entered.wait, 10)
+            await pilot.pause()
             assert app.operation_view is not None and not app.operation_view.terminal
             assert app.screen.state.step is WizardStep.PROGRESS
             assert app.screen.query_one("#wizard-next", Button).disabled
@@ -511,7 +522,7 @@ def test_real_provisioner_output_reaches_adapter_and_granular_tui(composition):
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await review(pilot)
             await click(pilot, "#wizard-next")
             await wait_for_observation(pilot, output.pip_partial)
@@ -727,7 +738,7 @@ def test_real_pip_failure_keeps_sanitized_last_observations_in_tui(composition):
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await review(pilot)
             await click(pilot, "#wizard-next")
             await wait_for_observation(pilot, output.pip_partial)
@@ -780,7 +791,7 @@ def test_real_model_download_reaches_the_real_wizard_and_second_run_is_quiet(com
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await review(pilot)
             await click(pilot, "#wizard-next")
             await wait_for_observation(pilot, transfer.intermediate_ready)
@@ -849,7 +860,7 @@ def test_real_unknown_total_stays_indeterminate_in_the_real_wizard(composition):
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await review(pilot)
             await click(pilot, "#wizard-next")
             await wait_for_observation(pilot, transfer.intermediate_ready)
@@ -894,7 +905,7 @@ def test_real_model_failure_preserves_last_transfer_in_the_real_wizard(compositi
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await review(pilot)
             await click(pilot, "#wizard-next")
             await wait_for_observation(pilot, transfer.intermediate_ready)
@@ -961,7 +972,7 @@ def test_real_failures_reach_the_wizard_as_terminal_diagnostics(
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await review(pilot)
             await click(pilot, "#wizard-next")
             await finish(pilot, adapter)
@@ -1013,7 +1024,7 @@ def test_install_location_round_trips_and_second_run_does_no_work(composition, m
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert not isinstance(app.screen, WizardScreen)
             assert "Pronta" in str(app.query_one("#dashboard-overview", Static).content)
             second.install(selection)
@@ -1044,7 +1055,7 @@ def test_custom_location_flows_from_the_real_wizard_to_backend(composition):
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await review(pilot, mode="custom", root=root)
             await click(pilot, "#wizard-next")
             await finish(pilot, adapter)
@@ -1089,7 +1100,7 @@ def test_open_webui_failure_does_not_open_browser_or_leave_running(composition):
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await click(pilot, "#dashboard-open-webui")
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -1151,7 +1162,7 @@ def test_dashboard_lifecycle_and_real_open_webui_target(composition):
 
     async def exercise():
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await click(pilot, "#dashboard-stop")
             await finish(pilot, adapter)
             assert app.operation_view.succeeded
@@ -1243,7 +1254,7 @@ def test_real_tui_backend_alongside_custom_test_profile_and_second_run(compositi
 
         async def exercise():
             async with app.run_test(size=(120, 40)) as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await review(pilot, profile="test", mode="custom", root=custom_root)
                 await click(pilot, "#wizard-next")
 
@@ -1351,7 +1362,7 @@ def test_real_tui_stop_confirmation_uses_only_adapter_preflight_authority(compos
 
         async def exercise():
             async with app.run_test(size=(120, 40)) as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await review(pilot, profile="test")
                 await click(pilot, "#wizard-next")
                 assert app.screen.state.step is WizardStep.CONFLICT
@@ -1406,7 +1417,7 @@ def test_real_tui_unsafe_external_hides_stop_and_allows_alongside(composition):
 
         async def exercise():
             async with app.run_test(size=(120, 40)) as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await review(pilot, profile="test")
                 await click(pilot, "#wizard-next")
                 report = adapter.current_conflict_preflight()
@@ -1448,7 +1459,7 @@ def test_real_tui_blocked_alternate_endpoint_cancels_without_mutation(compositio
 
         async def exercise():
             async with app.run_test(size=(120, 40)) as pilot:
-                await pilot.pause()
+                await settle(pilot)
                 await review(pilot, profile="test", mode="custom", root=custom_root)
                 await click(pilot, "#wizard-next")
                 report = adapter.current_conflict_preflight()

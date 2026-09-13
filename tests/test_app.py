@@ -197,6 +197,9 @@ def test_right_rail_is_persistent_and_can_collapse():
     async def exercise() -> None:
         app = make_app()
         async with app.run_test() as pilot:
+            # The shell repaints once its first projections arrive; a click
+            # lands on the settled layout, as a person's would.
+            await pilot.pause()
             rail = app.query_one(RightRail)
             assert not rail.is_collapsed
             assert "Pepe" in str(app.query_one("#rail-profile", Static).content)
@@ -599,6 +602,7 @@ def test_pet_animation_and_state_survive_rail_collapse():
     async def exercise() -> None:
         app = make_app()
         async with app.run_test() as pilot:
+            await pilot.pause()  # the first projections repaint the shell
             pet = app.query_one(PetSlot)
             rail = app.query_one(RightRail)
             animator = pet.animator
@@ -718,6 +722,23 @@ def test_plan_view_separates_supported_from_unsupported_steps():
     asyncio.run(exercise())
 
 
+async def preview_settled(app, pilot) -> str:
+    """The plan panel's preview once its workers are idle.
+
+    A request made while a previous resolution is still running is queued and
+    started from the message that ends the first one, so one wait for workers
+    can return in the gap between them. Wait until nothing is running and the
+    panel no longer says it is checking.
+    """
+    for _ in range(50):
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        preview = str(app.query_one("#install-plan-dry-run", Static).content)
+        if "Verificando" not in preview and not app.workers:
+            return preview
+    raise AssertionError("the plan preview never settled")
+
+
 def test_opening_the_plan_view_runs_nothing_and_creates_nothing(tmp_path, monkeypatch):
     stack_root = tmp_path / "PepitosAIHub"
     monkeypatch.setenv(ENV_ROOT, str(stack_root))
@@ -746,8 +767,7 @@ def test_dry_run_button_previews_without_creating_directories(tmp_path, monkeypa
             await pilot.click("#side-installation-plan")
             await pilot.pause()
             app.query_one("#plan-dry-run", Button).press()
-            await pilot.pause()
-            preview = str(app.query_one("#install-plan-dry-run", Static).content)
+            preview = await preview_settled(app, pilot)
             assert "Dry-run preview" in preview
             assert "No directory was created and no download was started" in preview
             assert "Directories that would be created:" in preview
@@ -768,8 +788,7 @@ def test_changing_the_install_location_rebuilds_the_plan_and_drops_the_preview(t
             await pilot.click("#side-installation-plan")
             await pilot.pause()
             app.query_one("#plan-dry-run", Button).press()
-            await pilot.pause()
-            assert "Dry-run preview" in str(app.query_one("#install-plan-dry-run", Static).content)
+            assert "Dry-run preview" in await preview_settled(app, pilot)
 
             await pilot.click("#side-installation-location")
             selector = app.query_one("#installation-location-mode", Select)
@@ -779,10 +798,10 @@ def test_changing_the_install_location_rebuilds_the_plan_and_drops_the_preview(t
             await pilot.pause()
 
             await pilot.click("#side-installation-plan")
-            await pilot.pause()
+            preview = await preview_settled(app, pilot)
             plan = str(app.query_one("#install-plan-steps", Static).content)
             assert "elsewhere" in plan
-            assert "Not run yet" in str(app.query_one("#install-plan-dry-run", Static).content)
+            assert "Not run yet" in preview
 
     asyncio.run(exercise())
     assert not custom_root.exists()

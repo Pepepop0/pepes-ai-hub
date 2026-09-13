@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 from hub_fakes import FakeHubApplication, activity_event, detail_event, transfer_event
 from test_download_progress_ux import state_event
-from test_tui_operations import click, hub, pump, run, text, walk_to_review
+from test_tui_operations import click, hub, pump, run, settle, text, walk_to_review
 from textual.widgets import Button, Static
 
 from local_ai_stack.operation_contracts import (
@@ -467,7 +467,7 @@ def test_the_wizard_shows_the_failure_heading_exactly_once():
     async def exercise() -> None:
         app, fake, _ = hub(FakeHubApplication(install_fail_at="Instalando ComfyUI"))
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
             await pump(pilot, fake)
@@ -593,7 +593,7 @@ def test_the_wizard_shows_activity_and_transfer_together_and_the_toggle_reveals_
     async def exercise() -> None:
         app, fake, _ = hub(FakeHubApplication(custom_script=observability_script))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
             await pump(pilot, fake, 4)
@@ -629,7 +629,7 @@ def test_the_granular_view_fits_at_several_terminal_widths(width):
     async def exercise() -> None:
         app, fake, _ = hub(FakeHubApplication(custom_script=observability_script))
         async with app.run_test(size=(width, 32)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
             await pump(pilot, fake, 4)

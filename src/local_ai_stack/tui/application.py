@@ -73,12 +73,17 @@ class InstallSelection:
 
 @dataclass(frozen=True)
 class InstallationView:
-    """Whether there is a stack to show, and which one. ``root_display`` is masked text."""
+    """Whether there is a stack to show, and which one. ``root_display`` is masked text.
+
+    ``checking`` is the view the shell shows before the application has
+    answered: not "nothing installed", just "not known yet".
+    """
 
     ready: bool
     profile_id: str | None = None
     mode: InstallLocationMode | None = None
     root_display: str | None = None
+    checking: bool = False
 
 
 @dataclass(frozen=True)

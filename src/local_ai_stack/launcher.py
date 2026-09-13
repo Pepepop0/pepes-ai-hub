@@ -167,11 +167,19 @@ SpawnFunction = Callable[..., SpawnedProcess]
 
 
 def _creation_flags() -> dict[str, object]:
-    """Detach the child so it outlives this call but stays addressable."""
+    """Separate the child so it outlives this call but stays addressable.
+
+    On Windows the child gets a console of its own with no window, which its
+    whole tree inherits. ``DETACHED_PROCESS`` is not enough: a detached root
+    has no console, so the first console program it starts (the interpreter
+    behind a venv or console-script launcher) is given a new, visible one, and
+    closing that window ends the service with STATUS_CONTROL_C_EXIT. Windows
+    ignores ``CREATE_NO_WINDOW`` when combined with ``DETACHED_PROCESS``.
+    """
     if os.name != "nt":
         return {"start_new_session": True}
     flags = 0
-    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
+    for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP"):
         flags |= getattr(subprocess, name, 0)
     return {"creationflags": flags} if flags else {}
 

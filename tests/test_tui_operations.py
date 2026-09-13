@@ -346,7 +346,8 @@ def test_progress_within_a_stage_is_shown_as_a_count_not_a_percentage():
             pane = text(app, "#wizard-step-progress")
             assert "Baixando modelos  1/3" in pane
             assert "%" not in pane
-            assert "[b]Instalando[/b]" in pane
+            assert "[b]Instalando[/b]" in text(app, "#wizard-title")
+            assert "[b]Instalando[/b]" not in pane, "the title already names the step"
 
     run(exercise)
 
@@ -364,7 +365,7 @@ def test_a_successful_install_ends_on_done_with_open_webui():
             assert screen.state.step is WizardStep.DONE
             # The frozen installation heading, not the generic operation headline.
             assert "[b]Concluído[/b]" in text(app, "#wizard-title")
-            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+            assert "[b]Concluído[/b]" not in text(app, "#wizard-step-done"), "shown once"
             visible = [b.id for b in screen.query("#wizard-actions Button") if b.display]
             assert visible == ["wizard-details-toggle", "wizard-open-webui", "wizard-finish"]
 
@@ -396,7 +397,7 @@ def test_a_failed_install_shows_a_short_reason_and_offers_a_retry():
             pane = text(app, "#wizard-step-done")
             # The frozen heading: never "Concluído" on a failure.
             assert "[b]Instalação não concluída[/b]" in text(app, "#wizard-title")
-            assert "[b]Instalação não concluída[/b]" in pane
+            assert "Instalação não concluída" not in pane, "shown once, in the title"
             assert "[b]Concluído[/b]" not in pane
             assert "[!]" in pane and "Instalando ComfyUI" in pane
             assert "Verifique a conexão" in pane
@@ -412,7 +413,7 @@ def test_a_failed_install_shows_a_short_reason_and_offers_a_retry():
             await click(pilot, "#wizard-next")
             await pump(pilot, fake)
             assert screen.state.step is WizardStep.DONE
-            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+            assert "[b]Concluído[/b]" in text(app, "#wizard-title")
             assert len(fake.calls) == 2, "a retry is a new operation, not a reopened one"
 
     run(exercise)
@@ -973,7 +974,7 @@ def test_no_conflicts_is_the_ordinary_flow_untouched():
             await pump(pilot, fake)
 
             assert screen.state.step is WizardStep.DONE
-            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+            assert "[b]Concluído[/b]" in text(app, "#wizard-title")
             await click(pilot, "#wizard-open-webui")
             assert opened == ["http://127.0.0.1:8080/"]
 
@@ -1038,7 +1039,7 @@ def test_install_alongside_starts_the_first_real_operation_after_preflight():
 
             assert screen.state.step is WizardStep.DONE
             assert app.operation_view.operation_id == "install-1"
-            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+            assert "[b]Concluído[/b]" in text(app, "#wizard-title")
             assert len(fake.calls) == 2, "preflight attempt plus the accepted install"
             assert {event.operation_id for event in fake.emitted} == {"install-1"}
 
@@ -1098,7 +1099,7 @@ def test_confirming_stop_sends_only_the_frozen_selection_and_resumes():
             assert screen.state.step is WizardStep.PROGRESS
             await pump(pilot, fake)
             assert screen.state.step is WizardStep.DONE
-            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+            assert "[b]Concluído[/b]" in text(app, "#wizard-title")
 
     run(exercise)
 
@@ -1167,7 +1168,7 @@ def test_abort_can_be_followed_by_a_normal_install():
             await pump(pilot, fake)
 
             assert screen.state.step is WizardStep.DONE
-            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+            assert "[b]Concluído[/b]" in text(app, "#wizard-title")
             assert fake.ready
 
     run(exercise)
@@ -1316,7 +1317,7 @@ def test_an_application_without_conflict_support_behaves_as_before():
             await click(pilot, "#wizard-next")
             await pump(pilot, fake)
             assert screen.state.step is WizardStep.DONE
-            assert "[b]Concluído[/b]" in text(app, "#wizard-step-done")
+            assert "[b]Concluído[/b]" in text(app, "#wizard-title")
 
     run(exercise)
 

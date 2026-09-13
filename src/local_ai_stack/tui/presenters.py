@@ -685,8 +685,13 @@ def render_install_progress(
     active_heading: str = "Instalando",
     width: int = DEFAULT_TRANSFER_WIDTH,
     expanded: bool = False,
+    include_heading: bool = True,
 ) -> str:
     """The wizard's granular install view: checklist, activity, transfer, history.
+
+    ``include_heading=False`` leaves the title line out, for a caller whose
+    screen already shows it -- the wizard puts the outcome in its own title,
+    and repeating it in the pane below printed the same heading twice.
 
     Separate from :func:`render_operation`, which the Dashboard's compact
     operation panels keep using for any lifecycle command. An install
@@ -704,13 +709,15 @@ def render_install_progress(
 
     lines: list[str] = []
     if view.terminal:
-        title = heading if heading is not None else view.headline
-        lines.append(f"[b]{escape(title)}[/b]")
+        if include_heading:
+            title = heading if heading is not None else view.headline
+            lines.append(f"[b]{escape(title)}[/b]")
         if view.succeeded:
             lines.append(escape(STATE_HEADLINES[OperationState.SUCCEEDED]))
-    else:
+    elif include_heading:
         lines.append(f"[b]{escape(active_heading)}[/b]")
-    lines.append("")
+    if lines:
+        lines.append("")
 
     # The step counter names *where in the plan* the current step sits, so it
     # only makes sense while a step is actually in progress. A terminal event's

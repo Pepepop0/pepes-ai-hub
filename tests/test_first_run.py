@@ -443,6 +443,114 @@ def test_other_shipped_profiles_are_accepted_by_the_flow(profile_id):
         built.release()
 
 
+def shipped_profile_yaml(name: str) -> str:
+    return (detect_repo_root() / "profiles" / f"{name}.yaml").read_text(encoding="utf-8")
+
+
+TEST_PROFILE = "test"
+
+
+def test_the_test_profile_completes_a_real_first_run_without_fetching_anything():
+    """The smoke that failed at "Aplicando configurações" now finishes.
+
+    Every service is installed, configured and started, and because the
+    profile enables no capability nothing heavy is downloaded or pulled.
+    """
+    built = controlled_stack(
+        profile_yaml=shipped_profile_yaml(TEST_PROFILE), profile_id=TEST_PROFILE
+    )
+    try:
+        recorder = Recorder()
+        result = built.app.first_run("op-test", TEST_PROFILE, emit=recorder)
+
+        assert result.state is OperationState.SUCCEEDED, [d.message for d in result.diagnostics]
+        assert "Aplicando configurações" in recorder.messages
+        assert "Falha ao aplicar configurações" not in recorder.messages
+        assert not any("/models/" in url for url in built.artifacts.requests)
+        assert built.ollama.pulls == []
+        assert built.launcher.starts == ["ollama", "open-webui", "comfyui"]
+        report = built.app.last_first_run
+        assert report.configured and report.acquired == []
+        env = (built.app.layout.open_webui_data / "open-webui.env").read_text(encoding="utf-8")
+        assert "ENABLE_OLLAMA_API=false" in env
+        assert "DEFAULT_MODELS" not in env and "OLLAMA_BASE_URL" not in env
+        assert built.app.status(TEST_PROFILE).installation_ready
+    finally:
+        built.release()
+
+
+def test_the_test_profile_second_run_does_nothing():
+    built = controlled_stack(
+        profile_yaml=shipped_profile_yaml(TEST_PROFILE), profile_id=TEST_PROFILE
+    )
+    try:
+        assert built.app.first_run("op-1", TEST_PROFILE).state is OperationState.SUCCEEDED
+        downloads, starts = len(built.artifacts.requests), list(built.launcher.starts)
+
+        result = built.app.first_run("op-2", TEST_PROFILE)
+
+        assert result.state is OperationState.SUCCEEDED
+        assert built.app.last_first_run.did_nothing
+        assert len(built.artifacts.requests) == downloads
+        assert built.launcher.starts == starts
+    finally:
+        built.release()
+
+
+def test_a_retry_after_configuration_failed_configures_without_reinstalling():
+    """The real partial state: every component installed, configuration refused."""
+    built = controlled_stack(
+        profile_yaml=shipped_profile_yaml(TEST_PROFILE),
+        profile_id=TEST_PROFILE,
+        injections=InjectionPlan.of(Injection.CONFIG_TAMPERED),
+    )
+    try:
+        failed = built.app.first_run("op-1", TEST_PROFILE)
+        assert failed.state is OperationState.FAILED
+        assert set(built.app.last_first_run.installed) == {"ollama", "open-webui", "comfyui"}
+        downloads = len(built.artifacts.requests)
+
+        built.app.deps.config_writer.injections = InjectionPlan.none()
+        recorder = Recorder()
+        result = built.app.first_run("op-2", TEST_PROFILE, emit=recorder)
+
+        assert result.state is OperationState.SUCCEEDED, [d.message for d in result.diagnostics]
+        assert built.app.last_first_run.installed == [], "a valid component was reinstalled"
+        assert built.app.last_first_run.configured
+        assert len(built.artifacts.requests) == downloads
+        assert "Aplicando configurações" in recorder.messages
+    finally:
+        built.release()
+
+
+def test_an_incoherent_profile_is_refused_before_anything_is_installed():
+    """Caught at "Verificando ambiente", not after minutes of installation.
+
+    This one loads -- its text-to-image workflow is declared -- but the manifest
+    it names is not mapped, which no amount of installing would change.
+    """
+    yaml_text = capella_yaml().replace(
+        "text_to_image: {manifest_id: flux2_klein_t2i}",
+        "text_to_image: {manifest_id: flux2_klein_edit}",
+    )
+    assert "flux2_klein_edit}" in yaml_text
+    built = controlled_stack(profile_yaml=yaml_text)
+    try:
+        recorder = Recorder()
+        result = built.app.first_run("op-1", CAPELLA, emit=recorder)
+
+        assert result.state is OperationState.FAILED
+        assert recorder.events[-1].phase is OperationPhase.PREPARATION
+        assert (
+            recorder.events[-1].message == "O perfil habilita recursos que não consegue configurar"
+        )
+        assert any(d.code == "profile-capability" for d in result.diagnostics)
+        assert built.artifacts.requests == []
+        assert built.app.last_first_run.installed == []
+    finally:
+        built.release()
+
+
 def test_an_unknown_profile_is_refused_before_any_operation(stack):
     from local_ai_stack.stack_application import UnknownProfile
 

@@ -14,28 +14,32 @@ hardware:
   vram_tolerance_mib: 128
   notes: O objetivo é validar a stack, não maximizar qualidade.
 
+# The whole stack is installed, started and checked for readiness: that is
+# what this profile smoke-tests, on any supported NVIDIA machine.
 services:
   ollama: {enabled: true, port: 11434}
   open-webui: {enabled: true, port: 8080}
   comfyui: {enabled: true, port: 8188}
 
+# No capability is enabled, because none has what it needs to be configured.
+# A capability is only enabled once the profile names the models and the
+# workflow behind it; enabled over TBD is refused when the profile loads.
+#
+# - chat: no chat model in the catalog meets this profile's own brief (small,
+#   vision, native tool calling). The pinned ones are 8-9B and mostly without
+#   vision, and pinning a new one is a separate decision.
+# - image generation: the only mapped text_to_image workflow is FLUX.2 Klein,
+#   about 12 GB of weights, which is the opposite of a light smoke test.
+#
+# Enable either by naming its models (and, for images, its workflows) here.
 features:
-  chat: true
-  vision: true
-  tools: true
-  image_generation: true
-  image_editing: true
+  chat: false
+  vision: false
+  tools: false
+  image_generation: false
+  image_editing: false
 
-models:
-  chat:
-    primary: TBD
-    status: unresolved
-    requirements: [small, vision, native_tool_calling, configurable_alignment]
-  image:
-    diffusion: TBD
-    text_encoder: TBD
-    vae: TBD
-    requirements: [lightweight, text_to_image, image_edit_if_possible]
+models: {}
 
 runtime:
   aggressive_vram_unload: true

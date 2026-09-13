@@ -594,7 +594,8 @@ def test_the_wizard_shows_the_bar_percentage_bytes_speed_and_eta_live():
             await pump(pilot, fake)
             assert screen.state.step is WizardStep.DONE
             done_pane = text(app, "#wizard-step-done")
-            assert "[b]Concluído[/b]" in done_pane
+            assert "[b]Concluído[/b]" in text(app, "#wizard-title")
+            assert "[b]Concluído[/b]" not in done_pane, "shown once, in the title"
             assert "[#" not in done_pane.replace("\\[", "[")
 
     run(exercise)
@@ -612,7 +613,8 @@ def test_a_download_that_fails_keeps_the_last_progress_with_the_failure_heading(
 
             assert screen.state.step is WizardStep.DONE
             done_pane = text(app, "#wizard-step-done")
-            assert "[b]Instalação não concluída[/b]" in done_pane
+            assert "[b]Instalação não concluída[/b]" in text(app, "#wizard-title")
+            assert "Instalação não concluída" not in done_pane, "shown once, in the title"
             assert "[b]Concluído[/b]" not in done_pane
             assert "1.5" in done_pane and "GiB" in done_pane
             assert "A conexão foi perdida durante o download." in done_pane

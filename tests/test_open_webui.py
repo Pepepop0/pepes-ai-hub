@@ -457,3 +457,132 @@ def test_real_machine_detection_is_read_only(tmp_path):
 def test_data_dir_is_the_layout_data_dir(tmp_path, component):
     context = context_for(tmp_path)
     assert pinned().data_dir(context) == context.layout.data / component
+
+
+# --- retry sobre instalacao parcial ------------------------------------------
+#
+# The real failure: an earlier attempt left a complete environment with the
+# pinned package installed but no marker, and a process from that attempt
+# still held the environment's interpreter. The retry re-ran `venv` over it,
+# which Windows refuses while the interpreter is in use, and the install failed
+# on an environment that needed nothing. `LockedRunner` models exactly that:
+# re-creating an environment that already exists is refused the way venv
+# really refuses it; everything else behaves like the ordinary fake.
+
+LOCK_ERROR = (
+    "Error: [Errno 13] Permission denied: "
+    "'C:\\Users\\Someone\\stack\\apps\\open-webui\\.venv\\Scripts\\python.exe'"
+)
+
+
+class LockedRunner(FakeRunner):
+    def run(self, argv, **kwargs):
+        items = tuple(str(a) for a in argv)
+        if "venv" in items and PythonEnvironment(root=Path(items[-1])).exists:
+            self.calls.append(items)
+            return CommandResult(argv=items, returncode=1, stderr=LOCK_ERROR)
+        return super().run(argv, **kwargs)
+
+
+def partial_install(context: ProvisionContext) -> None:
+    """A complete, pinned environment whose install never wrote its marker."""
+    install_managed(context, marker=False, script=True)
+
+
+def test_a_retry_over_a_partial_install_reuses_the_environment_and_completes(tmp_path):
+    runner = LockedRunner()
+    context = context_for(tmp_path, runner)
+    partial_install(context)
+    assert pinned().detect(context).state is ComponentState.INVALID
+
+    result = pinned().apply(context)
+
+    assert result.outcome is ProvisionOutcome.INSTALLED, result.failure
+    assert not any("venv" in call for call in runner.calls), "a working venv was recreated"
+    assert runner.ran("pip")
+    assert (context.layout.open_webui_app / MARKER_NAME).is_file()
+    assert pinned().verify(context).is_usable
+
+
+def test_a_retry_over_a_partial_install_says_it_is_reusing(tmp_path):
+    seen = []
+    resolved = resolve_installation(InstallLocation.custom(tmp_path / "stack"))
+    context = ProvisionContext(installation=resolved, runner=LockedRunner(), events=seen.append)
+    partial_install(context)
+
+    pinned().apply(context)
+
+    actions = [event.activity.action for event in seen if event.activity is not None]
+    assert "reusing" in actions
+    assert "creating" not in actions
+
+
+def test_the_retry_is_idempotent_once_the_marker_is_written(tmp_path):
+    runner = LockedRunner()
+    context = context_for(tmp_path, runner)
+    partial_install(context)
+    assert pinned().apply(context).outcome is ProvisionOutcome.INSTALLED
+    calls = len(runner.calls)
+
+    second = pinned().apply(context)
+
+    assert second.outcome is ProvisionOutcome.SKIPPED
+    assert not any("pip" in call or "venv" in call for call in runner.calls[calls:])
+
+
+def test_a_broken_environment_is_rebuilt_not_reused(tmp_path):
+    class BrokenInterpreter(FakeRunner):
+        """The environment's own interpreter will not start; others work."""
+
+        def run(self, argv, **kwargs):
+            items = tuple(str(a) for a in argv)
+            if "-c" in items and ".venv" in items[0] and "pip" in items[items.index("-c") + 1]:
+                self.calls.append(items)
+                return CommandResult(argv=items, returncode=1, stderr="cannot start")
+            return super().run(argv, **kwargs)
+
+    runner = BrokenInterpreter()
+    context = context_for(tmp_path, runner)
+    partial_install(context)
+
+    result = pinned().apply(context)
+
+    assert result.outcome is ProvisionOutcome.INSTALLED, result.failure
+    assert runner.ran("-m venv"), "a broken environment was reused"
+
+
+def test_a_locked_environment_that_must_be_rebuilt_reports_why(tmp_path):
+    """Broken interpreter AND locked: the rebuild really fails, and says so."""
+
+    class BrokenAndLocked(LockedRunner):
+        def run(self, argv, **kwargs):
+            items = tuple(str(a) for a in argv)
+            if "-c" in items and ".venv" in items[0] and "pip" in items[items.index("-c") + 1]:
+                self.calls.append(items)
+                return CommandResult(argv=items, returncode=1, stderr="cannot start")
+            return super().run(argv, **kwargs)
+
+    context = context_for(tmp_path, BrokenAndLocked())
+    partial_install(context)
+
+    result = pinned().apply(context)
+
+    assert result.outcome is ProvisionOutcome.FAILED
+    assert result.failure.reason is FailureReason.FILESYSTEM
+    message = result.failure.message
+    assert message.startswith("Could not create the environment.")
+    assert "locked" in message
+    for private in ("Someone", "Scripts", "Errno", "python.exe"):
+        assert private not in message
+    assert not (context.layout.open_webui_app / MARKER_NAME).exists()
+
+
+def test_an_unclassified_environment_failure_keeps_the_plain_message(tmp_path):
+    context = context_for(tmp_path, FakeRunner(venv_ok=False))
+
+    result = pinned().apply(context)
+
+    assert result.outcome is ProvisionOutcome.FAILED
+    assert result.failure.reason is FailureReason.COMMAND_FAILED
+    assert result.failure.message.startswith("Could not create the environment.")
+    assert "venv refused" not in result.failure.message

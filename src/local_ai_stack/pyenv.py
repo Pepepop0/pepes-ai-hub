@@ -76,15 +76,35 @@ class PipFailure:
     summary: str
 
 
+class EnvironmentFailureKind(StrEnum):
+    """Why `python -m venv` failed, when its own output says so plainly."""
+
+    INTERPRETER_IN_USE = "interpreter-in-use"
+    ACCESS_DENIED = "access-denied"
+    PIP_BOOTSTRAP_FAILED = "pip-bootstrap-failed"
+    UNCLASSIFIED = "environment-unclassified"
+
+
+@dataclass(frozen=True)
+class EnvironmentFailure:
+    """One classified environment-creation failure, short and safe to show."""
+
+    kind: EnvironmentFailureKind
+    summary: str
+
+
 class PythonEnvironmentError(RuntimeError):
     """No suitable interpreter, or an environment operation failed.
 
-    ``failure`` is set when the cause came from pip and could be classified,
-    so a provisioner can choose the right failure reason instead of calling
-    every pip problem a command failure.
+    ``failure`` is set when the cause could be classified -- a
+    :class:`PipFailure` for an install, an :class:`EnvironmentFailure` for
+    environment creation -- so a provisioner can choose the right failure
+    reason and say why, instead of calling every problem a command failure.
     """
 
-    def __init__(self, message: str, failure: PipFailure | None = None) -> None:
+    def __init__(
+        self, message: str, failure: PipFailure | EnvironmentFailure | None = None
+    ) -> None:
         super().__init__(message)
         self.failure = failure
 
@@ -116,8 +136,10 @@ class PythonEnvironment:
         return self.python.is_file()
 
 
-def _probe_version(runner: CommandRunner, prefix: Sequence[str]) -> tuple[int, int] | None:
-    result = runner.run([*prefix, "-c", _VERSION_PROBE], timeout=PROBE_TIMEOUT, dry_run=False)
+def _probe_version(
+    runner: CommandRunner, prefix: Sequence[str], *, code: str = _VERSION_PROBE
+) -> tuple[int, int] | None:
+    result = runner.run([*prefix, "-c", code], timeout=PROBE_TIMEOUT, dry_run=False)
     if not result.ok:
         return None
     text = result.stdout.strip().splitlines()
@@ -163,6 +185,31 @@ def describe_range(minimum: tuple[int, int], below: tuple[int, int]) -> str:
     return f">={minimum[0]}.{minimum[1]},<{below[0]}.{below[1]}"
 
 
+# Proves an existing environment is worth keeping: its interpreter starts, it
+# can import pip (so a later install has something to run), and it reports the
+# version it was built with. A venv interrupted before ensurepip finished passes
+# the first check and fails the second, which is exactly the one to rebuild.
+_ENVIRONMENT_PROBE = "import sys, pip; print('%d.%d' % sys.version_info[:2])"
+
+
+def environment_is_reusable(
+    runner: CommandRunner, environment: PythonEnvironment, interpreter: Sequence[str]
+) -> bool:
+    """True when an existing environment already works and matches the interpreter.
+
+    Read-only: it runs the environment's own Python, never writes to it. An
+    environment built from a different minor version is not reused -- its
+    compiled packages belong to that version -- and neither is one whose
+    interpreter will not start or has no pip.
+    """
+    if not environment.exists:
+        return False
+    existing = _probe_version(runner, (str(environment.python),), code=_ENVIRONMENT_PROBE)
+    if existing is None:
+        return False
+    return existing == _probe_version(runner, interpreter)
+
+
 def create_environment(
     runner: CommandRunner,
     environment: PythonEnvironment,
@@ -172,17 +219,24 @@ def create_environment(
     timeout: float = VENV_TIMEOUT,
     on_output: OutputSink | None = None,
 ) -> CommandResult:
-    """Create the virtual environment. Idempotent: an existing one is reused."""
-    result = runner.run(
-        [*interpreter, "-m", "venv", str(environment.root)],
-        timeout=timeout,
-        dry_run=dry_run,
-        on_output=on_output,
-    )
+    """Create the virtual environment, or keep one that already works.
+
+    Re-running ``python -m venv`` over a working environment is not a harmless
+    no-op. It rewrites ``pyvenv.cfg`` and then copies the interpreter over the
+    existing one, and on Windows that copy fails with "Permission denied" for
+    as long as any process started from that interpreter is still running -- a
+    pip left over from an interrupted attempt, say. A retry would then fail on
+    an environment that needed nothing. So a reusable environment is kept as
+    it is, and only an absent or broken one is (re)created.
+    """
+    command = [*interpreter, "-m", "venv", str(environment.root)]
+    if not dry_run and environment_is_reusable(runner, environment, interpreter):
+        return CommandResult(argv=tuple(command), returncode=0, stdout="reused")
+    result = runner.run(command, timeout=timeout, dry_run=dry_run, on_output=on_output)
     if not dry_run and not result.ok:
+        failure = classify_environment_failure(result)
         raise PythonEnvironmentError(
-            f"could not create the virtual environment at {environment.root}: "
-            f"{result.stderr.strip() or result.stdout.strip()}"
+            f"could not create the virtual environment: {failure.summary}", failure
         )
     return result
 
@@ -498,6 +552,59 @@ def _requirement(match: re.Match[str]) -> str:
     """The requirement a pip message named, when it really is one."""
     captured = (match.groupdict().get("item") or "").strip().strip(",;:'\"")
     return captured if _REQUIREMENT_TOKEN.match(captured) else "it"
+
+
+# --- falhas de criacao de ambiente -----------------------------------------
+
+# `venv` reports a failed copy as "[Errno 13] Permission denied: '<path>'" and a
+# sharing violation as "[WinError 32]"; which file it names is what separates
+# a locked interpreter from an unwritable directory. The path itself is only
+# inspected, never repeated.
+_DENIED_RE = re.compile(
+    r"(?:\[Errno 13\] Permission denied|\[WinError 5\] Access is denied"
+    r"|\[WinError 32\][^\n]*)(?::\s*'(?P<path>[^']*)')?",
+    re.IGNORECASE,
+)
+_INTERPRETER_NAME_RE = re.compile(
+    r"[\\/](?:python|pythonw)(?:\d+(?:\.\d+)?)?(?:\.exe)?$", re.IGNORECASE
+)
+_SHARING_VIOLATION_RE = re.compile(r"\[WinError 32\]", re.IGNORECASE)
+_ENSUREPIP_RE = re.compile(r"ensurepip", re.IGNORECASE)
+
+UNCLASSIFIED_ENVIRONMENT_SUMMARY = "Python could not create it, without a cause it stated plainly"
+
+
+def classify_environment_failure(result: CommandResult) -> EnvironmentFailure:
+    """Turn one failed `python -m venv` run into a short, safe summary.
+
+    Same rule as for pip: a handful of plain signals, this module's own words,
+    and nothing of the output itself -- no path, no traceback.
+    """
+    if result.timed_out:
+        return EnvironmentFailure(
+            EnvironmentFailureKind.UNCLASSIFIED, "Python took too long to create it"
+        )
+    if result.not_found:
+        return EnvironmentFailure(
+            EnvironmentFailureKind.UNCLASSIFIED, "the selected Python could not be started"
+        )
+    combined = f"{result.stderr}\n{result.stdout}"
+    denied = _DENIED_RE.search(combined)
+    if denied is not None:
+        path = denied.group("path") or ""
+        if _SHARING_VIOLATION_RE.search(denied.group(0)) or _INTERPRETER_NAME_RE.search(path):
+            return EnvironmentFailure(
+                EnvironmentFailureKind.INTERPRETER_IN_USE,
+                "its Python is locked, usually by a process still running from it",
+            )
+        return EnvironmentFailure(
+            EnvironmentFailureKind.ACCESS_DENIED, "its directory could not be written to"
+        )
+    if _ENSUREPIP_RE.search(combined):
+        return EnvironmentFailure(
+            EnvironmentFailureKind.PIP_BOOTSTRAP_FAILED, "Python could not install pip into it"
+        )
+    return EnvironmentFailure(EnvironmentFailureKind.UNCLASSIFIED, UNCLASSIFIED_ENVIRONMENT_SUMMARY)
 
 
 def distribution_version(

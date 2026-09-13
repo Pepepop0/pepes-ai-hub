@@ -42,7 +42,7 @@ from .installation import ResolvedInstallation
 from .layout import StackLayout
 from .operation_contracts import OperationActivity, OperationActivityCategory, TransferProgress
 from .operations import safe_text
-from .pyenv import PipFailure, PipFailureKind
+from .pyenv import EnvironmentFailure, EnvironmentFailureKind, PipFailure, PipFailureKind
 from .runner import CommandRunner, sanitize
 
 logger = logging.getLogger(__name__)
@@ -130,6 +130,27 @@ def reason_for_pip_failure(failure: PipFailure | None) -> FailureReason:
     if failure is None:
         return FailureReason.COMMAND_FAILED
     return _PIP_FAILURE_REASONS.get(failure.kind, FailureReason.COMMAND_FAILED)
+
+
+_ENVIRONMENT_FAILURE_REASONS = {
+    EnvironmentFailureKind.INTERPRETER_IN_USE: FailureReason.FILESYSTEM,
+    EnvironmentFailureKind.ACCESS_DENIED: FailureReason.FILESYSTEM,
+}
+
+
+def environment_failure_message(
+    base: str, failure: PipFailure | EnvironmentFailure | None
+) -> tuple[FailureReason, str]:
+    """The public reason and message for a failed environment creation.
+
+    Only a classified :class:`EnvironmentFailure` adds anything to ``base``,
+    and what it adds is its own short summary: the message is what reaches the
+    operation's public diagnostic, so nothing of Python's output goes in it.
+    """
+    if not isinstance(failure, EnvironmentFailure):
+        return FailureReason.COMMAND_FAILED, base
+    reason = _ENVIRONMENT_FAILURE_REASONS.get(failure.kind, FailureReason.COMMAND_FAILED)
+    return reason, f"{base} {failure.summary[:1].upper()}{failure.summary[1:]}."
 
 
 class EventLevel(StrEnum):

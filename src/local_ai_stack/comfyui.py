@@ -61,6 +61,7 @@ from .provisioning import (
     ProvisionResult,
     ProvisionStep,
     build_activity,
+    environment_failure_message,
     reason_for_pip_failure,
 )
 from .pyenv import (
@@ -71,6 +72,7 @@ from .pyenv import (
     create_environment,
     describe_range,
     distribution_version,
+    environment_is_reusable,
     find_interpreter,
     pip_install,
 )
@@ -568,22 +570,31 @@ class ComfyUIProvisioner(Provisioner):
                     "The tag moved upstream. No marker was written; re-pin deliberately.",
                 )
 
-        context.emit(
-            self.component_id,
-            f"Creating the environment at {environment.root}",
-            activity=build_activity(
-                OperationActivityCategory.ENVIRONMENT, "creating", "ambiente virtual"
-            ),
-        )
-        try:
-            create_environment(context.runner, environment, interpreter)
-        except PythonEnvironmentError as exc:
-            return self.failed(
-                detection,
-                FailureReason.COMMAND_FAILED,
-                "Could not create the environment.",
-                str(exc),
+        if environment_is_reusable(context.runner, environment, interpreter):
+            # A retry over a partial install: the environment already works,
+            # so it is kept, and only what is missing after it is redone.
+            context.emit(
+                self.component_id,
+                "Reusing the existing virtual environment",
+                activity=build_activity(
+                    OperationActivityCategory.ENVIRONMENT, "reusing", "ambiente virtual"
+                ),
             )
+        else:
+            context.emit(
+                self.component_id,
+                f"Creating the environment at {environment.root}",
+                activity=build_activity(
+                    OperationActivityCategory.ENVIRONMENT, "creating", "ambiente virtual"
+                ),
+            )
+            try:
+                create_environment(context.runner, environment, interpreter)
+            except PythonEnvironmentError as exc:
+                reason, message = environment_failure_message(
+                    "Could not create the environment.", exc.failure
+                )
+                return self.failed(detection, reason, message, str(exc))
         context.emit(
             self.component_id,
             "Validating the virtual environment",

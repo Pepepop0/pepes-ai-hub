@@ -52,7 +52,7 @@ from .download import DownloadProgress
 from .endpoints import DEFAULT_HOST, StackEndpoints
 from .execution import PlanExecutor, ProvisionerRegistry
 from .install_actions import InstallActionHandlers
-from .installation import ResolvedInstallation, detect_repo_root
+from .installation import ResolvedInstallation
 from .inventory import ListenerReport, ScanOutcome, list_listeners
 from .launcher import ProcessLauncher
 from .managed_config import ManagedConfigWriter
@@ -77,6 +77,7 @@ from .provisioning import (
 from .python_runtime import COMPONENT_ID as PYTHON_RUNTIME_COMPONENT_ID
 from .python_runtime import managed_python_runtime
 from .registry import ManagedProcessRegistry
+from .resources import resource_root
 from .runner import CommandRunner
 from .service_config import (
     COMFYUI_SEARCH_PATHS_FILE,
@@ -442,8 +443,15 @@ def default_install_actions(
     options: IntegrationOptions | None = None,
     on_transfer: Callable[[str, DownloadProgress], None] | None = None,
 ) -> InstallActionHandlers:
-    """Bind the shipped profiles/manifests to the three executable domains."""
-    root = Path(repo_root) if repo_root is not None else detect_repo_root()
+    """Bind the shipped profiles/manifests to the three executable domains.
+
+    ``repo_root`` is where the product's own data lives -- ``profiles/``,
+    ``manifests/``, ``workflows/`` -- and defaults to :func:`resource_root`,
+    which is the checkout on a checkout and the bundle inside a frozen build.
+    It is never the folder the executable sits in: that folder is where a
+    portable *stack* goes, and holds no manifests.
+    """
+    root = Path(repo_root) if repo_root is not None else resource_root()
     known_profiles = tuple(profiles) if profiles is not None else load_profiles(root / "profiles")
     known_catalog = catalog if catalog is not None else model_catalog()
     known_workflows = (

@@ -152,6 +152,49 @@ def smoke_report() -> dict:
 
         return f"{LocalAIStackApp.__name__}, {HubApplicationAdapter.__name__}"
 
+    def composition() -> dict:
+        """Build what the Hub builds to open, against the default root.
+
+        This is the path the first packaged build crashed on: the install
+        actions default their data root, the plan panel composes an executor
+        from it, and the hub application resolves every location. Nothing
+        here writes, downloads or starts anything -- the executor only
+        resolves plans, exactly as the Installation section does on render.
+        """
+        from .app import default_executor_factory, project_root, workspace_root
+        from .hub_application import create_hub_application
+        from .installation import InstallLocation, resolve_installation
+        from .integration import default_install_actions, provision_context
+        from .planning import build_install_plan
+
+        installation = resolve_installation(InstallLocation.default())
+        actions = default_install_actions(provision_context(installation))
+        if actions.repo_root != resource_root():
+            raise RuntimeError(f"install actions read {actions.repo_root}, not the resource root")
+        executor = default_executor_factory(installation)
+        # A step the executor cannot run (a "check" it only renders) is not a
+        # packaging problem; a resource it cannot read raises, and that is.
+        plans = {}
+        for profile in actions.profiles.values():
+            steps = executor.resolve(build_install_plan(profile, installation=installation))
+            plans[profile.id] = {
+                "steps": len(steps),
+                "executable": sum(1 for item in steps if item.supported),
+            }
+        hub = create_hub_application(project_root())
+        try:
+            portable = hub.resolve(InstallLocation.portable()).root
+        finally:
+            hub.close()
+        if portable != workspace_root() / "stack":
+            raise RuntimeError(f"portable resolves to {portable}, not beside the workspace")
+        return {
+            "resource_root": str(actions.repo_root),
+            "workflow_specs": sorted(actions.workflow_specs),
+            "plans": plans,
+            "portable_root": str(portable),
+        }
+
     check("profiles", profiles)
     check("manifests", manifests)
     check("workflows", workflows)
@@ -160,6 +203,7 @@ def smoke_report() -> dict:
     check("python_runtime", python_runtime)
     check("folder_picker", folder_picker)
     check("application", application)
+    check("composition", composition)
 
     if is_frozen():
         # A frozen build must never plan to build a venv from itself.
@@ -168,8 +212,12 @@ def smoke_report() -> dict:
         if not report.get("python_runtime", {}).get("managed_runtime_selected"):
             problems.append("python_runtime: frozen process did not select the managed runtime")
         bundle = bundle_directory()
-        for name in ("state_path", "portable_root"):
-            value = report.get(name)
+        composed = report.get("composition") or {}
+        for name, value in (
+            ("state_path", report.get("state_path")),
+            ("portable_root", report.get("portable_root")),
+            ("composition.portable_root", composed.get("portable_root")),
+        ):
             if bundle is not None and value and str(value).startswith(str(bundle)):
                 problems.append(f"{name}: inside the bundle ({value})")
 

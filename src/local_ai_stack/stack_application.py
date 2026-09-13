@@ -58,7 +58,7 @@ from .external_conflicts import (
     terminate_by_pid,
 )
 from .install_actions import InstallActionHandlers
-from .installation import ResolvedInstallation, detect_repo_root
+from .installation import ResolvedInstallation
 from .integration import (
     IntegrationOptions,
     IntegrationSnapshot,
@@ -104,6 +104,7 @@ from .processes import ProcessOrigin, RuntimeProcessState
 from .profiles import Profile, load_profiles
 from .provisioning import ProvisionContext, ProvisionEvent, ProvisionOutcome
 from .registry import ManagedProcessRegistry
+from .resources import resource_root
 from .runner import CommandRunner
 from .service_config import StackConfiguration, declared_capability_problems
 from .services import ServiceState
@@ -266,7 +267,9 @@ class StackApplication:
         dependencies: StackDependencies | None = None,
     ) -> None:
         self.installation = installation
-        self.repo_root = Path(repo_root) if repo_root is not None else detect_repo_root()
+        # Where profiles and manifests are read from: the checkout, or the
+        # bundle of a frozen build. Not the executable's folder.
+        self.repo_root = Path(repo_root) if repo_root is not None else resource_root()
         loaded = (
             tuple(profiles)
             if profiles is not None

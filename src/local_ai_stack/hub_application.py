@@ -333,7 +333,10 @@ def create_hub_application(
     resolve: Callable[[InstallLocation], ResolvedInstallation] | None = None,
     backend_factory: Callable[[ResolvedInstallation], StackApplication] | None = None,
 ) -> HubApplicationAdapter:
-    resolver = resolve or (lambda location: resolve_installation(location, repo_root=repo_root))
+    # ``repo_root`` is where profiles and manifests are read from. A portable
+    # stack is resolved against the workspace instead -- the checkout, or the
+    # folder the executable was unpacked into -- never inside a frozen bundle.
+    resolver = resolve or (lambda location: resolve_installation(location))
     default = resolver(InstallLocation.default())
     portable = resolver(InstallLocation.portable())
     selection_path = default.layout.state / "hub-selection.yaml"

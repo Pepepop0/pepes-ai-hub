@@ -31,6 +31,7 @@ from .installation import (
     InstallLocation,
     InstallLocationMode,
     ResolvedInstallation,
+    detect_repo_root,
     resolve_installation,
 )
 from .integration import IntegrationSnapshot, detect_integration, plan_executor, provision_context
@@ -79,6 +80,15 @@ __all__ = [
 def project_root() -> Path:
     """Where profiles, manifests and workflows live - checkout or frozen bundle alike."""
     return resource_root()
+
+
+def workspace_root() -> Path:
+    """Where a portable stack goes: the checkout, or the folder holding the executable.
+
+    Not :func:`project_root`: a frozen build reads its data from the bundle's
+    private directory, and a stack must never be created inside that.
+    """
+    return detect_repo_root()
 
 
 def default_executor_factory(installation: ResolvedInstallation) -> PlanExecutor:
@@ -319,7 +329,7 @@ class LocalAIStackApp(App):
             return VramSnapshot(datetime.now(UTC), None, None)
 
     def _resolved_installation(self) -> ResolvedInstallation:
-        return resolve_installation(self.installed_config.installation, repo_root=project_root())
+        return resolve_installation(self.installed_config.installation, repo_root=workspace_root())
 
     def _detect_integration(self) -> IntegrationSnapshot:
         return detect_integration(provision_context(self._resolved_installation()))
@@ -337,7 +347,7 @@ class LocalAIStackApp(App):
                 self.profiles,
                 self.selected_profile,
                 self.installed_config,
-                project_root(),
+                workspace_root(),
                 self._installation(),
                 services,
                 vram,

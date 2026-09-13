@@ -8,6 +8,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, ContentSwitcher, Input, Label, Select, Static
 
+from .. import PRODUCT_NAME, display_version
 from ..application_contracts import ServicesSnapshot, VramSnapshot
 from ..config import InstalledConfig, UiConfig
 from ..execution import ExecutionReport, PlanExecutor
@@ -748,5 +749,5 @@ class FooterBar(Horizontal):
         super().__init__(id="footer-bar")
 
     def compose(self) -> ComposeResult:
-        yield Static("Pepito's AI Hub", id="footer-brand")
-        yield Static("v0.1", id="footer-version")
+        yield Static(PRODUCT_NAME, id="footer-brand")
+        yield Static(display_version(), id="footer-version")

@@ -23,3 +23,23 @@ artifacts:
     filename: ollama-windows-amd64.zip
     sha256: 2439cbea65310b1aadf7d8fc41d7faf5d033f920d42e00a476c58bf9bff6950e
     size_bytes: 1460134793
+
+  # The Python the packaged Hub installs Open WebUI and ComfyUI with.
+  #
+  # A frozen build carries no usable interpreter of its own - its
+  # sys.executable is the Hub itself - and the person running it may have no
+  # Python installed at all. So the product provisions one, pinned like every
+  # other artifact, into <root>/runtime/python and creates every managed
+  # virtual environment from it. A source checkout keeps using its own venv.
+  #
+  # python-build-standalone 3.11.16, release 20260901, stable. The
+  # `install_only` flavour is a plain relocatable CPython with venv and
+  # ensurepip, not the python.org embeddable zip, which ships neither. 3.11
+  # is the version the ComfyUI torch triple and Open WebUI are validated on.
+  - id: python-windows-amd64
+    component: python-runtime
+    version: "3.11.16"
+    url: https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.11.16+20260901-x86_64-pc-windows-msvc-install_only.tar.gz
+    filename: cpython-3.11.16+20260901-x86_64-pc-windows-msvc-install_only.tar.gz
+    sha256: 6be524fa6752af802146a4adc7d098565425b0b1c166e19a5a7a4c8cccb86bf6
+    size_bytes: 47940627

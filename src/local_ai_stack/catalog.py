@@ -33,7 +33,7 @@ import yaml
 
 from .artifacts import Artifact, ArtifactError, load_artifact_manifest
 from .components import normalize_component_id
-from .installation import InstallLocationError, detect_repo_root
+from .resources import resource_root
 
 ARTIFACT_MANIFEST = "artifacts.yaml"
 REPOSITORY_MANIFEST = "repositories.yaml"
@@ -98,11 +98,14 @@ class PinnedRepository:
 
 
 def manifest_dir() -> Path | None:
-    """Where the shipped manifests live, or None outside a checkout."""
-    try:
-        return detect_repo_root() / MANIFEST_DIR
-    except InstallLocationError:
-        return None
+    """Where the shipped manifests live, or None when they cannot be found.
+
+    Resolved through :mod:`resources`, so a frozen build reads the manifests
+    PyInstaller bundled rather than walking up from ``__file__`` for a
+    ``pyproject.toml`` that does not exist inside the bundle.
+    """
+    directory = resource_root() / MANIFEST_DIR
+    return directory if directory.is_dir() else None
 
 
 def _manifest_path(name: str) -> Path | None:

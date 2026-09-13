@@ -63,9 +63,9 @@ from .pyenv import (
     describe_range,
     distribution_version,
     environment_is_reusable,
-    find_interpreter,
     pip_install,
 )
+from .python_runtime import ManagedPythonRuntime, resolve_interpreter
 
 COMPONENT_ID = str(ComponentId.OPEN_WEBUI)
 DISTRIBUTION = "open-webui"
@@ -86,9 +86,13 @@ class OpenWebUIProvisioner(Provisioner):
         *,
         version: str | None = None,
         install_alongside_external: bool = False,
+        python_runtime: ManagedPythonRuntime | None = None,
     ) -> None:
         self.version = version
         self.install_alongside_external = install_alongside_external
+        # The packaged product's own Python; None means "search the host",
+        # which is what a source checkout does. See python_runtime.py.
+        self.python_runtime = python_runtime
 
     @property
     def requirement(self) -> str | None:
@@ -309,14 +313,24 @@ class OpenWebUIProvisioner(Provisioner):
             "Locating a supported Python interpreter",
             activity=build_activity(OperationActivityCategory.ENVIRONMENT, "locating", "Python"),
         )
-        interpreter = find_interpreter(context.runner, minimum=PYTHON_MINIMUM, below=PYTHON_BELOW)
-        if interpreter is None:
+        resolution = resolve_interpreter(
+            context,
+            self.component_id,
+            minimum=PYTHON_MINIMUM,
+            below=PYTHON_BELOW,
+            runtime=self.python_runtime,
+            dry_run=dry_run,
+        )
+        if resolution.interpreter is None:
+            assert resolution.reason is not None
             return self.failed(
                 detection,
-                FailureReason.PRECONDITION,
-                "No supported Python interpreter was found.",
-                f"Open WebUI requires Python {describe_range(PYTHON_MINIMUM, PYTHON_BELOW)}.",
+                resolution.reason,
+                resolution.message,
+                resolution.detail
+                or f"Open WebUI requires Python {describe_range(PYTHON_MINIMUM, PYTHON_BELOW)}.",
             )
+        interpreter = resolution.interpreter
 
         if dry_run:
             return self.dry_run_result(

@@ -15,11 +15,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from .resources import resource_root
+
 ENV_ASSETS_ROOT = "PEPITOS_AI_HUB_ASSETS"
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return resource_root()
 
 
 def assets_directory() -> Path:

@@ -36,6 +36,7 @@ from .installation import (
 from .integration import IntegrationSnapshot, detect_integration, plan_executor, provision_context
 from .operation_contracts import OperationEvent, OperationSnapshot
 from .profiles import Profile, load_profiles
+from .resources import resource_root
 from .runtime import StackRuntime, stack_runtime
 from .system import SystemFacts, detect_system
 from .tui.appearance import TuiAppearance, resolve_tui_appearance, textual_theme
@@ -76,7 +77,8 @@ __all__ = [
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    """Where profiles, manifests and workflows live - checkout or frozen bundle alike."""
+    return resource_root()
 
 
 def default_executor_factory(installation: ResolvedInstallation) -> PlanExecutor:

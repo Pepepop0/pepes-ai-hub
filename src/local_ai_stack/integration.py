@@ -74,6 +74,8 @@ from .provisioning import (
     Provisioner,
     RuntimeHandoff,
 )
+from .python_runtime import COMPONENT_ID as PYTHON_RUNTIME_COMPONENT_ID
+from .python_runtime import managed_python_runtime
 from .registry import ManagedProcessRegistry
 from .runner import CommandRunner
 from .service_config import (
@@ -227,6 +229,9 @@ def default_provisioners(options: IntegrationOptions | None = None) -> dict[str,
     """
     resolved_options = options or IntegrationOptions()
     open_webui_pin = package_for(OPEN_WEBUI_COMPONENT_ID)
+    # A frozen build gets the pinned managed Python; a checkout gets None and
+    # keeps using its own venv. Both Python components share the one runtime.
+    python_runtime = managed_python_runtime(artifact_for(PYTHON_RUNTIME_COMPONENT_ID))
     return {
         OLLAMA_COMPONENT_ID: OllamaProvisioner(
             artifact=artifact_for(OLLAMA_COMPONENT_ID),
@@ -235,10 +240,12 @@ def default_provisioners(options: IntegrationOptions | None = None) -> dict[str,
         OPEN_WEBUI_COMPONENT_ID: OpenWebUIProvisioner(
             version=None if open_webui_pin is None else open_webui_pin.version,
             install_alongside_external=resolved_options.allows_alongside(OPEN_WEBUI_COMPONENT_ID),
+            python_runtime=python_runtime,
         ),
         COMFYUI_COMPONENT_ID: comfyui_provisioner(
             repository_for(COMFYUI_COMPONENT_ID),
             install_alongside_external=resolved_options.allows_alongside(COMFYUI_COMPONENT_ID),
+            python_runtime=python_runtime,
         ),
     }
 

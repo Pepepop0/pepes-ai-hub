@@ -654,9 +654,21 @@ class ControlledInventory:
         self.listeners.append(Listener("127.0.0.1", port, pid))
         self.processes.append(ProcessInfo(pid, Path(path).name, path, f"{path} serve", 1.0))
 
-    def spawn(self, pid: int, executable: str, port: int | None = None) -> None:
+    def spawn(
+        self,
+        pid: int,
+        executable: str,
+        port: int | None = None,
+        *,
+        ppid: int | None = None,
+        create_time: float = 2.0,
+    ) -> None:
+        """A process appears, with the parent pid and creation time the kernel
+        would record for it. Both are what ancestry proof reads."""
         self.processes.append(
-            ProcessInfo(pid, Path(executable).name, executable, f"{executable} serve", 2.0)
+            ProcessInfo(
+                pid, Path(executable).name, executable, f"{executable} serve", create_time, ppid
+            )
         )
         if port is not None:
             self.listeners.append(Listener("127.0.0.1", port, pid))
@@ -684,6 +696,13 @@ class ControlledLauncher:
     ``owns``/``tree_pids``. That matters because a stop that terminated only the
     root would leave those entries alive, and the world's residual check would
     find them, which is exactly the failure this models.
+
+    Each descendant is spawned as the kernel would record it: its parent is
+    the member above it and it was created after it. ``listener_depth`` says
+    which member opens the service port -- ``0`` is the root, as every early
+    scenario assumed; a real Open WebUI or ComfyUI serves from a child or
+    grandchild of the process the registry knows, and ownership must be proved
+    across that gap, not assumed away by giving the root the port.
     """
 
     def __init__(
@@ -697,7 +716,10 @@ class ControlledLauncher:
         endpoints: ControlledEndpoints | None = None,
         descendants: int = 1,
         ready_ports: Mapping[str, int] | None = None,
+        listener_depth: int = 0,
     ) -> None:
+        if not 0 <= listener_depth <= descendants:
+            raise ValueError("listener_depth must name the root (0) or one of the descendants")
         self.registry = registry
         self.inventory = inventory
         self.plan = plan or InjectionPlan.none()
@@ -710,6 +732,7 @@ class ControlledLauncher:
         self._pids: dict[str, int] = {}
         self.endpoints = endpoints
         self.descendants = descendants
+        self.listener_depth = listener_depth
         self.starts: list[str] = []
         self.stops: list[str] = []
         self.closed = False
@@ -736,11 +759,20 @@ class ControlledLauncher:
         self.starts.append(service_id)
         root_pid = self._pid_for(service_id)
         port = self.ready_ports.get(service_id, self.ready_port if root_pid == self.pid else None)
-        self.inventory.spawn(root_pid, executable, port)
+        born = 2.0 + len(self.starts)
+        self.inventory.spawn(
+            root_pid, executable, port if self.listener_depth == 0 else None, create_time=born
+        )
         tree = [root_pid]
         for offset in range(1, self.descendants + 1):
             child = root_pid + offset
-            self.inventory.spawn(child, f"{executable}-worker-{offset}")
+            self.inventory.spawn(
+                child,
+                f"{executable}-worker-{offset}",
+                port if offset == self.listener_depth else None,
+                ppid=tree[-1],
+                create_time=born + offset / 1000,
+            )
             tree.append(child)
         self.members[service_id] = tuple(tree)
         self.started_trees[service_id] = tuple(tree)

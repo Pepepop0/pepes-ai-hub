@@ -89,6 +89,7 @@ def controlled_stack(
     ollama_models=(),
     injections: InjectionPlan | None = None,
     ready_ports=ALL_PORTS,
+    listener_depth: int = 0,
 ) -> ControlledStack:
     plan = injections or InjectionPlan.none()
     fixture = repo_fixture(profile_id, profile_yaml=profile_yaml or capella_yaml(), injections=plan)
@@ -113,6 +114,10 @@ def controlled_stack(
             plan=plan,
             ready_ports=ports,
             endpoints=endpoints,
+            # Two descendants let the port sit two hops below the root, the
+            # shape of a real Open WebUI: launcher -> venv python -> server.
+            descendants=max(1, listener_depth),
+            listener_depth=listener_depth,
         )
         launchers.append(launcher)
         return launcher
@@ -190,3 +195,21 @@ def controlled_stack(
     )
     built.runner = runner
     return built
+
+
+def restarted_hub(built: ControlledStack) -> StackApplication:
+    """The same root, opened by a Hub that was started again.
+
+    Nothing about the machine changes: the processes the previous session
+    started are still in the inventory and still hold their ports. What is
+    gone is the session -- a new application gets a new launcher with no job
+    handles, so ownership can only be proved from the registry and the process
+    table, exactly as after a real restart.
+    """
+    return StackApplication(
+        built.root.installation,
+        profiles=load_profiles(built.fixture.path / "profiles"),
+        repo_root=built.fixture.path,
+        options=IntegrationOptions(),
+        dependencies=built.app.deps,
+    )

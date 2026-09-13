@@ -44,6 +44,9 @@ class ProcessInfo:
     exe: str | None = None
     cmdline: str = ""
     create_time: float | None = None
+    # The pid that created this process, as the kernel recorded it. A number,
+    # not a process: the parent may have exited and its pid been reused since.
+    ppid: int | None = None
 
 
 class LookupOutcome(str, Enum):
@@ -137,7 +140,7 @@ def list_processes(*, exclude_self: bool = True) -> ProcessReport:
         return ProcessReport(ScanOutcome.UNAVAILABLE, detail="psutil is not installed")
     own_pid = os.getpid()
     try:
-        raw = list(psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time"]))
+        raw = list(psutil.process_iter(["pid", "name", "exe", "cmdline", "create_time", "ppid"]))
     except (psutil.Error, NotImplementedError, OSError) as exc:
         return ProcessReport(ScanOutcome.UNAVAILABLE, detail=_unavailable_detail(exc))
     processes = []
@@ -154,6 +157,7 @@ def list_processes(*, exclude_self: bool = True) -> ProcessReport:
                 info.get("exe"),
                 " ".join(cmdline),
                 info.get("create_time"),
+                info.get("ppid"),
             )
         )
     return ProcessReport(ScanOutcome.OK, tuple(processes))
@@ -172,13 +176,14 @@ def lookup_process(pid: int) -> ProcessLookup:
             exe = _best_effort(proc.exe)
             cmdline = _best_effort(proc.cmdline) or []
             create_time = _best_effort(proc.create_time)
+            ppid = _best_effort(proc.ppid)
     except psutil.NoSuchProcess:
         return ProcessLookup(LookupOutcome.NOT_FOUND, detail=f"no process with pid {pid}")
     except (psutil.Error, NotImplementedError, OSError) as exc:
         return ProcessLookup(LookupOutcome.UNAVAILABLE, detail=_unavailable_detail(exc))
     return ProcessLookup(
         LookupOutcome.FOUND,
-        ProcessInfo(pid, name, exe, " ".join(cmdline), create_time),
+        ProcessInfo(pid, name, exe, " ".join(cmdline), create_time, ppid),
     )
 
 

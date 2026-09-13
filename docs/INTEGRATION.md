@@ -147,6 +147,22 @@ Dois limites medidos nesta máquina antes de escrever o código:
    instantes nasce fora do job. A falha é segura por construção: esse neto não é
    provável, então é **deixado vivo**, nunca morto por suposição.
 
+**Reconhecer não é matar.** O processo que atende a porta quase nunca é a raiz
+registrada: `open-webui.exe` inicia um `python.exe` de venv que inicia o
+interpretador real; o `python.exe` de venv do ComfyUI roda `main.py` num filho.
+Para *reconhecer* a stack como nossa (preflight, status, detecção de conflito)
+existe uma segunda prova, mais fraca que o job e usada só para isso:
+`registry.proven_descendants` sobe a cadeia de PPIDs dentro de **um** scan de
+processos, exigindo em cada salto que o pai exista no scan e tenha sido criado
+antes do filho — um PPID reciclado pertence a um processo nascido *depois* do
+filho, e é recusado por isso. A caminhada é limitada (`MAX_DESCENT_DEPTH`) e
+para em ciclo. A raiz continua sendo a entrada do registry com identidade
+verificada por `create_time`; raiz reciclada não possui árvore nenhuma.
+`StackApplication.managed_pids` junta as duas provas: membros do job quando a
+sessão os tem, descendência quando não tem. O que nenhuma das duas prova é
+externo, seja qual for o nome ou a porta. Essa prova **nunca** autoriza um
+stop: encerrar continua agindo sobre a raiz verificada ou sobre o job.
+
 3. **Shim de venv.** Um `python.exe` de venv no Windows é um lançador que
    inicia o interpretador real como outro processo e sai. Adotar o shim adota
    algo que já está saindo, e o processo que faz o trabalho nasce fora do job.

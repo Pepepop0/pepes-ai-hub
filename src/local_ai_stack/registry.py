@@ -20,6 +20,16 @@ The four verdicts are deliberately distinct:
 ``UNKNOWN``
     we could not inspect the pid. Nothing is assumed and nothing is acted on.
 
+A registered process is the *root* of a service, and the process that serves
+the port is often not the root: ``open-webui.exe`` starts a venv interpreter
+that starts the real one, and ``main.py`` under a venv ``python.exe`` runs in a
+child of it. So recognising the service also needs the root's descendants, and
+:func:`proven_descendants` proves them one hop at a time -- every hop must lead
+to a live process that was created *before* its child, which is exactly what a
+reused parent pid cannot satisfy. That proof says which processes may be
+*recognised* as the service's own; it is never a licence to stop them. Stopping
+still acts on the verified root, or on a kernel job (see :mod:`jobs`).
+
 Storage is one JSON document under ``StackLayout.state``, written atomically.
 No database, no daemon, no background thread.
 """
@@ -44,6 +54,9 @@ REGISTRY_NAME = "managed-processes"
 # than any rounding, and far less than the gap between a pid dying and the OS
 # handing the same number to a new process.
 CREATE_TIME_TOLERANCE = 1.0
+# A service tree is a launcher, an interpreter or two, and the process serving
+# the port. A chain longer than this is not a tree this manager started.
+MAX_DESCENT_DEPTH = 16
 
 
 class IdentityVerdict(str, Enum):
@@ -314,12 +327,69 @@ class ManagedProcessRegistry:
         return None if entry is None else self.verify(entry, processes=processes)
 
     def managed_pids(self, *, processes: ProcessReport | None = None) -> frozenset[int]:
-        """Pids we own *right now* — the input every discovery call expects."""
-        return frozenset(
-            status.entry.pid
-            for status in self.statuses(processes=processes).values()
-            if status.live
-        )
+        """Pids we own *right now* — the input every discovery call expects.
+
+        Every live root, plus the descendants a usable process report proves
+        are its tree (see :func:`proven_descendants`). Without a report only
+        the roots can be answered: descent is proved from the table, never
+        from one pid at a time.
+        """
+        pids: set[int] = set()
+        for status in self.statuses(processes=processes).values():
+            if not status.live:
+                continue
+            pids.add(status.entry.pid)
+            if processes is not None and processes.usable and status.process is not None:
+                pids |= proven_descendants(status.process, processes)
+        return frozenset(pids)
+
+
+def proven_descendants(root: ProcessInfo, processes: ProcessReport) -> frozenset[int]:
+    """Every process in the report whose ancestry provably reaches ``root``.
+
+    ``root`` must already be identity-verified (a ``LIVE`` entry's process).
+    A process is proved one hop at a time, from itself up to the root, and a
+    single doubtful hop rejects it:
+
+    * the recorded parent pid must name a process in the same report -- a
+      parent that exited breaks the chain, and nothing is guessed past it;
+    * both sides of a hop must carry a creation time, and the parent's must
+      not be later than the child's. A parent is alive when its child is
+      created, so a pid that was reused since belongs to a process created
+      *after* the child, which this rejects. That is the pid-reuse guard;
+    * the chain is bounded (:data:`MAX_DESCENT_DEPTH`) and a pid seen twice
+      ends it: a cycle is not a tree.
+
+    A parent pid is what the kernel recorded at creation, so this proves that
+    the root's tree created the process. It does not prove the process is
+    still in the tree's job, and it is never used to stop anything.
+    """
+    if not processes.usable:
+        return frozenset()
+    by_pid = {process.pid: process for process in processes.processes}
+    proven: set[int] = set()
+    for candidate in processes.processes:
+        if candidate.pid != root.pid and _descends_from(candidate, root, by_pid):
+            proven.add(candidate.pid)
+    return frozenset(proven)
+
+
+def _descends_from(candidate: ProcessInfo, root: ProcessInfo, by_pid: dict) -> bool:
+    current = candidate
+    visited = {candidate.pid}
+    for _ in range(MAX_DESCENT_DEPTH):
+        parent = by_pid.get(current.ppid) if current.ppid else None
+        if parent is None or parent.pid in visited:
+            return False
+        if parent.create_time is None or current.create_time is None:
+            return False
+        if parent.create_time > current.create_time:
+            return False
+        if parent.pid == root.pid:
+            return True
+        visited.add(parent.pid)
+        current = parent
+    return False
 
 
 def build_entry(

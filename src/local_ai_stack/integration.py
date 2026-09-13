@@ -275,9 +275,11 @@ def preflight_managed_stack(
     are free.
 
     ``managed_pids`` names processes this manager itself started and still
-    owns, as the registry proves them.  A managed port held by one of them is
-    not a collision: it is the stack already running.  Anything else on a
-    managed port still is.
+    owns -- the registry's verified roots and the descendants proved to be
+    their tree (``StackApplication.managed_pids``).  A managed port held by one
+    of them is not a collision: it is the stack already running, even when the
+    process on the port is the interpreter behind a launcher rather than the
+    launcher itself.  Anything else on a managed port still is.
     """
     endpoints = options.endpoints_for(profile)
     compatibility = evaluate_compatibility(facts or detect_system(), profile)

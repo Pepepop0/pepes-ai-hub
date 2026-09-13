@@ -224,10 +224,16 @@ def test_open_webui_adapter_drives_a_real_child_through_its_lifecycle(tmp_path, 
         list_listeners_fn=lambda: NO_LISTENER_SCAN,
         poll_interval=0.05,
     )
+    # The shipped spec recognises Open WebUI by name and command line. With no
+    # listener scan to scope it to a port, a real Open WebUI on this machine is
+    # found, correctly refused as external, and must never be reaped by us.
+    already = controller.status("open-webui")
+    if already.runtime.state is RuntimeProcessState.RUNNING:
+        pytest.skip(f"a real Open WebUI is running here (pids {already.runtime.pids})")
 
     started = controller.start("open-webui", wait=True)
+    assert started.outcome is LaunchOutcome.STARTED, started.launch.detail
     reaper.append(started.pid)
-    assert started.outcome is LaunchOutcome.STARTED
     assert started.ready
 
     running_status = controller.status("open-webui")

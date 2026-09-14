@@ -90,6 +90,8 @@ class FirstRunReport:
     configured: bool = False
     configuration_changed: bool = False
     started: list[str] = field(default_factory=list)
+    # Integrations that changed something inside a running service.
+    integrated: list[str] = field(default_factory=list)
     external: list[str] = field(default_factory=list)
     unmapped_workflows: list[str] = field(default_factory=list)
     warnings: list[OperationDiagnostic] = field(default_factory=list)
@@ -104,6 +106,7 @@ class FirstRunReport:
             and not self.acquired
             and not self.configuration_changed
             and not self.started
+            and not self.integrated
         )
 
 
@@ -235,6 +238,7 @@ class FirstRunCoordinator:
         controller = self.app._controller(self.profile)
         current = controller.status(service_id)
         if current.health.state is ServiceState.UP:
+            self._integrate(service_id)
             return
         component = self.app._integration().by_service(service_id)
         external = current.origin.value == "external" or (
@@ -272,6 +276,19 @@ class FirstRunCoordinator:
             OperationActivity(OperationActivityCategory.READINESS, "ready", name), f"{name} pronto"
         )
         self.report.started.append(service_id)
+        self._integrate(service_id)
+
+    def _integrate(self, service_id: str) -> None:
+        """What a running service still needs from the Hub. Idempotent."""
+        if service_id != str(ComponentId.OPEN_WEBUI):
+            return
+        report = self.app.integrate_open_webui(self.stream, self.profile)
+        if report is None:
+            return
+        if report.changed:
+            self.report.integrated.append(service_id)
+        elif not report.ok:
+            self.report.warnings.append(diagnostic("open-webui-integration", report.detail))
 
     def _acquire_models(self, plan: InstallPlan) -> None:
         steps = [step for step in plan.steps if step.action is PlanAction.ACQUIRE_MODEL]

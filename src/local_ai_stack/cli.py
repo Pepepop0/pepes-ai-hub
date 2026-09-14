@@ -115,6 +115,16 @@ def smoke_report() -> dict:
             raise RuntimeError(f"embedded workflow graphs missing: {', '.join(missing)}")
         return {"declared": sorted(specs), "embedded": sorted(embedded)}
 
+    def image_filter() -> dict:
+        # The Filter Function the Hub installs into Open WebUI is a resource;
+        # a build that cannot read it cannot connect the Image feature.
+        from .open_webui_filters import FILTER_ID, filter_path, filter_source
+
+        source = filter_source()
+        if "required_open_webui_version:" not in source or "class Filter" not in source:
+            raise RuntimeError(f"{filter_path()} is not the image chat filter")
+        return {"id": FILTER_ID, "path": str(filter_path()), "bytes": len(source)}
+
     def state_path() -> str:
         from .installation import InstallLocation, resolve_installation
 
@@ -198,6 +208,7 @@ def smoke_report() -> dict:
     check("profiles", profiles)
     check("manifests", manifests)
     check("workflows", workflows)
+    check("image_filter", image_filter)
     check("state_path", state_path)
     check("portable_root", portable_root)
     check("python_runtime", python_runtime)

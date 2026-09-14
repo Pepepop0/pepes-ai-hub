@@ -127,6 +127,17 @@ def test_the_smoke_exercises_the_composition_the_tui_needs(frozen_build):
     assert "flux2_klein_t2i" in composed["workflow_specs"]
 
 
+def test_the_image_chat_filter_is_read_from_the_bundle(frozen_build):
+    from local_ai_stack.open_webui_filters import filter_path, filter_source
+
+    _, bundle = frozen_build
+    assert filter_path() == bundle / "assets" / "open-webui" / "pepito_image_chat.py"
+    assert "class Filter" in filter_source()
+    report = smoke_report()
+    assert report["ok"], report["problems"]
+    assert report["image_filter"]["path"] == str(filter_path())
+
+
 def test_the_smoke_names_a_missing_workflow_manifest(frozen_build):
     _, bundle = frozen_build
     (bundle / "manifests" / "workflows.yaml").unlink()

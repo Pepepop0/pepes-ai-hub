@@ -90,7 +90,10 @@ from .model_installer import ModelInstaller
 from .model_resolver import StackModelResolver, unresolved_roles
 from .models import ManagedModelPaths
 from .ollama_models import HttpOllamaClient
+from .open_webui_filters import FilterSyncReport, sync_image_chat_filter
 from .operation_contracts import (
+    OperationActivity,
+    OperationActivityCategory,
     OperationEvent,
     OperationEventSink,
     OperationPhase,
@@ -102,7 +105,7 @@ from .operations import OperationStream, diagnostic, safe_text, utc_now
 from .planning import InstallPlan, PlanAction, build_install_plan
 from .probes import http_probe, tcp_probe
 from .processes import ProcessOrigin, RuntimeProcessState
-from .profiles import Profile, load_profiles
+from .profiles import FEATURE_IMAGE_GENERATION, Profile, load_profiles
 from .provisioning import ProvisionContext, ProvisionEvent, ProvisionOutcome
 from .registry import ManagedProcessRegistry
 from .resources import resource_root
@@ -173,6 +176,8 @@ class StackDependencies:
     # Ends one already identity-confirmed external process; see
     # external_conflicts.terminate_by_pid for why this is not launcher.py.
     terminate_process: Callable[[int, float], bool] = terminate_by_pid
+    # Keeps the Hub's image chat filter current inside a running Open WebUI.
+    filter_sync: Callable[[Path, str], FilterSyncReport] = sync_image_chat_filter
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], datetime] = utc_now
@@ -831,7 +836,12 @@ class StackApplication:
 
             controller = self._controller(profile)
             current = controller.status(service_id)
-            if current.health.state is not ServiceState.UP:
+            warnings = []
+            if current.health.state is ServiceState.UP:
+                # Already serving: still make sure the Hub's filter is current
+                # in it, so a stack started before an upgrade catches up here.
+                warnings = self._integrate(stream, profile, service_id)
+            else:
                 # Dependencies first, then the service itself, all bounded by the
                 # controller's own readiness wait.
                 failure = self._start_services(
@@ -863,8 +873,42 @@ class StackApplication:
                     [diagnostic("open-webui-not-ready", current.health.detail)],
                 )
                 return OpenWebUILaunch(result, target)
-            result = stream.succeed(OperationPhase.FINALIZATION, "Open WebUI pronto")
+            result = stream.succeed(
+                OperationPhase.FINALIZATION, "Open WebUI pronto", diagnostics=warnings
+            )
             return OpenWebUILaunch(result, target)
+
+    # --- integrações ---------------------------------------------------------
+
+    def integrate_open_webui(
+        self, stream: OperationStream, profile: Profile
+    ) -> FilterSyncReport | None:
+        """Once Open WebUI answers, keep the Hub's image chat filter current in it.
+
+        The filter is what makes the UI's Image feature reach ComfyUI (see
+        ``assets/open-webui/pepito_image_chat.py``). It lives in Open WebUI's own database,
+        so it is synced through Open WebUI's API every time the service is up
+        and the profile wants image generation: installed once, updated when
+        the shipped source changes, and otherwise left alone. None when the
+        profile has no use for it.
+        """
+        endpoints = self.options.endpoints_for(profile)
+        if not profile.enables(FEATURE_IMAGE_GENERATION) or not endpoints.enabled(
+            profile, str(ComponentId.OPEN_WEBUI)
+        ):
+            return None
+        stream.activity(
+            OperationActivity(OperationActivityCategory.CONFIGURATION, "integrating", "Open WebUI"),
+            "Integrando o Open WebUI",
+        )
+        report = self.deps.filter_sync(self.layout.open_webui_data, endpoints.open_webui)
+        stream.detail(
+            OperationActivity(
+                OperationActivityCategory.CONFIGURATION, report.outcome.value, "Open WebUI"
+            ),
+            f"Open WebUI: {_INTEGRATION_WORDS.get(report.outcome.value, report.outcome.value)}",
+        )
+        return report
 
     # --- ciclo de vida -------------------------------------------------------
 
@@ -888,6 +932,7 @@ class StackApplication:
         )
         endpoints = self.options.endpoints_for(profile)
         problems = []
+        warnings = []
         started = []
         for service_id in order:
             if not endpoints.enabled(profile, service_id):
@@ -895,6 +940,7 @@ class StackApplication:
             current = controller.status(service_id)
             if current.health.state is ServiceState.UP:
                 started.append(service_id)
+                warnings.extend(self._integrate(stream, profile, service_id))
                 continue
             component = snapshot.by_service(service_id)
             external = current.origin is ProcessOrigin.EXTERNAL or (
@@ -925,6 +971,7 @@ class StackApplication:
                 problems.append(diagnostic("service-not-ready", f"{service_id}: {report.detail}"))
                 break
             started.append(service_id)
+            warnings.extend(self._integrate(stream, profile, service_id))
         if not finish:
             return problems
         if problems:
@@ -933,7 +980,17 @@ class StackApplication:
             OperationPhase.FINALIZATION,
             "Stack pronta" if started else "Nada para iniciar",
             output_references=tuple(started),
+            diagnostics=warnings,
         )
+
+    def _integrate(self, stream: OperationStream, profile: Profile, service_id: str) -> list:
+        """What a running service still needs; a warning when it cannot be given."""
+        if service_id != str(ComponentId.OPEN_WEBUI):
+            return []
+        report = self.integrate_open_webui(stream, profile)
+        if report is None or report.ok:
+            return []
+        return [diagnostic("open-webui-integration", report.detail)]
 
     def _stop_services(self, stream: OperationStream, profile: Profile, *, finish: bool = True):
         controller = self._controller(profile)
@@ -1090,6 +1147,16 @@ def _result_of(stream: OperationStream) -> OperationResult:
 
 def _value(item: Any) -> str:
     return str(getattr(item, "value", item))
+
+
+_INTEGRATION_WORDS = {
+    "installed": "filtro de imagem instalado",
+    "updated": "filtro de imagem atualizado",
+    "unchanged": "filtro de imagem já atual",
+    "no-admin": "filtro de imagem aguarda o primeiro administrador",
+    "unavailable": "filtro de imagem não pôde ser verificado",
+    "refused": "filtro de imagem pertence a outra função",
+}
 
 
 _DISPLAY = {

@@ -1,276 +1,212 @@
-"""Drive the real Filter hook contract with controlled native tools/chunks."""
+"""The Filter Function the Hub installs in Open WebUI, hook by hook.
+
+Open WebUI executes the filter's source itself, so it is loaded here the way
+Open WebUI loads it -- as source, not as a Hub import -- and driven with the
+request metadata the real UI produces (captured from the managed instance).
+"""
+
+from __future__ import annotations
 
 import asyncio
-import json
-from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
-from local_ai_stack.open_webui_image_filter import (
-    FAILURE,
-    STATE_KEY,
-    SUCCESS,
-    TOOL_SUCCESS,
-    Filter,
-)
+from local_ai_stack.installation import detect_repo_root
+from local_ai_stack.open_webui_filters import filter_path, filter_source
+
+SOURCE = filter_source()
+
+
+def load_module() -> dict:
+    """What Open WebUI does with the stored source: exec it as a module."""
+    namespace: dict = {}
+    exec(compile(SOURCE, "function_pepito_image_chat", "exec"), namespace)  # noqa: S102
+    return namespace
+
+
+def load_filter():
+    return load_module()["Filter"]()
+
+
+def ui_metadata(*, image: bool = True, session: bool = True) -> dict:
+    """The shape captured from Open WebUI 0.11.3 for a composer turn."""
+    return {
+        "session_id": "sid-1234" if session else None,
+        "chat_id": "chat-1",
+        "message_id": "msg-1",
+        "features": {
+            "voice": False,
+            "image_generation": image,
+            "code_interpreter": False,
+            "web_search": False,
+            "memory": True,
+        },
+        "params": {
+            "stream_delta_chunk_size": None,
+            "reasoning_tags": None,
+            "compact_token_threshold": None,
+            "function_calling": "native",
+            "tool_approval_mode": "full",
+        },
+        "tools": {},
+    }
 
 
 def run(coroutine):
     return asyncio.run(coroutine)
 
 
-def metadata(tool=None):
-    return {
-        "session_id": "controlled-ui-session",
-        "features": {"image_generation": True},
-        "params": {"function_calling": "native"},
-        "tools": {"generate_image": {"type": "builtin", "callable": tool}} if tool else {},
-    }
+# --- inlet: the routing decision -----------------------------------------------
 
 
-def chunk(text="", *, finish=None, calls=None):
-    delta = {"content": text}
-    if calls:
-        delta["tool_calls"] = calls
-    return {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+def test_an_image_turn_is_routed_through_open_webui_forced_generation():
+    metadata = ui_metadata()
+    body = {"model": "hermes3:8b", "messages": [{"role": "user", "content": "an apple"}]}
+    assert run(load_filter().inlet(body, metadata)) is body
+    assert metadata["params"]["function_calling"] == "legacy"
+    assert body["messages"] == [{"role": "user", "content": "an apple"}]
 
 
-async def stream_text(plugin, meta, text):
-    # Individual characters exercise every possible JSON/token boundary.
-    for character in text:
-        event = await plugin.stream(chunk(character), meta)
-        assert not event["choices"][0]["delta"].get("content")
-    return (await plugin.stream(chunk(finish="stop"), meta))["choices"][0]
+def test_a_plain_chat_turn_is_left_alone():
+    metadata = ui_metadata(image=False)
+    run(load_filter().inlet({}, metadata))
+    assert metadata["params"]["function_calling"] == "native"
+    assert "pepito_image_chat" not in metadata
 
 
-def test_serialized_image_call_reaches_native_executor_and_result_has_no_transport():
-    async def scenario():
-        events = []
-        calls = []
-
-        async def tool(prompt):
-            calls.append(prompt)
-            images = [{"url": "/api/v1/files/private-id/content", "content_type": "image/png"}]
-            events.append({"type": "chat:message:files", "data": {"files": images}})
-            return json.dumps({"status": "success", "images": images})
-
-        plugin, meta = Filter(), metadata(tool)
-        await plugin.request({}, meta)
-        choice = await stream_text(
-            plugin, meta, json.dumps({"name": "generate_image", "arguments": {"prompt": "apple"}})
-        )
-        assert choice["finish_reason"] == "tool_calls"
-        assert not choice["delta"].get("content")
-        function = choice["delta"]["tool_calls"][0]["function"]
-        # Same lookup/invocation the upstream executor performs; the filter
-        # itself must not execute anything while parsing streamed content.
-        assert calls == []
-        result = await meta["tools"][function["name"]]["callable"](
-            **json.loads(function["arguments"])
-        )
-        assert result == TOOL_SUCCESS
-        assert calls == ["apple"]
-        assert len(events) == 1
-        assert events[0]["type"] == "chat:message:files"
-        await plugin.request({}, meta)  # next native round, same request
-        final = await stream_text(plugin, meta, "Internal URL: https://invented.example/123")
-        assert final["delta"]["content"] == SUCCESS
-        assert await meta["tools"]["generate_image"]["callable"](prompt="apple") == TOOL_SUCCESS
-        assert calls == ["apple"], "duplicate call cannot repeat image acquisition"
-
-    run(scenario())
+def test_an_api_call_without_a_ui_session_is_left_alone():
+    # No session means no event channel for Open WebUI to attach the image
+    # to, so forcing its pipeline would silently produce nothing.
+    metadata = ui_metadata(session=False)
+    run(load_filter().inlet({}, metadata))
+    assert metadata["params"]["function_calling"] == "native"
 
 
-def test_outlet_removes_only_current_image_transport_and_keeps_other_tools():
-    async def scenario():
-        meta = metadata()
-        meta[STATE_KEY] = {"outcome": "success"}
-        other = {"type": "function_call", "name": "get_time", "call_id": "other"}
-        message = {"type": "message", "content": [{"type": "output_text", "text": SUCCESS}]}
-        body = {
-            "id": "current",
-            "messages": [
-                {"id": "past", "role": "assistant", "content": "unchanged"},
-                {
-                    "id": "current",
-                    "role": "assistant",
-                    "output": [
-                        {"type": "function_call", "name": "generate_image", "call_id": "image"},
-                        {"type": "function_call_output", "call_id": "image"},
-                        other,
-                        message,
-                    ],
-                },
-            ],
+def test_missing_metadata_pieces_never_raise():
+    filter_ = load_filter()
+    for metadata in ({}, {"features": None}, {"features": {"image_generation": True}}):
+        assert run(filter_.inlet({"x": 1}, metadata)) == {"x": 1}
+    metadata = {"features": {"image_generation": True}, "session_id": "s", "params": None}
+    run(filter_.inlet({}, metadata))
+    assert metadata["params"] is None
+
+
+# --- stream and outlet: the acknowledgement ------------------------------------
+
+
+def stream_text(filter_, metadata: dict, chunks: list[str]) -> list[str]:
+    shown = []
+    for index, chunk in enumerate(chunks):
+        last = index == len(chunks) - 1
+        event = {
+            "choices": [{"delta": {"content": chunk}, "finish_reason": "stop" if last else None}]
         }
-        result = await Filter().outlet(body, meta)
-        assert result["messages"][0]["content"] == "unchanged"
-        assert result["messages"][1]["output"] == [other, message]
-
-    run(scenario())
-
-
-def test_ui_image_mode_uses_streaming_native_loop_and_other_modes_stay_unchanged():
-    async def scenario():
-        meta = metadata()
-        assert (await Filter().request({"stream": False}, meta))["stream"] is True
-        for altered in [
-            {**metadata(), "session_id": None},
-            {**metadata(), "params": {"function_calling": "legacy"}},
-        ]:
-            assert await Filter().request({"stream": False}, altered) == {"stream": False}
-
-    run(scenario())
+        event = run(filter_.stream(event, metadata))
+        text = event["choices"][0]["delta"].get("content")
+        if text:
+            shown.append(text)
+    return shown
 
 
-def test_concurrent_duplicate_calls_acquire_once_but_new_turn_can_repeat():
-    async def scenario():
-        entered, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
-        calls = []
-
-        async def tool(prompt):
-            calls.append(prompt)
-            entered.set()
-            await release.wait()
-            return json.dumps(
-                {"status": "success", "images": [{"content_type": "image/png", "url": "/image"}]}
-            )
-
-        plugin, meta = Filter(), metadata(tool)
-        await plugin.request({}, meta)
-        guarded = meta["tools"]["generate_image"]["callable"]
-        first = asyncio.create_task(guarded(prompt="apple"))
-        await entered.wait()
-
-        async def again():
-            second_started.set()
-            return await guarded(prompt="apple")
-
-        second = asyncio.create_task(again())
-        await second_started.wait()
-        release.set()
-        assert await asyncio.gather(first, second) == [TOOL_SUCCESS, TOOL_SUCCESS]
-        assert calls == ["apple"]
-        new_turn = metadata(tool)
-        await plugin.request({}, new_turn)
-        await new_turn["tools"]["generate_image"]["callable"](prompt="apple")
-        assert calls == ["apple", "apple"]
-
-    run(scenario())
+def test_a_made_up_image_link_never_reaches_the_screen():
+    filter_ = load_filter()
+    metadata = ui_metadata()
+    run(filter_.inlet({}, metadata))
+    shown = stream_text(
+        filter_,
+        metadata,
+        [
+            "Here is the image you requested:",
+            "\n\n![Red Apple](https://www.example.com/red_apple.jpg)",
+        ],
+    )
+    assert shown == ["Here is the image you requested:"]
 
 
-def test_oversized_payload_fails_closed_before_display():
-    async def scenario():
-        plugin, meta = Filter(), metadata()
-        await plugin.request({}, meta)
-        event = await plugin.stream(chunk("x" * 65537, finish="stop"), meta)
-        assert event["choices"][0]["delta"] == {"content": FAILURE}
+def test_an_acknowledgement_that_is_only_a_link_becomes_a_plain_statement():
+    filter_ = load_filter()
+    metadata = ui_metadata()
+    run(filter_.inlet({}, metadata))
+    assert stream_text(filter_, metadata, ["![image](/api/v1/files/abc/content)"]) == [
+        "Image generated."
+    ]
 
-    run(scenario())
+
+def test_an_empty_acknowledgement_becomes_a_plain_statement():
+    filter_ = load_filter()
+    metadata = ui_metadata()
+    run(filter_.inlet({}, metadata))
+    assert stream_text(filter_, metadata, [""]) == ["Image generated."]
+
+
+def test_a_relayed_failure_message_is_kept():
+    filter_ = load_filter()
+    metadata = ui_metadata()
+    run(filter_.inlet({}, metadata))
+    text = "Image generation was attempted but failed: ComfyUI did not answer."
+    assert stream_text(filter_, metadata, [text]) == [text]
+
+
+def test_the_persisted_message_is_cleaned_too():
+    filter_ = load_filter()
+    metadata = ui_metadata()
+    run(filter_.inlet({}, metadata))
+    body = {
+        "messages": [
+            {"role": "user", "content": "an apple"},
+            {"role": "assistant", "content": "Done: ![a](https://x.y/a.png) see www.x.y/a"},
+        ]
+    }
+    run(filter_.outlet(body, metadata))
+    assert body["messages"][1]["content"] == "Done:  see"
+    assert body["messages"][0]["content"] == "an apple"
+
+
+def test_plain_chat_streams_and_persists_untouched():
+    filter_ = load_filter()
+    metadata = ui_metadata(image=False)
+    run(filter_.inlet({}, metadata))
+    text = "See https://example.com and ![i](https://example.com/i.png)"
+    assert stream_text(filter_, metadata, [text]) == [text]
+    body = {"messages": [{"role": "assistant", "content": text}]}
+    run(filter_.outlet(body, metadata))
+    assert body["messages"][0]["content"] == text
+
+
+def test_turns_do_not_share_state():
+    filter_ = load_filter()
+    first, second = ui_metadata(), ui_metadata()
+    run(filter_.inlet({}, first))
+    run(filter_.inlet({}, second))
+    run(filter_.stream({"choices": [{"delta": {"content": "one"}, "finish_reason": None}]}, first))
+    assert stream_text(filter_, second, ["two"]) == ["two"]
+    assert stream_text(filter_, first, [" more"]) == ["one more"]
 
 
 @pytest.mark.parametrize(
-    "arguments", [{}, {"prompt": 42}, {"prompt": ""}, {"prompt": "a", "extra": 1}]
-)
-def test_bad_native_arguments_fail_inside_guard_without_calling_builtin(arguments):
-    async def scenario():
-        async def forbidden(**_kwargs):
-            pytest.fail("invalid native arguments must not reach generation")
-
-        plugin, meta = Filter(), metadata(forbidden)
-        await plugin.request({}, meta)
-        result = await meta["tools"]["generate_image"]["callable"](**arguments)
-        assert json.loads(result) == {"error": FAILURE}
-        assert meta[STATE_KEY]["outcome"] == "failed"
-
-    run(scenario())
-
-
-@pytest.mark.parametrize(
-    "payload",
+    ("text", "expected"),
     [
-        '{"name":"create_image","arguments":{"prompt":"apple"}}',
-        '{"name":"generate_image","arguments":{"prompt":42}}',
-        '{"name":"generate_image","arguments":{"prompt":"apple","shell":"bad"}}',
-        'Here is the call: {"name":"generate_image","arguments":{"prompt":"apple"}}',
-        '<tool_call>{"name":"generate_image","arguments":',
+        ("A red apple. ![x](https://a.b/c.png)", "A red apple."),
+        ("Look: [here](https://a.b/c) now", "Look: here now"),
+        ("http://a.b/c.png", "Image generated."),
+        ("Line\n\n\n\nBreak", "Line\n\nBreak"),
+        ("   ", "Image generated."),
     ],
 )
-def test_invalid_or_ambiguous_calls_fail_explicitly_without_execution_or_payload(payload):
-    async def forbidden(**_kwargs):
-        pytest.fail("invalid payload must never execute")
-
-    async def scenario():
-        plugin, meta = Filter(), metadata(forbidden)
-        await plugin.request({}, meta)
-        result = await stream_text(plugin, meta, payload)
-        assert result["delta"] == {"content": FAILURE}
-
-    run(scenario())
+def test_clean_acknowledgement(text, expected):
+    assert load_module()["clean_acknowledgement"](text) == expected
 
 
-@pytest.mark.parametrize("result", ['{"error":"secret backend URL"}', "{}", "[]", "bad json"])
-def test_tool_failure_never_becomes_success_or_leaks_backend_message(result):
-    async def scenario():
-        async def failed(prompt):
-            return result
-
-        plugin, meta = Filter(), metadata(failed)
-        await plugin.request({}, meta)
-        answer = await meta["tools"]["generate_image"]["callable"](prompt="apple")
-        assert json.loads(answer) == {"error": FAILURE}
-        await plugin.request({}, meta)
-        final = await stream_text(plugin, meta, "I successfully created your image!")
-        assert final["delta"]["content"] == FAILURE
-
-    run(scenario())
+def test_the_shipped_source_declares_the_pinned_open_webui_version():
+    assert "required_open_webui_version: 0.11.3" in SOURCE
+    assert "title: Pepito Image Chat" in SOURCE
 
 
-def test_missing_tool_and_empty_generation_have_explicit_failure():
-    async def scenario():
-        plugin, meta = Filter(), metadata()
-        await plugin.request({}, meta)
-        result = await stream_text(
-            plugin, meta, '{"name":"generate_image","arguments":{"prompt":"a"}}'
-        )
-        assert result["delta"]["content"] == FAILURE
-        await plugin.request({}, meta)
-        assert (await stream_text(plugin, meta, ""))["delta"]["content"] == FAILURE
-
-    run(scenario())
-
-
-def test_native_tool_calls_are_preserved_and_prose_does_not_leak():
-    async def scenario():
-        async def tool(prompt):
-            raise AssertionError("stream parsing must not execute tools")
-
-        plugin, meta = Filter(), metadata(tool)
-        await plugin.request({}, meta)
-        calls = [
-            {"index": 0, "id": "native", "function": {"name": "generate_image", "arguments": "{}"}}
-        ]
-        result = await plugin.stream(chunk("Calling with raw arguments", calls=calls), meta)
-        assert result["choices"][0]["delta"] == {"tool_calls": calls}
-        result = await plugin.stream(chunk(finish="tool_calls"), meta)
-        assert not result["choices"][0]["delta"].get("content")
-
-    run(scenario())
-
-
-def test_plain_chat_is_unchanged_and_other_requests_do_not_share_state():
-    async def scenario():
-        plugin = Filter()
-        meta = metadata()
-        meta["features"]["image_generation"] = False
-        await plugin.request({}, meta)
-        original = chunk("hi")
-        assert await plugin.stream(deepcopy(original), meta) == original
-        assert STATE_KEY not in meta
-        one, two = metadata(), metadata()
-        await plugin.request({}, one)
-        await plugin.request({}, two)
-        one[STATE_KEY]["outcome"] = "success"
-        assert (await stream_text(plugin, two, "Hello!"))["delta"]["content"] == "Hello!"
-
-    run(scenario())
+def test_the_filter_is_a_bundled_resource_not_a_package_module():
+    # A frozen build ships resources, not package sources; the filter must be
+    # readable from the resource root or the sync fails before any request.
+    assert (
+        filter_path() == Path(detect_repo_root()) / "assets" / "open-webui" / "pepito_image_chat.py"
+    )
+    assert filter_path().is_file()

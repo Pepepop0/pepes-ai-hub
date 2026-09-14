@@ -88,9 +88,10 @@ from .managed_config import ManagedConfigWriter
 from .model_catalog import ModelCatalog, model_catalog
 from .model_installer import ModelInstaller
 from .model_resolver import StackModelResolver, unresolved_roles
-from .models import ManagedModelPaths
+from .models import ManagedModelPaths, OllamaModelSource
 from .ollama_models import HttpOllamaClient
-from .open_webui_filters import FilterSyncReport, sync_image_chat_filter
+from .open_webui_filters import FilterSync, FilterSyncReport, sync_image_chat_filter
+from .open_webui_models import sync_chat_model
 from .operation_contracts import (
     OperationActivity,
     OperationActivityCategory,
@@ -105,7 +106,13 @@ from .operations import OperationStream, diagnostic, safe_text, utc_now
 from .planning import InstallPlan, PlanAction, build_install_plan
 from .probes import http_probe, tcp_probe
 from .processes import ProcessOrigin, RuntimeProcessState
-from .profiles import FEATURE_IMAGE_GENERATION, Profile, load_profiles
+from .profiles import (
+    CHAT_PRIMARY_ROLE,
+    FEATURE_IMAGE_GENERATION,
+    FEATURE_TOOLS,
+    Profile,
+    load_profiles,
+)
 from .provisioning import ProvisionContext, ProvisionEvent, ProvisionOutcome
 from .registry import ManagedProcessRegistry
 from .resources import resource_root
@@ -178,6 +185,8 @@ class StackDependencies:
     terminate_process: Callable[[int, float], bool] = terminate_by_pid
     # Keeps the Hub's image chat filter current inside a running Open WebUI.
     filter_sync: Callable[[Path, str], FilterSyncReport] = sync_image_chat_filter
+    # Keeps the profile's chat model configured for tool calling in that Open WebUI.
+    model_sync: Callable[[Path, str, str], FilterSyncReport] = sync_chat_model
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], datetime] = utc_now
@@ -883,32 +892,67 @@ class StackApplication:
     def integrate_open_webui(
         self, stream: OperationStream, profile: Profile
     ) -> FilterSyncReport | None:
-        """Once Open WebUI answers, keep the Hub's image chat filter current in it.
+        """Once Open WebUI answers, keep what the profile needs from it current.
 
-        The filter is what makes the UI's Image feature reach ComfyUI (see
-        ``assets/open-webui/pepito_image_chat.py``). It lives in Open WebUI's own database,
-        so it is synced through Open WebUI's API every time the service is up
-        and the profile wants image generation: installed once, updated when
-        the shipped source changes, and otherwise left alone. None when the
-        profile has no use for it.
+        Two things live in Open WebUI's own database and are synced through its
+        API every time the service is up: the image chat filter that makes the
+        UI's Image feature reach ComfyUI (``assets/open-webui/pepito_image_chat.py``,
+        when the profile enables image generation) and the chat model record
+        that keeps Open WebUI's builtin tools out of the model's prompt
+        (``open_webui_models``, when the profile enables tools). Each is
+        installed once, updated when it drifted, and otherwise left alone. The
+        report is the more significant of the two; None when the profile has
+        no use for either.
         """
         endpoints = self.options.endpoints_for(profile)
-        if not profile.enables(FEATURE_IMAGE_GENERATION) or not endpoints.enabled(
-            profile, str(ComponentId.OPEN_WEBUI)
-        ):
+        if not endpoints.enabled(profile, str(ComponentId.OPEN_WEBUI)):
+            return None
+        syncs: list[tuple[str, Callable[[], FilterSyncReport]]] = []
+        if profile.enables(FEATURE_IMAGE_GENERATION):
+            syncs.append(
+                (
+                    "filtro de imagem",
+                    lambda: self.deps.filter_sync(
+                        self.layout.open_webui_data, endpoints.open_webui
+                    ),
+                )
+            )
+        chat_model = self._chat_model_reference(profile)
+        if profile.enables(FEATURE_TOOLS) and chat_model is not None:
+            syncs.append(
+                (
+                    "modelo de chat",
+                    lambda: self.deps.model_sync(
+                        self.layout.open_webui_data, endpoints.open_webui, chat_model
+                    ),
+                )
+            )
+        if not syncs:
             return None
         stream.activity(
             OperationActivity(OperationActivityCategory.CONFIGURATION, "integrating", "Open WebUI"),
             "Integrando o Open WebUI",
         )
-        report = self.deps.filter_sync(self.layout.open_webui_data, endpoints.open_webui)
-        stream.detail(
-            OperationActivity(
-                OperationActivityCategory.CONFIGURATION, report.outcome.value, "Open WebUI"
-            ),
-            f"Open WebUI: {_INTEGRATION_WORDS.get(report.outcome.value, report.outcome.value)}",
-        )
-        return report
+        reports = []
+        for subject, sync in syncs:
+            report = sync()
+            reports.append(report)
+            stream.detail(
+                OperationActivity(
+                    OperationActivityCategory.CONFIGURATION, report.outcome.value, "Open WebUI"
+                ),
+                f"Open WebUI: {subject} "
+                f"{_INTEGRATION_WORDS.get(report.outcome.value, report.outcome.value)}",
+            )
+        return _combined_report(reports)
+
+    def _chat_model_reference(self, profile: Profile) -> str | None:
+        """The Ollama tag of the profile's primary chat model, when the catalog pins one."""
+        model_id = profile.model_for(CHAT_PRIMARY_ROLE)
+        spec = self.catalog().get(model_id) if model_id is not None else None
+        if spec is None or not isinstance(spec.source, OllamaModelSource):
+            return None
+        return spec.source.reference
 
     # --- ciclo de vida -------------------------------------------------------
 
@@ -1150,13 +1194,28 @@ def _value(item: Any) -> str:
 
 
 _INTEGRATION_WORDS = {
-    "installed": "filtro de imagem instalado",
-    "updated": "filtro de imagem atualizado",
-    "unchanged": "filtro de imagem já atual",
-    "no-admin": "filtro de imagem aguarda o primeiro administrador",
-    "unavailable": "filtro de imagem não pôde ser verificado",
-    "refused": "filtro de imagem pertence a outra função",
+    "installed": "instalado",
+    "updated": "atualizado",
+    "unchanged": "já atual",
+    "no-admin": "aguarda o primeiro administrador",
+    "unavailable": "não pôde ser verificado",
+    "refused": "pertence a outra configuração",
 }
+
+
+def _combined_report(reports: Sequence[FilterSyncReport]) -> FilterSyncReport:
+    """One report for several syncs: a failure outranks work done, which outranks no-ops."""
+    for outcome in (
+        FilterSync.REFUSED,
+        FilterSync.UNAVAILABLE,
+        FilterSync.INSTALLED,
+        FilterSync.UPDATED,
+        FilterSync.NO_ADMIN,
+    ):
+        matching = [report for report in reports if report.outcome is outcome]
+        if matching:
+            return FilterSyncReport(outcome, "; ".join(report.detail for report in matching))
+    return FilterSyncReport(FilterSync.UNCHANGED, "; ".join(report.detail for report in reports))
 
 
 _DISPLAY = {

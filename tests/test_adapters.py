@@ -196,8 +196,12 @@ def test_adapters_never_invent_a_path(layout):
     assert open_webui_control_spec(EXECUTABLE).launch.logs is None
 
 
-def test_force_kill_is_off_by_default_everywhere(layout):
-    for build in (ollama_control_spec, open_webui_control_spec, comfyui_control_spec):
+def test_ollama_stops_its_proved_runner_tree_by_default(layout):
+    assert ollama_control_spec(EXECUTABLE, layout=layout).launch.allow_force_kill is True
+
+
+def test_force_kill_stays_off_for_services_without_runner_children(layout):
+    for build in (open_webui_control_spec, comfyui_control_spec):
         assert build(EXECUTABLE, layout=layout).launch.allow_force_kill is False
 
 

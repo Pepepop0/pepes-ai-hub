@@ -102,7 +102,7 @@ def test_ollama_launch_spec_is_explicit_about_host_and_env(tmp_path):
     assert launch.argv == (OLLAMA_EXE, "serve")
     assert launch.env["OLLAMA_HOST"] == "127.0.0.1:11500"
     assert launch.env["OLLAMA_MODELS"] == str(tmp_path / "models")
-    assert launch.allow_force_kill is False
+    assert launch.allow_force_kill is True
 
 
 def test_ollama_control_spec_keeps_health_and_process_ports_aligned(tmp_path):
@@ -335,7 +335,7 @@ def test_stop_delegates_to_the_launcher_for_our_own_process(tmp_path, registry):
     assert calls[0][1]["timeout"] == 3
 
 
-def test_stop_uses_the_launch_policy_by_default(tmp_path, registry):
+def test_ollama_stop_uses_runner_tree_cleanup_policy_by_default(tmp_path, registry):
     registry.register(
         ManagedProcess("ollama", OLLAMA_PROC.pid, OLLAMA_EXE, create_time=OLLAMA_PROC.create_time)
     )
@@ -343,7 +343,7 @@ def test_stop_uses_the_launch_policy_by_default(tmp_path, registry):
     controller = make_controller(
         tmp_path,
         registry,
-        specs=(spec_for(tmp_path, allow_force_kill=True, stop_timeout=7.0),),
+        specs=(spec_for(tmp_path, stop_timeout=7.0),),
         processes=running(OLLAMA_PROC),
         listeners=listening(11434),
     )

@@ -28,9 +28,9 @@ every member at once — so it is an escalation, never the normal path:
 * ``allow_force`` is what permits the escalation, exactly as it always did for
   a single process. With it, a root that outlives its timeout, or descendants
   that outlive a root which exited cleanly, are terminated through the job;
-* without proof — another session created the job, or the host cannot make one
-  — the escalation degrades to the single process whose identity the registry
-  verifies, and the result says so.
+* an opted-in launch lets its root retain the named job, so a later manager can
+  reopen the same kernel proof; without proof, the escalation degrades to the
+  single process whose identity the registry verifies, and the result says so.
 
 See docs/INTEGRATION.md for the two boundaries and what closing them would cost.
 """
@@ -233,9 +233,9 @@ class ProcessLauncher:
         self._monotonic = monotonic
         self._sleep = sleep
         self.log = log or logger
-        # Job handles live exactly as long as this launcher does. A job whose
-        # last handle closes stops existing, so ownership proof cannot outlive
-        # the session that created it, and is never faked across one.
+        # This launcher closes every handle it owns. Opted-in roots retain a
+        # duplicate themselves, allowing a later launcher to reopen the same
+        # named kernel proof while the service remains alive.
         self._jobs: dict[str, ProcessJob] = {}
 
     # --- start -------------------------------------------------------------
@@ -294,7 +294,12 @@ class ProcessLauncher:
             )
             # Adopt before anything else runs. The child is already executing,
             # so this window is small but not zero: see _adopt.
-            job = self._adopt(spec.service_id, job, spawned)
+            job = self._adopt(
+                spec.service_id,
+                job,
+                spawned,
+                retain_for_restart=spec.allow_force_kill,
+            )
         except (OSError, ValueError) as exc:
             jobs.close(job)
             return LaunchResult(
@@ -326,7 +331,12 @@ class ProcessLauncher:
         )
 
     def _adopt(
-        self, service_id: str, job: ProcessJob | None, spawned: SpawnedProcess
+        self,
+        service_id: str,
+        job: ProcessJob | None,
+        spawned: SpawnedProcess,
+        *,
+        retain_for_restart: bool,
     ) -> ProcessJob | None:
         """Put the new process in its job, or give the job up entirely.
 
@@ -353,6 +363,11 @@ class ProcessLauncher:
                 self.log.debug("could not assign %s to a job; tree stop unavailable", service_id)
                 jobs.close(job)
                 return None
+            if retain_for_restart and not jobs.retain_by_process(job, spawned.handle or 0):
+                self.log.warning(
+                    "could not retain %s job across manager restart; tree proof is session-only",
+                    service_id,
+                )
             self._jobs[service_id] = job
             return job
         finally:
@@ -363,18 +378,35 @@ class ProcessLauncher:
     def tree_pids(self, service_id: str, pid: int) -> tuple[int, ...] | None:
         """Every process the kernel proves belongs to the tree we started.
 
-        ``None`` means unprovable, which is not the same as "no children": a
-        manager that restarted, or a host without job objects, gets ``None``
-        and must act on the single verified process instead.
+        ``None`` means unprovable, which is not the same as "no children". An
+        opted-in root can retain the job across manager sessions; ordinary jobs
+        and hosts without Job Objects still fall back to the verified root.
         """
-        job = self._jobs.get(service_id)
+        job = self._job_for(service_id)
         if job is None or jobs.membership(job, pid) is not Membership.MEMBER:
             return None
         return jobs.member_pids(job)
 
     def owns(self, service_id: str, pid: int) -> Membership:
         """Can this manager prove ``pid`` is part of the tree it started?"""
-        return jobs.membership(self._jobs.get(service_id), pid)
+        return jobs.membership(self._job_for(service_id), pid)
+
+    def _job_for(self, service_id: str) -> ProcessJob | None:
+        """Return this session's job, reopening a root-retained job if possible."""
+        current = self._jobs.get(service_id)
+        if current is not None:
+            return current
+        entry = self.registry.load().get(service_id)
+        if entry is None or entry.job_name is None:
+            return None
+        reopened = jobs.open_job(entry.job_name)
+        if reopened is None:
+            return None
+        if jobs.membership(reopened, entry.pid) is not Membership.MEMBER:
+            jobs.close(reopened)
+            return None
+        self._jobs[service_id] = reopened
+        return reopened
 
     def forget_job(self, service_id: str) -> None:
         """Release a job handle. Members keep running; proof is given up."""
@@ -383,7 +415,8 @@ class ProcessLauncher:
     def close_all(self) -> None:
         """Release every job handle this launcher holds.
 
-        Members keep running: a job is not a leash, it is a proof of origin.
+        Members keep running. An opted-in root retains its own handle and proof;
+        an ordinary job keeps the original session-only behavior.
         """
         for service_id in list(self._jobs):
             self.forget_job(service_id)

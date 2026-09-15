@@ -19,14 +19,13 @@ the user started — can never appear in it.
 
 Two properties, both verified on Windows 11 before this was written:
 
-* a job is destroyed as soon as the last *handle* to it closes, even while its
-  members keep running. Members survive; the name becomes unopenable. Ownership
-  proof is therefore **scoped to one manager session**, and a manager that
-  restarts can no longer prove the tree it once started. That boundary is real
-  and is reported rather than papered over;
-* ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` would make the proof outlive nothing
-  and kill every service when the Hub exits, which is the opposite of what a
-  detached service should do. It is deliberately not set.
+* a normal job is destroyed as soon as the last *handle* to it closes, even
+  while its members keep running. Members survive and its name becomes
+  unopenable, so ordinary services retain the conservative session boundary;
+* a service that explicitly permits proved-tree cleanup can give its root a
+  duplicate handle and set ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``. The detached
+  root then keeps the named job alive across Hub sessions. Root exit closes the
+  last service-held handle and prevents a proved runner from becoming orphaned.
 
 Everywhere else — any non-Windows host, a kernel call that fails, a job we no
 longer hold — this module answers "cannot tell", and the caller must fall back
@@ -44,7 +43,9 @@ WINDOWS = os.name == "nt"
 JOB_NAME_PREFIX = "PepitosAIHub"
 # JOBOBJECTINFOCLASS
 JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 JOB_OBJECT_ALL_ACCESS = 0x1F001F
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 MAX_TRACKED_MEMBERS = 1024
 
 if WINDOWS:  # pragma: no cover - exercised on Windows, skipped elsewhere
@@ -76,6 +77,14 @@ if WINDOWS:  # pragma: no cover - exercised on Windows, skipped elsewhere
         wintypes.LPDWORD,  # lpReturnLength
     ]
     _kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+
+    _kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
 
     _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
     _kernel32.TerminateJobObject.restype = wintypes.BOOL
@@ -110,6 +119,39 @@ if WINDOWS:  # pragma: no cover - exercised on Windows, skipped elsewhere
             ("NumberOfAssignedProcesses", wintypes.DWORD),
             ("NumberOfProcessIdsInList", wintypes.DWORD),
             ("ProcessIdList", ULONG_PTR * MAX_TRACKED_MEMBERS),
+        ]
+
+    class _BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimitInformation),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
 else:  # pragma: no cover - only the import shape matters off Windows
@@ -160,9 +202,9 @@ def create_job(name: str) -> ProcessJob | None:
 def open_job(name: str) -> ProcessJob | None:
     """Reopen a job by name.
 
-    Succeeds only while some handle to it is still open, which in practice
-    means within the session that created it. A restarted manager gets ``None``
-    and must not pretend it owns the tree.
+    Succeeds only while some handle to it is still open. This is normally the
+    creating manager session; opted-in roots may retain their own handle so a
+    restarted manager can recover the same kernel proof.
     """
     if not jobs_supported():
         return None
@@ -205,6 +247,52 @@ def assign(job: ProcessJob | None, process_handle: int) -> bool:
     if job is None or not jobs_supported() or not process_handle:
         return False
     return bool(_kernel32.AssignProcessToJobObject(job.handle, int(process_handle)))
+
+
+def retain_by_process(job: ProcessJob | None, process_handle: int) -> bool:
+    """Keep an opted-in job alive for exactly as long as its root process.
+
+    The duplicate is created inside the root process. This manager can close
+    its own handle while a detached service keeps the named job re-openable.
+    When the root exits, its handle closes and ``KILL_ON_JOB_CLOSE`` ensures
+    that any runner still in the proved job cannot become an orphan.
+    """
+    if job is None or not jobs_supported() or not process_handle:
+        return False
+    limits = _ExtendedLimitInformation()
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    configured = _kernel32.SetInformationJobObject(
+        job.handle,
+        JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+        ctypes.byref(limits),
+        ctypes.sizeof(limits),
+    )
+    if not configured:
+        return False
+    target_handle = wintypes.HANDLE()
+    current = _kernel32.GetCurrentProcess()
+    retained = _kernel32.DuplicateHandle(
+        current,
+        job.handle,
+        int(process_handle),
+        ctypes.byref(target_handle),
+        0,
+        False,
+        DUPLICATE_SAME_ACCESS,
+    )
+    if retained and target_handle.value:
+        return True
+
+    # Manager exit must not kill a detached service unless the root owns the
+    # handle that makes the job lifetime match the service lifetime.
+    limits.BasicLimitInformation.LimitFlags = 0
+    _kernel32.SetInformationJobObject(
+        job.handle,
+        JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+        ctypes.byref(limits),
+        ctypes.sizeof(limits),
+    )
+    return False
 
 
 def member_pids(job: ProcessJob | None) -> tuple[int, ...] | None:

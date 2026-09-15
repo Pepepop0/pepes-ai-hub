@@ -76,9 +76,16 @@ def ollama_launch_spec(
     cwd: Path | None = None,
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
-    allow_force_kill: bool = False,
+    allow_force_kill: bool = True,
 ) -> ProcessLaunchSpec:
-    """``ollama serve`` bound to an explicit host and port, with an explicit env."""
+    """``ollama serve`` bound to an explicit host and port, with an explicit env.
+
+    Ollama starts one or more ``llama-server`` children.  If the root exits
+    before those runners do, the launcher must be allowed to terminate the
+    members its Windows Job Object proves belong to this launch.  The launcher
+    still refuses unrelated processes and never widens the stop without that
+    kernel ownership proof.
+    """
     child_env: dict[str, str] = {"OLLAMA_HOST": f"{host}:{port}"}
     if models_dir is not None:
         child_env["OLLAMA_MODELS"] = str(models_dir)
@@ -108,7 +115,7 @@ def ollama_control_spec(
     cwd: Path | None = None,
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
-    allow_force_kill: bool = False,
+    allow_force_kill: bool = True,
 ) -> ServiceControlSpec:
     """Ollama, controllable: health spec, process spec and how to launch it."""
     if logs is None and layout is not None:

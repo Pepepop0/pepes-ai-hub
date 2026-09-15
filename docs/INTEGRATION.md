@@ -134,13 +134,13 @@ de uma vez. Por isso ele é **escalonamento**, nunca o caminho normal:
 
 Dois limites medidos nesta máquina antes de escrever o código:
 
-1. **A prova morre com a sessão.** O job é destruído quando o último *handle*
-   fecha, mesmo com membros vivos — os membros sobrevivem, mas o nome deixa de
-   resolver (`OpenJobObject` → erro 2). Um Hub reiniciado não consegue reabrir o
-   job e, portanto, não pode provar a árvore que iniciou antes. Nesse caso o
-   `stop` age só no processo registrado, cuja identidade ainda é verificável, e
-   diz isso no `detail`. Não usamos `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` porque
-   ele mataria todos os serviços quando o Hub fechasse.
+1. **A prova normalmente morre com a sessão.** O job é destruído quando o último
+   *handle* fecha, mesmo com membros vivos. Serviços comuns preservam esse limite.
+   O Ollama é a exceção explícita: como cria runners `llama-server`, seu root
+   recebe uma cópia do handle e o job usa `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+   O root mantém o job vivo quando o Hub fecha; outro Hub reabre o mesmo nome e
+   recupera a prova. Quando o root termina, o handle dele fecha e runners ainda
+   pertencentes ao job não podem virar órfãos.
 
 2. **Janela de adoção.** O filho já está executando quando `Popen` retorna, e a
    atribuição ao job acontece logo depois. Um neto criado nesses primeiros
@@ -180,11 +180,8 @@ da thread primária, então isso significa uma implementação própria de
 `CreateProcessW` via ctypes — incluindo herança de handles para os arquivos de
 log. É risco real em cima do caminho de spawn que hoje está estável e testado.
 
-Fazer a prova sobreviver a reinício do Hub (item 1) exige um processo
-supervisor que segure os handles, ou aceitar matar os serviços ao fechar o Hub.
-As duas são decisões de produto, não detalhes de implementação.
-
-Ambas ficam **BLOCKED até decisão**. O que está implementado é a parte segura:
-prova por job dentro da sessão, com fallback honesto fora dela.
+Para serviços sem essa opção, a prova continua limitada à sessão e o fallback
+continua honesto. O Ollama opta pela retenção porque o cleanup de seus runners é
+parte do contrato de stop/restart.
 
 **Ainda não existe:** VRAM orchestration e repair/update/uninstall.

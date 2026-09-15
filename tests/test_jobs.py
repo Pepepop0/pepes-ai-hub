@@ -148,6 +148,7 @@ def test_nothing_is_provable_without_a_job():
     assert jobs.member_pids(None) is None
     assert jobs.terminate(None) is False
     assert jobs.assign(None, 1234) is False
+    assert jobs.retain_by_process(None, 1234) is False
     assert jobs.duplicate_process_handle(0) is None
     jobs.close(None)  # must not raise
     jobs.close_handle(None)
@@ -276,6 +277,39 @@ def test_proof_does_not_survive_losing_the_handle(reaper):
     assert jobs.open_job(name) is None, "the name no longer resolves"
     assert alive(child.pid), "but the service itself keeps running"
     assert jobs.membership(None, child.pid) is Membership.UNPROVABLE
+
+
+@WINDOWS_ONLY
+def test_opted_in_tree_proof_survives_manager_restart_and_stops_the_runner(tmp_path, reaper):
+    """A detached Ollama root must keep its Job alive for the next Hub session."""
+    from local_ai_stack.launcher import ProcessLauncher, ProcessLaunchSpec, StopOutcome
+    from local_ai_stack.registry import ManagedProcessRegistry
+
+    registry = ManagedProcessRegistry(tmp_path / "state" / "managed.json")
+    first = ProcessLauncher(registry)
+    hand = Handshake(tmp_path)
+    started = first.start(ProcessLaunchSpec("ollama", hand.argv, allow_force_kill=True))
+    reaper.append(started.pid)
+    hand.wait_until_up()
+    hand.release()
+    child = hand.child_pid()
+    reaper.append(child)
+    assert child in (first.tree_pids("ollama", started.pid) or ())
+
+    first.close_all()  # the command/TUI process exits while Ollama stays up
+    assert alive(started.pid)
+    assert alive(child)
+
+    restarted = ProcessLauncher(registry)
+    assert child in (restarted.tree_pids("ollama", started.pid) or ())
+    result = restarted.stop("ollama", timeout=10, allow_force=True)
+
+    assert result.outcome is StopOutcome.STOPPED
+    assert child in result.tree_pids
+    assert wait_gone(started.pid)
+    assert wait_gone(child)
+    assert registry.load().entries == {}
+    restarted.close_all()
 
 
 # --- force policy ----------------------------------------------------------

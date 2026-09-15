@@ -146,3 +146,41 @@ def test_the_smoke_names_a_missing_workflow_manifest(frozen_build):
     assert any(problem.startswith("workflows:") for problem in report["problems"])
     assert any(problem.startswith("composition:") for problem in report["problems"])
     assert not any("Traceback" in problem for problem in report["problems"])
+
+
+def test_the_image_edit_graph_is_read_from_the_bundle(frozen_build):
+    """C: the edit workflow resolves to the bundled graph, never to a checkout."""
+    from local_ai_stack.workflows import load_workflow_graph, resolve_workflow
+
+    app, bundle = frozen_build
+    installation = resolve_installation(InstallLocation.custom(app.parent / "root"))
+    actions = default_install_actions(provision_context(installation))
+    spec = actions.workflow_specs["flux2_klein_edit"]
+    assert spec.complete
+    pepe = actions.profiles["pepe"]
+
+    class Available:
+        def resolve(self, model_id):
+            from local_ai_stack.model_catalog import model_catalog
+            from local_ai_stack.models import FileModelLocation, ModelState, ResolvedModel
+
+            source = model_catalog().require(model_id).source
+            return ResolvedModel(
+                model_id,
+                model_catalog().require(model_id).kind,
+                ModelState.AVAILABLE,
+                FileModelLocation(
+                    app.parent / "root" / source.artifact.filename,
+                    source.artifact.filename,
+                    source.placement,
+                ),
+            )
+
+    resolution = resolve_workflow(spec, pepe, Available(), repo_root=actions.repo_root)
+    assert resolution.ready, resolution.problems
+    assert resolution.template_path == bundle / "workflows" / "flux2-klein-edit-api.json"
+    assert CHECKOUT not in resolution.template_path.parents
+    assert load_workflow_graph(resolution)["76"]["class_type"] == "LoadImage"
+    report = smoke_report()
+    assert report["ok"], report["problems"]
+    assert report["workflows"]["embedded"] == ["flux2_klein_edit", "flux2_klein_t2i"]

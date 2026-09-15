@@ -40,10 +40,15 @@ class RecordingSync:
         return FilterSyncReport(outcome, f"{self.subject}: {outcome.value}")
 
 
-def pepe_stack(sync: RecordingSync, model_sync: RecordingSync | None = None):
+def pepe_stack(
+    sync: RecordingSync,
+    model_sync: RecordingSync | None = None,
+    edit_sync: RecordingSync | None = None,
+):
     built = controlled_stack(profile_yaml=shipped(PEPE), profile_id=PEPE, vram_mib=12227)
     built.app.deps.filter_sync = sync
     built.app.deps.model_sync = model_sync or RecordingSync(subject="hermes3:8b")
+    built.app.deps.image_edit_sync = edit_sync or RecordingSync(subject="image editing")
     return built
 
 
@@ -150,12 +155,14 @@ def test_a_profile_without_image_generation_or_tools_never_asks():
     sync = RecordingSync(FilterSync.INSTALLED)
     model_sync = RecordingSync(FilterSync.INSTALLED, subject="hermes3:8b")
     built = controlled_stack(profile_yaml=shipped(TEST), profile_id=TEST)
+    edit_sync = RecordingSync(FilterSync.INSTALLED, subject="image editing")
     built.app.deps.filter_sync = sync
     built.app.deps.model_sync = model_sync
+    built.app.deps.image_edit_sync = edit_sync
     try:
         assert built.app.first_run("op-1", TEST).state is OperationState.SUCCEEDED
         assert built.app.start_stack("op-2", TEST).state is OperationState.SUCCEEDED
-        assert sync.calls == [] and model_sync.calls == []
+        assert sync.calls == [] and model_sync.calls == [] and edit_sync.calls == []
     finally:
         built.release()
 
@@ -223,5 +230,101 @@ def test_somebody_elses_chat_model_record_is_a_warning_not_a_failure():
         warning = next(d for d in result.diagnostics if d.code == "open-webui-integration")
         assert warning.message == "hermes3:8b: refused"
         assert built.app.last_first_run.integrated == []
+    finally:
+        built.release()
+
+
+# --- image editing: the edit workflow's settings, synced like the rest ---------------------
+
+
+def test_pepe_points_open_webui_image_editing_at_its_edit_workflow():
+    edit_sync = RecordingSync(FilterSync.INSTALLED, subject="image editing")
+    built = pepe_stack(RecordingSync(FilterSync.UNCHANGED), edit_sync=edit_sync)
+    try:
+        events = []
+        result = built.app.first_run("op-1", PEPE, emit=events.append)
+        assert result.state is OperationState.SUCCEEDED, [d.message for d in result.diagnostics]
+        assert len(edit_sync.calls) == 1
+        data_dir, base_url, settings = edit_sync.calls[0]
+        assert (data_dir, base_url) == (built.app.layout.open_webui_data, "http://127.0.0.1:8080")
+        assert settings.base_url == "http://127.0.0.1:8188"
+        # The diffusion model's runtime name from the (controlled) catalog, never a path.
+        assert settings.model.endswith(".safetensors") and "/" not in settings.model
+        assert [node["type"] for node in settings.nodes] == ["image", "model", "prompt", "seed"]
+        assert settings.workflow["76"]["class_type"] == "LoadImage"
+        report = built.app.last_first_run
+        assert report.integrated == ["open-webui"] and not report.did_nothing
+        assert report.unmapped_workflows == []
+        assert not any(w.code == "workflow-not-mapped" for w in report.warnings)
+        details = [e.message for e in events if e.detail is not None]
+        assert "Open WebUI: edição de imagem instalado" in details
+        assert "Workflow aplicado: image_edit" in details
+    finally:
+        built.release()
+
+
+def test_current_image_edit_settings_keep_a_second_run_a_no_op():
+    edit_sync = RecordingSync(FilterSync.INSTALLED, FilterSync.UNCHANGED, subject="image editing")
+    built = pepe_stack(
+        RecordingSync(FilterSync.INSTALLED, FilterSync.UNCHANGED), edit_sync=edit_sync
+    )
+    try:
+        assert built.app.first_run("op-1", PEPE).state is OperationState.SUCCEEDED
+        assert built.app.first_run("op-2", PEPE).state is OperationState.SUCCEEDED
+        assert built.app.last_first_run.did_nothing
+        assert len(edit_sync.calls) == 2
+    finally:
+        built.release()
+
+
+def test_drifted_image_edit_settings_are_repaired_and_counted_once():
+    edit_sync = RecordingSync(
+        FilterSync.INSTALLED, FilterSync.UPDATED, FilterSync.UNCHANGED, subject="image editing"
+    )
+    built = pepe_stack(RecordingSync(FilterSync.UNCHANGED), edit_sync=edit_sync)
+    try:
+        assert built.app.first_run("op-1", PEPE).state is OperationState.SUCCEEDED
+        assert built.app.first_run("op-2", PEPE).state is OperationState.SUCCEEDED
+        assert built.app.last_first_run.integrated == ["open-webui"]
+        assert built.app.first_run("op-3", PEPE).state is OperationState.SUCCEEDED
+        assert built.app.last_first_run.did_nothing
+    finally:
+        built.release()
+
+
+def test_somebody_elses_image_edit_configuration_is_a_warning_not_a_failure():
+    edit_sync = RecordingSync(FilterSync.REFUSED, subject="image editing")
+    built = pepe_stack(RecordingSync(FilterSync.UNCHANGED), edit_sync=edit_sync)
+    try:
+        result = built.app.first_run("op-1", PEPE)
+        assert result.state is OperationState.SUCCEEDED
+        warning = next(d for d in result.diagnostics if d.code == "open-webui-integration")
+        assert warning.message == "image editing: refused"
+        assert built.app.last_first_run.integrated == []
+    finally:
+        built.release()
+
+
+def test_an_image_edit_workflow_still_unmapped_is_not_synced():
+    from dataclasses import replace
+
+    edit_sync = RecordingSync(FilterSync.INSTALLED, subject="image editing")
+    built = pepe_stack(RecordingSync(FilterSync.UNCHANGED), edit_sync=edit_sync)
+    try:
+        profile = built.app.profile(PEPE)
+        handlers = built.app.install_actions(profile)
+        specs = dict(handlers.workflow_specs)
+        specs["flux2_klein_edit"] = replace(specs["flux2_klein_edit"], unresolved=("image",))
+        original = built.app.install_actions
+
+        def drafting(p):
+            actions = original(p)
+            return replace(actions, workflow_specs=specs)
+
+        built.app.install_actions = drafting
+        result = built.app.first_run("op-1", PEPE)
+        assert result.state is OperationState.SUCCEEDED
+        assert edit_sync.calls == []
+        assert built.app.last_first_run.unmapped_workflows == ["image_edit"]
     finally:
         built.release()

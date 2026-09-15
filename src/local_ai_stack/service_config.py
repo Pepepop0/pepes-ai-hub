@@ -12,7 +12,10 @@ Three wirings, and nothing else:
 * **ComfyUI search paths** — where the managed model tree lives, taken from the
   parents of the resolved files rather than rebuilt from a placement table.
 * **Open WebUI to ComfyUI** — the image capability, including the workflow graph
-  and the node mapping the workflow domain owns.
+  and the node mapping the workflow domain owns. Image editing shares the
+  translation (:func:`open_webui_image_edit_settings`), but its values are only
+  expressible in Open WebUI's persisted settings, so they are handed to the
+  settings sync rather than to the launch environment.
 
 Values are produced as environment variables where upstream documents one, and
 as generated files where a file is what the service reads. Neither ever touches
@@ -41,7 +44,9 @@ from .models import (
 from .profiles import (
     CHAT_PRIMARY_ROLE,
     FEATURE_CHAT,
+    FEATURE_IMAGE_EDITING,
     FEATURE_IMAGE_GENERATION,
+    IMAGE_EDIT_WORKFLOW,
     TEXT_TO_IMAGE_WORKFLOW,
     Profile,
     capability_problems,
@@ -83,7 +88,21 @@ OPEN_WEBUI_NODE_TYPES: Mapping[WorkflowParameter, str] = {
     WorkflowParameter.HEIGHT: "height",
     WorkflowParameter.STEPS: "steps",
     WorkflowParameter.SEED: "seed",
+    WorkflowParameter.IMAGE: "image",
 }
+
+# What Open WebUI 0.11.3's edit path fills in (routers/images.py image_edits ->
+# ComfyUIEditImageForm): the uploaded image(s), the instruction, the configured
+# model and a seed. Width and height only when an edit size is configured, and
+# steps never, so a graph that maps those would receive None for them.
+OPEN_WEBUI_EDIT_PARAMETERS: frozenset[WorkflowParameter] = frozenset(
+    {
+        WorkflowParameter.IMAGE,
+        WorkflowParameter.PROMPT,
+        WorkflowParameter.MODEL,
+        WorkflowParameter.SEED,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -324,6 +343,66 @@ def open_webui_image_configuration(
     return ServiceConfiguration(ComponentId.OPEN_WEBUI, env, documents)
 
 
+@dataclass(frozen=True)
+class ImageEditSettings:
+    """What Open WebUI's image edit needs to drive ComfyUI with a managed workflow."""
+
+    base_url: str
+    model: str
+    workflow: Mapping[str, object]
+    nodes: tuple[Mapping[str, object], ...]
+
+
+def open_webui_image_edit_settings(
+    endpoints: StackEndpoints,
+    resolution: WorkflowResolution,
+    graph: Mapping[str, object] | None,
+) -> tuple[ImageEditSettings | None, tuple[str, ...]]:
+    """The edit settings for a ready workflow, or the reasons there are none.
+
+    Fail closed like generation: no ready workflow, no graph, a graph without
+    an image input, or a binding Open WebUI's edit path would leave empty all
+    mean nothing is configured.
+    """
+    if not resolution.ready:
+        return None, (
+            (
+                f"image editing is not configurable: workflow {resolution.spec.id!r} is "
+                f"{resolution.state.value}"
+            ),
+            *resolution.problems,
+        )
+    if graph is None:
+        return None, (
+            (
+                "image editing is not configurable: no workflow graph is available for "
+                f"{resolution.spec.id!r}"
+            ),
+        )
+    parameters = set(resolution.spec.parameters)
+    problems = []
+    if WorkflowParameter.IMAGE not in parameters or WorkflowParameter.PROMPT not in parameters:
+        problems.append(
+            f"image editing is not configurable: workflow {resolution.spec.id!r} must map "
+            "both an image and a prompt"
+        )
+    unsupported = sorted(p.value for p in parameters - OPEN_WEBUI_EDIT_PARAMETERS)
+    if unsupported:
+        problems.append(
+            f"image editing is not configurable: workflow {resolution.spec.id!r} maps "
+            f"{', '.join(unsupported)}, which Open WebUI's edit path does not fill in"
+        )
+    if problems:
+        return None, tuple(problems)
+    settings = ImageEditSettings(
+        base_url=endpoints.comfyui,
+        model=resolution.runtime_name,
+        workflow=dict(graph),
+        nodes=tuple(open_webui_workflow_nodes(resolution)),
+    )
+    return settings, ()
+
+
 # --- the whole stack --------------------------------------------------------
 
 
@@ -334,13 +413,15 @@ def declared_capability_problems(
 
     The profile's own coherence, plus what the workflow manifest settles: an
     enabled image generation needs its text-to-image workflow to exist, to be
-    mapped, and to name only models the profile declares. None of this waits
-    for an install -- a workflow that is not mapped today is not mapped after
-    downloading twelve gigabytes either. Whether a declared model can actually
-    be installed is ``unresolved_roles``'s question, not this one.
+    mapped, to generate from text alone (a graph that maps an input image is an
+    edit graph), and to name only models the profile declares. None of this
+    waits for an install -- a workflow that is not mapped today is not mapped
+    after downloading twelve gigabytes either. Whether a declared model can
+    actually be installed is ``unresolved_roles``'s question, not this one.
 
     An image-edit workflow still being mapped is deliberately not here: it
     does not block configuration, and is reported as a warning when it runs.
+    A mapped one must take an input image, or it cannot edit anything.
     """
     problems = list(capability_problems(profile))
     if not profile.enables(FEATURE_IMAGE_GENERATION):
@@ -359,12 +440,26 @@ def declared_capability_problems(
             f"workflows.text_to_image names {spec.id!r}, which is not mapped yet "
             f"({', '.join(spec.unresolved)})"
         )
+    elif WorkflowParameter.IMAGE in spec.bindings:
+        problems.append(
+            f"workflows.text_to_image names {spec.id!r}, which edits an input image "
+            "and cannot generate from text"
+        )
     else:
         missing = [role for role in spec.required_roles if profile.model_for(role) is None]
         if missing:
             problems.append(
                 f"workflow {spec.id!r} loads {', '.join(missing)}, which the profile does not name"
             )
+    edit = profile.workflows.get(IMAGE_EDIT_WORKFLOW)
+    edit_spec = workflow_specs.get(edit.manifest_id) if edit is not None else None
+    if (
+        profile.enables(FEATURE_IMAGE_EDITING)
+        and edit_spec is not None
+        and edit_spec.complete
+        and WorkflowParameter.IMAGE not in edit_spec.bindings
+    ):
+        problems.append(f"workflows.image_edit names {edit_spec.id!r}, which takes no input image")
     return tuple(problems)
 
 
@@ -492,7 +587,9 @@ __all__: Sequence[str] = (
     "COMFYUI_SEARCH_PATHS_FILE",
     "COMFYUI_WORKFLOW_FILE",
     "COMFYUI_WORKFLOW_NODES_FILE",
+    "OPEN_WEBUI_EDIT_PARAMETERS",
     "OPEN_WEBUI_ENV_FILE",
+    "ImageEditSettings",
     "ServiceConfiguration",
     "StackConfiguration",
     "build_stack_configuration",
@@ -501,6 +598,7 @@ __all__: Sequence[str] = (
     "declared_capability_problems",
     "open_webui_chat_configuration",
     "open_webui_image_configuration",
+    "open_webui_image_edit_settings",
     "open_webui_ollama_env",
     "open_webui_workflow_nodes",
 )

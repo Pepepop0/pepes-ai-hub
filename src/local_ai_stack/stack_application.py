@@ -45,6 +45,7 @@ from .application_contracts import (
 from .components import ComponentId
 from .controller import ServiceController
 from .download import Downloader, DownloadProgress
+from .endpoints import StackEndpoints
 from .execution import ExecutionReport, PlanExecutor
 from .external_conflict_contracts import (
     ConflictPolicySelection,
@@ -91,6 +92,7 @@ from .model_resolver import StackModelResolver, unresolved_roles
 from .models import ManagedModelPaths, OllamaModelSource
 from .ollama_models import HttpOllamaClient
 from .open_webui_filters import FilterSync, FilterSyncReport, sync_image_chat_filter
+from .open_webui_image_edit import sync_image_edit
 from .open_webui_models import sync_chat_model
 from .operation_contracts import (
     OperationActivity,
@@ -108,8 +110,10 @@ from .probes import http_probe, tcp_probe
 from .processes import ProcessOrigin, RuntimeProcessState
 from .profiles import (
     CHAT_PRIMARY_ROLE,
+    FEATURE_IMAGE_EDITING,
     FEATURE_IMAGE_GENERATION,
     FEATURE_TOOLS,
+    IMAGE_EDIT_WORKFLOW,
     Profile,
     load_profiles,
 )
@@ -117,9 +121,20 @@ from .provisioning import ProvisionContext, ProvisionEvent, ProvisionOutcome
 from .registry import ManagedProcessRegistry
 from .resources import resource_root
 from .runner import CommandRunner
-from .service_config import StackConfiguration, declared_capability_problems
+from .service_config import (
+    ImageEditSettings,
+    StackConfiguration,
+    declared_capability_problems,
+    open_webui_image_edit_settings,
+)
 from .services import ServiceState
 from .system import SystemFacts, detect_system
+from .workflows import (
+    WorkflowError,
+    load_workflow_graph,
+    resolve_workflow,
+    verify_workflow_references,
+)
 
 # Services start in dependency order and stop in the reverse. Open WebUI talks
 # to Ollama and ComfyUI needs the models the plan placed, so Ollama goes first.
@@ -187,6 +202,8 @@ class StackDependencies:
     filter_sync: Callable[[Path, str], FilterSyncReport] = sync_image_chat_filter
     # Keeps the profile's chat model configured for tool calling in that Open WebUI.
     model_sync: Callable[[Path, str, str], FilterSyncReport] = sync_chat_model
+    # Keeps that Open WebUI's image editing pointed at the profile's edit workflow.
+    image_edit_sync: Callable[[Path, str, ImageEditSettings], FilterSyncReport] = sync_image_edit
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], datetime] = utc_now
@@ -894,15 +911,17 @@ class StackApplication:
     ) -> FilterSyncReport | None:
         """Once Open WebUI answers, keep what the profile needs from it current.
 
-        Two things live in Open WebUI's own database and are synced through its
+        Three things live in Open WebUI's own database and are synced through its
         API every time the service is up: the image chat filter that makes the
         UI's Image feature reach ComfyUI (``assets/open-webui/pepito_image_chat.py``,
-        when the profile enables image generation) and the chat model record
-        that keeps Open WebUI's builtin tools out of the model's prompt
-        (``open_webui_models``, when the profile enables tools). Each is
-        installed once, updated when it drifted, and otherwise left alone. The
-        report is the more significant of the two; None when the profile has
-        no use for either.
+        when the profile enables image generation), the chat model record that
+        keeps Open WebUI's builtin tools out of the model's prompt
+        (``open_webui_models``, when the profile enables tools), and the image
+        edit settings that point Open WebUI's own edit path at the profile's
+        ComfyUI edit workflow (``open_webui_image_edit``, when the profile
+        enables image editing and that workflow is ready). Each is installed
+        once, updated when it drifted, and otherwise left alone. The report is
+        the most significant of them; None when the profile has no use for any.
         """
         endpoints = self.options.endpoints_for(profile)
         if not endpoints.enabled(profile, str(ComponentId.OPEN_WEBUI)):
@@ -927,6 +946,10 @@ class StackApplication:
                     ),
                 )
             )
+        if profile.enables(FEATURE_IMAGE_EDITING):
+            edit = self._image_edit_sync(profile, endpoints)
+            if edit is not None:
+                syncs.append(("edição de imagem", edit))
         if not syncs:
             return None
         stream.activity(
@@ -945,6 +968,43 @@ class StackApplication:
                 f"{_INTEGRATION_WORDS.get(report.outcome.value, report.outcome.value)}",
             )
         return _combined_report(reports)
+
+    def _image_edit_sync(
+        self, profile: Profile, endpoints: StackEndpoints
+    ) -> Callable[[], FilterSyncReport] | None:
+        """The edit settings sync for this profile, or None while its workflow is unmapped.
+
+        A workflow the manifest still declares as unmapped is reported by the
+        run that skips it; there is nothing to sync yet. A ready one whose
+        settings cannot be built is a warning with the reason, never a guess.
+        """
+        declaration = profile.workflows.get(IMAGE_EDIT_WORKFLOW)
+        handlers = self.install_actions(profile)
+        spec = handlers.workflow_specs.get(declaration.manifest_id) if declaration else None
+        if spec is None or not spec.complete:
+            return None
+        resolver = self.resolver(profile)
+        with resolver.installer.detection_snapshot():
+            resolution = resolve_workflow(spec, profile, resolver, repo_root=self.repo_root)
+        graph = None
+        if resolution.ready:
+            try:
+                graph = load_workflow_graph(resolution)
+                problems = verify_workflow_references(resolution, graph)
+            except (OSError, ValueError, WorkflowError) as exc:
+                problems = (str(exc),)
+            if problems:
+                detail = f"image editing: workflow {spec.id!r} does not match its graph: " + (
+                    "; ".join(problems)
+                )
+                return lambda: FilterSyncReport(FilterSync.UNAVAILABLE, detail)
+        settings, problems = open_webui_image_edit_settings(endpoints, resolution, graph)
+        if settings is None:
+            detail = "; ".join(problems)
+            return lambda: FilterSyncReport(FilterSync.UNAVAILABLE, detail)
+        return lambda: self.deps.image_edit_sync(
+            self.layout.open_webui_data, endpoints.open_webui, settings
+        )
 
     def _chat_model_reference(self, profile: Profile) -> str | None:
         """The Ollama tag of the profile's primary chat model, when the catalog pins one."""

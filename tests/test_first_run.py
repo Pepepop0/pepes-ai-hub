@@ -527,7 +527,8 @@ def test_an_incoherent_profile_is_refused_before_anything_is_installed():
     """Caught at "Verificando ambiente", not after minutes of installation.
 
     This one loads -- its text-to-image workflow is declared -- but the manifest
-    it names is not mapped, which no amount of installing would change.
+    it names is the edit graph, which needs an input image and cannot generate
+    from text; no amount of installing would change that.
     """
     yaml_text = capella_yaml().replace(
         "text_to_image: {manifest_id: flux2_klein_t2i}",

@@ -125,10 +125,33 @@ def test_the_shipped_manifest_parses_into_declarative_bindings(specs):
     assert t2i.binding(WorkflowParameter.SEED) == NodeBinding("75:73", "noise_seed")
 
 
-def test_a_workflow_still_being_mapped_is_incomplete(specs):
+def test_the_edit_workflow_maps_exactly_what_a_caller_supplies(specs):
     edit = specs["flux2_klein_edit"]
-    assert not edit.complete
-    assert "prompt" in edit.unresolved and "model" in edit.unresolved
+    assert edit.complete and edit.status == "mapped_and_embedded"
+    assert edit.file == Path("workflows/flux2-klein-edit-api.json")
+    assert set(edit.parameters) == {
+        WorkflowParameter.IMAGE,
+        WorkflowParameter.PROMPT,
+        WorkflowParameter.MODEL,
+        WorkflowParameter.SEED,
+    }
+    assert edit.required_roles == ("image.diffusion", "image.text_encoder", "image.vae")
+
+
+def test_a_workflow_still_being_mapped_is_incomplete():
+    manifest = {
+        "schema_version": 1,
+        "workflows": {
+            "draft": {
+                "file": "workflows/draft.json",
+                "models": {"required": ["image.diffusion"], "parameter": "image.diffusion"},
+                "mapping": {"image": "TBD", "prompt": "TBD", "seed": {"node_id": "3", "key": "s"}},
+            }
+        },
+    }
+    draft = parse_workflow_manifest(manifest)["draft"]
+    assert not draft.complete
+    assert draft.unresolved == ("image", "prompt")
 
 
 def test_no_node_id_appears_anywhere_but_the_manifest():
@@ -259,8 +282,10 @@ def test_an_unavailable_model_can_never_be_rendered(specs, profile, graph):
 
 
 def test_an_incomplete_mapping_blocks_the_workflow(specs, profile, tmp_path):
+    from dataclasses import replace
+
     resolver = image_resolver(tmp_path)
-    edit = specs["flux2_klein_edit"]
+    edit = replace(specs["flux2_klein_edit"], unresolved=("image",))
     resolution = resolve_workflow(edit, profile, resolver, repo_root=tmp_path)
     assert resolution.state is WorkflowState.MAPPING_INCOMPLETE
     assert "no node binding" in resolution.problems[0]
@@ -530,3 +555,105 @@ def test_rendering_the_real_graph_replaces_everything_it_was_exported_with(
         )
 
     assert SHIPPED_GRAPH.read_text(encoding="utf-8") == before, "the export on disk is read-only"
+
+
+# --- the image edit graph: embedded, mapped, and made of the models Pepe has ----------
+
+SHIPPED_EDIT_GRAPH = REPO / "workflows" / "flux2-klein-edit-api.json"
+
+
+def test_the_edit_graph_is_embedded_and_every_binding_addresses_a_real_field(specs, profile):
+    """A: the resource is in the repository; B: the mapping matches the export."""
+    assert SHIPPED_EDIT_GRAPH.is_file()
+    edit = specs["flux2_klein_edit"]
+    resolution = resolve_workflow(edit, profile, image_resolver_repo(), repo_root=REPO)
+    assert resolution.ready, resolution.problems
+    assert resolution.template_path == REPO / "workflows" / "flux2-klein-edit-api.json"
+    graph = json.loads(SHIPPED_EDIT_GRAPH.read_text(encoding="utf-8"))
+    assert verify_workflow_references(resolution, graph) == ()
+    kinds = {
+        parameter: graph[edit.binding(parameter).node_id]["class_type"]
+        for parameter in edit.parameters
+    }
+    assert kinds == {
+        WorkflowParameter.IMAGE: "LoadImage",
+        WorkflowParameter.PROMPT: "CLIPTextEncode",
+        WorkflowParameter.MODEL: "UNETLoader",
+        WorkflowParameter.SEED: "RandomNoise",
+    }
+
+
+def test_the_edit_graph_takes_one_image_and_saves_one_output(graph_edit):
+    classes = [node["class_type"] for node in graph_edit.values()]
+    assert classes.count("LoadImage") == 1, "one input image, one mapped node"
+    assert classes.count("SaveImage") == 1
+    # The size comes from the input image, and every input references a node that exists.
+    assert "EmptyFlux2LatentImage" in classes and "GetImageSize" in classes
+    for node in graph_edit.values():
+        for value in node["inputs"].values():
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
+                assert value[0] in graph_edit, value
+
+
+def test_the_edit_graph_loads_exactly_the_models_the_catalog_already_pins(graph_edit):
+    """No new download: the three files Pepe's text-to-image already installed."""
+    from local_ai_stack.model_catalog import model_catalog
+
+    catalog = model_catalog()
+    pinned = {
+        catalog.require(model_id).source.artifact.filename
+        for model_id in (DIFFUSION_ID, ENCODER_ID, VAE_ID)
+    }
+    loaded = {
+        value
+        for node in graph_edit.values()
+        for key, value in node["inputs"].items()
+        if key in {"unet_name", "clip_name", "vae_name"}
+    }
+    assert (
+        loaded
+        == pinned
+        == {
+            "flux-2-klein-4b-fp8.safetensors",
+            "qwen_3_4b.safetensors",
+            "flux2-vae.safetensors",
+        }
+    )
+
+
+def test_the_edit_graph_carries_no_machine_path(graph_edit):
+    text = SHIPPED_EDIT_GRAPH.read_text(encoding="utf-8")
+    for needle in (":\\", "C:/", "/Users/", "\\\\", "PEPEH", "scratchpad", "Temp"):
+        assert needle not in text, needle
+    assert json.loads(text) == graph_edit
+
+
+def test_rendering_the_edit_graph_puts_prompt_model_and_seed_where_mapped(specs, profile):
+    resolution = resolve_workflow(
+        specs["flux2_klein_edit"], profile, image_resolver_repo(), repo_root=REPO
+    )
+    rendered = render_workflow(resolution, WorkflowParameters(prompt="make it green", seed=5))
+    assert rendered["75:74"]["inputs"]["text"] == "make it green"
+    assert rendered["75:73"]["inputs"]["noise_seed"] == 5
+    assert rendered["75:70"]["inputs"]["unet_name"] == resolution.runtime_name
+    assert rendered["76"]["inputs"]["image"] == "handbag_white.png", "the image is Open WebUI's"
+
+
+@pytest.fixture
+def graph_edit():
+    return json.loads(SHIPPED_EDIT_GRAPH.read_text(encoding="utf-8"))
+
+
+def image_resolver_repo() -> FakeResolver:
+    """Every image role available under its real catalog filename, without touching disk."""
+    from local_ai_stack.model_catalog import model_catalog
+
+    catalog = model_catalog()
+    models = {}
+    for model_id, (placement, _, kind) in IMAGE_MODELS.items():
+        filename = catalog.require(model_id).source.artifact.filename
+        path = Path(os.path.abspath(os.sep)) / "stack" / "models" / placement.value / filename
+        models[model_id] = ResolvedModel(
+            model_id, kind, ModelState.AVAILABLE, FileModelLocation(path, filename, placement)
+        )
+    return FakeResolver(models)

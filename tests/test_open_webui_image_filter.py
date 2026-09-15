@@ -188,6 +188,11 @@ def test_turns_do_not_share_state():
     ("text", "expected"),
     [
         ("A red apple. ![x](https://a.b/c.png)", "A red apple."),
+        (
+            'Here it is:\n\n<img src="https://a.b/green.png" alt="A green apple.">\n\nEnjoy.',
+            "Here it is:\n\nEnjoy.",
+        ),
+        ('<IMG SRC="/api/v1/files/x/content">', "Image generated."),
         ("Look: [here](https://a.b/c) now", "Look: here now"),
         ("http://a.b/c.png", "Image generated."),
         ("Line\n\n\n\nBreak", "Line\n\nBreak"),

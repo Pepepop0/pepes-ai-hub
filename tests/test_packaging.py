@@ -361,7 +361,7 @@ def test_the_smoke_report_from_a_checkout_is_clean():
     assert report["frozen"] is False
     assert report["profiles"] == ["capella", "pepe", "test"]
     assert "python-windows-amd64" in report["manifests"]["artifacts"]
-    assert report["workflows"]["embedded"] == ["flux2_klein_t2i"]
+    assert report["workflows"]["embedded"] == ["flux2_klein_edit", "flux2_klein_t2i"]
     assert report["python_runtime"]["managed_runtime_selected"] is False
     assert report["folder_picker"] in {"WindowsFolderPicker", "NullFolderPicker"}
 

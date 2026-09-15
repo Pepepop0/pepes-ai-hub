@@ -215,11 +215,30 @@ def test_enabled_images_with_unavailable_models_still_leave_comfyui_unconfigured
 
 def test_an_unmapped_text_to_image_workflow_is_caught_before_installing(specs):
     pepe = SHIPPED["pepe"]
-    unmapped = replace(
+    unmapped = {**specs, "flux2_klein_t2i": replace(specs["flux2_klein_t2i"], unresolved=("seed",))}
+    problems = declared_capability_problems(pepe, unmapped)
+    assert any("not mapped yet" in problem for problem in problems)
+
+
+def test_an_edit_graph_is_refused_as_text_to_image_before_installing(specs):
+    pepe = SHIPPED["pepe"]
+    swapped = replace(
         pepe, workflows={**pepe.workflows, "text_to_image": pepe.workflows["image_edit"]}
     )
-    problems = declared_capability_problems(unmapped, specs)
-    assert any("not mapped yet" in problem for problem in problems)
+    problems = declared_capability_problems(swapped, specs)
+    assert any("edits an input image" in problem for problem in problems)
+
+
+def test_an_image_edit_graph_without_an_input_image_is_refused(specs):
+    from local_ai_stack.workflows import WorkflowParameter
+
+    edit = specs["flux2_klein_edit"]
+    blind = replace(
+        edit,
+        bindings={k: v for k, v in edit.bindings.items() if k is not WorkflowParameter.IMAGE},
+    )
+    problems = declared_capability_problems(SHIPPED["pepe"], {**specs, edit.id: blind})
+    assert any("takes no input image" in problem for problem in problems)
 
 
 def test_an_unknown_text_to_image_manifest_is_caught_before_installing(specs):
@@ -247,8 +266,17 @@ def test_a_workflow_model_the_profile_does_not_name_is_caught_before_installing(
 
 def test_an_image_edit_workflow_still_being_mapped_does_not_block(specs):
     """Configuration never depended on it; the run reports it as a warning."""
-    assert not specs["flux2_klein_edit"].complete
-    assert declared_capability_problems(SHIPPED["capella"], specs) == ()
+    drafting = {
+        **specs,
+        "flux2_klein_edit": replace(specs["flux2_klein_edit"], unresolved=("image",)),
+    }
+    assert declared_capability_problems(SHIPPED["capella"], drafting) == ()
+
+
+def test_the_shipped_profiles_are_coherent_with_the_mapped_edit_workflow(specs):
+    assert specs["flux2_klein_edit"].complete
+    for name in ("capella", "pepe"):
+        assert declared_capability_problems(SHIPPED[name], specs) == ()
 
 
 # --- the launch gate follows the capability, not the service -----------------------

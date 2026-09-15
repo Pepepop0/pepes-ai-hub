@@ -18,15 +18,16 @@ workflows:
       seed: {node_id: "75:73", key: noise_seed}
   flux2_klein_edit:
     file: workflows/flux2-klein-edit-api.json
-    status: TODO_export_and_map
+    status: mapped_and_embedded
     models:
       required: [image.diffusion, image.text_encoder, image.vae]
       parameter: image.diffusion
+    # Width, height and steps are not inputs of this graph: the size comes from
+    # the input image (scaled to one megapixel, then GetImageSize) and the
+    # distilled model runs its fixed 4 steps. Only what a caller supplies is
+    # mapped, which is also exactly what Open WebUI's edit path fills in.
     mapping:
-      image: TBD
-      prompt: TBD
-      model: TBD
-      width: TBD
-      height: TBD
-      steps: TBD
-      seed: TBD
+      image: {node_id: "76", key: image}
+      prompt: {node_id: "75:74", key: text}
+      model: {node_id: "75:70", key: unet_name}
+      seed: {node_id: "75:73", key: noise_seed}

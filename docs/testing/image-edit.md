@@ -141,8 +141,9 @@ next reported `já atual` with `did_nothing=True`; the
 - In a chat that holds an uploaded image, a turn with Image **off** still sends
   the pixels to Hermes3 and shows Ollama's 400 JSON. That is chat with a
   non-vision model, outside this change.
-- With Image on, every turn in a chat that holds an image is an edit of the
-  newest image.
+- With Image on, a turn that asks to change the picture edits the chat's
+  newest image; a turn that asks for a new picture generates one. How that is
+  decided, and why it had to be: `docs/testing/image-generate-vs-edit.md`.
 
 Focused tests:
 

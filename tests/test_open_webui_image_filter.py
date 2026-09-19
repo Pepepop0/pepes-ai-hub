@@ -215,3 +215,120 @@ def test_the_filter_is_a_bundled_resource_not_a_package_module():
         filter_path() == Path(detect_repo_root()) / "assets" / "open-webui" / "pepito_image_chat.py"
     )
     assert filter_path().is_file()
+
+
+# --- edit or new picture: the user's words decide, biased towards a new picture ---------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Generate an image of a cat.",
+        "Now an image of a necromancer.",
+        "I want an image of a blue ceramic mug.",
+        "Gere uma imagem de um castelo.",
+        "Agora faça uma imagem de um carro vermelho.",
+        "Generate an image of the WW2 tiger heavy tank",
+        "Now an image of a necromancer",
+        "Now I want an image of a blue ceramic mug",
+        "Generate an image of a medieval castle",
+        "Generate a castle at night.",
+        "Now generate an image of a necromancer.",
+        "Make a cat",
+        "Paint a sunset",
+        "Faça um gato",
+        "Gere a imagem de um gato",
+        "A dragon flying over mountains",
+        "the same but at night",
+        "",
+    ],
+)
+def test_these_ask_for_a_new_picture(text):
+    assert load_module()["edit_intent"](text) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Change the cat to black.",
+        "Make it blue.",
+        "Change the background to white.",
+        "Put a hat on it.",
+        "Mude a cor para verde.",
+        "Troque o fundo para preto.",
+        "Coloque um chapéu nela.",
+        "Change the mug to red",
+        "Change the background to black",
+        "Put the red mug on a wooden table.",
+        "Now change the mug to red",
+        "Add a hat",
+        "Turn it into a robot",
+        "Paint the sky red",
+        "Faça o fundo preto",
+        "Deixe o fundo preto",
+        "Remove the background",
+        "Keep the mug but make the table wooden",
+        "add a hat to this image",
+        "in this image, make the sky purple",
+        "Replace the background with a picture of a forest",
+        "Change this into an image of a cat",
+        "Nessa imagem, mude o fundo",
+        "Transforme em uma pintura a óleo",
+        "Make the previous image darker",
+        "Pinte o céu de vermelho",
+        "Mantenha a caneca, mas mude a mesa",
+    ],
+)
+def test_these_ask_to_change_the_picture_in_the_chat(text):
+    assert load_module()["edit_intent"](text) is True
+
+
+def test_a_new_picture_in_a_chat_that_holds_one_turns_the_feature_off_for_the_turn():
+    """The inlet's contract: Open WebUI's handler must not see this turn at all."""
+    module = load_module()
+    filter_ = module["Filter"]()
+    metadata = ui_metadata()
+    body = {
+        "model": "hermes3:8b",
+        "features": metadata["features"],
+        "messages": [{"role": "user", "content": "Now an image of a necromancer"}],
+    }
+
+    async def holds(metadata, user_id):
+        return True
+
+    module["chat_holds_images"] = holds
+    filter_.inlet.__func__.__globals__["chat_holds_images"] = holds
+    run(filter_.inlet(body, metadata, {"id": "user-1"}))
+    assert metadata["features"]["image_generation"] is False
+    assert body["features"]["image_generation"] is False
+    assert metadata["params"]["function_calling"] == "legacy"
+    state = metadata["pepito_image_chat"]
+    assert state["edit"] is False
+    assert state["generate"] == {"prompt": "Now an image of a necromancer", "model": "hermes3:8b"}
+
+    # An edit leaves everything to Open WebUI, and so does a chat without pictures.
+    for text, holds_images in (("Change it to red", True), ("Now an image of a dog", False)):
+
+        async def answer(metadata, user_id, value=holds_images):
+            return value
+
+        filter_.inlet.__func__.__globals__["chat_holds_images"] = answer
+        metadata = ui_metadata()
+        body = {
+            "model": "m",
+            "features": metadata["features"],
+            "messages": [{"role": "user", "content": text}],
+        }
+        run(filter_.inlet(body, metadata, {"id": "user-1"}))
+        assert metadata["features"]["image_generation"] is True
+        assert "generate" not in metadata["pepito_image_chat"]
+        assert metadata["pepito_image_chat"]["edit"] is (text == "Change it to red")
+
+
+def test_the_chat_lookup_answers_false_when_it_cannot_look():
+    module = load_module()
+    holds = module["chat_holds_images"]
+    assert run(holds({"chat_id": "local:abc"}, "user-1")) is False
+    assert run(holds({"chat_id": "chat-1"}, None)) is False
+    assert run(holds({}, "user-1")) is False

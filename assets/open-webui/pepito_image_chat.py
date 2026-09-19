@@ -1,9 +1,9 @@
 """
 title: Pepito Image Chat
 author: Pepito's AI Hub
-version: 0.3.0
+version: 0.4.0
 required_open_webui_version: 0.11.3
-description: Send every Image turn through Open WebUI's own image generation or editing, whatever the model says.
+description: Send every Image turn through Open WebUI's own image generation or editing, and decide which from the user's words.
 """
 
 # This file is uploaded verbatim as an Open WebUI Filter Function. Keep it
@@ -54,6 +54,20 @@ description: Send every Image turn through Open WebUI's own image generation or 
 # Open WebUI's image step and before the model is asked; when that success
 # context is present but the message holds no image, the context is replaced
 # by a failure, the status says so, and the turn's text is the failure itself.
+#
+# And the decision the pinned handler does not make: with editing enabled, a
+# chat that already holds an image edits it on *every* Image turn -- "Now an
+# image of a necromancer" after a tank puts a necromancer into the tank. The
+# handler reads the saved chat's history for that, not the request, so no
+# body or metadata edit hides those images from it. So the filter decides
+# first, from the user's words (``edit_intent``, biased towards a new image:
+# an unwanted fresh picture is recoverable, a silently altered old one is
+# not). An edit is left to Open WebUI exactly as before. A new image while the
+# chat holds one is taken over: the handler is skipped for the turn
+# (``features.image_generation`` off) and the ``request`` hook makes the
+# picture through Open WebUI's own ``image_generations`` -- the same call the
+# handler makes, with the same statuses, the same file attachment and the same
+# context -- from the current message alone, so no earlier image is an input.
 from __future__ import annotations
 
 import re
@@ -71,10 +85,109 @@ NOT_CREATED_CONTEXT = (
 )
 # Open WebUI 0.11.3 chat_image_generation_handler, both success contexts.
 SUCCESS_MARK = "is now being shown to the user"
+# The handler's own words for a generated picture, and for a failed attempt.
+GENERATED_CONTEXT = (
+    "<context>The requested image has been created by the system successfully and is now "
+    "being shown to the user. Let the user know that the image they requested has been "
+    "generated and is now shown in the chat.</context>"
+)
+FAILED_CONTEXT = (
+    "<context>Image generation was attempted but failed because of an error. The system is "
+    "currently unable to generate the image. Tell the user that the following error occurred: "
+    "{error}</context>"
+)
 MAX_TEXT = 65536
 
 _SUCCESS_CONTEXT = re.compile(r"<context>[^<]*" + re.escape(SUCCESS_MARK) + r"[^<]*</context>")
 
+# --- edit or new image ------------------------------------------------------------
+#
+# Words that only make sense about a picture already in the chat, and words
+# that announce a new one; Portuguese and English. The order of the rules is
+# the policy: an explicit reference to the earlier picture, then a request
+# that opens with an editing verb, then a request phrased as a new picture,
+# then an editing verb anywhere, then a verb that only edits when it points
+# at something ("make it blue", "faça o fundo preto"). Anything undecided is
+# a new picture.
+_W = r"(?<![\w])(?:{})(?![\w])"
+_THE_IMAGE = re.compile(
+    _W.format(
+        r"(?:this|that|the (?:previous|last|current|above|same)|previous|last|current|above|same)"
+        r" (?:image|picture|photo|drawing|render|pic|one)"
+        r"|(?:nessa|nesta|essa|esta|dessa|desta) (?:imagem|foto|figura|ilustra[cç][aã]o)"
+        r"|(?:imagem|foto|figura) (?:anterior|acima|atual|de cima)"
+    ),
+    re.IGNORECASE,
+)
+_NEW_IMAGE = re.compile(
+    _W.format(
+        r"(?:an?|another|one more|new) (?:\w+ ){0,2}?"
+        r"(?:image|picture|photo|drawing|illustration|render|painting|portrait|sketch)"
+        r"|(?:image|picture|photo|drawing|illustration|render|painting|sketch) of"
+        r"|(?:uma?|outra?|mais uma?|nova?) (?:\w+ ){0,2}?"
+        r"(?:imagem|foto|desenho|ilustra[cç][aã]o|pintura|retrato|figura)"
+        r"|(?:imagem|foto|desenho|ilustra[cç][aã]o|pintura|retrato) de"
+    ),
+    re.IGNORECASE,
+)
+_EDIT_VERB = re.compile(
+    _W.format(
+        r"change|edit|modify|alter|adjust|remove|erase|delete|replace|swap|recolou?r|repaint|"
+        r"keep|retain|crop|resize|rotate|flip|blur|brighten|darken|add|insert|put|place|"
+        r"mude|muda|mudar|altere|altera|alterar|edite|edita|editar|modifique|modifica|"
+        r"remova|remove|remover|tire|tira|tirar|apague|apaga|troque|troca|trocar|substitua|"
+        r"substitui|mantenha|mant[eé]m|manter|ajuste|ajusta|recorte|corte|adicione|adiciona|"
+        r"coloque|coloca|ponha|p[oõ]e|insira|insere|bote|bota|deixe|deixa|transforme|transforma"
+    ),
+    re.IGNORECASE,
+)
+# Verbs that edit only when they point at something already there. "a" is an
+# English article and a Portuguese pointer, so each language keeps its own.
+_POINTING = (
+    (
+        re.compile(_W.format(r"make|turn|give|paint|colou?r|set|fill|leave"), re.IGNORECASE),
+        re.compile(_W.format(r"it|its|this|that|these|those|them|the"), re.IGNORECASE),
+    ),
+    (
+        re.compile(_W.format(r"fa[cç]a|faz|fazer|pinte|pinta|pintar|d[eê]"), re.IGNORECASE),
+        re.compile(
+            _W.format(
+                r"ele|ela|eles|elas|isso|isto|aquilo|nele|nela|neles|nelas|nisso|nisto|"
+                r"o|a|os|as|no|na|nos|nas|do|da|dos|das|ao|à|esse|essa|este|esta|desse|dessa"
+            ),
+            re.IGNORECASE,
+        ),
+    ),
+)
+_LEADING_FILLER = re.compile(
+    r"^(?:(?:now|then|next|ok|okay|please|and|also|so|well|hmm|agora|ent[aã]o|depois|"
+    r"por favor|e|tamb[eé]m|bem)[,.!:]?\s+)+",
+    re.IGNORECASE,
+)
+_FIRST_WORD = re.compile(r"^\W*([\w\-]+)")
+
+
+def edit_intent(text: str) -> bool:
+    """Whether the user's words ask to change the picture already in the chat.
+
+    Only positive evidence says edit; everything else is a new picture.
+    """
+    words = _LEADING_FILLER.sub("", (text or "").strip())
+    if not words:
+        return False
+    if _THE_IMAGE.search(words):
+        return True
+    first = _FIRST_WORD.match(words)
+    if first and _EDIT_VERB.fullmatch(first.group(1)):
+        return True
+    if _NEW_IMAGE.search(words):
+        return False
+    if _EDIT_VERB.search(words):
+        return True
+    return any(verb.search(words) and pointer.search(words) for verb, pointer in _POINTING)
+
+
+# The model's acknowledgement, without any picture it made up.
 _HTML_IMAGE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 _MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _MARKDOWN_LINK = re.compile(r"\[([^\]]*)\]\((?:https?:|data:|file:|/)[^)]*\)")
@@ -154,8 +267,128 @@ def claimed_success(messages: list) -> dict | None:
     return None
 
 
+def last_user_text(messages: list) -> str:
+    """The words of the last user message, whatever shape Open WebUI gave it."""
+    for message in reversed(messages):
+        if not (isinstance(message, dict) and message.get("role") == "user"):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "\n".join(
+                str(part.get("text") or "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        return ""
+    return ""
+
+
+async def chat_holds_images(metadata: dict, user_id: str | None) -> bool:
+    """Whether Open WebUI's image handler would find an image to edit in this chat.
+
+    The same lookup the handler makes (utils/middleware.py
+    chat_image_generation_handler): the saved chat's history up to the current
+    message, newest first. Unknowable -> False, which leaves the turn to Open WebUI.
+    """
+    chat_id = metadata.get("chat_id")
+    if not (isinstance(chat_id, str) and chat_id and user_id):
+        return False
+    try:
+        from open_webui.models.chats import Chats
+        from open_webui.utils.chat_id import is_saved_chat_id
+        from open_webui.utils.middleware import get_images_from_messages
+        from open_webui.utils.misc import get_message_list
+
+        if not is_saved_chat_id(chat_id):
+            return False
+        chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
+        history = (chat.chat if chat else {}).get("history") or {}
+        messages = get_message_list(history.get("messages") or {}, history.get("currentId"))
+        return bool(get_images_from_messages(messages or []))
+    except Exception:  # noqa: BLE001 - no answer is better than breaking the turn
+        return False
+
+
+def with_system_context(messages: list, content: str) -> list:
+    """Open WebUI's add_or_update_system_message: one system message, first."""
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        existing = messages[0].get("content")
+        messages[0]["content"] = (
+            f"{content}\n\n{existing}" if isinstance(existing, str) else content
+        )
+        return messages
+    return [{"role": "system", "content": content}, *messages]
+
+
+async def generate_new_image(request, prompt: str, metadata: dict, user, emit) -> str:
+    """Make a picture from ``prompt`` alone through Open WebUI's own generation.
+
+    The same calls as the pinned handler's generation branch, in the same
+    order: the task model may refine the prompt (from this message only, so
+    no earlier picture leaks in through the words either), image_generations
+    submits the configured text-to-image workflow and attaches the result to
+    this message, and the statuses and the context the model is given are the
+    handler's own. Returns that context.
+    """
+    from open_webui.models.config import Config
+    from open_webui.routers.images import CreateImageForm, image_generations
+
+    image_metadata = {"chat_id": metadata.get("chat_id"), "message_id": metadata.get("message_id")}
+    await emit({"type": "status", "data": {"description": "Creating image", "done": False}})
+    refined = prompt
+    try:
+        if await Config.get("image_generation.prompt.enable"):
+            from open_webui.routers.tasks import generate_image_prompt
+            from open_webui.utils.json_codec import JSONCodec
+
+            answer = await generate_image_prompt(
+                request,
+                {
+                    "model": metadata.get("model_id"),
+                    "messages": [{"role": "user", "content": prompt}],
+                    "chat_id": metadata.get("chat_id"),
+                },
+                user,
+            )
+            text = answer["choices"][0]["message"]["content"]
+            candidate = JSONCodec.loads(text[text.rfind("{") : text.rfind("}") + 1]).get("prompt")
+            if isinstance(candidate, str) and candidate.strip():
+                refined = candidate
+    except Exception:  # noqa: BLE001 - the handler falls back to the user's words too
+        refined = prompt
+    try:
+        images = await image_generations(
+            request=request,
+            form_data=CreateImageForm(prompt=refined),
+            metadata=image_metadata,
+            user=user,
+        )
+    except Exception as exc:  # noqa: BLE001 - reported to the user, like the handler
+        detail = getattr(exc, "detail", None)
+        error = (
+            detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail or exc)
+        )
+        await emit(
+            {
+                "type": "status",
+                "data": {
+                    "description": "An error occurred while generating an image",
+                    "done": True,
+                },
+            }
+        )
+        return FAILED_CONTEXT.format(error=error)
+    await emit({"type": "status", "data": {"description": "Image created", "done": True}})
+    await emit(
+        {"type": "files", "data": {"files": [{"type": "image", **image} for image in images]}}
+    )
+    return GENERATED_CONTEXT
+
+
 class Filter:
-    async def inlet(self, body: dict, __metadata__: dict) -> dict:
+    async def inlet(self, body: dict, __metadata__: dict, __user__: dict | None = None) -> dict:
         metadata = __metadata__
         features = metadata.get("features") or {}
         params = metadata.get("params")
@@ -169,17 +402,42 @@ class Filter:
         # whether to generate the image itself (see utils/middleware.py,
         # process_chat_payload). Only this turn is affected.
         params["function_calling"] = FORCED_MODE
-        metadata[STATE_KEY] = {"text": ""}
+        state: dict = {"text": ""}
+        metadata[STATE_KEY] = state
         messages = body.get("messages")
-        if isinstance(messages, list):
-            text_only(messages)
+        if not isinstance(messages, list):
+            return body
+        text_only(messages)
+        prompt = last_user_text(messages)
+        state["edit"] = edit_intent(prompt)
+        if not state["edit"] and await chat_holds_images(metadata, (__user__ or {}).get("id")):
+            # Open WebUI would edit the chat's latest picture. Keep it out of
+            # this turn: the handler is skipped and ``request`` generates instead.
+            body_features = body.get("features")
+            for holder in (features, body_features if isinstance(body_features, dict) else None):
+                if holder is not None:
+                    holder[FEATURE] = False
+            state["generate"] = {"prompt": prompt, "model": body.get("model")}
         return body
 
-    async def request(self, body: dict, __metadata__: dict, __event_emitter__=None) -> dict:
+    async def request(
+        self,
+        body: dict,
+        __metadata__: dict,
+        __event_emitter__=None,
+        __request__=None,
+        __user__: dict | None = None,
+    ) -> dict:
         state = __metadata__.get(STATE_KEY)
         messages = body.get("messages")
         if state is None or not isinstance(messages, list):
             return body
+        generate = state.pop("generate", None)
+        if generate is not None:
+            context = await self._generate(
+                generate, __metadata__, __request__, __user__, __event_emitter__
+            )
+            body["messages"] = messages = with_system_context(messages, context)
         system = claimed_success(messages)
         if system is None:
             return body
@@ -197,6 +455,26 @@ class Filter:
             except Exception:  # noqa: BLE001, S110 - the status is a courtesy; the text still says it
                 pass
         return body
+
+    async def _generate(
+        self, generate: dict, metadata: dict, request, user: dict | None, emit
+    ) -> str:
+        """A new picture for this turn through Open WebUI, or the handler's failure context."""
+        try:
+            from open_webui.models.users import Users
+
+            account = await Users.get_user_by_id((user or {}).get("id"))
+            if request is None or account is None or emit is None:
+                raise RuntimeError("the request, the user or the event channel is missing")
+            return await generate_new_image(
+                request,
+                generate["prompt"],
+                {**metadata, "model_id": generate.get("model")},
+                account,
+                emit,
+            )
+        except Exception as exc:  # noqa: BLE001 - never a silent turn; the model reports it
+            return FAILED_CONTEXT.format(error=str(exc))
 
     async def stream(self, event: dict, __metadata__: dict) -> dict:
         state = __metadata__.get(STATE_KEY)

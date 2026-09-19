@@ -45,6 +45,16 @@ CHILD_SCRIPT = (
     "os.replace(path + '.tmp', path);"
     "time.sleep(60)"
 )
+LISTENER_CHILD_SCRIPT = """
+import os, socket, sys, time
+path = sys.argv[1]
+listener = socket.socket()
+listener.bind(('127.0.0.1', 0))
+listener.listen()
+open(path + '.tmp', 'w').write(f'{os.getpid()}:{listener.getsockname()[1]}')
+os.replace(path + '.tmp', path)
+time.sleep(60)
+"""
 
 ROOT_SCRIPT = """
 import os, subprocess, sys, time
@@ -116,6 +126,18 @@ class Handshake:
 
     def child_pid(self) -> int:
         return int(self._await(self.child_file, "the root to publish its child"))
+
+
+class ListenerHandshake(Handshake):
+    """A managed root whose child is the runtime that owns a TCP listener."""
+
+    @property
+    def argv(self) -> tuple[str, ...]:
+        return (*super().argv[:-1], LISTENER_CHILD_SCRIPT)
+
+    def runtime(self) -> tuple[int, int]:
+        pid, port = self._await(self.child_file, "the runtime to publish its listener").split(":")
+        return int(pid), int(port)
 
 
 def spawn(code: str) -> subprocess.Popen:
@@ -310,6 +332,45 @@ def test_opted_in_tree_proof_survives_manager_restart_and_stops_the_runner(tmp_p
     assert wait_gone(child)
     assert registry.load().entries == {}
     restarted.close_all()
+
+
+@WINDOWS_ONLY
+def test_comfyui_tree_proof_survives_manager_restart_and_stops_the_listener(tmp_path, reaper):
+    """ComfyUI's Python runtime must remain provable after the first Hub exits."""
+    from local_ai_stack.adapters import comfyui_control_spec
+    from local_ai_stack.launcher import ProcessLauncher, ProcessLaunchSpec, StopOutcome
+    from local_ai_stack.registry import ManagedProcessRegistry
+
+    registry = ManagedProcessRegistry(tmp_path / "state" / "managed.json")
+    policy = comfyui_control_spec(PYTHON).launch.allow_force_kill
+    first = ProcessLauncher(registry)
+    hand = ListenerHandshake(tmp_path)
+    started = first.start(ProcessLaunchSpec("comfyui", hand.argv, allow_force_kill=policy))
+    reaper.append(started.pid)
+    hand.wait_until_up()
+    hand.release()
+    runtime_pid, port = hand.runtime()
+    reaper.append(runtime_pid)
+    assert any(
+        item.pid == runtime_pid and item.laddr.port == port for item in psutil.net_connections()
+    )
+    assert runtime_pid in (first.tree_pids("comfyui", started.pid) or ())
+
+    first.close_all()  # normal Hub exit; the managed service must remain up
+    assert alive(started.pid)
+    assert alive(runtime_pid)
+
+    later = ProcessLauncher(registry)
+    assert runtime_pid in (later.tree_pids("comfyui", started.pid) or ())
+    result = later.stop("comfyui", timeout=10, allow_force=policy)
+
+    assert result.outcome is StopOutcome.STOPPED
+    assert runtime_pid in result.tree_pids
+    assert wait_gone(started.pid)
+    assert wait_gone(runtime_pid)
+    assert not any(item.laddr.port == port for item in psutil.net_connections())
+    assert registry.load().entries == {}
+    later.close_all()
 
 
 # --- force policy ----------------------------------------------------------
@@ -606,7 +667,15 @@ def test_restarting_a_service_replaces_its_job_instead_of_stacking_them(tmp_path
 # --- a failed tree termination must still let go ---------------------------
 
 
-def stop_scenario(monkeypatch, tmp_path, *, root: int, child: int, terminate_ok: bool):
+def stop_scenario(
+    monkeypatch,
+    tmp_path,
+    *,
+    root: int,
+    child: int,
+    terminate_ok: bool,
+    child_exit_after: int = 0,
+):
     """A root that exits, a proved descendant that does not, and a chosen
     outcome for TerminateJobObject. No real process is involved: every kernel
     answer is scripted, so the path under test is exact.
@@ -625,15 +694,29 @@ def stop_scenario(monkeypatch, tmp_path, *, root: int, child: int, terminate_ok:
         "membership",
         lambda job, pid: Membership.MEMBER if job is not None else Membership.UNPROVABLE,
     )
-    monkeypatch.setattr(job_module, "terminate", lambda job, exit_code=1: terminate_ok)
 
     # The root is alive and ours until it is asked to stop; the child stays.
     root_info = ProcessInfo(root, "python.exe", PYTHON, "root", 500.0)
-    state = {"root_alive": True}
+    state = {
+        "root_alive": True,
+        "tree_terminated": False,
+        "child_checks_after_terminate": 0,
+    }
+
+    def terminate_tree(job, exit_code=1):
+        if terminate_ok:
+            state["tree_terminated"] = True
+        return terminate_ok
+
+    monkeypatch.setattr(job_module, "terminate", terminate_tree)
 
     def fake_lookup(pid: int) -> ProcessLookup:
         if pid == root and not state["root_alive"]:
             return ProcessLookup(LookupOutcome.NOT_FOUND, detail="gone")
+        if pid == child and state["tree_terminated"]:
+            state["child_checks_after_terminate"] += 1
+            if state["child_checks_after_terminate"] > child_exit_after:
+                return ProcessLookup(LookupOutcome.NOT_FOUND, detail="gone")
         info = root_info if pid == root else ProcessInfo(pid, "python.exe", PYTHON, "child", 600.0)
         return ProcessLookup(LookupOutcome.FOUND, info)
 
@@ -660,14 +743,14 @@ def stop_scenario(monkeypatch, tmp_path, *, root: int, child: int, terminate_ok:
         sleep=lambda seconds: None,
     )
     launcher.start(launch_spec())
-    return launcher, registry, ledger
+    return launcher, registry, ledger, state
 
 
 def test_a_failed_tree_termination_still_releases_the_record_and_the_job(tmp_path, monkeypatch):
     """The blocker: root gone, tree termination failed, state must be let go."""
     from local_ai_stack.launcher import StopOutcome
 
-    launcher, registry, ledger = stop_scenario(
+    launcher, registry, ledger, _ = stop_scenario(
         monkeypatch, tmp_path, root=7001, child=7002, terminate_ok=False
     )
 
@@ -691,7 +774,7 @@ def test_a_successful_tree_termination_still_releases_everything(tmp_path, monke
     """The sibling path, so the fix cannot regress it."""
     from local_ai_stack.launcher import StopOutcome
 
-    launcher, registry, ledger = stop_scenario(
+    launcher, registry, ledger, _ = stop_scenario(
         monkeypatch, tmp_path, root=7101, child=7102, terminate_ok=True
     )
 
@@ -705,11 +788,33 @@ def test_a_successful_tree_termination_still_releases_everything(tmp_path, monke
     assert ledger.balanced
 
 
+def test_tree_termination_waits_for_every_proved_descendant(tmp_path, monkeypatch):
+    from local_ai_stack.launcher import StopOutcome
+
+    launcher, registry, ledger, state = stop_scenario(
+        monkeypatch,
+        tmp_path,
+        root=7151,
+        child=7152,
+        terminate_ok=True,
+        child_exit_after=3,
+    )
+
+    result = launcher.stop("fixture", timeout=5, allow_force=True)
+
+    assert result.outcome is StopOutcome.STOPPED
+    assert state["child_checks_after_terminate"] == 4
+    assert result.tree_pids == (7151, 7152)
+    assert registry.load().entries == {}
+    assert launcher._jobs == {}
+    assert ledger.balanced
+
+
 def test_a_root_that_exits_without_force_releases_everything_too(tmp_path, monkeypatch):
     """And the conservative path keeps its own cleanup."""
     from local_ai_stack.launcher import StopOutcome
 
-    launcher, registry, ledger = stop_scenario(
+    launcher, registry, ledger, _ = stop_scenario(
         monkeypatch, tmp_path, root=7201, child=7202, terminate_ok=False
     )
 

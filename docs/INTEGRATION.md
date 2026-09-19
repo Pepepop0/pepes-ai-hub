@@ -136,11 +136,13 @@ Dois limites medidos nesta máquina antes de escrever o código:
 
 1. **A prova normalmente morre com a sessão.** O job é destruído quando o último
    *handle* fecha, mesmo com membros vivos. Serviços comuns preservam esse limite.
-   O Ollama é a exceção explícita: como cria runners `llama-server`, seu root
-   recebe uma cópia do handle e o job usa `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
-   O root mantém o job vivo quando o Hub fecha; outro Hub reabre o mesmo nome e
-   recupera a prova. Quando o root termina, o handle dele fecha e runners ainda
-   pertencentes ao job não podem virar órfãos.
+   Ollama e ComfyUI são exceções explícitas porque ambos mantêm trabalho real em
+   descendentes: runners `llama-server` no primeiro; o interpretador Python que
+   atende `8188` no segundo. O root recebe uma cópia do handle e o job usa
+   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. O root mantém o job vivo quando o Hub
+   fecha; outro Hub reabre o mesmo nome e recupera a prova. Quando o root termina,
+   o handle dele fecha e descendentes ainda pertencentes ao job não podem virar
+   órfãos.
 
 2. **Janela de adoção.** O filho já está executando quando `Popen` retorna, e a
    atribuição ao job acontece logo depois. Um neto criado nesses primeiros
@@ -181,7 +183,7 @@ da thread primária, então isso significa uma implementação própria de
 log. É risco real em cima do caminho de spawn que hoje está estável e testado.
 
 Para serviços sem essa opção, a prova continua limitada à sessão e o fallback
-continua honesto. O Ollama opta pela retenção porque o cleanup de seus runners é
-parte do contrato de stop/restart.
+continua honesto. Ollama e ComfyUI optam pela retenção porque o cleanup de seus
+processos de trabalho é parte do contrato de stop/restart.
 
 **Ainda não existe:** VRAM orchestration e repair/update/uninstall.

@@ -200,9 +200,12 @@ def test_ollama_stops_its_proved_runner_tree_by_default(layout):
     assert ollama_control_spec(EXECUTABLE, layout=layout).launch.allow_force_kill is True
 
 
-def test_force_kill_stays_off_for_services_without_runner_children(layout):
-    for build in (open_webui_control_spec, comfyui_control_spec):
-        assert build(EXECUTABLE, layout=layout).launch.allow_force_kill is False
+def test_comfyui_stops_its_proved_runtime_tree_by_default(layout):
+    assert comfyui_control_spec(EXECUTABLE, layout=layout).launch.allow_force_kill is True
+
+
+def test_force_kill_stays_off_for_open_webui(layout):
+    assert open_webui_control_spec(EXECUTABLE, layout=layout).launch.allow_force_kill is False
 
 
 def test_paths_survive_as_strings(tmp_path):

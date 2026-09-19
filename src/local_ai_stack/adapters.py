@@ -235,7 +235,7 @@ def comfyui_launch_spec(
     cwd: Path | None = None,
     startup_timeout: float = COMFYUI_STARTUP_TIMEOUT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
-    allow_force_kill: bool = False,
+    allow_force_kill: bool = True,
 ) -> ProcessLaunchSpec:
     """ComfyUI bound to one address.
 
@@ -278,7 +278,7 @@ def comfyui_control_spec(
     cwd: Path | None = None,
     startup_timeout: float = COMFYUI_STARTUP_TIMEOUT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
-    allow_force_kill: bool = False,
+    allow_force_kill: bool = True,
 ) -> ServiceControlSpec:
     """ComfyUI, controllable: health spec, process spec and how to launch it."""
     if logs is None and layout is not None:

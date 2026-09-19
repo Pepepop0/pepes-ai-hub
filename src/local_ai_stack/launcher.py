@@ -597,13 +597,18 @@ class ProcessLauncher:
             return StopResult(
                 StopOutcome.FAILED, service_id, pid, "could not terminate the process tree"
             )
-        if not self._wait_for_exit(pid, timeout):
+        if not self._wait_for_tree_exit(proved, timeout):
+            survivors = self.surviving_members(proved, -1)
             return StopResult(
                 StopOutcome.TIMEOUT,
                 service_id,
                 pid,
-                f"pid {pid} still alive after {timeout:.1f}s despite terminating its tree",
+                (
+                    f"{len(survivors)} process(es) still alive after {timeout:.1f}s "
+                    "despite terminating the process tree"
+                ),
                 tree_pids=proved,
+                left_running=survivors,
             )
         self._release(service_id)
         others = len(proved) - 1
@@ -618,6 +623,16 @@ class ProcessLauncher:
         deadline = self._monotonic() + timeout
         while True:
             if lookup_process(pid).outcome is LookupOutcome.NOT_FOUND:
+                return True
+            if self._monotonic() >= deadline:
+                return False
+            self._sleep(STOP_POLL_INTERVAL)
+
+    def _wait_for_tree_exit(self, pids: tuple[int, ...], timeout: float) -> bool:
+        """Wait until every kernel-proved member is gone, under one deadline."""
+        deadline = self._monotonic() + timeout
+        while True:
+            if all(lookup_process(pid).outcome is LookupOutcome.NOT_FOUND for pid in pids):
                 return True
             if self._monotonic() >= deadline:
                 return False

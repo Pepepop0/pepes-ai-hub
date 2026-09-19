@@ -294,7 +294,7 @@ def test_a_new_picture_in_a_chat_that_holds_one_turns_the_feature_off_for_the_tu
         "messages": [{"role": "user", "content": "Now an image of a necromancer"}],
     }
 
-    async def holds(metadata, user_id):
+    async def holds(metadata, user_id, messages):
         return True
 
     module["chat_holds_images"] = holds
@@ -310,7 +310,7 @@ def test_a_new_picture_in_a_chat_that_holds_one_turns_the_feature_off_for_the_tu
     # An edit leaves everything to Open WebUI, and so does a chat without pictures.
     for text, holds_images in (("Change it to red", True), ("Now an image of a dog", False)):
 
-        async def answer(metadata, user_id, value=holds_images):
+        async def answer(metadata, user_id, messages, value=holds_images):
             return value
 
         filter_.inlet.__func__.__globals__["chat_holds_images"] = answer
@@ -329,6 +329,36 @@ def test_a_new_picture_in_a_chat_that_holds_one_turns_the_feature_off_for_the_tu
 def test_the_chat_lookup_answers_false_when_it_cannot_look():
     module = load_module()
     holds = module["chat_holds_images"]
-    assert run(holds({"chat_id": "local:abc"}, "user-1")) is False
-    assert run(holds({"chat_id": "chat-1"}, None)) is False
-    assert run(holds({}, "user-1")) is False
+    assert run(holds({"chat_id": "chat-1"}, None, [])) is False
+    assert run(holds({}, "user-1", [])) is False
+
+
+@pytest.mark.parametrize("chat_id", ["temporary:sid-1", "local:sid-1", "channel:c1"])
+def test_a_chat_that_is_not_saved_is_read_from_the_request_like_the_handler_does(chat_id):
+    module = load_module()
+    holds = module["chat_holds_images"]
+    text_only = [
+        {"role": "user", "content": "Generate a tank"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    with_picture = [
+        *text_only,
+        {
+            "role": "assistant",
+            "content": "",
+            "files": [{"type": "image", "url": "/api/v1/files/a/content"}],
+        },
+    ]
+    by_content_type = [
+        {"role": "user", "content": "x", "files": [{"content_type": "image/png", "url": "u"}]}
+    ]
+    assert run(holds({"chat_id": chat_id}, "user-1", text_only)) is False
+    assert run(holds({"chat_id": chat_id}, "user-1", with_picture)) is True
+    assert run(holds({"chat_id": chat_id}, None, with_picture)) is True, "no user needed"
+    assert run(holds({"chat_id": chat_id}, "user-1", by_content_type)) is True
+    assert (
+        module["images_in_messages"](
+            [{"role": "user", "files": [{"type": "file", "content_type": "text/plain"}]}]
+        )
+        is False
+    )

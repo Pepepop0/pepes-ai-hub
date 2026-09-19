@@ -96,7 +96,16 @@ FAILED_CONTEXT = (
     "currently unable to generate the image. Tell the user that the following error occurred: "
     "{error}</context>"
 )
+DISABLED_STATUS = "Image generation is disabled"
+DISABLED_CONTEXT = (
+    "<context>Image generation was requested but the feature is currently disabled by the "
+    "administrator, so no image was created. Let the user know that image generation is "
+    "currently unavailable.</context>"
+)
 MAX_TEXT = 65536
+# open_webui/utils/chat_id.py: the chats Open WebUI does not persist, whose
+# messages therefore travel in the request.
+NOT_SAVED_CHAT_PREFIXES = ("temporary:", "local:", "channel:")
 
 _SUCCESS_CONTEXT = re.compile(r"<context>[^<]*" + re.escape(SUCCESS_MARK) + r"[^<]*</context>")
 
@@ -285,28 +294,46 @@ def last_user_text(messages: list) -> str:
     return ""
 
 
-async def chat_holds_images(metadata: dict, user_id: str | None) -> bool:
-    """Whether Open WebUI's image handler would find an image to edit in this chat.
+def images_in_messages(messages: list) -> bool:
+    """Open WebUI's get_images_from_messages (utils/middleware.py 1673): any message
+    whose ``files`` hold an image, by type or by content type."""
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for item in message.get("files") or []:
+            if isinstance(item, dict) and (
+                item.get("type") == "image"
+                or str(item.get("content_type") or "").startswith("image/")
+            ):
+                return True
+    return False
 
-    The same lookup the handler makes (utils/middleware.py
-    chat_image_generation_handler): the saved chat's history up to the current
-    message, newest first. Unknowable -> False, which leaves the turn to Open WebUI.
+
+async def chat_holds_images(metadata: dict, user_id: str | None, messages: list) -> bool:
+    """Whether Open WebUI's image handler would find an image to edit on this turn.
+
+    The handler (utils/middleware.py chat_image_generation_handler) has two
+    sources, and this asks the same one it would: a saved chat's history up to
+    the current message, read from the database; a temporary or channel chat's
+    messages as sent in the request. A saved chat that cannot be read -> False,
+    which leaves the turn to Open WebUI.
     """
     chat_id = metadata.get("chat_id")
-    if not (isinstance(chat_id, str) and chat_id and user_id):
+    if not (isinstance(chat_id, str) and chat_id):
+        return False
+    if chat_id.startswith(NOT_SAVED_CHAT_PREFIXES):
+        return images_in_messages(messages)
+    if not user_id:
         return False
     try:
         from open_webui.models.chats import Chats
-        from open_webui.utils.chat_id import is_saved_chat_id
         from open_webui.utils.middleware import get_images_from_messages
         from open_webui.utils.misc import get_message_list
 
-        if not is_saved_chat_id(chat_id):
-            return False
         chat = await Chats.get_chat_by_id_and_user_id(chat_id, user_id)
         history = (chat.chat if chat else {}).get("history") or {}
-        messages = get_message_list(history.get("messages") or {}, history.get("currentId"))
-        return bool(get_images_from_messages(messages or []))
+        chain = get_message_list(history.get("messages") or {}, history.get("currentId"))
+        return bool(get_images_from_messages(chain or []))
     except Exception:  # noqa: BLE001 - no answer is better than breaking the turn
         return False
 
@@ -322,7 +349,7 @@ def with_system_context(messages: list, content: str) -> list:
     return [{"role": "system", "content": content}, *messages]
 
 
-async def generate_new_image(request, prompt: str, metadata: dict, user, emit) -> str:
+async def generate_new_image(request, prompt: str, metadata: dict, user, emit) -> str | None:
     """Make a picture from ``prompt`` alone through Open WebUI's own generation.
 
     The same calls as the pinned handler's generation branch, in the same
@@ -334,7 +361,19 @@ async def generate_new_image(request, prompt: str, metadata: dict, user, emit) -
     """
     from open_webui.models.config import Config
     from open_webui.routers.images import CreateImageForm, image_generations
+    from open_webui.utils.access_control import has_permission
 
+    # The gates the handler and the /images routes apply, in the same order:
+    # the user's permission (an administrator always passes) and the
+    # administrator's global switch. The internal image_generations checks
+    # neither, so they are checked here, before anything reaches ComfyUI.
+    if getattr(user, "role", None) != "admin" and not await has_permission(
+        getattr(user, "id", ""), "features.image_generation", await Config.get("user.permissions")
+    ):
+        return None
+    if not await Config.get("image_generation.enable"):
+        await emit({"type": "status", "data": {"description": DISABLED_STATUS, "done": True}})
+        return DISABLED_CONTEXT
     image_metadata = {"chat_id": metadata.get("chat_id"), "message_id": metadata.get("message_id")}
     await emit({"type": "status", "data": {"description": "Creating image", "done": False}})
     refined = prompt
@@ -410,7 +449,9 @@ class Filter:
         text_only(messages)
         prompt = last_user_text(messages)
         state["edit"] = edit_intent(prompt)
-        if not state["edit"] and await chat_holds_images(metadata, (__user__ or {}).get("id")):
+        if not state["edit"] and await chat_holds_images(
+            metadata, (__user__ or {}).get("id"), messages
+        ):
             # Open WebUI would edit the chat's latest picture. Keep it out of
             # this turn: the handler is skipped and ``request`` generates instead.
             body_features = body.get("features")
@@ -437,7 +478,8 @@ class Filter:
             context = await self._generate(
                 generate, __metadata__, __request__, __user__, __event_emitter__
             )
-            body["messages"] = messages = with_system_context(messages, context)
+            if context is not None:
+                body["messages"] = messages = with_system_context(messages, context)
         system = claimed_success(messages)
         if system is None:
             return body
@@ -458,8 +500,9 @@ class Filter:
 
     async def _generate(
         self, generate: dict, metadata: dict, request, user: dict | None, emit
-    ) -> str:
-        """A new picture for this turn through Open WebUI, or the handler's failure context."""
+    ) -> str | None:
+        """A new picture for this turn through Open WebUI, the handler's failure or
+        disabled context, or None when the user may not generate images at all."""
         try:
             from open_webui.models.users import Users
 

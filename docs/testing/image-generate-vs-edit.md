@@ -74,6 +74,36 @@ ComfyUI dispatch, attachment storage or the edit path.
 own generation from the instruction, with the "created" context (documented
 safe behaviour: nothing is claimed to have been edited).
 
+**Chats Open WebUI does not save** (`temporary:`, the legacy `local:`,
+`channel:`): the handler takes their images from the request's messages
+instead of the database, and the filter asks the same source
+(`images_in_messages`, the handler's `get_images_from_messages` rule) before
+applying the same policy. On the pinned 0.11.3 that source is always empty:
+`process_messages_with_output` (`utils/middleware.py` 2497) strips `files`
+from every request message before the inlet and the handler run, so a
+temporary chat can never edit through this route -- every Image turn
+generates, an edit request included. Proven on the root: the browser's
+temporary chat (tank, necromancer, an uploaded apple + "Now an image of a
+banana") and an API-shaped temporary chat that resent `files` on its
+messages (tank, necromancer, "Change the necromancer's cloak to red", mug,
+dragon) produced text-to-image jobs only, no persisted rows. The filter's
+mirror matters for a pipeline in which those files do reach the handler;
+the harness covers both.
+
+**The administrator's switch.** `image_generations` itself checks nothing;
+the handler and the `/images` routes check `image_generation.enable` (the
+`config` row seeded from `ENABLE_IMAGE_GENERATION`; the composer's Image
+toggle is a separate, per-request flag) and the user's
+`features.image_generation` permission first. The taken-over turn checks
+both in that order before anything reaches ComfyUI: a user without the
+permission gets nothing, as upstream gives nothing; with the switch off the
+turn gets the handler's own "Image generation is disabled" status and
+"disabled by the administrator" context -- no job, no file, no success
+claimed. On the root, with the switch turned off through the admin Images
+API after a generated cat: "Now an image of a dog." → status "Image
+generation is disabled", 0 ComfyUI jobs, 0 files, the model says the feature
+is disabled; switched back on, the next request generates again.
+
 ## Evidence — Pepe root, 2026-09-19
 
 Same envelope as the reproduction, filter 0.4.0 synced by the Hub
@@ -111,7 +141,11 @@ apologises; no edit attempted, no fabricated picture.
 (`test_pedros_sequence_…`, fails on `19816cc`: `['t2i', 'edit', 'edit']`),
 the full generate→edit→edit→generate transition with input hashes, the
 generation and edit sentences of the brief, the no-picture edit, the failed
-new picture, and the previous filter's behaviour kept as a record.
+new picture, temporary chats on the pinned pipeline and with request files
+that survive to the handler (fails on `cda785e`: `['t2i', 'edit', …]`),
+the administrator's switch off (fails on `cda785e`: a second
+`image_generations` call), a user without the permission, and the previous
+filters' behaviour kept as a record.
 `tests/test_open_webui_image_filter.py` — the rule set over 45 sentences and
 the inlet's contract.
 

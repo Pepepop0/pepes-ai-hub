@@ -155,6 +155,13 @@ class EditTurn:
         self.config = config
         self.history: list[dict] = []
         self.statuses: list[str] = []
+        self.chat_id = "chat-1"
+        self.generation_enabled = True  # Config image_generation.enable
+        self.user_role = "admin"
+        # 2497 process_messages_with_output: before the inlet, every request
+        # message loses its `files`. True is the pinned 0.11.3 pipeline.
+        self.request_files_stripped = True
+        self.image_generations_calls = 0
         self.model_requests: list[list[dict]] = []
         self.shown: list[str] = []
 
@@ -213,6 +220,7 @@ class EditTurn:
             return results
 
     def image_generations(self, prompt: str) -> list[dict]:
+        self.image_generations_calls += 1
         workflow = json.loads(json.dumps(T2I_WORKFLOW))
         workflow["76"]["inputs"]["value"] = prompt
         with self.comfyui.client() as client:
@@ -249,9 +257,27 @@ class EditTurn:
                 sets.append(found)
         return [url for group in sets[:2] for url in group]
 
-    def image_handler(self, prompt: str, metadata: dict, assistant: dict) -> str:
-        images = self.images_in_history()
+    def request_images(self, messages: list) -> list[str]:
+        """1782: a temporary or channel chat's images come from the request's messages."""
+        sets = []
+        for message in reversed(messages):
+            found = [
+                f["url"]
+                for f in message.get("files") or []
+                if f.get("type") == "image" or str(f.get("content_type", "")).startswith("image/")
+            ]
+            if found:
+                sets.append(found)
+        return [url for group in sets[:2] for url in group]
+
+    def image_handler(
+        self, prompt: str, metadata: dict, assistant: dict, request_messages: list
+    ) -> str | None:
+        saved = not metadata["chat_id"].startswith(("temporary:", "local:", "channel:"))
+        images = self.images_in_history() if saved else self.request_images(request_messages)
         editing = bool(images) and self.config["ENABLE_IMAGE_EDIT"]
+        if not editing and not self.generation_enabled:
+            return None  # 1807: the handler leaves the turn alone
         self.statuses.append("Creating image")
         try:
             files = (
@@ -287,22 +313,31 @@ class EditTurn:
         features = {"image_generation": image, "memory": True}
         metadata = {
             "session_id": "sid-1",
-            "chat_id": "chat-1",
+            "chat_id": self.chat_id,
             "message_id": assistant["id"],
             "features": features,  # main.py: the same dict as the body's
             "params": {"function_calling": "native", "tool_approval_mode": "full"},
         }
-        # 2431: image files of user messages become image_url parts for the model.
+        # 2431: in a saved chat, image files of user messages become image_url
+        # parts for the model and `files` is stripped. A temporary chat's request
+        # arrives as the client built it, and 2497 strips `files` from every
+        # message before the inlet -- so on 0.11.3 the handler's request branch
+        # never sees a picture; request_files_stripped=False models a pipeline
+        # (or client path) in which they survive to the handler.
+        saved = not self.chat_id.startswith(("temporary:", "local:", "channel:"))
         messages = []
         for message in self.history[:-1]:
             images = [f["url"] for f in message.get("files") or [] if message["role"] == "user"]
             content = message["content"]
-            if images:
+            if images and saved:
                 content = [{"type": "text", "text": content}] + [
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{u}"}}
                     for u in images
                 ]
-            messages.append({"role": message["role"], "content": content})
+            entry = {"role": message["role"], "content": content}
+            if not saved and message.get("files") and not self.request_files_stripped:
+                entry["files"] = [dict(f) for f in message["files"]]
+            messages.append(entry)
         body = {"model": "hermes3:8b", "messages": messages, "features": features}
         with open_webui_modules(self, assistant):
             body = run(hook(self.filter.inlet, body, metadata))
@@ -310,8 +345,9 @@ class EditTurn:
             if body.get("features", {}).get("image_generation") and (
                 metadata["params"].get("function_calling") == "legacy"
             ):
-                context = self.image_handler(text, metadata, assistant)
-                body["messages"].insert(0, {"role": "system", "content": context})
+                context = self.image_handler(text, metadata, assistant, body["messages"])
+                if context is not None:
+                    body["messages"].insert(0, {"role": "system", "content": context})
             body = run(hook(self.filter.request, body, metadata, emitter=self.emit))
         self.model_requests.append(body["messages"])
         event = {"choices": [{"delta": {"content": answer}, "finish_reason": "stop"}]}
@@ -355,12 +391,19 @@ class open_webui_modules:
         class Users:
             @staticmethod
             async def get_user_by_id(user_id):
-                return types.SimpleNamespace(id=user_id, role="admin") if user_id else None
+                return types.SimpleNamespace(id=user_id, role=turn.user_role) if user_id else None
 
         class Config:
             @staticmethod
             async def get(key, default=None):
-                return {"image_generation.prompt.enable": False}.get(key, default)
+                return {
+                    "image_generation.prompt.enable": False,
+                    "image_generation.enable": turn.generation_enabled,
+                    "user.permissions": {},
+                }.get(key, default)
+
+        async def has_permission(user_id, permission, permissions):
+            return False
 
         class CreateImageForm:
             def __init__(self, prompt: str) -> None:
@@ -408,9 +451,14 @@ class open_webui_modules:
                 image_generations=image_generations,
             ),
             "open_webui.utils": module("open_webui.utils"),
+            "open_webui.utils.access_control": module(
+                "open_webui.utils.access_control", has_permission=has_permission
+            ),
             "open_webui.utils.chat_id": module(
                 "open_webui.utils.chat_id",
-                is_saved_chat_id=lambda value: bool(value) and not value.startswith("local:"),
+                is_saved_chat_id=lambda value: (
+                    bool(value) and not value.startswith(("temporary:", "local:", "channel:"))
+                ),
             ),
             "open_webui.utils.middleware": module(
                 "open_webui.utils.middleware", get_images_from_messages=get_images_from_messages
@@ -784,6 +832,140 @@ def previous_filter_source() -> str | None:
     try:
         return subprocess.run(
             ["git", "show", "19816cc:assets/open-webui/pepito_image_chat.py"],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=detect_repo_root(),
+            encoding="utf-8",
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+# --- the review's two gaps: chats Open WebUI does not save, and the admin's switch ---------
+
+
+@pytest.mark.parametrize("chat_id", ["temporary:sid-1", "local:sid-1"])
+def test_a_temporary_chat_on_the_pinned_pipeline_never_edits_and_never_leaks(edit_config, chat_id):
+    """0.11.3 strips `files` from every request message before the inlet and the
+    handler (process_messages_with_output), so a chat Open WebUI does not save has
+    no picture to edit: every Image turn generates, an edit request included."""
+    comfyui = ComfyUI()
+    files = OpenWebUIFiles()
+    turn = EditTurn(load_filter(filter_source()), comfyui, files, edit_config)
+    turn.chat_id = chat_id
+    turn.turn("Generate a tank")
+    turn.turn("Now an image of a necromancer")
+    turn.turn("Change the necromancer's cloak to red")
+    turn.turn("Generate a mug")
+    assert kinds(comfyui) == ["t2i", "t2i", "t2i", "t2i"]
+    assert comfyui.uploads == []
+    assert [job["76"]["inputs"]["value"] for job in comfyui.jobs][2] == (
+        "Change the necromancer's cloak to red"
+    )
+
+
+@pytest.mark.parametrize("chat_id", ["temporary:sid-1", "local:sid-1"])
+def test_a_temporary_chat_whose_request_carries_files_gets_the_same_policy(edit_config, chat_id):
+    """Where the handler does see a non-saved chat's request files, the filter
+    asks the same source and applies the same policy: a new picture never takes
+    the chat's picture as input, an edit takes the latest one."""
+    comfyui = ComfyUI()
+    files = OpenWebUIFiles()
+    turn = EditTurn(load_filter(filter_source()), comfyui, files, edit_config)
+    turn.chat_id = chat_id
+    turn.request_files_stripped = False
+    turn.turn("Generate a tank")
+    necromancer = turn.turn("Now an image of a necromancer")
+    red = turn.turn("Change the necromancer's cloak to red")
+    turn.turn("Generate a mug")
+
+    assert kinds(comfyui) == ["t2i", "t2i", "edit", "t2i"]
+    assert edit_input(comfyui, comfyui.jobs[2]) == png_of(files, necromancer)
+    assert comfyui.jobs[2]["75:74"]["inputs"]["text"] == "Change the necromancer's cloak to red"
+    # 1797: the handler uploads the two newest image sets; the mapped node takes the first.
+    assert len(comfyui.uploads) == 2 and all(u["type"] == "input" for u in comfyui.uploads)
+    assert comfyui.jobs[3]["76"]["inputs"]["value"] == "Generate a mug"
+    assert png_of(files, red) != png_of(files, necromancer)
+
+
+def test_the_filter_in_cda785e_edited_in_a_temporary_chat_whose_request_carried_files(edit_config):
+    """Pinned: the previous revision asked only the database, which a temporary chat has none of."""
+    source = revision_filter_source("cda785e")
+    if source is None:
+        pytest.skip("the previous revision is not available in this checkout")
+    comfyui = ComfyUI()
+    files = OpenWebUIFiles()
+    turn = EditTurn(load_filter(source), comfyui, files, edit_config)
+    turn.chat_id = "temporary:sid-1"
+    turn.request_files_stripped = False
+    tank = turn.turn("Generate a tank")
+    turn.turn("Now an image of a necromancer")
+    assert kinds(comfyui) == ["t2i", "edit"]
+    assert edit_input(comfyui, comfyui.jobs[1]) == png_of(files, tank)
+
+
+def test_with_image_generation_disabled_by_the_administrator_nothing_is_dispatched(edit_config):
+    """image_generations checks nothing; the handler and the routes check
+    image_generation.enable first, and so must the taken-over turn."""
+    comfyui = ComfyUI()
+    files = OpenWebUIFiles()
+    turn = EditTurn(load_filter(filter_source()), comfyui, files, edit_config)
+    cat = turn.turn("Generate an image of a cat.")
+    assert kinds(comfyui) == ["t2i"] and turn.image_generations_calls == 1
+
+    turn.generation_enabled = False
+    reply = turn.turn("Now an image of a dog.", answer="Here is your dog!")
+
+    assert turn.image_generations_calls == 1, "no call for the disabled turn"
+    assert kinds(comfyui) == ["t2i"] and comfyui.uploads == []
+    assert reply["files"] == []
+    assert len(files.store) == 1 and png_of(files, cat) == next(iter(files.store.values()))[0]
+    assert turn.statuses[-1] == "Image generation is disabled"
+    system = turn.model_requests[-1][0]["content"]
+    assert "disabled by the administrator" in system and "is now being shown" not in system
+    assert (
+        reply["content"] == "Here is your dog!"
+    )  # the model relays it; no picture is claimed by us
+
+
+def test_the_filter_in_cda785e_dispatched_with_image_generation_disabled(edit_config):
+    source = revision_filter_source("cda785e")
+    if source is None:
+        pytest.skip("the previous revision is not available in this checkout")
+    comfyui = ComfyUI()
+    files = OpenWebUIFiles()
+    turn = EditTurn(load_filter(source), comfyui, files, edit_config)
+    turn.turn("Generate an image of a cat.")
+    turn.generation_enabled = False
+    turn.turn("Now an image of a dog.")
+    assert turn.image_generations_calls == 2 and kinds(comfyui) == ["t2i", "t2i"]
+
+
+def test_a_user_without_the_image_permission_gets_no_picture_and_no_claim(edit_config):
+    """Non-admin, features.image_generation denied: the handler is skipped upstream; so is ours."""
+    comfyui = ComfyUI()
+    files = OpenWebUIFiles()
+    turn = EditTurn(load_filter(filter_source()), comfyui, files, edit_config)
+    turn.turn("Generate an image of a cat.")
+    turn.user_role = "user"
+    reply = turn.turn("Now an image of a dog.", answer="Here it is!")
+    assert turn.image_generations_calls == 1 and reply["files"] == []
+    assert not any(
+        "<context>" in m.get("content", "")
+        for m in turn.model_requests[-1]
+        if m["role"] == "system"
+    )
+
+
+def revision_filter_source(revision: str) -> str | None:
+    import subprocess
+
+    from local_ai_stack.installation import detect_repo_root
+
+    try:
+        return subprocess.run(
+            ["git", "show", f"{revision}:assets/open-webui/pepito_image_chat.py"],
             capture_output=True,
             text=True,
             check=True,

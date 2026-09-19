@@ -1,7 +1,7 @@
 """
 title: Pepito Image Chat
 author: Pepito's AI Hub
-version: 0.4.0
+version: 0.5.0
 required_open_webui_version: 0.11.3
 description: Send every Image turn through Open WebUI's own image generation or editing, and decide which from the user's words.
 """
@@ -101,6 +101,21 @@ DISABLED_CONTEXT = (
     "<context>Image generation was requested but the feature is currently disabled by the "
     "administrator, so no image was created. Let the user know that image generation is "
     "currently unavailable.</context>"
+)
+# What the model is told once a picture really is attached to its reply. Open
+# WebUI's own sentence ("...is now being shown to the user. Let the user know
+# ...") is enough for an 8B model; a 3B one answers it with "I cannot create
+# images" under the very picture it was asked about (measured on the 8 GB
+# profile: hermes3:3b, llama3.2:3b, qwen3:4b; docs/testing/profile-8gb.md).
+# Said this way, the same models acknowledge the picture. The success mark
+# stays inside so nothing downstream reads it differently.
+SHOWN_CONTEXT = (
+    "<context>The requested image has been {verb} by the system successfully and is now "
+    "being shown to the user: it is attached to this reply, in the chat, where the user can "
+    "see it. You do not see the picture yourself and you do not need to. Tell the user "
+    "briefly that the image they requested has been {verb} and is now shown in the chat. "
+    "Do not say that you cannot create or display images, and do not describe the picture "
+    "as if you had drawn it.</context>"
 )
 MAX_TEXT = 65536
 # open_webui/utils/chat_id.py: the chats Open WebUI does not persist, whose
@@ -261,6 +276,15 @@ async def attached_images(metadata: dict) -> list | None:
             item.get("type") == "image" or str(item.get("content_type") or "").startswith("image/")
         )
     ]
+
+
+def shown_context(claimed: str) -> str:
+    """Open WebUI's success context, said so that a small model believes it.
+
+    Keeps what the claim said happened: an edit stays an edit, anything else
+    was created.
+    """
+    return SHOWN_CONTEXT.format(verb="edited" if "edited" in claimed else "created")
 
 
 def claimed_success(messages: list) -> dict | None:
@@ -484,7 +508,13 @@ class Filter:
         if system is None:
             return body
         images = await attached_images(__metadata__)
-        if images is None or images:
+        if images is None:
+            return body
+        if images:
+            # A picture is attached: tell the model so in words it will not argue with.
+            system["content"] = _SUCCESS_CONTEXT.sub(
+                lambda claim: shown_context(claim.group(0)), system["content"]
+            )
             return body
         # Open WebUI says a picture is shown, and the message holds none.
         system["content"] = _SUCCESS_CONTEXT.sub(NOT_CREATED_CONTEXT, system["content"])

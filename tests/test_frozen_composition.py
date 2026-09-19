@@ -33,7 +33,7 @@ from local_ai_stack.resources import ENV_RESOURCE_ROOT, RESOURCE_DIRECTORIES, re
 from local_ai_stack.stack_application import StackApplication
 
 CHECKOUT = Path(__file__).resolve().parents[1]
-PROFILES = {"capella", "pepe", "test"}
+PROFILES = {"capella", "pepe", "pepe-8gb", "test"}
 
 
 @pytest.fixture

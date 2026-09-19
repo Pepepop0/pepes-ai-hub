@@ -359,7 +359,7 @@ def test_the_smoke_report_from_a_checkout_is_clean():
     report = smoke_report()
     assert report["ok"], report["problems"]
     assert report["frozen"] is False
-    assert report["profiles"] == ["capella", "pepe", "test"]
+    assert report["profiles"] == ["capella", "pepe", "pepe-8gb", "test"]
     assert "python-windows-amd64" in report["manifests"]["artifacts"]
     assert report["workflows"]["embedded"] == ["flux2_klein_edit", "flux2_klein_t2i"]
     assert report["python_runtime"]["managed_runtime_selected"] is False

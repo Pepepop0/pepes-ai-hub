@@ -26,6 +26,28 @@ ollama:
     capabilities: {text: true, tools: true, vision: false}
     status: candidate
 
+  # The 3B of the same family as hermes3_8b: the same ChatML template, the
+  # same native tool calling, at 2.0 GB on disk. Pinned for the 8 GB profile,
+  # where the chat model has to leave room for the image models on one GPU.
+  hermes3_3b:
+    kind: chat
+    reference: hermes3:3b
+    digest: a8851c5041d4
+    aliases: [ollama/hermes3-3b]
+    capabilities: {text: true, tools: true, vision: false}
+    status: candidate
+
+  # The plain Llama 3.2 3B instruct, the base hermes3_3b was tuned from. Same
+  # size, same VRAM; measured on the 8 GB profile as the alternative that
+  # acknowledges a generated picture most literally.
+  llama3_2_3b:
+    kind: chat
+    reference: llama3.2:3b
+    digest: a80c4f17acd5
+    aliases: [ollama/llama3-2-3b]
+    capabilities: {text: true, tools: true, vision: false}
+    status: candidate
+
   qwen3_5_9b:
     kind: chat
     reference: qwen3.5:9b

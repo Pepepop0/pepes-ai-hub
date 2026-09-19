@@ -1,0 +1,53 @@
+schema_version: 1
+id: pepe-8gb
+name: Pepe 8 GB
+ui:
+  default_pet: claw
+  default_theme: pepe
+description: >-
+  Perfil completo para GPUs NVIDIA de 8 GB: chat, geração e edição de imagem,
+  em configuração reduzida (modelo de chat de 3B, respostas mais simples,
+  sem prometer desempenho alto).
+
+hardware:
+  os: windows
+  gpu_vendor: nvidia
+  min_vram_gb: 8
+  recommended_vram_gb: 8
+  vram_tolerance_mib: 128
+  notes: >-
+    Single GPU de 8 GB (8188-8192 MiB reportados). O chat e as imagens
+    dividem a mesma VRAM: o modelo de chat é pequeno (2.4 GiB residente)
+    para que os modelos de imagem caibam ao lado dele. A stack de imagem é
+    a do Pepe e guarda os mesmos ~11 GB de RAM; 32 GB de RAM recomendados.
+
+services:
+  ollama: {enabled: true, port: 11434}
+  open-webui: {enabled: true, port: 8080}
+  comfyui: {enabled: true, port: 8188}
+
+features:
+  chat: true
+  vision: true
+  tools: true
+  image_generation: true
+  image_editing: true
+
+models:
+  chat:
+    primary: ollama/hermes3_3b
+    status: candidate
+    alternatives: [ollama/llama3_2_3b]
+  image:
+    diffusion: comfyui/flux2_klein_fp8
+    text_encoder: comfyui/qwen_3_4b_encoder
+    vae: comfyui/flux2_vae
+
+workflows:
+  text_to_image: {manifest_id: flux2_klein_t2i}
+  image_edit: {manifest_id: flux2_klein_edit}
+
+runtime:
+  aggressive_vram_unload: true
+  prefer_single_heavy_model_resident: true
+  open_browser: true

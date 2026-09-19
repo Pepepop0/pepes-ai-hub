@@ -345,6 +345,15 @@ class ModelInstaller:
     def _invalidate_snapshot(self) -> None:
         self._generation = object()
 
+    def forget_detections(self) -> None:
+        """Make every open snapshot read the world again on its next question.
+
+        For when the world changed under a snapshot without this installer
+        doing it: the Ollama store that was unreachable a moment ago is
+        serving now.
+        """
+        self._invalidate_snapshot()
+
     def detect(self, spec: ModelSpec) -> ModelStatus:
         """Downloads nothing, pulls nothing.
 

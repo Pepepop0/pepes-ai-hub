@@ -203,6 +203,38 @@ def test_clean_acknowledgement(text, expected):
     assert load_module()["clean_acknowledgement"](text) == expected
 
 
+# --- the success context, said so that a small model believes it -----------------------
+
+
+@pytest.mark.parametrize(
+    ("claim", "verb"),
+    [
+        (
+            (
+                "<context>The requested image has been created by the system successfully and "
+                "is now being shown to the user. Let the user know that the image they "
+                "requested has been generated and is now shown in the chat.</context>"
+            ),
+            "created",
+        ),
+        (
+            (
+                "<context>The requested image has been edited and created and is now being "
+                "shown to the user. Let them know that it has been generated.</context>"
+            ),
+            "edited",
+        ),
+    ],
+)
+def test_the_shown_context_keeps_what_happened_and_the_success_mark(claim, verb):
+    module = load_module()
+    shown = module["shown_context"](claim)
+    assert shown.startswith(f"<context>The requested image has been {verb}")
+    assert module["SUCCESS_MARK"] in shown and shown.endswith("</context>")
+    assert "you cannot create" in shown  # the sentence a 3B model needs
+    assert module["claimed_success"]([{"role": "system", "content": shown}]) is not None
+
+
 def test_the_shipped_source_declares_the_pinned_open_webui_version():
     assert "required_open_webui_version: 0.11.3" in SOURCE
     assert "title: Pepito Image Chat" in SOURCE

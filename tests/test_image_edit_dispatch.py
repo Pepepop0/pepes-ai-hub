@@ -634,6 +634,25 @@ def test_comfyui_offline_is_a_controlled_error(edit_config):
     assert "Failed to upload images to ComfyUI." in turn.model_requests[-1][0]["content"]
 
 
+def test_with_a_picture_attached_the_model_is_told_so_in_the_firmer_words(world):
+    """Both routes -- Open WebUI's handler and the filter's own generation -- end in
+    the same system context, the one a 3B model does not answer with "I cannot"."""
+    turn, comfyui, _ = world
+    turn.turn("Generate an image of a cat.")
+    generated = turn.model_requests[-1][0]["content"]
+    assert generated.startswith("<context>The requested image has been created")
+    assert "Do not say that you cannot create or display images" in generated
+    turn.turn("Make it blue.")
+    edited = turn.model_requests[-1][0]["content"]
+    assert edited.startswith("<context>The requested image has been edited")
+    assert "Do not say that you cannot create or display images" in edited
+    turn.turn("Now an image of a dog.")
+    taken_over = turn.model_requests[-1][0]["content"]
+    assert kinds(comfyui) == ["t2i", "edit", "t2i"]
+    assert taken_over.startswith("<context>The requested image has been created")
+    assert "Do not say that you cannot create or display images" in taken_over
+
+
 def test_a_made_up_link_in_the_acknowledgement_is_removed(world):
     turn, _, files = world
     reply = turn.turn(

@@ -460,7 +460,11 @@ def load_profile(path: Path) -> Profile:
 
 
 def load_profiles(directory: Path) -> list[Profile]:
-    profiles = [load_profile(path) for path in sorted(directory.glob("*.yaml"))]
+    """Every profile in ``directory``, ordered by id so a file's name decides nothing."""
+    profiles = sorted(
+        (load_profile(path) for path in sorted(directory.glob("*.yaml"))),
+        key=lambda profile: profile.id,
+    )
     seen: set[str] = set()
     duplicates: set[str] = set()
     for profile in profiles:

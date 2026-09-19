@@ -430,7 +430,7 @@ def test_the_shipped_capella_profile_has_a_resolvable_primary_chat_model():
         built.release()
 
 
-@pytest.mark.parametrize("profile_id", ["pepe", "test"])
+@pytest.mark.parametrize("profile_id", ["pepe", "pepe-8gb", "test"])
 def test_other_shipped_profiles_are_accepted_by_the_flow(profile_id):
     """They load and are planned; whether they can finish is their own data's business."""
     text = (detect_repo_root() / "profiles" / f"{profile_id}.yaml").read_text(encoding="utf-8")
@@ -622,6 +622,29 @@ def test_stop_and_start_the_stack(stack):
 
     started = stack.app.start_stack("op-3", CAPELLA)
     assert started.state is OperationState.SUCCEEDED
+    assert stack.app.status(CAPELLA).stack_up
+
+
+def test_start_after_stop_configures_open_webui_from_the_ollama_it_just_started(stack):
+    """Stopped stack, Ollama's store unreachable until Ollama is up again -- the
+    real shape of a stop followed by a start. Open WebUI's chat configuration
+    needs the model store, so it must be read after Ollama comes up, not before."""
+    stack.app.first_run("op-1", CAPELLA)
+    assert stack.app.stop_stack("op-2", CAPELLA).state is OperationState.SUCCEEDED
+    stack.ollama.reachable = False
+    launcher = stack.launcher
+    original = launcher.start
+
+    def start(spec, **kwargs):
+        result = original(spec, **kwargs)
+        if getattr(spec, "service_id", None) == "ollama":
+            stack.ollama.reachable = True
+        return result
+
+    launcher.start = start
+    started = stack.app.start_stack("op-3", CAPELLA)
+    assert started.state is OperationState.SUCCEEDED, started.diagnostics
+    assert set(started.output_references) == {"ollama", "open-webui", "comfyui"}
     assert stack.app.status(CAPELLA).stack_up
 
 

@@ -86,7 +86,7 @@ def test_the_test_profile_is_a_light_install_and_runtime_smoke():
     assert test.workflows == {}
 
 
-@pytest.mark.parametrize("name", ["capella", "pepe"])
+@pytest.mark.parametrize("name", ["capella", "pepe", "pepe-8gb"])
 def test_the_reference_profiles_keep_every_capability_they_had(name):
     profile = SHIPPED[name]
     assert all(profile.features.values())

@@ -1076,6 +1076,13 @@ class StackApplication:
                 break
             started.append(service_id)
             warnings.extend(self._integrate(stream, profile, service_id))
+            if service_id == str(ComponentId.OLLAMA):
+                # The chat model lives in the Ollama that just came up. Launch
+                # specs built while it was down could not configure Open WebUI's
+                # chat (the model store was unreachable), so the services still
+                # to start are built again on what Ollama answers now.
+                self.model_installer(profile).forget_detections()
+                controller = self._controller(profile, snapshot=snapshot)
         if not finish:
             return problems
         if problems:

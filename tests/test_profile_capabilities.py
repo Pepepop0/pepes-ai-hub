@@ -77,6 +77,23 @@ def test_no_shipped_profile_enables_a_capability_it_cannot_configure(name, specs
     assert declared_capability_problems(profile, specs) == ()
 
 
+@pytest.mark.parametrize("workflow", ["image_edit", "text_to_image"])
+def test_a_manifest_id_nothing_declares_is_refused_before_anything_is_installed(specs, workflow):
+    """Known from the profile and the shipped manifest alone, for every workflow."""
+    data = data_for("capella")
+    data["workflows"][workflow] = {"manifest_id": "missing", "size": "1024x1024", "steps": 20}
+    profile = validate_profile_data(data)
+
+    problems = declared_capability_problems(profile, specs)
+
+    assert any(
+        f"workflows.{workflow} names 'missing'" in problem
+        and "the workflow manifest does not declare" in problem
+        for problem in problems
+    ), problems
+    assert not any("maps no" in problem for problem in problems), problems
+
+
 def test_a_size_or_steps_a_workflow_cannot_take_is_refused_before_anything_is_installed(specs):
     """Known from the profile and the manifest alone, so the first run stops at
     "Verificando ambiente" instead of after the downloads."""

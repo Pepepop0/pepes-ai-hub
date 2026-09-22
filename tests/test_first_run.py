@@ -552,6 +552,49 @@ def test_an_incoherent_profile_is_refused_before_anything_is_installed():
         built.release()
 
 
+@pytest.mark.parametrize(
+    ("workflow", "declaration"),
+    [
+        ("image_edit", "image_edit: {manifest_id: missing, size: 1024x1024, steps: 20}"),
+        ("text_to_image", "text_to_image: {manifest_id: missing}"),
+    ],
+)
+def test_a_workflow_whose_manifest_does_not_exist_is_refused_before_anything_is_installed(
+    workflow, declaration
+):
+    """Every declared workflow's manifest id is settled by the shipped manifest alone,
+    so a name nothing declares stops the run before a byte is fetched -- whichever
+    workflow names it, and whatever else that declaration asks for."""
+    yaml_text = capella_yaml()
+    start = yaml_text.index(f"  {workflow}: ")
+    end = yaml_text.index("\n", start)
+    yaml_text = yaml_text[:start] + f"  {declaration}" + yaml_text[end:]
+    assert "manifest_id: missing" in yaml_text
+    built = controlled_stack(profile_yaml=yaml_text)
+    try:
+        recorder = Recorder()
+        result = built.app.first_run("op-1", CAPELLA, emit=recorder)
+
+        assert result.state is OperationState.FAILED
+        assert recorder.events[-1].phase is OperationPhase.PREPARATION
+        messages = [d.message for d in result.diagnostics]
+        assert any(
+            f"workflows.{workflow} names 'missing'" in message
+            and "the workflow manifest does not declare" in message
+            for message in messages
+        ), messages
+        # The unknown manifest is the whole story: nothing derived from a spec
+        # that does not exist.
+        assert not any("maps no" in message for message in messages), messages
+        # Nothing was provisioned: no downloads, no pulls, no service started.
+        assert built.artifacts.requests == []
+        assert built.ollama.pulls == []
+        assert [start for launcher in built.launchers for start in launcher.starts] == []
+        assert built.app.last_first_run.installed == []
+    finally:
+        built.release()
+
+
 def test_an_unknown_profile_is_refused_before_any_operation(stack):
     from local_ai_stack.stack_application import UnknownProfile
 

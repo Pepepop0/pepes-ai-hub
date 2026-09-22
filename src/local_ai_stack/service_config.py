@@ -436,6 +436,25 @@ def open_webui_image_edit_settings(
 # --- the whole stack --------------------------------------------------------
 
 
+def workflow_manifest_problems(
+    profile: Profile, workflow_specs: Mapping[str, WorkflowSpec]
+) -> dict[str, tuple[str, ...]]:
+    """Every workflow the profile declares under a name the manifest does not.
+
+    Settled by the profile and the shipped manifest alone, for every workflow
+    the schema allows and not only the two this version configures: a name
+    nothing declares can never resolve, so it is worth saying before anything
+    is installed. Keyed by the profile's workflow id, so a caller can refuse
+    exactly the workflow that named it.
+    """
+    unknown = "which the workflow manifest does not declare"
+    return {
+        workflow_id: (f"workflows.{workflow_id} names {declared.manifest_id!r}, {unknown}",)
+        for workflow_id, declared in sorted(profile.workflows.items())
+        if declared.manifest_id not in workflow_specs
+    }
+
+
 def workflow_drive_problems(
     profile: Profile, workflow_specs: Mapping[str, WorkflowSpec]
 ) -> dict[str, tuple[str, ...]]:
@@ -446,8 +465,10 @@ def workflow_drive_problems(
     size nor a step count, and a graph that maps no width, height or steps
     would be submitted with the profile's numbers quietly dropped. Keyed by the
     profile's workflow id so a caller can refuse exactly the workflow it was
-    about to configure. A manifest id the workflow manifest does not declare is
-    reported by the checks that own it, not here.
+    about to configure. Nothing is said about a workflow whose manifest id does
+    not exist: there is no spec to ask, ``workflow_manifest_problems`` owns
+    that, and "it maps no width and height" about a workflow that was never
+    declared would only bury the real reason.
     """
     problems: dict[str, tuple[str, ...]] = {}
     size_parameters = {WorkflowParameter.WIDTH, WorkflowParameter.HEIGHT}
@@ -489,6 +510,9 @@ def declared_capability_problems(
     profile asks each workflow to be driven with is checked for all of them.
     """
     problems = list(capability_problems(profile))
+    unknown = workflow_manifest_problems(profile, workflow_specs)
+    for messages in unknown.values():
+        problems.extend(messages)
     for messages in workflow_drive_problems(profile, workflow_specs).values():
         problems.extend(messages)
     if not profile.enables(FEATURE_IMAGE_GENERATION):
@@ -498,10 +522,7 @@ def declared_capability_problems(
         return tuple(problems)
     spec = workflow_specs.get(declared.manifest_id)
     if spec is None:
-        problems.append(
-            f"workflows.text_to_image names {declared.manifest_id!r}, "
-            "which the workflow manifest does not declare"
-        )
+        pass  # said once already, by the check every workflow goes through
     elif not spec.complete:
         problems.append(
             f"workflows.text_to_image names {spec.id!r}, which is not mapped yet "
@@ -572,12 +593,15 @@ def build_stack_configuration(
         problems.append("this profile enables chat but not Ollama, so chat cannot be configured")
 
     workflows: dict[str, WorkflowResolution] = {}
-    # What the profile asks each workflow to be driven with, checked once for
-    # every workflow it declares; the one being configured below is then not
-    # configured at all, rather than configured without what was asked for.
+    # Every workflow the profile declares: the manifest id it names, and then
+    # what it asks that workflow to be driven with. A workflow either check
+    # refuses is not configured at all below, rather than configured in part.
+    refused = workflow_manifest_problems(profile, workflow_specs or {})
     drive_problems = workflow_drive_problems(profile, workflow_specs or {})
-    for messages in drive_problems.values():
-        problems.extend(messages)
+    for source in (refused, drive_problems):
+        for messages in source.values():
+            problems.extend(messages)
+    refused = {**refused, **drive_problems}
     if workflow_specs:
         wanted = {config.manifest_id for config in profile.workflows.values()}
         workflows = resolve_workflows(
@@ -593,7 +617,7 @@ def build_stack_configuration(
     elif image_enabled:
         declared = profile.workflows.get(image_workflow)
         resolution = workflows.get(declared.manifest_id) if declared else None
-        if image_workflow in drive_problems:
+        if image_workflow in refused:
             pass  # already refused, with the reason, above
         elif resolution is None:
             problems.append(
@@ -682,4 +706,5 @@ __all__: Sequence[str] = (
     "open_webui_ollama_env",
     "open_webui_workflow_nodes",
     "workflow_drive_problems",
+    "workflow_manifest_problems",
 )

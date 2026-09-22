@@ -480,6 +480,40 @@ def test_a_size_asked_of_a_workflow_that_cannot_take_it_fails_the_whole_composit
     assert "maps no width and height" in problems and "maps no step count" in problems
 
 
+@pytest.mark.parametrize("workflow", ["image_edit", "text_to_image"])
+def test_a_workflow_manifest_that_does_not_exist_invalidates_the_configuration(
+    specs, layout, tmp_path, workflow
+):
+    """An unknown manifest id is a configuration problem for any workflow that names
+    it, and the workflow it names is not composed even in part."""
+    stage_graph(tmp_path)
+    data = deepcopy(profile_named("capella").raw)
+    data["workflows"][workflow] = {"manifest_id": "missing", "size": "1024x1024", "steps": 20}
+    profile = validate_profile_data(data)
+
+    configuration = build_stack_configuration(
+        profile,
+        resolver_for(profile, tmp_path),
+        layout,
+        workflow_specs=specs,
+        repo_root=tmp_path,
+        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
+    )
+
+    assert not configuration.ok
+    problems = "\n".join(configuration.problems)
+    assert f"workflows.{workflow} names 'missing'" in problems
+    assert "the workflow manifest does not declare" in problems
+    assert "maps no" not in problems, "nothing is derived from a spec that does not exist"
+    open_webui = configuration.service(ComponentId.OPEN_WEBUI)
+    if workflow == "text_to_image":
+        assert ENV_ENABLE_IMAGE_GENERATION not in open_webui.env
+        assert ENV_IMAGE_SIZE not in open_webui.env and ENV_IMAGE_STEPS not in open_webui.env
+        assert open_webui.documents == tuple(
+            d for d in open_webui.documents if d.path.name == "open-webui.env"
+        )
+
+
 def test_the_shipped_capella_asks_only_what_its_workflows_map(specs, layout, tmp_path):
     """The valid half of the contraproof: 1024x1024 and 20 steps on the text-to-image
     workflow, nothing asked of the edit workflow."""

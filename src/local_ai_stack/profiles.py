@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,15 @@ from .models import ModelContractError, ModelId, ModelRequirement
 
 PROFILE_SCHEMA_VERSION = 1
 MIB_PER_GIB = 1024
+
+# Who a profile is offered to. A profile is part of the product unless it says
+# otherwise; one that exists to exercise the machinery says so, and screens
+# built for a person do not offer it. Nothing reads a profile's id to decide.
+VISIBILITY_PUBLIC = "public"
+VISIBILITY_INTERNAL = "internal"
+VISIBILITIES = (VISIBILITY_PUBLIC, VISIBILITY_INTERNAL)
+# How a developer asks for the internal ones anyway, without editing a profile.
+ENV_SHOW_INTERNAL_PROFILES = "PEPITOS_AI_HUB_INTERNAL_PROFILES"
 
 # Capabilities a profile can switch on, and what each one needs declared to be
 # configurable at all. Enabled means "this profile has what it takes": a
@@ -89,6 +100,7 @@ class Profile:
     id: str
     name: str
     description: str
+    visibility: str
     ui: ProfileUiDefaults
     hardware: HardwareRequirement
     services: dict[str, ServiceConfig]
@@ -98,6 +110,11 @@ class Profile:
     workflows: dict[str, WorkflowConfig]
     runtime: dict[str, bool]
     raw: dict[str, Any]
+
+    @property
+    def internal(self) -> bool:
+        """Whether this profile is machinery rather than a product choice."""
+        return self.visibility == VISIBILITY_INTERNAL
 
     def enables(self, feature: str) -> bool:
         """Whether this profile switches ``feature`` on. Absent means off."""
@@ -273,6 +290,7 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
             "id",
             "name",
             "description",
+            "visibility",
             "ui",
             "hardware",
             "services",
@@ -459,11 +477,16 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
         for key, value in runtime_data.items()
     }
 
+    visibility = _string(root.get("visibility", VISIBILITY_PUBLIC), source, "visibility")
+    if visibility not in VISIBILITIES:
+        raise _error(source, "visibility", f"must be one of: {', '.join(VISIBILITIES)}")
+
     profile = Profile(
         schema_version=schema_version,
         id=profile_id,
         name=_string(root["name"], source, "name"),
         description=_string(root.get("description", ""), source, "description", allow_empty=True),
+        visibility=visibility,
         ui=ProfileUiDefaults(
             default_pet=optional_ui_id("default_pet"),
             default_theme=optional_ui_id("default_theme"),
@@ -501,6 +524,26 @@ def load_profile(path: Path) -> Profile:
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
         raise ProfileError(f"{path}: could not read profile: {exc}") from exc
     return validate_profile_data(data, path)
+
+
+def offered_profiles(
+    profiles: Sequence[Profile], *, env: Mapping[str, str] | None = None
+) -> tuple[Profile, ...]:
+    """The profiles a screen should offer a person.
+
+    Internal ones are left out unless this machine asks for them through
+    ``PEPITOS_AI_HUB_INTERNAL_PROFILES``, which is how a developer or a test
+    gets at them without a profile id being special anywhere.
+    """
+    environment = os.environ if env is None else env
+    if (environment.get(ENV_SHOW_INTERNAL_PROFILES, "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return tuple(profiles)
+    return tuple(profile for profile in profiles if not profile.internal)
 
 
 def load_profiles(directory: Path) -> list[Profile]:

@@ -12,6 +12,7 @@ root is touched.
 
 from __future__ import annotations
 
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from local_ai_stack.tui.application import (
     ConflictResolutionRequired,
     HubError,
     InstallSelection,
+    SwitchRequiresStop,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +53,7 @@ class RecordingBackend:
     def status(self, profile_id=None):
         return SimpleNamespace(
             installation_ready=self.root in self.world.installed,
+            stack_up=self.root in self.world.running,
             observed_at=datetime.now(UTC),
             components=(),
             gpu=None,
@@ -78,6 +81,9 @@ class RecordingBackend:
         if self.root in self.world.failing:
             return SimpleNamespace(state=OperationState.FAILED, diagnostics=())
         self.world.installed.add(self.root)
+        # An installed stack writes its own configuration, which is what makes
+        # the folder recognisable as an installation later.
+        self.world.write_config(self.installation, profile_id)
         return SimpleNamespace(state=OperationState.SUCCEEDED, diagnostics=())
 
     def _command(self, name, operation_id, profile_id, *, emit=None):
@@ -89,7 +95,12 @@ class RecordingBackend:
         return self._command("start_stack", operation_id, profile_id, emit=emit)
 
     def stop_stack(self, operation_id, profile_id, *, emit=None):
-        return self._command("stop_stack", operation_id, profile_id, emit=emit)
+        self.commands.append("stop_stack")
+        self.world.calls.append((self.root, "stop_stack", profile_id))
+        if self.root in self.world.refuse_stop:
+            return SimpleNamespace(state=OperationState.FAILED, diagnostics=())
+        self.world.running.discard(self.root)
+        return SimpleNamespace(state=OperationState.SUCCEEDED, diagnostics=())
 
     def restart_stack(self, operation_id, profile_id, *, emit=None):
         return self._command("restart_stack", operation_id, profile_id, emit=emit)
@@ -106,6 +117,8 @@ class World:
         self.installed: set[Path] = set()
         self.failing: set[Path] = set()
         self.conflicting: set[Path] = set()
+        self.running: set[Path] = set()
+        self.refuse_stop: set[Path] = set()
         self.backends: dict[Path, RecordingBackend] = {}
 
     def backend(self, installation) -> RecordingBackend:
@@ -115,6 +128,15 @@ class World:
 
     def commands_on(self, root: Path) -> list[str]:
         return [name for where, name, _ in self.calls if where == root]
+
+    def write_config(self, installation, profile_id: str) -> None:
+        from local_ai_stack.config import InstalledConfig, config_path
+        from local_ai_stack.installations import write_installed_config
+
+        write_installed_config(
+            config_path(installation.layout),
+            InstalledConfig(profile_id, installation=installation.location),
+        )
 
 
 @pytest.fixture
@@ -278,5 +300,247 @@ def test_the_backend_of_a_cancelled_selection_is_never_reused_for_the_next_comma
         projections = adapter.projections()
         assert projections[0].profile_id == "pepe"
         assert projections[0].root_display is None or str(first) in projections[0].root_display
+    finally:
+        adapter.close()
+
+
+# --- the installations the Hub knows -------------------------------------------------
+
+
+def test_every_installation_that_was_installed_is_remembered_and_the_active_one_leads(
+    tmp_path, world
+):
+    first, second = tmp_path / "first", tmp_path / "second"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(second, "pepe-8gb"))
+
+        rows = adapter.installation_summaries()
+        assert [row.root for row in rows] == [second, first], "active first, then most recent"
+        assert rows[0].active and not rows[1].active
+        assert rows[0].profile_id == "pepe-8gb" and rows[0].profile_name == "Pepinho"
+        assert rows[1].profile_id == "pepe" and rows[1].profile_name == "Pepe"
+        assert all(row.status in {"ready", "stopped", "running"} for row in rows)
+    finally:
+        adapter.close()
+
+
+def test_the_list_survives_a_restart_and_keeps_its_order(tmp_path, world):
+    first, second = tmp_path / "first", tmp_path / "second"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(second, "pepe-8gb"))
+    finally:
+        adapter.close()
+
+    restarted = hub(tmp_path, world)
+    try:
+        assert restarted.active_root() == second
+        assert [row.root for row in restarted.installation_summaries()] == [second, first]
+    finally:
+        restarted.close()
+
+
+def test_one_folder_written_three_ways_is_one_installation(tmp_path, world):
+    root = tmp_path / "PEPEH"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(root))
+        install(adapter, custom(Path(str(root).upper())))
+        install(adapter, custom(Path(f"{root}\\")))
+        assert len(adapter.installation_summaries()) == 1
+    finally:
+        adapter.close()
+
+
+# --- switching ------------------------------------------------------------------------
+
+
+def test_switching_to_a_stopped_installation_moves_every_command_with_it(tmp_path, world):
+    first, second = tmp_path / "first", tmp_path / "second"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(second, "pepe-8gb"))
+
+        adapter.switch_installation(first)
+
+        assert adapter.active_root() == first and adapter.active_profile() == "pepe"
+        adapter.start_stack()
+        adapter.wait(10)
+        assert world.commands_on(first)[-1] == "start_stack"
+        assert world.commands_on(second) == ["first_run"]
+    finally:
+        adapter.close()
+
+
+def test_a_running_installation_is_never_stopped_just_because_another_was_chosen(tmp_path, world):
+    first, second = tmp_path / "first", tmp_path / "second"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(second, "pepe-8gb"))
+        world.running.add(second)
+
+        with pytest.raises(SwitchRequiresStop) as raised:
+            adapter.switch_installation(first)
+
+        assert raised.value.plan.must_stop and raised.value.plan.running_profile == "pepe-8gb"
+        assert adapter.active_root() == second, "nothing moved"
+        assert "stop_stack" not in world.commands_on(second), "and nothing was stopped"
+    finally:
+        adapter.close()
+
+
+def test_stop_and_switch_stops_the_one_in_use_and_then_binds_the_other(tmp_path, world):
+    first, second = tmp_path / "first", tmp_path / "second"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(second, "pepe-8gb"))
+        world.running.add(second)
+
+        adapter.stop_and_switch(first)
+        adapter.wait(10)
+
+        assert world.commands_on(second)[-1] == "stop_stack"
+        assert adapter.active_root() == first
+        adapter.restart_stack()
+        adapter.wait(10)
+        assert world.commands_on(first)[-1] == "restart_stack"
+    finally:
+        adapter.close()
+
+
+def test_a_switch_whose_stop_fails_keeps_the_installation_that_is_running(tmp_path, world):
+    first, second = tmp_path / "first", tmp_path / "second"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(second, "pepe-8gb"))
+        world.running.add(second)
+        world.refuse_stop.add(second)
+
+        adapter.stop_and_switch(first)
+        adapter.wait(10)
+
+        assert adapter.active_root() == second and adapter.active_profile() == "pepe-8gb"
+        adapter.start_stack()
+        adapter.wait(10)
+        assert world.commands_on(first) == ["first_run"]
+    finally:
+        adapter.close()
+
+
+# --- a folder that is not there any more ----------------------------------------------
+
+
+def test_an_installation_whose_folder_is_gone_stays_in_the_list_as_unavailable(tmp_path, world):
+    first, second = tmp_path / "first", tmp_path / "second"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(second, "pepe-8gb"))
+        shutil.rmtree(first)
+
+        row = next(row for row in adapter.installation_summaries() if row.root == first)
+        assert row.missing and not row.usable
+        assert "não está disponível" in row.detail
+
+        plan = adapter.plan_switch(first)
+        assert not plan.ok and "não está disponível" in plan.problems[0]
+        with pytest.raises(HubError):
+            adapter.switch_installation(first)
+        assert adapter.active_root() == second
+    finally:
+        adapter.close()
+
+
+def test_a_folder_that_holds_no_installation_is_refused_in_plain_words(tmp_path, world):
+    first, elsewhere = tmp_path / "first", tmp_path / "pictures"
+    elsewhere.mkdir()
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        with pytest.raises(HubError) as raised:
+            adapter.open_installation(elsewhere)
+        assert "não contém uma instalação" in str(raised.value)
+        assert adapter.active_root() == first
+        assert [row.root for row in adapter.installation_summaries()] == [first]
+    finally:
+        adapter.close()
+
+
+def test_opening_an_installation_the_hub_never_saw_adopts_it(tmp_path, world):
+    first, second = tmp_path / "first", tmp_path / "second"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(second, "pepe-8gb"))
+        adapter.switch_installation(first)
+        adapter.forget_installation(second)
+        assert [row.root for row in adapter.installation_summaries()] == [first]
+
+        adapter.open_installation(second)
+
+        assert adapter.active_root() == second and adapter.active_profile() == "pepe-8gb"
+        assert {row.root for row in adapter.installation_summaries()} == {first, second}
+    finally:
+        adapter.close()
+
+
+# --- forgetting is not deleting --------------------------------------------------------
+
+
+def test_forgetting_removes_the_shortcut_and_not_one_file(tmp_path, world):
+    first, second = tmp_path / "first", tmp_path / "second"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(second, "pepe-8gb"))
+        before = sorted(p.name for p in first.rglob("*"))
+
+        adapter.forget_installation(first)
+
+        assert [row.root for row in adapter.installation_summaries()] == [second]
+        assert first.exists() and sorted(p.name for p in first.rglob("*")) == before
+        assert world.commands_on(first) == ["first_run"], "nothing was stopped"
+    finally:
+        adapter.close()
+
+
+def test_the_installation_in_use_is_never_forgotten_by_accident(tmp_path, world):
+    first = tmp_path / "first"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        with pytest.raises(HubError) as raised:
+            adapter.forget_installation(first)
+        assert "instalação em uso" in str(raised.value)
+        assert [row.root for row in adapter.installation_summaries()] == [first]
+    finally:
+        adapter.close()
+
+
+# --- checking and repairing, in place ---------------------------------------------------
+
+
+def test_repair_runs_on_the_active_installation_without_asking_anything_again(tmp_path, world):
+    first, second = tmp_path / "first", tmp_path / "second"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(second, "pepe-8gb"))
+
+        adapter.repair()
+        adapter.wait(10)
+
+        assert world.commands_on(second) == ["first_run", "first_run"]
+        assert world.commands_on(first) == ["first_run"]
+        assert adapter.active_root() == second and adapter.active_profile() == "pepe-8gb"
+        entry = adapter.state.entry_for(second)
+        assert entry.last_repair is not None
     finally:
         adapter.close()

@@ -946,10 +946,34 @@ def test_real_model_failure_preserves_last_transfer_in_the_real_wizard(compositi
     assert_streams(events)
 
 
+def test_a_profile_this_machine_cannot_run_is_refused_where_it_is_chosen(composition):
+    """The environment check is not a surprise at the end: a profile that asks for
+    more VRAM than the machine has cannot be carried into an installation."""
+    _, adapter, _ = composition(vram_mib=12227)
+    app, _ = tui(adapter)
+
+    async def exercise():
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            await click(pilot, "#wizard-next")
+            await click(pilot, "#wizard-profile-capella")
+            screen = pilot.app.screen
+            assert screen.state.profile_id == "capella"
+            assert screen.query_one("#wizard-next", Button).disabled
+            assert "Requer mais VRAM" in str(
+                screen.query_one("#wizard-profile-summary", Static).content
+            )
+
+            # Nothing was attempted: the refusal is in the choice, not at the end.
+            assert screen.state.step is WizardStep.PROFILE
+
+    asyncio.run(exercise())
+    assert adapter.installation().ready is False
+
+
 @pytest.mark.parametrize(
     "kind,kwargs,expected",
     [
-        ("preflight", {"vram_mib": 12227}, "Ambiente não está pronto"),
         (
             "provision",
             {"injections": InjectionPlan.of(Injection.CHECKSUM_MISMATCH)},

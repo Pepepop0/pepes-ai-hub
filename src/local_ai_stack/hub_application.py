@@ -41,26 +41,35 @@ from .installation import (
 from .installations import (
     FAILURE,
     INSTALL,
+    REPAIR,
     STATE_FILENAME,
     HubState,
     KnownInstallation,
     read_state,
+    root_key,
     write_installed_config,
     write_state,
 )
+from .layout import StackLayout
 from .operation_contracts import OperationEvent, OperationEventSink, OperationSnapshot
-from .profiles import Profile, load_profiles
+from .profiles import Profile, load_profiles, offered_profiles
 from .stack_application import StackApplication, StackDependencies
 from .tui.application import (
+    COMPATIBLE,
+    INSUFFICIENT,
+    RECOMMENDED,
     ConflictResolutionRequired,
     HubError,
     HubUnavailable,
+    InstallationSummary,
     InstallationView,
     InstallSelection,
     LaunchRefusal,
     LaunchTarget,
     OperationBusy,
     ProfileChoice,
+    SwitchPlan,
+    SwitchRequiresStop,
 )
 
 
@@ -149,6 +158,240 @@ class HubApplicationAdapter:
         """Every installation the Hub knows, most recently used first."""
         return self.state.ordered()
 
+    def _profile_name(self, profile_id: str | None) -> str | None:
+        return next((p.name for p in self.profiles if p.id == profile_id), profile_id)
+
+    def _observed_status(self, entry: KnownInstallation) -> tuple[str, str, str | None]:
+        """What this installation looks like right now: status, detail, profile.
+
+        Cheap on purpose -- the folder, its configuration, and (only for the
+        active one, which already has a backend) whether its services answer.
+        Nothing is hashed, nothing is installed, nothing is created.
+        """
+        if not entry.root.exists():
+            return "missing", "A pasta não está disponível.", entry.last_known_profile
+        layout = StackLayout.from_root(entry.root)
+        path = config_path(layout)
+        config = _installed_config(path)
+        if config is None and path.exists():
+            return "unreadable", "A configuração não pôde ser lida.", entry.last_known_profile
+        profile_id = config.profile_id if config else entry.last_known_profile
+        if profile_id is not None and profile_id not in {p.id for p in self.profiles}:
+            return "unreadable", f"O perfil {profile_id} não existe nesta versão.", profile_id
+        active_root = self.active_root()
+        if active_root is not None and root_key(active_root) == entry.key:
+            try:
+                status = self.backend.status(self._profile_id())
+            except Exception:  # noqa: BLE001 -- a list row never fails the screen
+                return "unknown", "", profile_id
+            if status.stack_up:
+                return "running", "", profile_id
+            return (
+                ("ready", "", profile_id)
+                if status.installation_ready
+                else ("stopped", "", profile_id)
+            )
+        return ("ready" if config is not None else "unknown"), "", profile_id
+
+    def installation_summaries(self) -> tuple[InstallationSummary, ...]:
+        """Every known installation as a row, active one first, then most recent."""
+        active_root = self.active_root()
+        rows = []
+        for entry in self.state.ordered():
+            status, detail, profile_id = self._observed_status(entry)
+            rows.append(
+                InstallationSummary(
+                    root=entry.root,
+                    profile_id=profile_id,
+                    profile_name=self._profile_name(profile_id),
+                    mode=entry.mode,
+                    status=status,
+                    active=active_root is not None and root_key(active_root) == entry.key,
+                    last_used_at=entry.last_used_at,
+                    detail=detail,
+                )
+            )
+        return tuple(sorted(rows, key=lambda row: not row.active))
+
+    def forget_installation(self, root: Path | str) -> None:
+        """Remove the Hub's shortcut to an installation. Deletes nothing, stops nothing."""
+        with self._lock:
+            active = self.active_root()
+            if active is not None and root_key(active) == root_key(root):
+                raise HubError(
+                    "Esta é a instalação em uso. Troque de instalação antes de removê-la da lista."
+                )
+            self._persist(self.state.forgetting(root))
+
+    # --- switching, as a transaction ---------------------------------------------
+
+    def plan_switch(self, root: Path | str) -> SwitchPlan:
+        """What switching would mean. Reads; changes nothing, stops nothing."""
+        entry = self.state.entry_for(root)
+        target = Path(root)
+        mode = entry.mode if entry else InstallLocationMode.CUSTOM
+        problems: list[str] = []
+        profile_id = entry.last_known_profile if entry else None
+        if not target.exists():
+            problems.append("A pasta desta instalação não está disponível.")
+        else:
+            config = _installed_config(config_path(StackLayout.from_root(target)))
+            if config is None:
+                problems.append("Esta pasta não contém uma instalação que o Hub reconheça.")
+            else:
+                profile_id = config.profile_id
+                if profile_id not in {p.id for p in self.profiles}:
+                    problems.append(f"O perfil {profile_id} não existe nesta versão do Hub.")
+                mode = config.installation.mode
+        running_profile = None
+        must_stop = False
+        active = self.active_root()
+        if active is not None and root_key(active) != root_key(target):
+            try:
+                status = self.backend.status(self._profile_id())
+                must_stop = status.stack_up
+            except Exception:  # noqa: BLE001 -- treat an unreadable stack as stopped
+                must_stop = False
+            if must_stop:
+                running_profile = self._profile_id()
+        return SwitchPlan(
+            root=target,
+            profile_id=profile_id,
+            mode=mode,
+            must_stop=must_stop,
+            running_profile=running_profile,
+            problems=tuple(problems),
+        )
+
+    def _bind(self, root: Path, config: InstalledConfig) -> None:
+        installation = self.resolve(location_of_config(config, root))
+        backend = self._backends.get(installation.root)
+        if backend is None:
+            backend = self.backend_factory(installation)
+            self._backends[installation.root] = backend
+        self.config = config
+        self.backend = backend
+        self._persist(self.state.activating(config))
+
+    def switch_installation(self, root: Path | str) -> None:
+        """Make a known installation the active one. Stopped stacks only.
+
+        Raises :class:`SwitchRequiresStop` when the installation in use is
+        running: stopping it is a decision, never a side effect of choosing
+        another one from a list.
+        """
+        with self._lock:
+            plan = self.plan_switch(root)
+            if not plan.ok:
+                raise HubError(plan.problems[0])
+            if plan.must_stop:
+                raise SwitchRequiresStop(plan)
+            config = _installed_config(config_path(StackLayout.from_root(Path(root))))
+            if config is None:  # pragma: no cover - plan_switch already refused it
+                raise HubError("Esta pasta não contém uma instalação que o Hub reconheça.")
+            self._bind(Path(root), config)
+
+    def stop_and_switch(self, root: Path | str) -> str:
+        """Stop the managed services of the installation in use, then switch to another.
+
+        Only processes this Hub can prove it owns are stopped; anything else on
+        those ports is left alone. If stopping fails, the previous installation
+        stays active and bound.
+        """
+        with self._lock:
+            plan = self.plan_switch(root)
+            if not plan.ok:
+                raise HubError(plan.problems[0])
+            config = _installed_config(config_path(StackLayout.from_root(Path(root))))
+            if config is None:  # pragma: no cover - plan_switch already refused it
+                raise HubError("Esta pasta não contém uma instalação que o Hub reconheça.")
+            operation_id = self._reserve()
+            previous = self.backend
+            profile_id = self._profile_id()
+            target = Path(root)
+
+            def execute():
+                result = None
+                try:
+                    result = previous.stop_stack(
+                        operation_id, profile_id, emit=self._publisher(previous)
+                    )
+                finally:
+                    with self._lock:
+                        if _succeeded(result):
+                            self._bind(target, config)
+                        self._busy = False
+                        self._idle.set()
+
+            self._worker = threading.Thread(target=execute, name="hub-operation")
+            self._worker.start()
+            return operation_id
+
+    def open_installation(self, root: Path | str) -> None:
+        """Adopt a folder the person picked: validate it, remember it, switch to it."""
+        with self._lock:
+            target = Path(root)
+            if not target.exists():
+                raise HubError("A pasta escolhida não existe.")
+            config = _installed_config(config_path(StackLayout.from_root(target)))
+            if config is None:
+                raise HubError(
+                    "Esta pasta não contém uma instalação do Hub. "
+                    "Escolha a pasta de uma instalação ou crie uma nova."
+                )
+            if config.profile_id not in {p.id for p in self.profiles}:
+                raise HubError(f"O perfil {config.profile_id} não existe nesta versão do Hub.")
+            self._persist(
+                self.state.remembering(
+                    target,
+                    config.installation.mode,
+                    profile_id=config.profile_id,
+                    stack_id=config.stack_id,
+                )
+            )
+        self.switch_installation(target)
+
+    def repair(self) -> str:
+        """Check the active installation and repair what is missing, in place.
+
+        The same idempotent first run the installer uses, with the root, the
+        profile and the mode it already has: nothing is asked again, and what
+        is already correct is left alone.
+        """
+        with self._lock:
+            if self.config is None:
+                raise HubError("Nenhuma instalação está selecionada.")
+            operation_id = self._reserve()
+            backend = self.backend
+            config = self.config
+            root = self.active_root()
+
+            def execute():
+                result = None
+                try:
+                    result = backend.first_run(
+                        operation_id, config.profile_id, emit=self._publisher(backend)
+                    )
+                finally:
+                    with self._lock:
+                        if root is not None:
+                            self._persist(
+                                self.state.recording(
+                                    root,
+                                    REPAIR if _succeeded(result) else FAILURE,
+                                    result="succeeded" if _succeeded(result) else "",
+                                    summary=""
+                                    if _succeeded(result)
+                                    else "a verificação não pôde ser concluída",
+                                )
+                            )
+                        self._busy = False
+                        self._idle.set()
+
+            self._worker = threading.Thread(target=execute, name="hub-operation")
+            self._worker.start()
+            return operation_id
+
     def installation(self) -> InstallationView:
         if self.config is None:
             return InstallationView(False)
@@ -184,14 +427,44 @@ class HubApplicationAdapter:
         return installation, services, status.gpu
 
     def profile_choices(self) -> tuple[ProfileChoice, ...]:
+        """The profiles to offer, and how each stands against this machine.
+
+        The largest one that fits is the recommendation -- no profile is
+        preferred by name -- and the ones that do not fit are presented as
+        asking for more than there is, never as an ordinary choice.
+        """
+        facts = self.backend.facts()
+        offered = offered_profiles(self.profiles)
+        compatible = {
+            profile.id: evaluate_compatibility(facts, profile).compatible for profile in offered
+        }
+        fitting = [profile for profile in offered if compatible[profile.id]]
+        best = max(
+            fitting,
+            key=lambda profile: profile.hardware.min_vram_mib,
+            default=None,
+        )
         return tuple(
             ProfileChoice(
-                p.id,
-                p.name,
-                p.description,
-                evaluate_compatibility(self.backend.facts(), p).compatible,
+                profile.id,
+                profile.name,
+                profile.description,
+                compatible[profile.id],
+                standing=(
+                    RECOMMENDED
+                    if best is not None and profile.id == best.id
+                    else (COMPATIBLE if compatible[profile.id] else INSUFFICIENT)
+                ),
+                required_vram_gb=profile.hardware.min_vram_gb,
             )
-            for p in self.profiles
+            for profile in sorted(offered, key=lambda item: item.hardware.min_vram_mib)
+        )
+
+    def recommended_profile(self) -> str | None:
+        """Which profile a screen should start on. None when nothing fits."""
+        return next(
+            (choice.id for choice in self.profile_choices() if choice.recommended),
+            None,
         )
 
     def services_snapshot(self):
@@ -503,6 +776,18 @@ class _Subscription:
             if not self.closed:
                 self.closed = True
                 self.app._subscriptions.remove(self)
+
+
+def location_of_config(config: InstalledConfig, root: Path) -> InstallLocation:
+    """Where an installation lives: its own mode, and the folder it was found in.
+
+    A portable or default installation names no root of its own -- it resolves
+    to one at runtime -- so the folder the Hub found it in is used as the custom
+    root only when the configuration says custom.
+    """
+    if config.installation.mode is InstallLocationMode.CUSTOM:
+        return InstallLocation.custom(root)
+    return InstallLocation(config.installation.mode, None)
 
 
 def _installed_config(path: Path) -> InstalledConfig | None:

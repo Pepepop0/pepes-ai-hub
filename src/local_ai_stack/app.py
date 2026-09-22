@@ -107,10 +107,6 @@ WIDE_TERMINAL_COLUMNS = 90
 # second press does not open a second tab.
 LAUNCH_COOLDOWN_SECONDS = 2.0
 
-# The wizard highlights this profile when it is offered, because it is the
-# path the first-run flow is built around. It is a suggestion, not a choice.
-SUGGESTED_PROFILE = "capella"
-
 UNWIRED_MESSAGE = "A instalação ainda não está conectada nesta versão do Hub."
 
 # What the shell shows until the application has answered. A probe of the
@@ -465,10 +461,14 @@ class LocalAIStackApp(App):
                 ProfileChoice(profile.id, profile.name, profile.description)
                 for profile in self.profiles
             )
+        # The wizard starts on the largest profile this machine can run, which
+        # the application works out from the detected hardware. No profile is
+        # preferred by name.
+        recommended = next((choice.id for choice in choices if choice.recommended), None)
         self.push_screen(
             WizardScreen(
                 choices,
-                preselect=SUGGESTED_PROFILE,
+                preselect=recommended,
                 recent_roots=self._recent_custom_roots(),
                 can_pick_folder=self.folder_picker is not None,
             )

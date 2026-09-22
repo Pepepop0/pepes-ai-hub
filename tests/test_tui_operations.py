@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,7 @@ from local_ai_stack.installation import InstallLocationMode
 from local_ai_stack.operation_contracts import OperationEventKind, OperationState
 from local_ai_stack.pets import unsafe_characters
 from local_ai_stack.tui.application import (
+    COMPATIBLE,
     HubApplication,
     InstallSelection,
     LaunchRefusal,
@@ -209,7 +211,9 @@ def test_the_wizard_can_be_skipped_for_now():
 # --- profile selection ------------------------------------------------------------
 
 
-def test_capella_is_suggested_and_every_profile_is_offered():
+def test_the_largest_profile_that_fits_is_preselected_and_the_others_are_offered():
+    """No profile is preferred by name: the application says which one fits best."""
+
     async def exercise() -> None:
         app, _, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
@@ -217,9 +221,9 @@ def test_capella_is_suggested_and_every_profile_is_offered():
             screen = wizard(app)
             await click(pilot, "#wizard-next")
             labels = [str(b.label) for b in screen.query("#wizard-profile-buttons Button")]
-            assert labels == ["Capella", "Pepe", "Test"]
-            assert screen.state.profile_id == "capella"
-            assert screen.query_one("#wizard-profile-capella", Button).variant == "primary"
+            assert labels == ["Pepinho", "Pepe", "Capella"]
+            assert screen.state.profile_id == "pepe"
+            assert screen.query_one("#wizard-profile-pepe", Button).variant == "primary"
             assert "Recomendado" in text(app, "#wizard-profile-summary")
 
     run(exercise)
@@ -232,22 +236,22 @@ def test_choosing_a_profile_updates_the_summary_and_the_selection():
             await pilot.pause()
             screen = wizard(app)
             await click(pilot, "#wizard-next")
-            await click(pilot, "#wizard-profile-test")
-            assert screen.state.profile_id == "test"
-            assert screen.query_one("#wizard-profile-test", Button).variant == "primary"
+            await click(pilot, "#wizard-profile-pepe-8gb")
+            assert screen.state.profile_id == "pepe-8gb"
+            assert screen.query_one("#wizard-profile-pepe-8gb", Button).variant == "primary"
             assert screen.query_one("#wizard-profile-capella", Button).variant == "default"
-            assert "experimentar" in text(app, "#wizard-profile-summary")
+            summary = text(app, "#wizard-profile-summary")
+            assert "8 GB" in summary and "Compatível" in summary
 
     run(exercise)
 
 
-def test_without_a_suggested_profile_nothing_is_preselected_and_continue_waits():
+def test_without_a_recommendation_nothing_is_preselected_and_continue_waits():
     async def exercise() -> None:
         fake = FakeHubApplication(
             profile_choices_value=tuple(
-                choice
+                replace(choice, standing=COMPATIBLE)
                 for choice in FakeHubApplication().profile_choices()
-                if choice.id != "capella"
             )
         )
         app, _, _ = hub(fake)
@@ -309,7 +313,7 @@ def test_custom_needs_an_absolute_path_and_refuses_a_relative_one():
             assert r"D:\PepitosAIHub" in text(app, "#wizard-step-review")
             await click(pilot, "#wizard-next")
             assert fake.calls[0][1] == InstallSelection(
-                "capella", InstallLocationMode.CUSTOM, r"D:\PepitosAIHub"
+                "pepe", InstallLocationMode.CUSTOM, r"D:\PepitosAIHub"
             )
 
     run(exercise)
@@ -1217,7 +1221,7 @@ def test_custom_path_stays_correct_through_a_conflict_and_is_not_confused_for_in
             await pilot.pause()
             screen = wizard(app)
             await click(pilot, "#wizard-next")
-            await click(pilot, "#wizard-profile-test")
+            await click(pilot, "#wizard-profile-pepe-8gb")
             await click(pilot, "#wizard-next")
             await click(pilot, "#wizard-mode-custom")
             screen.set_custom_root(r"C:\Users\Pedro\Desktop\loira-40k")
@@ -1226,7 +1230,7 @@ def test_custom_path_stays_correct_through_a_conflict_and_is_not_confused_for_in
             await click(pilot, "#wizard-next")
 
             review = text(app, "#wizard-step-review")
-            assert "Perfil: [b]Test[/b]" in review
+            assert "Perfil: [b]Pepinho[/b]" in review
             assert "Local: [b]Personalizado[/b]" in review
             assert r"Pasta: C:\Users\Pedro\Desktop\loira-40k" in review
 

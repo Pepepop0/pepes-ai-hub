@@ -16,6 +16,7 @@ URL, or a process it could signal. The Open WebUI button asks for a
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -44,14 +45,44 @@ class ConflictResolutionRequired(HubError):
         self.report = report
 
 
+class SwitchRequiresStop(HubError):
+    """The installation in use is running; switching needs that stopped first.
+
+    Carries the plan so the screen can name both installations in the question
+    it asks. Nothing has been stopped or changed when this is raised.
+    """
+
+    def __init__(self, plan: SwitchPlan) -> None:
+        super().__init__("A instalação atual ainda está em execução.")
+        self.plan = plan
+
+
+# How a profile stands against the machine it would be installed on.
+RECOMMENDED = "recommended"
+COMPATIBLE = "compatible"
+INSUFFICIENT = "insufficient"
+
+
 @dataclass(frozen=True)
 class ProfileChoice:
-    """One profile as the wizard presents it: a name and a one-line reason to pick it."""
+    """One profile as the wizard presents it: a name and a one-line reason to pick it.
+
+    ``standing`` is what the detected hardware says: the largest profile this
+    machine can run is recommended, the smaller ones that also fit are
+    compatible, and the ones that ask for more VRAM than there is say so
+    instead of being offered as if they were a choice.
+    """
 
     id: str
     name: str
     summary: str
     compatible: bool | None = None
+    standing: str | None = None
+    required_vram_gb: int | float | None = None
+
+    @property
+    def recommended(self) -> bool:
+        return self.standing == RECOMMENDED
 
 
 @dataclass(frozen=True)
@@ -69,6 +100,49 @@ class InstallSelection:
             raise ValueError("a custom installation needs a root")
         if self.mode is not InstallLocationMode.CUSTOM and self.custom_root:
             raise ValueError("only a custom installation names a root")
+
+
+@dataclass(frozen=True)
+class InstallationSummary:
+    """One installation as a list row: what it is, where it is, and how it stands.
+
+    ``status`` is observed, never stored: an installation whose folder is gone
+    reads ``missing`` and keeps its place in the list, because the way back is
+    to find the folder, not to forget it happened.
+    """
+
+    root: Path
+    profile_id: str | None
+    profile_name: str | None
+    mode: InstallLocationMode
+    status: str = "unknown"  # ready | stopped | running | missing | unreadable | unknown
+    active: bool = False
+    last_used_at: datetime | None = None
+    detail: str = ""
+
+    @property
+    def missing(self) -> bool:
+        return self.status == "missing"
+
+    @property
+    def usable(self) -> bool:
+        return self.status in {"ready", "stopped", "running"}
+
+
+@dataclass(frozen=True)
+class SwitchPlan:
+    """What switching to another installation would do, before anything is done."""
+
+    root: Path
+    profile_id: str | None
+    mode: InstallLocationMode
+    must_stop: bool = False
+    running_profile: str | None = None
+    problems: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
 
 
 @dataclass(frozen=True)
@@ -161,9 +235,12 @@ __all__ = [
     "HubError",
     "HubUnavailable",
     "InstallSelection",
+    "InstallationSummary",
     "InstallationView",
     "LaunchRefusal",
     "LaunchTarget",
     "OperationBusy",
     "ProfileChoice",
+    "SwitchPlan",
+    "SwitchRequiresStop",
 ]

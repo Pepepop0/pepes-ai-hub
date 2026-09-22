@@ -25,6 +25,7 @@ ollama:
     aliases: [ollama/hermes3-8b]
     capabilities: {text: true, tools: true, vision: false}
     status: candidate
+    size_bytes: 4661226758
 
   # The 3B of the same family as hermes3_8b: the same ChatML template, the
   # same native tool calling, at 2.0 GB on disk. Pinned for the 8 GB profile,
@@ -36,6 +37,7 @@ ollama:
     aliases: [ollama/hermes3-3b]
     capabilities: {text: true, tools: true, vision: false}
     status: candidate
+    size_bytes: 2019383881
 
   # The plain Llama 3.2 3B instruct, the base hermes3_3b was tuned from. Same
   # size, same VRAM; measured on the 8 GB profile as the alternative that
@@ -47,6 +49,7 @@ ollama:
     aliases: [ollama/llama3-2-3b]
     capabilities: {text: true, tools: true, vision: false}
     status: candidate
+    size_bytes: 2019392628
 
   qwen3_5_9b:
     kind: chat
@@ -55,6 +58,7 @@ ollama:
     aliases: [ollama/qwen3-5-9b]
     capabilities: {text: true, tools: true, vision: true}
     status: tested_chat_tool_calling_unreliable_for_image
+    size_bytes: 6594474236
 
   # The dense 27B of the same family, for the 32 GB class: 17.4 GB on disk,
   # vision and native tool calling, Portuguese and English. Pinned for
@@ -66,6 +70,7 @@ ollama:
     aliases: [ollama/qwen3-5-27b]
     capabilities: {text: true, tools: true, vision: true}
     status: candidate
+    size_bytes: 17420432252
 
   qwen3_8b:
     kind: chat
@@ -74,6 +79,7 @@ ollama:
     aliases: [ollama/qwen3-8b]
     capabilities: {text: true, tools: true, vision: false}
     status: tested
+    size_bytes: 5225387677
 
 comfyui:
   # The FLUX.2 Klein 4B set, as the ComfyUI tutorial for this model specifies

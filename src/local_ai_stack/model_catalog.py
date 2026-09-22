@@ -44,7 +44,15 @@ MODEL_SCHEMA_VERSION = 1
 
 UNPINNED = "TBD"
 
-_OLLAMA_FIELDS = {"kind", "reference", "digest", "aliases", "capabilities", "status"}
+_OLLAMA_FIELDS = {
+    "kind",
+    "reference",
+    "digest",
+    "aliases",
+    "capabilities",
+    "status",
+    "size_bytes",
+}
 _COMFYUI_FIELDS = {
     "kind",
     "placement",
@@ -196,8 +204,13 @@ def _ollama_spec(
             raise _error(source, f"{field_name}.digest", "must be hexadecimal")
     else:
         digest = None
+    size_bytes = record.get("size_bytes")
+    if size_bytes is not None and (
+        not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0
+    ):
+        raise _error(source, f"{field_name}.size_bytes", "must be a positive integer")
     try:
-        source_record = OllamaModelSource(reference=reference, digest=digest)
+        source_record = OllamaModelSource(reference=reference, digest=digest, size_bytes=size_bytes)
         return ModelSpec(
             id=model_id,
             kind=_kind(record.get("kind", "chat"), source, f"{field_name}.kind"),

@@ -33,7 +33,13 @@ from ..external_conflict_contracts import (
     installation_outcome_heading,
 )
 from ..installation import InstallLocation, InstallLocationError, InstallLocationMode
-from .application import InstallSelection, ProfileChoice
+from .application import (
+    COMPATIBLE,
+    INSUFFICIENT,
+    RECOMMENDED,
+    InstallSelection,
+    ProfileChoice,
+)
 from .operations import OperationView
 from .presenters import (
     DEFAULT_TRANSFER_WIDTH,
@@ -64,6 +70,30 @@ CHOICE_STEPS: tuple[WizardStep, ...] = (
     WizardStep.MODE,
     WizardStep.REVIEW,
 )
+
+# What a profile's standing is called on screen. The application decides which
+# one applies; this only writes it in the language the interface speaks.
+STANDING_LABELS = {
+    RECOMMENDED: "Recomendado",
+    COMPATIBLE: "Compatível",
+    INSUFFICIENT: "Requer mais VRAM",
+}
+
+
+def profile_summary(choice: ProfileChoice) -> str:
+    """One line for a profile: what it is for, and how it stands here."""
+    parts = []
+    if choice.required_vram_gb is not None:
+        parts.append(f"Para GPUs NVIDIA de {choice.required_vram_gb} GB")
+    elif choice.summary:
+        parts.append(choice.summary.rstrip("."))
+    standing = STANDING_LABELS.get(choice.standing or "")
+    detail = escape(". ".join(part for part in parts if part))
+    if standing is None:
+        return detail or escape(choice.summary)
+    marked = f"[b]{standing}[/b]" if choice.standing == RECOMMENDED else standing
+    return f"{detail}\n{marked}" if detail else marked
+
 
 MODE_LABELS: dict[InstallLocationMode, tuple[str, str]] = {
     InstallLocationMode.DEFAULT: (
@@ -482,7 +512,7 @@ class WizardScreen(Screen):
                 "primary" if choice.id == state.profile_id else "default"
             )
         self.query_one("#wizard-profile-summary", Static).update(
-            escape(chosen.summary) if chosen else "Escolha um perfil para continuar."
+            profile_summary(chosen) if chosen else "Escolha um perfil para continuar."
         )
 
         for mode in InstallLocationMode:
@@ -575,6 +605,11 @@ class WizardScreen(Screen):
         abort = self.query_one("#wizard-conflict-abort", Button)
         abort.variant = "primary" if recommended is ExternalConflictPolicy.ABORT else "default"
 
+    def _selected_fits(self) -> bool:
+        """Whether the profile chosen can run on this machine. Unknown counts as yes."""
+        chosen = self._chosen()
+        return chosen is None or chosen.compatible is not False
+
     def _set_buttons(self, *, review_refused: bool = False) -> None:
         state = self.state
         view = self.operation
@@ -592,7 +627,14 @@ class WizardScreen(Screen):
             self.query_one(f"#{button_id}", Button).display = visible
         nxt = self.query_one("#wizard-next", Button)
         nxt.label = "Instalar" if state.step is WizardStep.REVIEW else "Continuar"
-        nxt.disabled = not state.can_continue or review_refused or self.picker_busy
+        nxt.disabled = (
+            not state.can_continue
+            or review_refused
+            or self.picker_busy
+            # A profile that asks for more VRAM than this machine has is not a
+            # choice to be talked out of later: it cannot be installed here.
+            or (state.step is not WizardStep.WELCOME and not self._selected_fits())
+        )
         self.query_one("#wizard-back", Button).disabled = self.picker_busy
 
     # --- input --------------------------------------------------------------

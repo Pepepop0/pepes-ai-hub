@@ -104,10 +104,16 @@ class OllamaModelSource:
 
     reference: str
     digest: str | None = None
+    # What the pull weighs, as the provider's manifest records it. Optional:
+    # only screens that show what an installation will download read it, and a
+    # model pinned without one is simply not counted.
+    size_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if not self.reference or self.reference != self.reference.strip():
             raise ModelContractError("Ollama reference must be a non-empty trimmed string")
+        if self.size_bytes is not None and self.size_bytes <= 0:
+            raise ModelContractError("Ollama size_bytes must be a positive integer")
         if self.digest is not None and (not self.digest or self.digest != self.digest.strip()):
             raise ModelContractError("Ollama digest must be a non-empty trimmed string")
 

@@ -198,9 +198,19 @@ class HubState:
         return next((item for item in self.known if item.key == wanted), None)
 
     def ordered(self) -> tuple[KnownInstallation, ...]:
-        """Known installations, most recently used first; never used ones last."""
+        """Known installations, most recently used first; never used ones last.
+
+        Two entries can carry the same instant -- the clock's resolution is
+        coarser than two switches in a row -- so the one touched last wins, and
+        the order never depends on how a dictionary happened to iterate.
+        """
         epoch = datetime.fromtimestamp(0, UTC)
-        return tuple(sorted(self.known, key=lambda item: item.last_used_at or epoch, reverse=True))
+        ranked = sorted(
+            enumerate(self.known),
+            key=lambda pair: (pair[1].last_used_at or epoch, pair[0]),
+            reverse=True,
+        )
+        return tuple(entry for _, entry in ranked)
 
     # --- writing ------------------------------------------------------------
 

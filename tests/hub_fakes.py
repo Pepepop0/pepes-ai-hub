@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -46,6 +46,9 @@ from local_ai_stack.operation_contracts import (
     advance_operation,
 )
 from local_ai_stack.tui.application import (
+    COMPATIBLE,
+    INSUFFICIENT,
+    RECOMMENDED,
     ConflictResolutionRequired,
     HubUnavailable,
     InstallationView,
@@ -58,10 +61,40 @@ from local_ai_stack.tui.application import (
 
 SERVICE_IDS = ("ollama", "open-webui", "comfyui")
 
+# A machine every offered profile fits on; the one that does not fit is its own
+# fixture, because refusing to install is a different screen.
 PROFILE_CHOICES = (
-    ProfileChoice("capella", "Capella", "Chat e imagens. Recomendado para esta máquina.", True),
-    ProfileChoice("pepe", "Pepe", "Perfil pessoal de referência.", True),
-    ProfileChoice("test", "Test", "Sem modelos pesados, para experimentar o Hub.", True),
+    ProfileChoice(
+        "pepe-8gb",
+        "Pepinho",
+        "Para GPUs NVIDIA de 8 GB.",
+        True,
+        standing=COMPATIBLE,
+        required_vram_gb=8,
+    ),
+    ProfileChoice(
+        "pepe",
+        "Pepe",
+        "Para GPUs NVIDIA de 12 GB.",
+        True,
+        standing=RECOMMENDED,
+        required_vram_gb=12,
+    ),
+    ProfileChoice(
+        "capella",
+        "Capella",
+        "Para GPUs NVIDIA de 32 GB.",
+        True,
+        standing=COMPATIBLE,
+        required_vram_gb=32,
+    ),
+)
+
+# The same offer on a machine too small for the largest profile.
+PROFILE_CHOICES_TOO_SMALL = (
+    PROFILE_CHOICES[0],
+    PROFILE_CHOICES[1],
+    replace(PROFILE_CHOICES[2], compatible=False, standing=INSUFFICIENT),
 )
 
 # The stages a real installation reports, in the words the producer uses.

@@ -5,6 +5,9 @@ ui:
   default_pet: none
   default_theme: neutral
 description: Profile leve para smoke-test universal dentro do escopo Windows/NVIDIA.
+# Machinery, not a product choice: the wizard does not offer it, and
+# PEPITOS_AI_HUB_INTERNAL_PROFILES=1 brings it back for development.
+visibility: internal
 
 hardware:
   os: windows

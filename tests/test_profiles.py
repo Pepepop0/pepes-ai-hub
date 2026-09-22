@@ -94,7 +94,7 @@ def test_profiles_expose_only_active_canonical_model_requirements():
         ("image.vae", "comfyui/flux2_vae"),
     }
     assert {str(item.model_id) for item in profiles["capella"].model_requirements} == {
-        "ollama/qwen3_5_9b",
+        "ollama/qwen3_5_27b",
         "comfyui/flux2_klein_fp8",
         "comfyui/qwen_3_4b_encoder",
         "comfyui/flux2_vae",
@@ -134,6 +134,68 @@ def test_formal_validation_rejects_invalid_profiles(mutation, expected_field):
     mutation(data)
     with pytest.raises(ProfileError, match=expected_field):
         validate_profile_data(data)
+
+
+@pytest.mark.parametrize(
+    ("size", "steps", "field"),
+    [
+        ("1024", None, "workflows.text_to_image.size"),
+        ("1024X1024", None, "workflows.text_to_image.size"),
+        ("0x1024", None, "workflows.text_to_image.size"),
+        (None, 0, "workflows.text_to_image.steps"),
+        (None, "20", "workflows.text_to_image.steps"),
+    ],
+)
+def test_a_workflow_size_or_step_count_is_validated_in_open_webui_spelling(size, steps, field):
+    data = copy.deepcopy(load_profile(ROOT / "profiles" / "pepe.yaml").raw)
+    if size is not None:
+        data["workflows"]["text_to_image"]["size"] = size
+    if steps is not None:
+        data["workflows"]["text_to_image"]["steps"] = steps
+    with pytest.raises(ProfileError, match=field):
+        validate_profile_data(data)
+
+
+@pytest.mark.parametrize(
+    ("params", "field"),
+    [
+        ("think=false", "models.chat.params"),
+        ({"think": None}, "models.chat.params.think"),
+        ({"think": [False]}, "models.chat.params.think"),
+        ({"system": "   "}, "models.chat.params.system"),
+    ],
+)
+def test_chat_model_parameters_must_be_named_scalars(params, field):
+    data = copy.deepcopy(load_profile(ROOT / "profiles" / "pepe.yaml").raw)
+    data["models"]["chat"]["params"] = params
+    with pytest.raises(ProfileError, match=field):
+        validate_profile_data(data)
+
+
+def test_chat_model_parameters_are_read_as_declared_and_default_to_none():
+    profiles = {p.id: p for p in load_profiles(ROOT / "profiles")}
+    assert profiles["capella"].chat_params == {"think": False}
+    assert profiles["pepe"].chat_params == {} and profiles["pepe-8gb"].chat_params == {}
+    data = copy.deepcopy(profiles["pepe"].raw)
+    data["models"]["chat"]["params"] = {"think": False, "num_ctx": 8192, "system": "Be terse."}
+    assert validate_profile_data(data).chat_params == {
+        "think": False,
+        "num_ctx": 8192,
+        "system": "Be terse.",
+    }
+
+
+def test_a_workflow_declaration_may_carry_a_size_and_a_step_count():
+    data = copy.deepcopy(load_profile(ROOT / "profiles" / "pepe.yaml").raw)
+    data["workflows"]["text_to_image"].update(size="1024x1024", steps=20)
+    workflow = validate_profile_data(data).workflows["text_to_image"]
+    assert (workflow.manifest_id, workflow.size, workflow.steps) == (
+        "flux2_klein_t2i",
+        "1024x1024",
+        20,
+    )
+    plain = load_profile(ROOT / "profiles" / "pepe.yaml").workflows["text_to_image"]
+    assert (plain.size, plain.steps) == (None, None)
 
 
 def test_machine_readable_schema_is_valid_json():

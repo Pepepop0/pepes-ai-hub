@@ -14,14 +14,21 @@ Open WebUI's own switch for this is the model capability ``builtin_tools``.
 This module keeps a model record for the profile's primary chat model with
 that capability off, through the authenticated Models API, exactly as an
 administrator would in Admin → Models. The record is created once and marked
-as the Hub's; it is written again only when the capability was turned back on.
-A record somebody else created under that id is left alone and reported. The
-same short-lived local administrator token as the filter sync signs the calls.
+as the Hub's; it is written again only when the capability was turned back on
+or a parameter the profile declares was changed. A record somebody else
+created under that id is left alone and reported. The same short-lived local
+administrator token as the filter sync signs the calls.
+
+The profile may also ask something of the model at every request
+(``models.chat.params``: Open WebUI's own model parameters, ``think`` for a
+reasoning model being the case that made this necessary). Those go into the
+record's ``params``, which Open WebUI's Ollama route applies to every call for
+that model id -- chat turns and its own background tasks alike.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import httpx
@@ -47,14 +54,14 @@ CAPABILITIES = {
 PUBLIC_READ = {"principal_type": "anyone", "principal_id": "*", "permission": "read"}
 
 
-def chat_model_record(reference: str) -> dict:
+def chat_model_record(reference: str, params: Mapping[str, object] | None = None) -> dict:
     """The record the Hub creates for an Ollama chat model it has not seen configured."""
     return {
         "id": reference,
         "base_model_id": None,
         "name": reference,
         "meta": {"managed_by": OWNER, "capabilities": dict(CAPABILITIES)},
-        "params": {},
+        "params": dict(params or {}),
         "access_grants": [dict(PUBLIC_READ)],
         "is_active": True,
     }
@@ -75,17 +82,30 @@ def _builtin_tools_off(record: dict | None) -> bool:
     return capabilities.get("builtin_tools") is False
 
 
-def configure_chat_model(client: httpx.Client, reference: str) -> FilterSync:
+def _carries_params(record: dict | None, params: Mapping[str, object]) -> bool:
+    """Whether the record already holds every parameter the profile declares."""
+    current = (record or {}).get("params") or {}
+    return all(key in current and current[key] == value for key, value in params.items())
+
+
+def _configured(record: dict | None, params: Mapping[str, object]) -> bool:
+    return _builtin_tools_off(record) and _carries_params(record, params)
+
+
+def configure_chat_model(
+    client: httpx.Client, reference: str, params: Mapping[str, object] | None = None
+) -> FilterSync:
     """Create or update only our record for ``reference``, then read it back."""
+    params = dict(params or {})
     current = _current_record(client, reference)
-    if _builtin_tools_off(current):
+    if _configured(current, params):
         return FilterSync.UNCHANGED
     if current is not None and (current.get("meta") or {}).get("managed_by") != OWNER:
         raise PermissionError(
             f"model {reference!r} has a record in Open WebUI that was not created by the Hub"
         )
     if current is None:
-        result = client.post("/api/v1/models/create", json=chat_model_record(reference))
+        result = client.post("/api/v1/models/create", json=chat_model_record(reference, params))
         outcome = FilterSync.INSTALLED
     else:
         meta = dict(current.get("meta") or {})
@@ -95,14 +115,15 @@ def configure_chat_model(client: httpx.Client, reference: str) -> FilterSync:
             "base_model_id": current.get("base_model_id"),
             "name": current.get("name") or reference,
             "meta": meta,
-            "params": current.get("params") or {},
+            # The profile's parameters over the record's; anything else it holds stays.
+            "params": {**(current.get("params") or {}), **params},
             "access_grants": current.get("access_grants") or [dict(PUBLIC_READ)],
             "is_active": current.get("is_active", True),
         }
         result = client.post("/api/v1/models/model/update", params={"id": reference}, json=form)
         outcome = FilterSync.UPDATED
     result.raise_for_status()
-    if not _builtin_tools_off(_current_record(client, reference)):
+    if not _configured(_current_record(client, reference), params):
         raise RuntimeError("Open WebUI did not retain the chat model configuration")
     # The running instance serves models from a cache that a listing refreshes;
     # without this the new record only counts after the next page load.
@@ -115,12 +136,14 @@ def sync_chat_model(
     base_url: str,
     reference: str,
     *,
+    params: Mapping[str, object] | None = None,
     client_factory: Callable[[str, str], httpx.Client] | None = None,
 ) -> FilterSyncReport:
     """Bring the managed instance's record for the chat model up to date. Idempotent.
 
-    Builtin tools already off → nothing is written. Absent → created. Turned
-    back on under our record → updated. No administrator yet → reported, not
+    Builtin tools already off and every declared parameter in place → nothing
+    is written. Absent → created. Turned back on, or a declared parameter
+    changed, under our record → updated. No administrator yet → reported, not
     attempted. An unreachable or refusing instance is reported as unavailable;
     somebody else's record under the model's id is reported as refused.
     Never raises.
@@ -138,7 +161,7 @@ def sync_chat_model(
     )
     try:
         with factory(base_url, token) as client:
-            outcome = configure_chat_model(client, reference)
+            outcome = configure_chat_model(client, reference, params)
     except PermissionError as exc:
         return FilterSyncReport(FilterSync.REFUSED, str(exc))
     except (httpx.HTTPError, RuntimeError, ValueError) as exc:

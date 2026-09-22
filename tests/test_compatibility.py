@@ -55,6 +55,28 @@ def test_the_8gb_profile_takes_8gb_cards_and_refuses_the_class_below(gpu, vram_m
         assert "vram_below_minimum" in {blocker.code for blocker in report.blockers}
 
 
+@pytest.mark.parametrize(
+    ("gpu", "vram_mib", "compatible", "codes"),
+    [
+        # What nvidia-smi reports for the card the profile is for: 161 MiB
+        # short of 32 GiB, which the 128 MiB tolerance of the other profiles
+        # would refuse.
+        ("NVIDIA GeForce RTX 5090", 32607, True, ["vram_within_tolerance"]),
+        ("NVIDIA GeForce RTX 5090", 32768, True, []),
+        ("NVIDIA GeForce RTX 4090", 24564, False, ["vram_below_minimum"]),
+        ("NVIDIA GeForce RTX 5070", 12227, False, ["vram_below_minimum"]),
+    ],
+)
+def test_capella_takes_the_5090_as_it_reports_itself_and_refuses_the_class_below(
+    gpu, vram_mib, compatible, codes
+):
+    profile = load_profile(ROOT / "profiles" / "capella.yaml")
+    facts = SystemFacts("Windows", "10", "3.11.9", True, True, (GPUInfo(gpu, vram_mib),))
+    report = evaluate_compatibility(facts, profile)
+    assert report.compatible is compatible
+    assert [issue.code for issue in (*report.blockers, *report.warnings)] == codes
+
+
 def test_capella_is_incompatible_on_reference_machine():
     profile = load_profile(ROOT / "profiles" / "capella.yaml")
     report = evaluate_compatibility(facts_with_vram(12227), profile)

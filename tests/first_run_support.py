@@ -34,14 +34,18 @@ from local_ai_stack.e2e.seams import InjectionPlan
 from local_ai_stack.installation import detect_repo_root
 from local_ai_stack.integration import IntegrationOptions
 from local_ai_stack.model_catalog import model_catalog
-from local_ai_stack.models import ModelId
 from local_ai_stack.profiles import load_profiles
 from local_ai_stack.stack_application import (
     StackApplication,
     StackDependencies,
 )
 
-CHAT_SPEC = model_catalog().get(ModelId("ollama/qwen3_5_9b"))
+# The shipped Capella profile's primary chat model, whichever the profile names.
+CHAT_SPEC = model_catalog().get(
+    next(p for p in load_profiles(detect_repo_root() / "profiles") if p.id == "capella").model_for(
+        "chat.primary"
+    )
+)
 CHAT_REFERENCE = CHAT_SPEC.source.reference
 CHAT_DIGEST = CHAT_SPEC.source.digest
 # What the controlled Ollama store serves for every catalogued Ollama model:

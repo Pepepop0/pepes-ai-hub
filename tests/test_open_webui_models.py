@@ -107,6 +107,24 @@ def test_a_fresh_instance_gets_a_record_with_builtin_tools_off():
     assert api.listings == 1  # the running instance is told to reload its models
 
 
+def test_a_profile_s_model_parameters_ride_on_the_record():
+    """Declared parameters are written with the record, kept when already there,
+    and put back when changed under our record; the record's other parameters stay."""
+    api = FakeModelsApi()
+    with api.client() as client:
+        assert configure_chat_model(client, MODEL, {"think": False}) is FilterSync.INSTALLED
+        assert api.records[MODEL]["params"] == {"think": False}
+        assert capabilities(api)["builtin_tools"] is False
+        assert configure_chat_model(client, MODEL, {"think": False}) is FilterSync.UNCHANGED
+        # An administrator adds a parameter of their own and flips ours.
+        api.records[MODEL]["params"] = {"think": True, "num_ctx": 8192}
+        assert configure_chat_model(client, MODEL, {"think": False}) is FilterSync.UPDATED
+        assert api.records[MODEL]["params"] == {"think": False, "num_ctx": 8192}
+        # A profile that declares nothing leaves whatever parameters the record has.
+        assert configure_chat_model(client, MODEL) is FilterSync.UNCHANGED
+    assert api.writes == ["/api/v1/models/create", "/api/v1/models/model/update"]
+
+
 def test_a_record_that_already_has_builtin_tools_off_is_left_alone_whoever_wrote_it():
     ours = FakeModelsApi({MODEL: chat_model_record(MODEL)})
     theirs = FakeModelsApi(

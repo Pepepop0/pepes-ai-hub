@@ -201,7 +201,7 @@ class StackDependencies:
     # Keeps the Hub's image chat filter current inside a running Open WebUI.
     filter_sync: Callable[[Path, str], FilterSyncReport] = sync_image_chat_filter
     # Keeps the profile's chat model configured for tool calling in that Open WebUI.
-    model_sync: Callable[[Path, str, str], FilterSyncReport] = sync_chat_model
+    model_sync: Callable[..., FilterSyncReport] = sync_chat_model
     # Keeps that Open WebUI's image editing pointed at the profile's edit workflow.
     image_edit_sync: Callable[[Path, str, ImageEditSettings], FilterSyncReport] = sync_image_edit
     monotonic: Callable[[], float] = time.monotonic
@@ -938,11 +938,14 @@ class StackApplication:
             )
         chat_model = self._chat_model_reference(profile)
         if profile.enables(FEATURE_TOOLS) and chat_model is not None:
+            # What the profile asks of the model at every request rides on the
+            # same record; a profile that asks nothing keeps the call as it was.
+            extra = {"params": profile.chat_params} if profile.chat_params else {}
             syncs.append(
                 (
                     "modelo de chat",
                     lambda: self.deps.model_sync(
-                        self.layout.open_webui_data, endpoints.open_webui, chat_model
+                        self.layout.open_webui_data, endpoints.open_webui, chat_model, **extra
                     ),
                 )
             )

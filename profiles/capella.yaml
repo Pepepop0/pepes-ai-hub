@@ -4,15 +4,23 @@ name: Capella
 ui:
   default_pet: hello-kitty
   default_theme: capella
-description: RTX 5090 32 GB — single GPU profile.
+description: >-
+  RTX 5090 32 GB — perfil principal: chat com visão e ferramentas num modelo
+  de 27B, geração e edição de imagem a 1024×1024, tudo residente na mesma GPU.
 
 hardware:
   os: windows
   gpu_vendor: nvidia
   min_vram_gb: 32
   recommended_vram_gb: 32
-  vram_tolerance_mib: 128
-  notes: Single RTX 5090. Multi-GPU fora do escopo v0.1.
+  # A real RTX 5090 reports 32607 MiB to nvidia-smi, 161 short of 32 GiB;
+  # the 128 MiB the other profiles use would refuse the very card this
+  # profile is for.
+  vram_tolerance_mib: 256
+  notes: >-
+    Single RTX 5090 (32 GB, 32607 MiB reportados). O modelo de chat (17 GB) e
+    os modelos de imagem (12 GB) cabem juntos na VRAM. RAM: 32 GB é o mínimo
+    operacional, 64 GB o recomendado. Multi-GPU fora do escopo v0.1.
 
 services:
   ollama: {enabled: true, port: 11434}
@@ -28,16 +36,23 @@ features:
 
 models:
   chat:
-    primary: ollama/qwen3_5_9b
+    primary: ollama/qwen3_5_27b
     status: candidate
-    alternatives: []
+    alternatives: [ollama/qwen3_5_9b]
+    # Qwen3.5 reasons before it answers unless told not to. Measured on the
+    # reference machine: 5-10x the tokens of the answer on a plain chat turn,
+    # 2,684 tokens to write one image prompt. Open WebUI applies this to every
+    # call for the model, its own background tasks included.
+    params: {think: false}
   image:
     diffusion: comfyui/flux2_klein_fp8
     text_encoder: comfyui/qwen_3_4b_encoder
     vae: comfyui/flux2_vae
 
 workflows:
-  text_to_image: {manifest_id: flux2_klein_t2i}
+  # The card has the room: FLUX.2 Klein at its native megapixel, not the
+  # 512x512 Open WebUI defaults to. The step count is the profile's, too.
+  text_to_image: {manifest_id: flux2_klein_t2i, size: 1024x1024, steps: 20}
   image_edit: {manifest_id: flux2_klein_edit}
 
 runtime:

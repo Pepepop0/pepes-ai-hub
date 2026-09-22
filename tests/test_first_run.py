@@ -421,7 +421,7 @@ def test_the_shipped_capella_profile_has_a_resolvable_primary_chat_model():
     built = controlled_stack(profile_yaml=capella_yaml())
     try:
         profile = built.app.profile(CAPELLA)
-        assert profile.models["chat"]["primary"] == "ollama/qwen3_5_9b"
+        assert profile.models["chat"]["primary"] == "ollama/qwen3_5_27b"
         assert not built.app.unresolved_models(profile)
         result = built.app.first_run("op-shipped", CAPELLA)
         assert result.state is OperationState.SUCCEEDED
@@ -531,10 +531,10 @@ def test_an_incoherent_profile_is_refused_before_anything_is_installed():
     from text; no amount of installing would change that.
     """
     yaml_text = capella_yaml().replace(
-        "text_to_image: {manifest_id: flux2_klein_t2i}",
-        "text_to_image: {manifest_id: flux2_klein_edit}",
+        "text_to_image: {manifest_id: flux2_klein_t2i,",
+        "text_to_image: {manifest_id: flux2_klein_edit,",
     )
-    assert "flux2_klein_edit}" in yaml_text
+    assert "manifest_id: flux2_klein_edit," in yaml_text
     built = controlled_stack(profile_yaml=yaml_text)
     try:
         recorder = Recorder()

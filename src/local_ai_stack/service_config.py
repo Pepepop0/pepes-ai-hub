@@ -288,6 +288,9 @@ def open_webui_image_configuration(
     endpoints: StackEndpoints,
     resolution: WorkflowResolution,
     graph: Mapping[str, object] | None = None,
+    *,
+    size: str | None = None,
+    steps: int | None = None,
 ) -> ServiceConfiguration:
     """Everything Open WebUI needs to drive ComfyUI, or the reason it cannot.
 
@@ -295,6 +298,13 @@ def open_webui_image_configuration(
     submit there is nothing to enable, and enabling image generation anyway
     would let Open WebUI fall back to a default workflow that knows nothing
     about this stack's models.
+
+    ``size`` and ``steps`` are what the profile asks the workflow for. They go
+    out as Open WebUI's own IMAGE_SIZE and IMAGE_STEPS, which seed its persisted
+    settings on first start and are then the administrator's to change; a
+    profile that asks for neither leaves Open WebUI's defaults alone. Asking a
+    graph for a size or a step count it does not map is a profile error, not
+    something to send and have silently ignored.
     """
     if not resolution.ready:
         return ServiceConfiguration(
@@ -325,6 +335,22 @@ def open_webui_image_configuration(
             ),
         )
 
+    parameters = set(resolution.spec.parameters)
+    unmapped = []
+    if size is not None and not {WorkflowParameter.WIDTH, WorkflowParameter.HEIGHT} <= parameters:
+        unmapped.append(f"a size of {size}, but it maps no width and height")
+    if steps is not None and WorkflowParameter.STEPS not in parameters:
+        unmapped.append(f"{steps} steps, but it maps no step count")
+    if unmapped:
+        return ServiceConfiguration(
+            ComponentId.OPEN_WEBUI,
+            problems=tuple(
+                f"image generation is not configurable: the profile asks workflow "
+                f"{resolution.spec.id!r} for {item}"
+                for item in unmapped
+            ),
+        )
+
     workflow_path = layout.open_webui_data / COMFYUI_WORKFLOW_FILE
     nodes_path = layout.open_webui_data / COMFYUI_WORKFLOW_NODES_FILE
     nodes = open_webui_workflow_nodes(resolution)
@@ -340,6 +366,10 @@ def open_webui_image_configuration(
         ENV_COMFYUI_WORKFLOW_NODES: json.dumps(nodes),
         ENV_IMAGE_GENERATION_MODEL: resolution.runtime_name,
     }
+    if size is not None:
+        env[ENV_IMAGE_SIZE] = size
+    if steps is not None:
+        env[ENV_IMAGE_STEPS] = str(steps)
     return ServiceConfiguration(ComponentId.OPEN_WEBUI, env, documents)
 
 
@@ -527,7 +557,12 @@ def build_stack_configuration(
             )
         else:
             image = open_webui_image_configuration(
-                layout, endpoints, resolution, (graphs or {}).get(resolution.spec.id)
+                layout,
+                endpoints,
+                resolution,
+                (graphs or {}).get(resolution.spec.id),
+                size=declared.size,
+                steps=declared.steps,
             )
             env.update(image.env)
             open_webui_documents.extend(image.documents)

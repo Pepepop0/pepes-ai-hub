@@ -56,6 +56,17 @@ ollama:
     capabilities: {text: true, tools: true, vision: true}
     status: tested_chat_tool_calling_unreliable_for_image
 
+  # The dense 27B of the same family, for the 32 GB class: 17.4 GB on disk,
+  # vision and native tool calling, Portuguese and English. Pinned for
+  # Capella, where it leaves the card room for the image models beside it.
+  qwen3_5_27b:
+    kind: chat
+    reference: qwen3.5:27b
+    digest: 7653528ba5cb
+    aliases: [ollama/qwen3-5-27b]
+    capabilities: {text: true, tools: true, vision: true}
+    status: candidate
+
   qwen3_8b:
     kind: chat
     reference: qwen3:8b

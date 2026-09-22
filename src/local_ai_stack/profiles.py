@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -61,9 +62,19 @@ class ServiceConfig:
     port: int
 
 
+# The size a profile may ask its text-to-image workflow for: Open WebUI's own
+# "WxH" spelling (IMAGE_SIZE), the one it validates before submitting.
+IMAGE_SIZE_PATTERN = re.compile(r"^[1-9]\d*x[1-9]\d*$")
+
+
 @dataclass(frozen=True)
 class WorkflowConfig:
+    """A workflow the profile drives, and how hard: size and steps are optional,
+    and only meaningful for a workflow whose graph maps them."""
+
     manifest_id: str
+    size: str | None = None
+    steps: int | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +110,13 @@ class Profile:
     def model_for(self, role: str) -> ModelId | None:
         """The model a role names, or None when it is absent or TBD."""
         return next((item.model_id for item in self.model_requirements if item.role == role), None)
+
+    @property
+    def chat_params(self) -> dict[str, bool | int | float | str]:
+        """What the profile asks of its chat model at every request: Open WebUI's
+        own model parameters (``think``, ``num_ctx``, ...), validated on load.
+        Empty when the profile leaves the model's defaults alone."""
+        return dict(self.models.get("chat", {}).get("params") or {})
 
 
 class ProfileError(ValueError):
@@ -229,6 +247,20 @@ def _model_contract(
         raise _error(source, "models.chat.alternatives", "must be a list")
     for index, value in enumerate(chat_alternatives):
         _model_id(value, source, f"models.chat.alternatives[{index}]")
+
+    # Model parameters travel to Open WebUI's model record as they are written
+    # here, so only what that record can hold is accepted: named scalars.
+    chat_params = models.get("chat", {}).get("params", {})
+    if not isinstance(chat_params, dict):
+        raise _error(source, "models.chat.params", "must be a mapping")
+    for key, value in chat_params.items():
+        _string(key, source, "models.chat.params key")
+        if not isinstance(value, (bool, int, float, str)) or (
+            isinstance(value, str) and not value.strip()
+        ):
+            raise _error(
+                source, f"models.chat.params.{key}", "must be a boolean, a number or a string"
+            )
     return tuple(requirements)
 
 
@@ -396,17 +428,29 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
         workflow = _mapping(workflow_value, source, f"workflows.{workflow_id}")
         _reject_unknown(
             workflow,
-            {"manifest_id"},
+            {"manifest_id", "size", "steps"},
             source,
             f"workflows.{workflow_id}",
         )
         _required(workflow, ("manifest_id",), source, f"workflows.{workflow_id}")
+        size = workflow.get("size")
+        if size is not None:
+            size = _string(size, source, f"workflows.{workflow_id}.size")
+            if not IMAGE_SIZE_PATTERN.match(size):
+                raise _error(
+                    source, f"workflows.{workflow_id}.size", "must be WIDTHxHEIGHT, e.g. 1024x1024"
+                )
+        steps = workflow.get("steps")
+        if steps is not None:
+            steps = _integer(steps, source, f"workflows.{workflow_id}.steps", minimum=1)
         workflows[_string(workflow_id, source, "workflows key")] = WorkflowConfig(
             manifest_id=_string(
                 workflow["manifest_id"],
                 source,
                 f"workflows.{workflow_id}.manifest_id",
-            )
+            ),
+            size=size,
+            steps=steps,
         )
 
     runtime_data = _mapping(root["runtime"], source, "runtime")

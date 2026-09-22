@@ -39,6 +39,8 @@ from local_ai_stack.service_config import (
     ENV_ENABLE_IMAGE_GENERATION,
     ENV_ENABLE_OLLAMA_API,
     ENV_IMAGE_GENERATION_MODEL,
+    ENV_IMAGE_SIZE,
+    ENV_IMAGE_STEPS,
     ENV_OLLAMA_BASE_URL,
     build_stack_configuration,
     comfyui_search_paths,
@@ -332,6 +334,51 @@ def test_image_configuration_uses_the_runtime_name_and_the_comfyui_url(specs, la
     assert str(resolution.model_path) not in json.dumps(dict(configuration.env))
 
 
+def test_a_profile_that_asks_for_a_size_and_steps_seeds_open_webui_with_them(
+    specs, layout, tmp_path
+):
+    """IMAGE_SIZE and IMAGE_STEPS, in Open WebUI's own spelling, only when asked for."""
+    endpoints = StackEndpoints.from_profile(profile_named("pepe"))
+    resolution = ready_t2i(specs, profile_named("pepe"), tmp_path)
+    graph = json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))
+
+    plain = open_webui_image_configuration(layout, endpoints, resolution, graph)
+    assert ENV_IMAGE_SIZE not in plain.env and ENV_IMAGE_STEPS not in plain.env
+
+    asked = open_webui_image_configuration(
+        layout, endpoints, resolution, graph, size="1024x1024", steps=20
+    )
+    assert asked.ok
+    assert asked.env[ENV_IMAGE_SIZE] == "1024x1024"
+    assert asked.env[ENV_IMAGE_STEPS] == "20"
+    assert asked.documents == plain.documents
+
+
+def test_a_size_or_steps_the_workflow_does_not_map_is_refused_not_ignored(specs, layout, tmp_path):
+    """The edit graph maps neither width nor steps; asking it for them is a problem."""
+    profile = profile_named("pepe")
+    endpoints = StackEndpoints.from_profile(profile)
+    template = tmp_path / "workflows" / "flux2-klein-edit-api.json"
+    template.parent.mkdir(parents=True, exist_ok=True)
+    template.write_text(
+        (REPO / "workflows" / "flux2-klein-edit-api.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    resolution = resolve_workflow(
+        specs["flux2_klein_edit"], profile, full_resolver(tmp_path), repo_root=tmp_path
+    )
+    graph = json.loads(template.read_text(encoding="utf-8"))
+
+    configuration = open_webui_image_configuration(
+        layout, endpoints, resolution, graph, size="1024x1024", steps=8
+    )
+
+    assert not configuration.ok and configuration.env == {}
+    assert len(configuration.problems) == 2
+    assert "maps no width and height" in configuration.problems[0]
+    assert "maps no step count" in configuration.problems[1]
+
+
 def test_image_configuration_refuses_an_unusable_workflow(specs, layout):
     profile = profile_named("pepe")
     endpoints = StackEndpoints.from_profile(profile)
@@ -431,9 +478,12 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
     assert pepe.env[ENV_ENABLE_IMAGE_GENERATION] == "true"
 
     capella = built["capella"].service(ComponentId.OPEN_WEBUI)
-    assert capella.env[ENV_DEFAULT_MODELS] == "qwen3-5-9b"
+    assert capella.env[ENV_DEFAULT_MODELS] == "qwen3-5-27b"
     assert capella.problems == ()
     assert capella.env[ENV_ENABLE_IMAGE_GENERATION] == "true", "images still work"
+    # Capella asks its workflow for the card's room; Pepe leaves the defaults alone.
+    assert (capella.env[ENV_IMAGE_SIZE], capella.env[ENV_IMAGE_STEPS]) == ("1024x1024", "20")
+    assert ENV_IMAGE_SIZE not in pepe.env and ENV_IMAGE_STEPS not in pepe.env
 
     test = built["test"].service(ComponentId.OPEN_WEBUI)
     # Chat is disabled, so no backend address and no model -- but not an empty

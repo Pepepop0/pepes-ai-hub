@@ -65,6 +65,10 @@
             "alternatives": {
               "type": "array",
               "items": { "$ref": "#/$defs/modelId" }
+            },
+            "params": {
+              "type": "object",
+              "additionalProperties": { "type": ["boolean", "integer", "number", "string"] }
             }
           }
         },
@@ -133,7 +137,9 @@
       "additionalProperties": false,
       "required": ["manifest_id"],
       "properties": {
-        "manifest_id": { "type": "string", "minLength": 1 }
+        "manifest_id": { "type": "string", "minLength": 1 },
+        "size": { "type": "string", "pattern": "^[1-9][0-9]*x[1-9][0-9]*$" },
+        "steps": { "type": "integer", "minimum": 1 }
       }
     }
   }

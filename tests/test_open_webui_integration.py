@@ -34,8 +34,8 @@ class RecordingSync:
         self.subject = subject
         self.calls: list[tuple] = []
 
-    def __call__(self, data_dir: Path, base_url: str, *rest: str) -> FilterSyncReport:
-        self.calls.append((Path(data_dir), base_url, *rest))
+    def __call__(self, data_dir: Path, base_url: str, *rest: str, **extra) -> FilterSyncReport:
+        self.calls.append((Path(data_dir), base_url, *rest, *([extra] if extra else [])))
         outcome = self.outcomes.pop(0) if self.outcomes else FilterSync.UNCHANGED
         return FilterSyncReport(outcome, f"{self.subject}: {outcome.value}")
 
@@ -187,6 +187,32 @@ def test_pepe_configures_its_chat_model_for_tool_calling_once_open_webui_answers
         details = [e.message for e in events if e.detail is not None]
         assert "Open WebUI: modelo de chat instalado" in details
         assert "Open WebUI: filtro de imagem já atual" in details
+    finally:
+        built.release()
+
+
+def test_capella_asks_its_chat_model_not_to_think_through_the_same_record():
+    """The profile's models.chat.params reach the record sync; Pepe, declaring none,
+    keeps the call exactly as it was (the test above)."""
+    from first_run_support import CAPELLA, RTX_5090_MIB, capella_yaml
+
+    sync = RecordingSync(FilterSync.UNCHANGED)
+    model_sync = RecordingSync(FilterSync.INSTALLED, subject="qwen3.5:27b")
+    built = controlled_stack(profile_yaml=capella_yaml(), profile_id=CAPELLA, vram_mib=RTX_5090_MIB)
+    built.app.deps.filter_sync = sync
+    built.app.deps.model_sync = model_sync
+    built.app.deps.image_edit_sync = RecordingSync(subject="image edit")
+    try:
+        result = built.app.first_run("op-1", CAPELLA)
+        assert result.state is OperationState.SUCCEEDED, [d.message for d in result.diagnostics]
+        assert model_sync.calls == [
+            (
+                built.app.layout.open_webui_data,
+                "http://127.0.0.1:8080",
+                "qwen3.5:27b",
+                {"params": {"think": False}},
+            )
+        ]
     finally:
         built.release()
 

@@ -217,6 +217,52 @@ def test_capella_asks_its_chat_model_not_to_think_through_the_same_record():
         built.release()
 
 
+def test_declared_chat_parameters_are_synced_even_with_tools_off():
+    """models.chat.params is a request-time contract of its own: a profile that
+    declares one gets its record written whether or not it enables tools."""
+    from first_run_support import CAPELLA, RTX_5090_MIB, capella_yaml
+
+    yaml_text = capella_yaml().replace("  tools: true\n", "  tools: false\n")
+    assert "tools: false" in yaml_text
+    model_sync = RecordingSync(FilterSync.INSTALLED, subject="qwen3.5:27b")
+    built = controlled_stack(profile_yaml=yaml_text, profile_id=CAPELLA, vram_mib=RTX_5090_MIB)
+    built.app.deps.filter_sync = RecordingSync(FilterSync.UNCHANGED)
+    built.app.deps.model_sync = model_sync
+    built.app.deps.image_edit_sync = RecordingSync(subject="image edit")
+    try:
+        result = built.app.first_run("op-1", CAPELLA)
+        assert result.state is OperationState.SUCCEEDED, [d.message for d in result.diagnostics]
+        assert model_sync.calls == [
+            (
+                built.app.layout.open_webui_data,
+                "http://127.0.0.1:8080",
+                "qwen3.5:27b",
+                {"params": {"think": False}},
+            )
+        ]
+    finally:
+        built.release()
+
+
+def test_a_profile_that_declares_neither_tools_nor_parameters_leaves_the_record_alone():
+    """Nothing to configure on the record, so it is never touched."""
+    from first_run_support import CAPELLA, RTX_5090_MIB, capella_yaml
+
+    yaml_text = capella_yaml().replace("  tools: true\n", "  tools: false\n")
+    yaml_text = yaml_text.replace("    params: {think: false}\n", "")
+    assert "params:" not in yaml_text
+    model_sync = RecordingSync(FilterSync.INSTALLED, subject="qwen3.5:27b")
+    built = controlled_stack(profile_yaml=yaml_text, profile_id=CAPELLA, vram_mib=RTX_5090_MIB)
+    built.app.deps.filter_sync = RecordingSync(FilterSync.UNCHANGED)
+    built.app.deps.model_sync = model_sync
+    built.app.deps.image_edit_sync = RecordingSync(subject="image edit")
+    try:
+        assert built.app.first_run("op-1", CAPELLA).state is OperationState.SUCCEEDED
+        assert model_sync.calls == []
+    finally:
+        built.release()
+
+
 def test_a_current_chat_model_record_keeps_a_second_run_a_no_op():
     sync = RecordingSync(FilterSync.INSTALLED, FilterSync.UNCHANGED)
     model_sync = RecordingSync(FilterSync.INSTALLED, FilterSync.UNCHANGED, subject="hermes3:8b")

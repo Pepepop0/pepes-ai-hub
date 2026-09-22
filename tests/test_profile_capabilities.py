@@ -77,6 +77,20 @@ def test_no_shipped_profile_enables_a_capability_it_cannot_configure(name, specs
     assert declared_capability_problems(profile, specs) == ()
 
 
+def test_a_size_or_steps_a_workflow_cannot_take_is_refused_before_anything_is_installed(specs):
+    """Known from the profile and the manifest alone, so the first run stops at
+    "Verificando ambiente" instead of after the downloads."""
+    data = data_for("capella")
+    data["workflows"]["image_edit"].update(size="1024x1024", steps=20)
+    profile = validate_profile_data(data)
+
+    problems = declared_capability_problems(profile, specs)
+
+    assert len(problems) == 2
+    assert all("workflows.image_edit" in problem for problem in problems)
+    assert declared_capability_problems(SHIPPED["capella"], specs) == ()
+
+
 def test_the_test_profile_is_a_light_install_and_runtime_smoke():
     """Every service on; no capability on, so nothing heavy is ever fetched."""
     test = SHIPPED["test"]

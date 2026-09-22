@@ -915,8 +915,10 @@ class StackApplication:
         API every time the service is up: the image chat filter that makes the
         UI's Image feature reach ComfyUI (``assets/open-webui/pepito_image_chat.py``,
         when the profile enables image generation), the chat model record that
-        keeps Open WebUI's builtin tools out of the model's prompt
-        (``open_webui_models``, when the profile enables tools), and the image
+        keeps Open WebUI's builtin tools out of the model's prompt and carries
+        what the profile asks of the model at every request
+        (``open_webui_models``, when the profile enables tools or declares
+        ``models.chat.params``), and the image
         edit settings that point Open WebUI's own edit path at the profile's
         ComfyUI edit workflow (``open_webui_image_edit``, when the profile
         enables image editing and that workflow is ready). Each is installed
@@ -937,9 +939,11 @@ class StackApplication:
                 )
             )
         chat_model = self._chat_model_reference(profile)
-        if profile.enables(FEATURE_TOOLS) and chat_model is not None:
-            # What the profile asks of the model at every request rides on the
-            # same record; a profile that asks nothing keeps the call as it was.
+        # Two independent reasons to own the record: keeping Open WebUI's builtin
+        # tools out of the prompt (the tools capability), and what the profile
+        # asks of the model at every request (models.chat.params). Either one on
+        # its own is enough; a profile with neither never touches the record.
+        if chat_model is not None and (profile.enables(FEATURE_TOOLS) or profile.chat_params):
             extra = {"params": profile.chat_params} if profile.chat_params else {}
             syncs.append(
                 (

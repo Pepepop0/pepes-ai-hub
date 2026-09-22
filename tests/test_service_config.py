@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from local_ai_stack.models import (
     OllamaModelLocation,
     ResolvedModel,
 )
-from local_ai_stack.profiles import load_profile
+from local_ai_stack.profiles import load_profile, validate_profile_data
 from local_ai_stack.service_config import (
     ENV_COMFYUI_BASE_URL,
     ENV_COMFYUI_WORKFLOW_NODES,
@@ -451,6 +452,54 @@ def test_a_profile_produces_a_complete_configuration(specs, layout, tmp_path):
     assert open_webui.env[ENV_COMFYUI_BASE_URL] == "http://127.0.0.1:8188"
     assert any(doc.path.name == "open-webui.env" for doc in open_webui.documents)
     assert any(doc.path.name == "extra_model_paths.yaml" for doc in configuration.documents)
+
+
+def test_a_size_asked_of_a_workflow_that_cannot_take_it_fails_the_whole_composition(
+    specs, layout, tmp_path
+):
+    """The edit graph maps neither width nor steps. A profile that asks it for them
+    is refused by the composition itself -- not only by the text-to-image helper --
+    and nothing is configured from it."""
+    stage_graph(tmp_path)
+    data = deepcopy(profile_named("capella").raw)
+    data["workflows"]["image_edit"].update(size="1024x1024", steps=20)
+    profile = validate_profile_data(data)
+
+    configuration = build_stack_configuration(
+        profile,
+        resolver_for(profile, tmp_path),
+        layout,
+        workflow_specs=specs,
+        repo_root=tmp_path,
+        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
+    )
+
+    assert not configuration.ok
+    problems = "\n".join(configuration.problems)
+    assert "workflows.image_edit" in problems and "flux2_klein_edit" in problems
+    assert "maps no width and height" in problems and "maps no step count" in problems
+
+
+def test_the_shipped_capella_asks_only_what_its_workflows_map(specs, layout, tmp_path):
+    """The valid half of the contraproof: 1024x1024 and 20 steps on the text-to-image
+    workflow, nothing asked of the edit workflow."""
+    stage_graph(tmp_path)
+    profile = profile_named("capella")
+    assert profile.workflows["image_edit"].size is None
+    assert profile.workflows["image_edit"].steps is None
+
+    configuration = build_stack_configuration(
+        profile,
+        resolver_for(profile, tmp_path),
+        layout,
+        workflow_specs=specs,
+        repo_root=tmp_path,
+        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
+    )
+
+    assert configuration.ok, configuration.problems
+    open_webui = configuration.service(ComponentId.OPEN_WEBUI)
+    assert (open_webui.env[ENV_IMAGE_SIZE], open_webui.env[ENV_IMAGE_STEPS]) == ("1024x1024", "20")
 
 
 def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_path):

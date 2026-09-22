@@ -436,6 +436,40 @@ def open_webui_image_edit_settings(
 # --- the whole stack --------------------------------------------------------
 
 
+def workflow_drive_problems(
+    profile: Profile, workflow_specs: Mapping[str, WorkflowSpec]
+) -> dict[str, tuple[str, ...]]:
+    """Every size or step count the profile asks of a workflow that cannot take it.
+
+    A declaration nothing can act on is an error wherever it appears, not only
+    on the text-to-image workflow: Open WebUI's edit path fills in neither a
+    size nor a step count, and a graph that maps no width, height or steps
+    would be submitted with the profile's numbers quietly dropped. Keyed by the
+    profile's workflow id so a caller can refuse exactly the workflow it was
+    about to configure. A manifest id the workflow manifest does not declare is
+    reported by the checks that own it, not here.
+    """
+    problems: dict[str, tuple[str, ...]] = {}
+    size_parameters = {WorkflowParameter.WIDTH, WorkflowParameter.HEIGHT}
+    for workflow_id, declared in sorted(profile.workflows.items()):
+        if declared.size is None and declared.steps is None:
+            continue
+        spec = workflow_specs.get(declared.manifest_id)
+        if spec is None:
+            continue
+        mapped = set(spec.bindings)
+        unmapped = []
+        if declared.size is not None and not size_parameters <= mapped:
+            unmapped.append(f"a size of {declared.size}, but it maps no width and height")
+        if declared.steps is not None and WorkflowParameter.STEPS not in mapped:
+            unmapped.append(f"{declared.steps} steps, but it maps no step count")
+        if unmapped:
+            problems[workflow_id] = tuple(
+                f"workflows.{workflow_id} asks {spec.id!r} for {item}" for item in unmapped
+            )
+    return problems
+
+
 def declared_capability_problems(
     profile: Profile, workflow_specs: Mapping[str, WorkflowSpec]
 ) -> tuple[str, ...]:
@@ -451,9 +485,12 @@ def declared_capability_problems(
 
     An image-edit workflow still being mapped is deliberately not here: it
     does not block configuration, and is reported as a warning when it runs.
-    A mapped one must take an input image, or it cannot edit anything.
+    A mapped one must take an input image, or it cannot edit anything. What a
+    profile asks each workflow to be driven with is checked for all of them.
     """
     problems = list(capability_problems(profile))
+    for messages in workflow_drive_problems(profile, workflow_specs).values():
+        problems.extend(messages)
     if not profile.enables(FEATURE_IMAGE_GENERATION):
         return tuple(problems)
     declared = profile.workflows.get(TEXT_TO_IMAGE_WORKFLOW)
@@ -535,6 +572,12 @@ def build_stack_configuration(
         problems.append("this profile enables chat but not Ollama, so chat cannot be configured")
 
     workflows: dict[str, WorkflowResolution] = {}
+    # What the profile asks each workflow to be driven with, checked once for
+    # every workflow it declares; the one being configured below is then not
+    # configured at all, rather than configured without what was asked for.
+    drive_problems = workflow_drive_problems(profile, workflow_specs or {})
+    for messages in drive_problems.values():
+        problems.extend(messages)
     if workflow_specs:
         wanted = {config.manifest_id for config in profile.workflows.values()}
         workflows = resolve_workflows(
@@ -550,7 +593,9 @@ def build_stack_configuration(
     elif image_enabled:
         declared = profile.workflows.get(image_workflow)
         resolution = workflows.get(declared.manifest_id) if declared else None
-        if resolution is None:
+        if image_workflow in drive_problems:
+            pass  # already refused, with the reason, above
+        elif resolution is None:
             problems.append(
                 f"profile {profile.id!r} enables image generation but declares no usable "
                 f"{image_workflow!r} workflow"
@@ -636,4 +681,5 @@ __all__: Sequence[str] = (
     "open_webui_image_edit_settings",
     "open_webui_ollama_env",
     "open_webui_workflow_nodes",
+    "workflow_drive_problems",
 )

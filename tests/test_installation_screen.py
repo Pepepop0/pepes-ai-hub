@@ -197,6 +197,11 @@ def test_asking_for_the_same_installation_twice_is_the_decision_to_stop_and_swit
             await pilot.pause()
             # The second request checks again before stopping anything.
             assert [name for name, _ in fake.managed] == ["switch", "switch", "stop_and_switch"]
+            # Stopping and switching is an operation: nothing moves until it ends.
+            assert fake.profile_id == "pepe"
+            while fake.step() is not None:
+                await pilot.pause()
+            await pilot.pause()
             assert fake.profile_id == "pepe-8gb"
 
     run(exercise)

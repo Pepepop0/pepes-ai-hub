@@ -184,7 +184,8 @@ def test_a_failed_installation_leaves_the_wizard_selection_and_the_screens_on_th
         async with app.run_test(size=(120, 40)) as pilot:
             await installation_section(pilot)
             before_profile = app.selected_profile.id
-            before_root = app.installed_config.installation.root
+            # The installation in use, as the application committed it.
+            before_root = fake.config.installation.root
 
             from local_ai_stack.tui.application import InstallSelection
 

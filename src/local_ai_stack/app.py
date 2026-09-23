@@ -373,6 +373,9 @@ class LocalAIStackApp(App):
             self.installed_config = replace(
                 self.installed_config, profile_id=self.selected_profile.id
             )
+        # What the screens describe while the application has committed nothing:
+        # the configuration the shell was opened with, never a candidate's.
+        self._uncommitted_config = self.installed_config
         self.current_appearance = self._resolve_appearance(self.selected_profile)
         self.active_section = Section.DASHBOARD
         self.executor_factory = executor_factory or default_executor_factory
@@ -569,17 +572,17 @@ class LocalAIStackApp(App):
             self._pending_replacing = replacing
             if panel is not None:
                 panel.notice(self._stop_and_switch_question(pending))
-            self._adopt_active_installation()
+            self.adopt_committed_installation()
             return
         except HubError as exc:
             if panel is not None:
                 panel.notice(str(exc))
-            self._adopt_active_installation()
+            self.adopt_committed_installation()
             return
         if panel is not None:
             panel.select_row(None)
             panel.notice("")
-        self._adopt_active_installation()
+        self.adopt_committed_installation()
 
     def _install_panel(self):
         try:
@@ -587,27 +590,31 @@ class LocalAIStackApp(App):
         except NoMatches:
             return None
 
-    def _adopt_active_installation(self) -> None:
-        """Read which installation is in use and make every surface say the same.
+    def adopt_committed_installation(self) -> None:
+        """Make every surface describe the installation the application committed.
 
-        The application is the authority: what it reports after a commit is
-        what the configuration the screens read, the selected profile, the
-        Installation screen and the Dashboard describe. Called after anything
-        that may have moved the selection -- including the attempts that did
-        not, where it puts the screens back on the installation still in use.
+        The one way the screens learn which installation is in use: after a
+        switch, an adoption, a relocation or an installation that succeeded,
+        and equally after one that failed, was refused or was cancelled, where
+        it takes away whatever a candidate had shown. Everything is derived
+        from the application's committed configuration -- the configuration
+        the screens read, the selected profile, the Dashboard, the Installation
+        screen and its quick switch -- and nothing is restored from what a
+        widget happened to show before.
         """
-        config = getattr(self.application, "config", None)
-        if config is None:
+        if not hasattr(self.application, "config"):
+            # No authority to read from: nothing was ever committed through it.
             self.refresh_projections()
             return
+        config = self.application.config or self._uncommitted_config
         self.installed_config = config
+        try:
+            main = self.query_one(MainContent)
+        except NoMatches:  # pragma: no cover - the shell is not on screen
+            return
         profile = next((item for item in self.profiles if item.id == config.profile_id), None)
         if profile is not None and profile.id != self.selected_profile.id:
             self.select_profile(profile.id)
-        try:
-            main = self.query_one(MainContent)
-        except NoMatches:  # pragma: no cover - the shell is being taken down
-            return
         main.update_config(config)
         self.refresh_projections()
 
@@ -632,21 +639,20 @@ class LocalAIStackApp(App):
                     self._end_operation()
                     if panel is not None:
                         panel.notice(str(exc))
-                    self._adopt_active_installation()
                 return
             self._pending_switch = message.root
             if panel is not None:
                 panel.notice(self._stop_and_switch_question(pending))
-            self._adopt_active_installation()
+            self.adopt_committed_installation()
             return
         except HubError as exc:
             if panel is not None:
                 panel.notice(str(exc))
-            self._adopt_active_installation()
+            self.adopt_committed_installation()
             return
         if panel is not None:
             panel.notice("")
-        self._adopt_active_installation()
+        self.adopt_committed_installation()
 
     def _stop_and_switch_question(self, pending: SwitchRequiresStop) -> str:
         """What has to happen before another installation can be used, in one paragraph."""
@@ -763,7 +769,7 @@ class LocalAIStackApp(App):
                 # The attempt has just been recorded; a retry should already offer it.
                 wizard.update_recent_roots(self._recent_custom_roots())
         except ConflictResolutionRequired as conflict:
-            self._end_operation()
+            self._end_operation(adopt=False)
             report = conflict.report
             checker = getattr(self.application, "current_conflict_preflight", None)
             if checker is not None:
@@ -784,9 +790,16 @@ class LocalAIStackApp(App):
         self.open_webui()
 
     def on_wizard_screen_finished(self, _: WizardScreen.Finished) -> None:
+        if not self.busy_with_operation():
+            # An installation paused on a conflict decision is abandoned here;
+            # one already running is not -- it cannot be cancelled safely.
+            cancel = getattr(self.application, "cancel_pending_installation", None)
+            if cancel is not None:
+                cancel()
+            self._pending_install_selection = None
         if self.wizard is not None:
             self.pop_screen()
-        self.refresh_projections()
+        self.adopt_committed_installation()
         self.show_section(Section.DASHBOARD)
 
     # --- operations ---------------------------------------------------------
@@ -796,17 +809,31 @@ class LocalAIStackApp(App):
         if view is self.operation_view:
             return
         self.operation_view = view
-        if view is not None and view.terminal:
-            self._operation_pending = False
+        kind = self._operation_kind
         heading = None
-        if view is not None and view.terminal and self._operation_kind == "install":
+        if view is not None and view.terminal and kind == "install":
             heading = installation_outcome_heading(view.state)
         self.query_one(MainContent).show_operation(view, heading=heading)
         wizard = self.wizard
         if wizard is not None:
             wizard.show_operation(view)
         if view is not None and view.terminal:
-            self.refresh_projections()
+            # The application settled before it sent this: committed, recorded
+            # or refused. The screens now follow whatever it committed.
+            self._end_operation()
+            if kind == "switch":
+                self._show_switch_outcome()
+
+    def _show_switch_outcome(self) -> None:
+        """Say why a stop-and-switch did not switch, or clear the question it answered."""
+        panel = self._install_panel()
+        reader = getattr(self.application, "last_switch_refusal", None)
+        refusal = reader() if reader is not None else None
+        if panel is None:
+            return
+        panel.notice(refusal or "")
+        if refusal is None:
+            panel.select_row(None)
 
     def on_wizard_screen_conflict_policy_chosen(
         self, message: WizardScreen.ConflictPolicyChosen
@@ -971,10 +998,18 @@ class LocalAIStackApp(App):
         self._operation_kind = kind
         self._operation_pending = True
 
-    def _end_operation(self) -> None:
-        """The command never started, or will not finish: nothing is pending."""
+    def _end_operation(self, *, adopt: bool = True) -> None:
+        """The operation is over -- ended, refused, cancelled -- and nothing is pending.
+
+        Whatever it was, the screens then describe the installation the
+        application committed. ``adopt=False`` is only for an attempt that is
+        not over: an installation paused on a conflict decision still owns
+        what the wizard shows.
+        """
         self._operation_kind = None
         self._operation_pending = False
+        if adopt:
+            self.adopt_committed_installation()
 
     def busy_with_operation(self) -> bool:
         """Whether an operation is under way, launched or already reporting."""

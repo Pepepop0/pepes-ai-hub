@@ -484,6 +484,9 @@ class FakeHubApplication:
     # resolvable (or blocked) preflight instead of running straight through.
     conflict_report: ConflictPreflightReport | None = None
     conflict_resolution_fails: bool = False
+    # Set to make a stop-and-switch stop and then refuse to take the ports,
+    # the way the real post-condition refuses.
+    handover_refusal: str | None = None
 
     # Set before calling install() to replace the ordinary script with a
     # hand-built one - the transfer-progress tests use this to inject events
@@ -507,6 +510,8 @@ class FakeHubApplication:
         self._sinks: list[_Subscription] = []
         self._operation_kind: str | None = None
         self._selection: InstallSelection | None = None
+        self._switching: tuple[Path, Path | None] | None = None
+        self._switch_refusal: str | None = None
         self._counter = 0
 
     # --- read model ---------------------------------------------------------
@@ -564,11 +569,24 @@ class FakeHubApplication:
         self._activate(Path(str(root)))
 
     def stop_and_switch(self, root, *, replacing=None) -> str:
+        self._check_available()
         self.managed.append(("stop_and_switch", Path(str(root))))
-        if replacing is not None:
-            self.summaries = tuple(row for row in self.summaries if str(row.root) != str(replacing))
-        self._activate(Path(str(root)))
-        return "op-stop-and-switch"
+        operation_id = self._begin("switch")
+        self._switching = (Path(str(root)), None if replacing is None else Path(str(replacing)))
+        self._switch_refusal = None
+        refused = self.handover_refusal is not None
+        self._pending = lifecycle_script(
+            operation_id, "Parando", fail=self.lifecycle_fails or refused
+        )
+        return operation_id
+
+    def last_switch_refusal(self) -> str | None:
+        refusal, self._switch_refusal = self._switch_refusal, None
+        return refusal
+
+    def cancel_pending_installation(self) -> None:
+        self.managed.append(("cancel", None))
+        self._active_conflict = None
 
     def relocate_installation(self, old_root, new_root) -> None:
         self.managed.append(("relocate", (Path(str(old_root)), Path(str(new_root)))))
@@ -716,10 +734,10 @@ class FakeHubApplication:
         event = self._pending.pop(0)
         self._snapshot = advance_operation(self._snapshot, event)
         self.emitted.append(event)
-        for subscription in list(self._sinks):
-            subscription.deliver(event)
         if event.state.terminal:
             self._settle(event)
+        for subscription in list(self._sinks):
+            subscription.deliver(event)
         return event
 
     def run_to_end(self) -> list[OperationEvent]:
@@ -770,6 +788,19 @@ class FakeHubApplication:
             self.health = dict.fromkeys(SERVICE_IDS, "UP")
         elif self._operation_kind == "stop" and succeeded:
             self.health = dict.fromkeys(SERVICE_IDS, "DOWN")
+        elif self._operation_kind == "switch" and self._switching is not None:
+            target, replacing = self._switching
+            self._switching = None
+            if self.handover_refusal is not None:
+                self._switch_refusal = self.handover_refusal
+            elif not succeeded:
+                self._switch_refusal = "Não foi possível parar os serviços da instalação atual."
+            else:
+                if replacing is not None:
+                    self.summaries = tuple(
+                        row for row in self.summaries if str(row.root) != str(replacing)
+                    )
+                self._activate(target)
 
 
 def ready_application(**overrides: object) -> FakeHubApplication:

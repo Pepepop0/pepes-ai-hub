@@ -191,7 +191,9 @@ def test_a_clean_stop_switches(tmp_path, world):
 
 def config_for(root: str, profile: str = "pepe", mode=InstallLocationMode.CUSTOM):
     location = (
-        InstallLocation.custom(root) if mode is InstallLocationMode.CUSTOM else InstallLocation(mode, None)
+        InstallLocation.custom(root)
+        if mode is InstallLocationMode.CUSTOM
+        else InstallLocation(mode, None)
     )
     return InstalledConfig(profile, installation=location)
 
@@ -241,9 +243,7 @@ def test_the_same_folder_written_twice_in_a_state_file_is_one_entry():
 # --- portable is an installation like any other, and it is never forgotten ------------
 
 
-def test_a_portable_installation_in_use_is_identified_by_the_folder_it_resolved_to(
-    tmp_path, world
-):
+def test_a_portable_installation_in_use_is_identified_by_the_folder_it_resolved_to(tmp_path, world):
     adapter = hub(tmp_path, world)
     try:
         install(adapter, InstallSelectionPortable())

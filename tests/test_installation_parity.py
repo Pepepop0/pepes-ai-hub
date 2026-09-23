@@ -152,6 +152,7 @@ def test_a_refused_switch_leaves_every_surface_on_the_installation_in_use():
             app.show_section(Section.DASHBOARD)
             await settle(pilot, 4)
             assert str(PEPEH) in dashboard_text(app)
+
     run(exercise)
 
 
@@ -168,9 +169,8 @@ def test_a_switch_that_needs_a_stop_changes_nothing_until_it_is_approved():
             assert app.installed_config.installation.root == PEPEH
             assert app.selected_profile.id == "pepe"
             assert str(PEPEH) in install_text(app)
-            assert "ainda está em execução" in str(
-                app.query_one("#install-notice", Static).content
-            )
+            assert "ainda está em execução" in str(app.query_one("#install-notice", Static).content)
+
     run(exercise)
 
 
@@ -197,6 +197,7 @@ def test_a_failed_installation_leaves_the_wizard_selection_and_the_screens_on_th
             assert app.selected_profile.id == before_profile
             assert app.installed_config.installation.root == before_root
             assert str(PEPEH) in install_text(app)
+
     run(exercise)
 
 
@@ -214,6 +215,7 @@ def test_the_installation_in_use_is_always_a_row_in_the_list():
             assert "Pepe" in install_text(app)
             assert str(PEPEH) in install_text(app) or "PEPEH" in install_text(app)
             assert panel.summaries == fake.summaries
+
     run(exercise)
 
 
@@ -229,4 +231,5 @@ def test_every_mode_reads_the_same_on_the_dashboard(mode):
             text = dashboard_text(app)
             assert str(PEPEH) in text
             assert mode.value not in text, "the mode is written in words, not as an id"
+
     run(exercise)

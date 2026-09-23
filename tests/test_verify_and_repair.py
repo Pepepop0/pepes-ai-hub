@@ -131,3 +131,36 @@ def test_repairing_a_running_installation_leaves_it_running(composition):  # noq
     assert adapter.current_operation().last_event.state is OperationState.SUCCEEDED
     assert adapter.backend.status("capella").stack_up, "running stays running"
     assert world.launcher.stops == stops_before, "nothing was stopped"
+
+
+# --- a stopped installation is still an installation --------------------------------------
+
+
+def test_a_stopped_installation_is_shown_as_installed_and_can_be_started(composition):  # noqa: F811
+    """With Ollama stopped its models cannot be read; that must not read as "nothing
+    installed" -- which also disabled Start, the one way to make them readable."""
+    import asyncio
+
+    from test_delivery_wave_a import settle, tui
+    from textual.widgets import Button, Static
+
+    world, adapter = installed_and_stopped(composition)
+    world.ollama.reachable = False
+    try:
+        assert adapter.installation().ready
+        view, _, _ = adapter.projections()
+        assert view.ready
+        [row] = [row for row in adapter.installation_summaries() if row.active]
+        assert row.status == "ready"
+        app, _ = tui(adapter)
+
+        async def exercise():
+            async with app.run_test(size=(120, 40)) as pilot:
+                await settle(pilot)
+                overview = str(app.query_one("#dashboard-overview", Static).content)
+                assert "Nenhuma stack instalada" not in overview
+                assert not app.query_one("#dashboard-start", Button).disabled
+
+        asyncio.run(exercise())
+    finally:
+        world.ollama.reachable = True

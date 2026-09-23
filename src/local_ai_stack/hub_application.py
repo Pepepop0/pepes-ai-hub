@@ -124,6 +124,34 @@ UNCHECKED_MODELS = (
 UNSETTLED = "Não foi possível concluir a operação. Nada foi alterado."
 
 
+def _pending(status) -> tuple[tuple[str, ...], bool]:
+    """What an installation still needs, and whether its models could not be read.
+
+    With Ollama stopped its model store cannot be read, so every model check
+    says "not installed": that is an unknown, not something missing. Those
+    items are set aside -- the second value says whether there were any --
+    and everything else pending still counts.
+    """
+    ollama_up = any(item.service_id == "ollama" and item.up for item in status.components)
+    unread = False
+    pending: list[str] = []
+    for item in status.pending_work:
+        if not ollama_up and STORE_UNREADABLE in item:
+            unread = True
+            continue
+        pending.append(item)
+    return tuple(pending), unread
+
+
+def _installed(status) -> bool:
+    """Whether the installation is installed, as far as can be told right now.
+
+    A stopped stack is still an installed one: models nobody could look at
+    because Ollama is stopped do not make it "not installed".
+    """
+    return bool(status.installation_ready) or not _pending(status)[0]
+
+
 class _Ending:
     """One operation's events on their way to the screens, its ending held back.
 
@@ -349,11 +377,7 @@ class HubApplicationAdapter:
                 return "unknown", "", profile_id
             if status.stack_up:
                 return "running", "", profile_id
-            return (
-                ("ready", "", profile_id)
-                if status.installation_ready
-                else ("stopped", "", profile_id)
-            )
+            return ("ready", "", profile_id) if _installed(status) else ("stopped", "", profile_id)
         return "ready", "", profile_id
 
     def installation_summaries(self) -> tuple[InstallationSummary, ...]:
@@ -755,16 +779,8 @@ class HubApplicationAdapter:
             status = backend.status(profile_id)
         except Exception as exc:
             raise HubError("Não foi possível verificar a instalação. Tente novamente.") from exc
-        ollama_up = any(item.service_id == "ollama" and item.up for item in status.components)
-        problems: list[str] = []
-        unread = False
-        for item in status.pending_work:
-            if not ollama_up and STORE_UNREADABLE in item:
-                unread = True
-                continue
-            problems.append(item)
-        notes = (UNCHECKED_MODELS,) if unread else ()
-        return InstallationCheck(tuple(problems), notes)
+        problems, unread = _pending(status)
+        return InstallationCheck(problems, (UNCHECKED_MODELS,) if unread else ())
 
     def repair(self) -> str:
         """Repair what is missing in the installation in use, leaving it as it was.
@@ -809,7 +825,7 @@ class HubApplicationAdapter:
                 "Não foi possível verificar a instalação. Tente novamente."
             ) from exc
         return InstallationView(
-            status.installation_ready,
+            _installed(status),
             self.config.profile_id,
             self.config.installation.mode,
             self._root_display(),
@@ -827,7 +843,7 @@ class HubApplicationAdapter:
             InstallationView(False)
             if self.config is None
             else InstallationView(
-                status.installation_ready,
+                _installed(status),
                 self.config.profile_id,
                 self.config.installation.mode,
                 self._root_display(),

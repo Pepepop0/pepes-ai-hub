@@ -53,6 +53,7 @@ from .installations import (
 )
 from .layout import StackLayout
 from .model_catalog import model_catalog
+from .ollama_models import STORE_UNREADABLE
 from .operation_contracts import (
     OperationEvent,
     OperationEventKind,
@@ -74,6 +75,7 @@ from .tui.application import (
     ConflictResolutionRequired,
     HubError,
     HubUnavailable,
+    InstallationCheck,
     InstallationSummary,
     InstallationView,
     InstallSelection,
@@ -110,6 +112,11 @@ def _succeeded(result: object) -> bool:
 # Said when the machine is not clear for the installation being switched to.
 HANDOVER_REFUSED = (
     "Não foi possível trocar de instalação porque os serviços necessários ainda estão em uso."
+)
+# Said when a check could not look at the models because Ollama is stopped.
+UNCHECKED_MODELS = (
+    "Com o Ollama parado, os modelos não foram conferidos. "
+    "Inicie a stack e verifique de novo para conferi-los."
 )
 # Said when a settle step failed in a way that has no message of its own.
 UNSETTLED = "Não foi possível concluir a operação. Nada foi alterado."
@@ -585,12 +592,46 @@ class HubApplicationAdapter:
                 raise SwitchRequiresStop(plan)
             self._bind(target, config, forgetting=Path(old_root))
 
-    def repair(self) -> str:
-        """Check the active installation and repair what is missing, in place.
+    def verify_installation(self) -> InstallationCheck:
+        """Look at the installation in use and say what is wrong with it. Changes nothing.
 
-        The same idempotent first run the installer uses, with the root, the
-        profile and the mode it already has: nothing is asked again, and what
-        is already correct is left alone.
+        Read-only by construction: the folder, its configuration, and the
+        status the Dashboard already reads -- which services answer and what a
+        dry run of the plan would still do. Nothing is started, downloaded,
+        installed, written or hashed. With Ollama stopped its model store
+        cannot be read, which is not a problem with the installation: those
+        checks are reported as not done, not as failed.
+        """
+        with self._lock:
+            if self.config is None:
+                raise HubError("Nenhuma instalação está selecionada.")
+            backend, profile_id, root = self.backend, self._profile_id(), self.active_root()
+        if root is None or not Path(root).exists():
+            return InstallationCheck(("A pasta desta instalação não está disponível.",))
+        if _installed_config(config_path(StackLayout.from_root(Path(root)))) is None:
+            return InstallationCheck(("A configuração do Hub nesta pasta não pôde ser lida.",))
+        try:
+            status = backend.status(profile_id)
+        except Exception as exc:
+            raise HubError("Não foi possível verificar a instalação. Tente novamente.") from exc
+        ollama_up = any(item.service_id == "ollama" and item.up for item in status.components)
+        problems: list[str] = []
+        unread = False
+        for item in status.pending_work:
+            if not ollama_up and STORE_UNREADABLE in item:
+                unread = True
+                continue
+            problems.append(item)
+        notes = (UNCHECKED_MODELS,) if unread else ()
+        return InstallationCheck(tuple(problems), notes)
+
+    def repair(self) -> str:
+        """Repair what is missing in the installation in use, leaving it as it was.
+
+        Only on request, never as part of a check. The backend's repair runs
+        the same idempotent steps the installer does, with the root, the
+        profile and the mode it already has, and ends with the stack exactly
+        as it found it: stopped stays stopped, running stays running.
         """
         with self._lock:
             if self.config is None:
@@ -613,7 +654,7 @@ class HubApplicationAdapter:
 
             return self._launch(
                 operation_id,
-                lambda emit: backend.first_run(operation_id, config.profile_id, emit=emit),
+                lambda emit: backend.repair(operation_id, config.profile_id, emit=emit),
                 settle,
             )
 

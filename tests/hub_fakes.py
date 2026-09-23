@@ -52,6 +52,7 @@ from local_ai_stack.tui.application import (
     ConflictResolutionRequired,
     HubError,
     HubUnavailable,
+    InstallationCheck,
     InstallationSummary,
     InstallationView,
     InstallSelection,
@@ -487,6 +488,9 @@ class FakeHubApplication:
     # Set to make a stop-and-switch stop and then refuse to take the ports,
     # the way the real post-condition refuses.
     handover_refusal: str | None = None
+    # What a read-only check of the installation in use finds.
+    check: InstallationCheck = field(default_factory=InstallationCheck)
+    verify_error: str | None = None
 
     # Set before calling install() to replace the ordinary script with a
     # hand-built one - the transfer-progress tests use this to inject events
@@ -619,6 +623,13 @@ class FakeHubApplication:
         """The same idempotent run the installer uses, on what is already here."""
         self.managed.append(("repair", None))
         return self._lifecycle("repair", "Verificando")
+
+    def verify_installation(self) -> InstallationCheck:
+        """A read-only look at the installation in use. Changes nothing, starts nothing."""
+        self.managed.append(("verify", None))
+        if self.verify_error is not None:
+            raise HubError(self.verify_error)
+        return self.check
 
     @property
     def config(self):

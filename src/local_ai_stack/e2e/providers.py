@@ -37,7 +37,7 @@ from ..launcher import LaunchOutcome, LaunchResult, StopOutcome, StopResult
 from ..managed_config import ManagedConfigWriter, ManagedFile, read_managed
 from ..model_installer import ModelInstaller, ModelStatus
 from ..models import FileModelSource
-from ..ollama_models import OllamaClientError, OllamaModelEntry
+from ..ollama_models import STORE_UNREADABLE, OllamaClientError, OllamaModelEntry
 from ..probes import ProbeOutcome, ProbeResult
 from ..runner import CommandResult, CommandRunner
 from ..system import GPUInfo, NvidiaFacts, SystemFacts
@@ -403,7 +403,7 @@ class ControlledOllama:
     def list_models(self) -> tuple[OllamaModelEntry, ...]:
         self.list_calls += 1
         if not self.reachable:
-            raise OllamaClientError("controlled Ollama store is unreachable")
+            raise OllamaClientError(f"{STORE_UNREADABLE}: controlled store is unreachable")
         if self.plan.active(Injection.MODEL_MISSING):
             return ()
         return tuple(self.installed)

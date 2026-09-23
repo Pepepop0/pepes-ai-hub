@@ -35,6 +35,11 @@ LIST_TIMEOUT = 10.0
 PULL_TIMEOUT = 3 * 60 * 60.0
 
 
+# What a model check says when Ollama is not answering: the store could not be
+# read, which says nothing about whether the models are there.
+STORE_UNREADABLE = "could not read the Ollama model store"
+
+
 class OllamaClientError(RuntimeError):
     """The Ollama model store could not be reached or refused an operation."""
 
@@ -99,9 +104,7 @@ class HttpOllamaClient:
                 response.raise_for_status()
                 payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
-            raise OllamaClientError(
-                f"could not read the Ollama model store: {sanitize(str(exc))}"
-            ) from exc
+            raise OllamaClientError(f"{STORE_UNREADABLE}: {sanitize(str(exc))}") from exc
 
         raw_models = payload.get("models") if isinstance(payload, dict) else None
         if not isinstance(raw_models, list):

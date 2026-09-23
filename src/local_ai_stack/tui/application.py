@@ -193,6 +193,23 @@ class LaunchRefusal:
     code: str = "not-ready"
 
 
+@dataclass(frozen=True)
+class InstallationCheck:
+    """What a read-only check of the installation in use found.
+
+    ``problems`` are things a repair would fix; ``notes`` are things the check
+    could not look at right now -- models behind a stopped Ollama -- which are
+    not problems, only unknowns.
+    """
+
+    problems: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.problems
+
+
 class FolderPicker(Protocol):
     """Asks the operating system for a folder. The TUI never sees how.
 
@@ -253,6 +270,7 @@ __all__ = [
     "HubError",
     "HubUnavailable",
     "InstallSelection",
+    "InstallationCheck",
     "InstallationSummary",
     "InstallationView",
     "LaunchRefusal",

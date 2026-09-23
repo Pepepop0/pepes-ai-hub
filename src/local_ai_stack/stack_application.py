@@ -827,6 +827,42 @@ class StackApplication:
             coordinator.run()
         return _result_of(stream)
 
+    def repair(
+        self, operation_id: str, profile_id: str, *, emit: OperationEventSink | None = None
+    ) -> OperationResult:
+        """Bring an existing installation back to what its profile needs.
+
+        The same idempotent steps as :meth:`first_run`, with one difference
+        that matters to the person who asked: the stack ends the way it was
+        found. A stopped stack is still stopped afterwards -- whatever the
+        repair had to start to check and acquire models is stopped again --
+        and a running one is left running. An external service in the way is
+        reported, not resolved: a repair makes no conflict decisions.
+        """
+        from .first_run import FirstRunCoordinator
+
+        profile = self.profile(profile_id)
+        with self._operation_stream(operation_id, emit) as stream:
+            self._active_profile = profile.id
+            if self.check_conflicts(profile.id) is not None:
+                stream.begin("Verificando instalação")
+                stream.fail(
+                    OperationPhase.PREPARATION,
+                    "Um serviço externo está usando as portas desta instalação",
+                    [
+                        diagnostic(
+                            "external-conflict",
+                            "an external service holds this installation's endpoints; "
+                            "a repair does not decide conflicts",
+                        )
+                    ],
+                )
+            else:
+                coordinator = FirstRunCoordinator(self, profile, stream, keep_lifecycle=True)
+                self.last_first_run = coordinator.report
+                coordinator.run()
+        return _result_of(stream)
+
     def start_stack(
         self, operation_id: str, profile_id: str, *, emit: OperationEventSink | None = None
     ) -> OperationResult:

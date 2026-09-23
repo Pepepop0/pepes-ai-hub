@@ -167,6 +167,12 @@ class RecordingBackend:
         self.world.write_config(self.installation, profile_id)
         return succeeded(operation_id)
 
+    def repair(self, operation_id, profile_id, *, emit=None):
+        """The real repair's contract: fix what is missing, leave the stack as it was."""
+        self.commands.append("repair")
+        self.world.calls.append((self.root, "repair", profile_id))
+        return succeeded(operation_id)
+
     def _command(self, name, operation_id, profile_id, *, emit=None):
         self.commands.append(name)
         self.world.calls.append((self.root, name, profile_id))
@@ -645,7 +651,8 @@ def test_repair_runs_on_the_active_installation_without_asking_anything_again(tm
         adapter.repair()
         adapter.wait(10)
 
-        assert world.commands_on(second) == ["first_run", "first_run"]
+        # A repair is the repair operation, not another first run.
+        assert world.commands_on(second) == ["first_run", "repair"]
         assert world.commands_on(first) == ["first_run"]
         assert adapter.active_root() == second and adapter.active_profile() == "pepe-8gb"
         entry = adapter.state.entry_for(second)

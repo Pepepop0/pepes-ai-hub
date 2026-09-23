@@ -113,11 +113,23 @@ class FirstRunReport:
 class FirstRunCoordinator:
     """Runs the sequence once, on one stream, for one profile."""
 
-    def __init__(self, app: StackApplication, profile: Profile, stream: OperationStream) -> None:
+    def __init__(
+        self,
+        app: StackApplication,
+        profile: Profile,
+        stream: OperationStream,
+        *,
+        keep_lifecycle: bool = False,
+    ) -> None:
         self.app = app
         self.profile = profile
         self.stream = stream
         self.report = FirstRunReport(profile_id=profile.id)
+        # A repair of an existing installation: the same idempotent steps, but
+        # the stack ends the way it was found. Whatever this run had to start
+        # -- Ollama, to check and acquire models -- it stops again; nothing is
+        # started just because a first installation would end started.
+        self.keep_lifecycle = keep_lifecycle
 
     def run(self) -> OperationResult:
         stream = self.stream
@@ -132,10 +144,23 @@ class FirstRunCoordinator:
             self._start(OLLAMA, state=OperationState.RUNNING)
             self._acquire_models(phases.after_ollama_ready)
             self._configure(phases.after_ollama_ready)
-            self._start_the_rest()
+            if self.keep_lifecycle:
+                self._integrate_running()
+            else:
+                self._start_the_rest()
         except FirstRunStopped as stop:
             self.report.problems.extend(item.message for item in stop.diagnostics)
-            self.report.result = stream.fail(stop.phase, stop.message, stop.diagnostics)
+            left = self._restore_lifecycle()
+            self.report.result = stream.fail(stop.phase, stop.message, [*stop.diagnostics, *left])
+            return self.report.result
+        left = self._restore_lifecycle()
+        if left:
+            self.report.problems.extend(item.message for item in left)
+            self.report.result = stream.fail(
+                OperationPhase.RESOURCE_RELEASE,
+                "Não foi possível deixar a stack como estava",
+                left,
+            )
             return self.report.result
         message = "Tudo pronto" if not self.report.did_nothing else "Tudo pronto (nada a fazer)"
         self.report.result = stream.succeed(
@@ -459,6 +484,41 @@ class FirstRunCoordinator:
                 ),
                 "Configuração verificada",
             )
+
+    def _integrate_running(self) -> None:
+        """A repair touches what is already running, and starts nothing else."""
+        controller = self.app._controller(self.profile)
+        for service_id in (str(ComponentId.OPEN_WEBUI), str(ComponentId.COMFYUI)):
+            if controller.status(service_id).health.state is ServiceState.UP:
+                self._integrate(service_id)
+
+    def _restore_lifecycle(self) -> list[OperationDiagnostic]:
+        """Stop what this run started, when it was asked to leave the stack as it was.
+
+        Returns what could not be stopped. Nothing this run did not start is
+        touched, and a first installation (``keep_lifecycle`` off) is left
+        running, as it always has been.
+        """
+        if not self.keep_lifecycle or not self.report.started:
+            return []
+        self.stream.advance(
+            OperationState.FINALIZING,
+            OperationPhase.RESOURCE_RELEASE,
+            "Parando o que o reparo iniciou",
+        )
+        controller = self.app._controller(self.profile)
+        left: list[OperationDiagnostic] = []
+        for service_id in reversed(self.report.started):
+            result = controller.stop(service_id)
+            if not result.stopped or result.left_running:
+                left.append(
+                    diagnostic(
+                        "repair-left-running",
+                        f"{service_id} was started for the repair and could not be stopped: "
+                        f"{result.detail}",
+                    )
+                )
+        return left
 
     def _start_the_rest(self) -> None:
         self.stream.advance(

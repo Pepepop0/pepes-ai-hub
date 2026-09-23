@@ -19,6 +19,7 @@ from hub_fakes import (
     alongside_conflict,
     conflict_report,
     install_script,
+    press_visible,
     ready_application,
     unsafe_conflict,
 )
@@ -896,9 +897,7 @@ def test_the_installation_section_reopens_the_wizard():
             assert str(app.query_one("#install-open-wizard", Button).label) == "Nova instalação"
             assert not app.query_one("#install-repair", Button).disabled
             # Below the fold on this terminal: scrolled to, as a person would.
-            app.query_one("#install-open-wizard", Button).scroll_visible(animate=False)
-            await pilot.pause()
-            await click(pilot, "#install-open-wizard")
+            await press_visible(pilot, "#install-open-wizard")
             assert isinstance(app.screen, WizardScreen)
             await click(pilot, "#wizard-skip")
             assert not isinstance(app.screen, WizardScreen)

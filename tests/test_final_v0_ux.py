@@ -18,7 +18,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from hub_fakes import FakeFolderPicker, FakeHubApplication
+from hub_fakes import FakeFolderPicker, FakeHubApplication, press_visible
 from test_app import all_profiles, integration_snapshot, reference_facts, stopped_runtime
 from test_installation_screen import CAPELLA, PEPEH, PEPINHO, installed, summaries
 from test_installation_switching import World, custom, hub, install
@@ -58,13 +58,7 @@ async def settle(pilot, times: int = 6) -> None:
         await pilot.pause()
 
 
-async def press(pilot, selector: str) -> None:
-    """Click a button on whatever screen is in front, once it can be clicked."""
-    button = pilot.app.screen.query_one(selector, Button)
-    button.scroll_visible(animate=False)
-    await pilot.pause()
-    assert await pilot.click(selector), f"the click did not land on {selector}"
-    await pilot.pause()
+press = press_visible
 
 
 async def installations(pilot) -> InstallPanel:

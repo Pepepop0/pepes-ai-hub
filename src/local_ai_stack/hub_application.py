@@ -26,6 +26,7 @@ from uuid import uuid4
 from .application_contracts import ServicesSnapshot, ServiceView, VramSnapshot
 from .compatibility import evaluate_compatibility
 from .config import ConfigError, InstalledConfig, config_path, loads
+from .deletion import delete_tree, deletion_refusal, first_link_inside
 from .external_conflict_contracts import (
     ConflictPolicySelection,
     ConflictResolutionResult,
@@ -64,7 +65,7 @@ from .operation_contracts import (
     OperationState,
     advance_operation,
 )
-from .operations import diagnostic, safe_text, utc_now
+from .operations import OperationStream, diagnostic, safe_text, utc_now
 from .profiles import Profile, load_profiles, offered_profiles
 from .stack_application import StackApplication, StackDependencies
 from .storage import enough_space, free_space, model_download_estimate
@@ -73,6 +74,7 @@ from .tui.application import (
     INSUFFICIENT,
     RECOMMENDED,
     ConflictResolutionRequired,
+    DeletePlan,
     HubError,
     HubUnavailable,
     InstallationCheck,
@@ -373,6 +375,145 @@ class HubApplicationAdapter:
                 )
             )
         return tuple(sorted(rows, key=lambda row: not row.active))
+
+    # --- deleting an installation ---------------------------------------------------
+
+    def _deletion_target(self, root: Path) -> tuple[DeletePlan, _Candidate | None]:
+        """Judge one known installation for deletion. Reads; changes nothing."""
+        root = Path(root)
+        entry = self.state.entry_for(root)
+        name = self._profile_name(entry.last_known_profile if entry else None) or "Instalação"
+        active = self.active_root()
+        is_active = active is not None and root_key(active) == root_key(root)
+
+        def refused(reason: str) -> tuple[DeletePlan, None]:
+            return DeletePlan(root, name, active=is_active, refusal=reason), None
+
+        others = [item.root for item in self.state.known if item.key != root_key(root)]
+        reason = deletion_refusal(root, state_file=self.selection_path, other_installations=others)
+        if reason is not None:
+            return refused(reason)
+        if entry is None:
+            return refused("Esta pasta não é uma instalação que o Hub conheça.")
+        if not root.is_dir():
+            return refused("A pasta desta instalação não existe. Use Esquecer da lista.")
+        config = _installed_config(config_path(StackLayout.from_root(root)))
+        if config is None:
+            return refused("Esta pasta não tem a configuração do Hub e não será apagada por aqui.")
+        name = self._profile_name(config.profile_id) or name
+        link = first_link_inside(root)
+        if link is not None:
+            return refused(
+                f"Esta instalação contém um atalho para outro lugar ({link}) e não será "
+                "apagada por aqui."
+            )
+        try:
+            target = self._target(root, config)
+            surviving = tuple(target.backend.surviving_services())
+            status = target.backend.status(config.profile_id)
+        except Exception:  # noqa: BLE001 -- an unreadable answer is not a proof of rest
+            return refused(
+                "Não foi possível confirmar se os serviços desta instalação estão parados."
+            )
+        running = bool(surviving) or any(
+            item.up and item.ownership == "managed" for item in status.components
+        )
+        return DeletePlan(root, name, active=is_active, must_stop=running), target
+
+    def plan_delete(self, root: Path | str) -> DeletePlan:
+        """What deleting this installation would mean, for the confirmation to show."""
+        with self._lock:
+            plan, _ = self._deletion_target(Path(root))
+        return plan
+
+    def delete_installation(self, root: Path | str, *, stop: bool = False) -> str:
+        """Delete an installation's folder, then forget it. One operation.
+
+        Validated again, here, whatever the confirmation said: a refusal is
+        raised before anything is touched. Running managed services are
+        stopped only when ``stop`` says the person asked for it, and only
+        processes proved to be this installation's; the deletion then waits
+        for the registry to show none of them alive. The entry leaves the
+        list only after the folder is gone; a deletion that fails keeps it,
+        and says so. The installation in use can be deleted: nothing is
+        selected in its place.
+        """
+        with self._lock:
+            plan, target = self._deletion_target(Path(root))
+            if not plan.ok or target is None:
+                raise HubError(plan.refusal or "Esta instalação não pode ser apagada.")
+            if plan.must_stop and not stop:
+                raise HubError(
+                    "Os serviços desta instalação estão em execução. Pare-os antes de apagar."
+                )
+            operation_id = self._reserve()
+        folder = plan.root
+        backend, profile_id = target.backend, target.config.profile_id
+
+        def run(emit) -> object:
+            stream = OperationStream(operation_id, emit=emit)
+            stream.begin("Verificando instalação")
+            if plan.must_stop:
+                stream.advance(
+                    OperationState.RUNNING,
+                    OperationPhase.RESOURCE_RELEASE,
+                    "Parando os serviços desta instalação",
+                )
+                stopped = backend.stop_stack(uuid4().hex, profile_id)
+                try:
+                    surviving = tuple(backend.surviving_services())
+                except Exception:  # noqa: BLE001 -- an unreadable registry proves nothing
+                    surviving = ("?",)
+                if not _succeeded(stopped) or surviving:
+                    return stream.fail(
+                        OperationPhase.RESOURCE_RELEASE,
+                        "Os serviços desta instalação não pararam. Nada foi apagado.",
+                        [diagnostic("delete-not-stopped", ", ".join(surviving) or "stop failed")],
+                    )
+            stream.advance(OperationState.RUNNING, OperationPhase.EXECUTION, "Apagando arquivos")
+            failures = delete_tree(folder)
+            if failures:
+                return stream.fail(
+                    OperationPhase.EXECUTION,
+                    "Não foi possível apagar todos os arquivos. A instalação continua na lista.",
+                    [diagnostic("delete-failed", item) for item in failures[:4]],
+                )
+            return stream.succeed(OperationPhase.FINALIZATION, "Instalação apagada")
+
+        def settle(result: object) -> str | None:
+            if not _succeeded(result):
+                return None
+            try:
+                self._forget_deleted(folder)
+            except HubError:
+                return (
+                    "A instalação foi apagada, mas a lista não pôde ser atualizada. "
+                    "Use Esquecer da lista."
+                )
+            return None
+
+        return self._launch(operation_id, run, settle)
+
+    def _forget_deleted(self, root: Path) -> None:
+        """The folder is gone: its entry goes, and if it was in use, nothing is in use."""
+        active = self.active_root()
+        was_active = active is not None and root_key(active) == root_key(root)
+        state = replace(
+            self.state,
+            active=None if was_active else self.state.active,
+            known=tuple(item for item in self.state.known if item.key != root_key(root)),
+        )
+        # Raises when the disk refuses; the folder is gone either way, and the
+        # entry left behind shows as a missing folder, forgettable by hand.
+        self._persist(state)
+        self._backends = {
+            key: value for key, value in self._backends.items() if root_key(key) != root_key(root)
+        }
+        if was_active:
+            self.config = None
+            default = self.resolve(InstallLocation.default())
+            self.backend = self._backends.get(default.root) or self.backend_factory(default)
+            self._backends[default.root] = self.backend
 
     def last_switch_refusal(self) -> str | None:
         """Why the last stop-and-switch did not happen. Read once, then cleared."""

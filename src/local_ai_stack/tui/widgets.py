@@ -626,6 +626,13 @@ class InstallPanel(VerticalScroll):
             super().__init__()
             self.root = root
 
+    class DeleteRequested(Message):
+        """Delete this installation's files, after a confirmation that names them."""
+
+        def __init__(self, root: Path) -> None:
+            super().__init__()
+            self.root = root
+
     class RepairRequested(Message):
         """Repair what is missing in the installation in use, leaving it as it was."""
 
@@ -675,9 +682,9 @@ class InstallPanel(VerticalScroll):
         yield Static("[b]Instalações conhecidas[/b]", id="install-known")
         yield OptionList(id="install-known-list")
         yield Static(
-            "[dim]Escolha uma instalação na lista para usá-la, abrir a pasta, localizá-la "
-            "ou esquecê-la. Esquecer remove apenas esta instalação da lista. "
-            "Nenhum arquivo será apagado.[/dim]",
+            "[dim]Esquecer remove apenas esta instalação da lista. Nenhum arquivo será "
+            "apagado. Apagar instalação remove os arquivos da pasta, depois de "
+            "confirmar.[/dim]",
             id="install-known-help",
         )
         with Horizontal(classes="install-actions"):
@@ -686,6 +693,8 @@ class InstallPanel(VerticalScroll):
         with Horizontal(classes="install-actions"):
             yield Button("Localizar pasta", id="install-locate")
             yield Button("Esquecer da lista", id="install-forget")
+        with Horizontal(classes="install-actions"):
+            yield Button("Apagar instalação", id="install-delete", variant="error")
         with Horizontal(classes="install-actions"):
             yield Button("Abrir instalação existente", id="install-open-existing")
             yield Button("Nova instalação", id="install-open-wizard")
@@ -871,6 +880,8 @@ class InstallPanel(VerticalScroll):
             selected is not None and selected.missing and self.can_pick_folder
         )
         self.query_one("#install-forget", Button).disabled = selected is None or selected.active
+        # The installation in use can be deleted too; a folder that is gone cannot.
+        self.query_one("#install-delete", Button).disabled = selected is None or selected.missing
 
     def select_row(self, root: Path | str | None) -> None:
         """Point at one known installation, so the row actions apply to it."""
@@ -889,6 +900,7 @@ class InstallPanel(VerticalScroll):
             "install-open-existing",
             "install-locate",
             "install-forget",
+            "install-delete",
         ):
             self.query_one(f"#{button_id}", Button).disabled = (
                 True if busy else self.query_one(f"#{button_id}", Button).disabled
@@ -912,6 +924,7 @@ class InstallPanel(VerticalScroll):
             "install-open-wizard",
             "install-locate",
             "install-forget",
+            "install-delete",
         }:
             return
         event.stop()
@@ -941,6 +954,8 @@ class InstallPanel(VerticalScroll):
             self.post_message(self.LocateRequested(self.selected_root))
         elif button_id == "install-forget" and self.selected_root is not None:
             self.post_message(self.ForgetRequested(self.selected_root))
+        elif button_id == "install-delete" and self.selected_root is not None:
+            self.post_message(self.DeleteRequested(self.selected_root))
 
 
 class ServicesPanel(VerticalScroll):

@@ -210,6 +210,26 @@ class InstallationCheck:
         return not self.problems
 
 
+@dataclass(frozen=True)
+class DeletePlan:
+    """What deleting one installation would mean. Nothing has been touched yet.
+
+    ``refusal`` says why it will not be deleted at all; ``must_stop`` that its
+    managed services are running and would be stopped first. The path is
+    always the full one: it is what the confirmation shows.
+    """
+
+    root: Path
+    profile_name: str
+    active: bool = False
+    must_stop: bool = False
+    refusal: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.refusal is None
+
+
 class FolderPicker(Protocol):
     """Asks the operating system for a folder. The TUI never sees how.
 
@@ -265,6 +285,7 @@ class HubApplication(ApplicationReadModel, Protocol):
 
 __all__ = [
     "ConflictResolutionRequired",
+    "DeletePlan",
     "FolderPicker",
     "HubApplication",
     "HubError",

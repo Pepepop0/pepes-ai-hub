@@ -299,7 +299,8 @@ Screen {
 /* --- Dialogs --------------------------------------------------------------- */
 
 WelcomeScreen,
-SwitchInstallationScreen {
+SwitchInstallationScreen,
+DeleteInstallationScreen {
     align: center middle;
 }
 
@@ -314,7 +315,8 @@ SwitchInstallationScreen {
     background: $surface;
 }
 
-#welcome-body {
+#welcome-body,
+#delete-body {
     margin: 1 0;
 }
 

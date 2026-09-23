@@ -858,3 +858,27 @@ class FakeFolderPicker:
         if self._gate is not None and not self._gate.wait(10):
             raise TimeoutError("FakeFolderPicker was never released")
         return self.result
+
+
+async def press_visible(pilot, selector: str) -> None:
+    """Scroll a button into view, wait until it is really under the pointer, click it.
+
+    ``scroll_visible`` scrolls after the next refresh, not at once; clicking on
+    the strength of one pause would sometimes aim at where the button was.
+    """
+    from textual.widgets import Button
+
+    screen = pilot.app.screen
+    button = screen.query_one(selector, Button)
+    button.scroll_visible(animate=False)
+    for _ in range(100):
+        await pilot.pause()
+        region = button.region
+        if button.display and region.area and region in screen.region:
+            point = (region.x + region.width // 2, region.y + region.height // 2)
+            if screen.get_widget_at(*point)[0] is button:
+                break
+    else:
+        raise AssertionError(f"{selector} never came into view")
+    assert await pilot.click(selector), f"the click did not land on {selector}"
+    await pilot.pause()

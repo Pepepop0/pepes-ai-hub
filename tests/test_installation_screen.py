@@ -12,7 +12,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from hub_fakes import FakeFolderPicker, FakeHubApplication, ready_application
+from hub_fakes import FakeFolderPicker, FakeHubApplication, press_visible, ready_application
 from test_app import all_profiles, integration_snapshot, reference_facts, stopped_runtime
 from textual.widgets import Button, OptionList, Static
 
@@ -97,6 +97,11 @@ def known_text(app) -> str:
             str(app.query_one("#install-known-help", Static).content),
         ]
     )
+
+
+async def click_visible(pilot, selector: str) -> None:
+    """Scroll a button into view and click it, as a person does below the fold."""
+    await press_visible(pilot, selector)
 
 
 async def open_switch_dialog(pilot) -> SwitchInstallationScreen:
@@ -274,7 +279,7 @@ def test_opening_an_existing_installation_uses_the_folder_picker():
         app, _ = hub(fake, picker=FakeFolderPicker(picked))
         async with app.run_test(size=(120, 40)) as pilot:
             await open_installation_section(pilot)
-            await pilot.click("#install-open-existing")
+            await click_visible(pilot, "#install-open-existing")
             for _ in range(8):
                 await pilot.pause()
             assert ("open", picked) in fake.managed
@@ -290,7 +295,7 @@ def test_a_folder_that_is_not_an_installation_is_refused_in_plain_words():
         app, _ = hub(fake, picker=FakeFolderPicker(Path(r"F:\Fotos")))
         async with app.run_test(size=(120, 40)) as pilot:
             await open_installation_section(pilot)
-            await pilot.click("#install-open-existing")
+            await click_visible(pilot, "#install-open-existing")
             for _ in range(8):
                 await pilot.pause()
             assert "não contém uma instalação" in text_of(app, "#install-notice")
@@ -376,7 +381,7 @@ def test_installing_again_is_a_new_installation_and_opens_the_wizard():
         async with app.run_test(size=(120, 40)) as pilot:
             await open_installation_section(pilot)
             assert str(app.query_one("#install-open-wizard", Button).label) == "Nova instalação"
-            await pilot.click("#install-open-wizard")
+            await click_visible(pilot, "#install-open-wizard")
             await pilot.pause()
             assert isinstance(app.screen, WizardScreen)
             assert fake.calls == [], "opening the wizard installs nothing"

@@ -20,7 +20,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, OptionList, Static
 from textual.widgets.option_list import Option
 
-from .application import InstallationSummary
+from .application import DeletePlan, InstallationSummary
 
 # How a known installation's observed state is written in these lists. The
 # same words the Installations screen uses.
@@ -193,7 +193,54 @@ class SwitchInstallationScreen(ModalScreen[SwitchChoice | None]):
         self.dismiss(None)
 
 
+class DeleteInstallationScreen(ModalScreen[bool]):
+    """Confirm deleting one installation's files. Always names the full path.
+
+    Cancel is where the focus starts: deleting is the one thing the Hub
+    cannot undo, so it is never what Enter does by accident.
+    """
+
+    BINDINGS: ClassVar[list[Binding]] = [Binding("escape", "cancel", "Cancelar")]
+
+    def __init__(self, plan: DeletePlan) -> None:
+        super().__init__()
+        self.plan = plan
+
+    def compose(self) -> ComposeResult:
+        plan = self.plan
+        with Vertical(id="delete-dialog", classes="dialog"):
+            yield Static("[b]Apagar instalação?[/b]", id="delete-title")
+            lines = [f"[b]{escape(plan.profile_name)}[/b]", escape(str(plan.root)), ""]
+            lines.append("Esta ação apagará permanentemente os arquivos desta instalação.")
+            if plan.active:
+                lines.append("É a instalação em uso: nenhuma outra será escolhida no lugar.")
+            if plan.must_stop:
+                lines.append(
+                    "Os serviços desta instalação estão em execução e serão parados antes. "
+                    "Processos externos não são encerrados."
+                )
+            yield Static("\n".join(lines), id="delete-body")
+            with Horizontal(classes="dialog-actions"):
+                yield Button(
+                    "Parar e apagar" if plan.must_stop else "Apagar instalação",
+                    id="delete-confirm",
+                    variant="error",
+                )
+                yield Button("Cancelar", id="delete-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#delete-cancel", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.dismiss(event.button.id == "delete-confirm")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 __all__ = [
+    "DeleteInstallationScreen",
     "SwitchChoice",
     "SwitchInstallationScreen",
     "WelcomeScreen",

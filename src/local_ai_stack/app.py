@@ -46,6 +46,7 @@ from .system import SystemFacts, detect_system
 from .tui.appearance import TuiAppearance, resolve_tui_appearance, textual_theme
 from .tui.application import (
     ConflictResolutionRequired,
+    DeletePlan,
     FolderPicker,
     HubApplication,
     HubError,
@@ -60,7 +61,12 @@ from .tui.application import (
     ProfileChoice,
     SwitchRequiresStop,
 )
-from .tui.dialogs import SwitchChoice, SwitchInstallationScreen, WelcomeScreen
+from .tui.dialogs import (
+    DeleteInstallationScreen,
+    SwitchChoice,
+    SwitchInstallationScreen,
+    WelcomeScreen,
+)
 from .tui.navigation import DEFAULT_ITEM, SIDEBAR_ROUTES, Section
 from .tui.operations import OperationView, observe
 from .tui.presenters import render_profile_details
@@ -196,6 +202,15 @@ class InstallationChecked(Message):
     def __init__(self, check: InstallationCheck | None, error: str | None = None) -> None:
         super().__init__()
         self.check = check
+        self.error = error
+
+
+class DeletePlanned(Message):
+    """What deleting an installation would mean, judged off the render thread."""
+
+    def __init__(self, plan: DeletePlan | None, error: str | None = None) -> None:
+        super().__init__()
+        self.plan = plan
         self.error = error
 
 
@@ -619,7 +634,10 @@ class LocalAIStackApp(App):
             # No authority to read from: nothing was ever committed through it.
             self.refresh_projections()
             return
-        config = self.application.config or self._uncommitted_config
+        config = self.application.config or InstalledConfig(
+            profile_id=self._uncommitted_config.profile_id,
+            general=self._uncommitted_config.general,
+        )
         self.installed_config = config
         try:
             main = self.query_one(MainContent)
@@ -747,6 +765,53 @@ class LocalAIStackApp(App):
             return
         panel.show_check(message.check)
         panel.notice(message.error or "")
+
+    def on_install_panel_delete_requested(self, message: InstallPanel.DeleteRequested) -> None:
+        """Judge the deletion first -- it reads services and folders -- then ask."""
+        planner = getattr(self.application, "plan_delete", None)
+        if planner is None:
+            return
+        root = message.root
+
+        def judge() -> None:
+            try:
+                self.post_message(DeletePlanned(planner(root)))
+            except HubError as exc:
+                self.post_message(DeletePlanned(None, str(exc)))
+            except Exception:  # noqa: BLE001 -- a failed check is reported, never a crash
+                self.post_message(
+                    DeletePlanned(None, "Não foi possível verificar esta instalação.")
+                )
+
+        self.run_worker(judge, thread=True, group="delete")
+
+    def on_delete_planned(self, message: DeletePlanned) -> None:
+        panel = self._install_panel()
+        plan = message.plan
+        if plan is None or not plan.ok:
+            if panel is not None:
+                panel.notice(message.error or (plan.refusal if plan else "") or "")
+            return
+
+        def confirmed(yes: bool | None) -> None:
+            if not yes:
+                return
+            delete = getattr(self.application, "delete_installation", None)
+            if delete is None:
+                return
+            self._begin_operation("delete")
+            try:
+                delete(plan.root, stop=plan.must_stop)
+            except HubError as exc:
+                self._end_operation()
+                if panel is not None:
+                    panel.notice(str(exc))
+                return
+            if panel is not None:
+                panel.select_row(None)
+                panel.notice("")
+
+        self.push_screen(DeleteInstallationScreen(plan), confirmed)
 
     def on_install_panel_repair_requested(self, message: InstallPanel.RepairRequested) -> None:
         repair = getattr(self.application, "repair", None)

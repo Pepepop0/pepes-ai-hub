@@ -12,7 +12,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
-from hub_fakes import FakeHubApplication, ready_application
+from hub_fakes import FakeHubApplication, press_visible, ready_application
 from test_app import all_profiles, integration_snapshot, reference_facts, stopped_runtime
 from test_installation_screen import CAPELLA, PEPEH, PEPINHO, installed, summaries
 from textual.widgets import Static
@@ -116,7 +116,8 @@ def test_adopting_a_folder_moves_every_surface_with_it():
         )
         async with app.run_test(size=(120, 40)) as pilot:
             await installation_section(pilot)
-            await pilot.click("#install-open-existing")
+            # Below the fold on this terminal: scrolled to, as a person would.
+            await press_visible(pilot, "#install-open-existing")
             await settle(pilot, 12)
 
             assert fake.root_display == str(picked)

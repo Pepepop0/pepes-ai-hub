@@ -226,7 +226,9 @@ class HubApplication(ApplicationReadModel, Protocol):
 
     ``recent_custom_roots() -> tuple[str, ...]`` follows the same rule for the
     same reason: optional, called defensively, and an adapter without it simply
-    has no history to offer.
+    has no history to offer. So do ``last_switch_refusal() -> str | None`` (why
+    the last stop-and-switch did not switch) and ``cancel_pending_installation()``
+    (let go of an installation paused on a conflict decision).
     """
 
     def installation(self) -> InstallationView: ...

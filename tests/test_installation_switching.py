@@ -15,20 +15,27 @@ from __future__ import annotations
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from test_app import reference_facts
 
+from local_ai_stack.application_contracts import VramSnapshot
 from local_ai_stack.external_conflict_contracts import (
     ConflictHardBlocker,
     ConflictPreflightReport,
+    ConflictResolutionResult,
+    ConflictResolutionStatus,
 )
 from local_ai_stack.hub_application import create_hub_application
 from local_ai_stack.installation import InstallLocationMode, resolve_installation
 from local_ai_stack.installations import read_state
+from local_ai_stack.integration import IntegrationOptions, endpoint_collisions
+from local_ai_stack.inventory import Listener, ListenerReport, ScanOutcome
 from local_ai_stack.layout import ENV_ROOT
-from local_ai_stack.operation_contracts import OperationState
+from local_ai_stack.operation_contracts import OperationResult, OperationState
+from local_ai_stack.operations import diagnostic
+from local_ai_stack.profiles import load_profiles
+from local_ai_stack.stack_application import AppStatus, ComponentStatus
 from local_ai_stack.tui.application import (
     ConflictResolutionRequired,
     HubError,
@@ -39,24 +46,65 @@ from local_ai_stack.tui.application import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+def succeeded(operation_id: str) -> OperationResult:
+    return OperationResult(operation_id, OperationState.SUCCEEDED)
+
+
+def failed(operation_id: str, reason: str) -> OperationResult:
+    return OperationResult(
+        operation_id, OperationState.FAILED, diagnostics=(diagnostic("controlled", reason),)
+    )
+
+
+# Every installation of every shipped profile serves on the same three ports,
+# which is exactly why two of them cannot run at once.
+SHARED_PORTS = (11434, 8080, 8188)
+
+
 class RecordingBackend:
-    """A backend that remembers which commands reached which root."""
+    """A backend that remembers which commands reached which root.
+
+    It answers with the production types and only through methods the real
+    ``StackApplication`` has -- ``test_the_stub_backend_speaks_only_the_real_contract``
+    keeps it that way -- so what the adapter decides against it is what it
+    would decide against the real thing.
+    """
 
     def __init__(self, installation, world: World) -> None:
         self.installation = installation
         self.world = world
         self.root = installation.root
         self.commands: list[str] = []
+        self.options = IntegrationOptions()
+        self._conflict: ConflictPreflightReport | None = None
 
     # --- read model ---------------------------------------------------------
 
     def status(self, profile_id=None):
-        return SimpleNamespace(
+        """The real read model: every service up exactly when this root runs."""
+        now = datetime.now(UTC)
+        health = "UP" if self.root in self.world.running else "DOWN"
+        return AppStatus(
+            observed_at=now,
+            profile_id=profile_id or "pepe",
             installation_ready=self.root in self.world.installed,
-            stack_up=self.root in self.world.running,
-            observed_at=datetime.now(UTC),
-            components=(),
-            gpu=None,
+            pending_work=(),
+            components=tuple(
+                ComponentStatus(
+                    service_id,
+                    enabled=True,
+                    ownership="managed",
+                    availability="installed",
+                    health=health,
+                    runtime="RUNNING" if health == "UP" else "STOPPED",
+                    controllable=True,
+                    endpoint=None,
+                    detail="controlled",
+                )
+                for service_id in ("ollama", "open-webui", "comfyui")
+            ),
+            gpu=VramSnapshot(now, None, None),
+            operation=None,
         )
 
     def facts(self):
@@ -67,11 +115,44 @@ class RecordingBackend:
 
     def check_conflicts(self, profile_id):
         if self.root in self.world.conflicting:
-            return ConflictPreflightReport(
+            self._conflict = ConflictPreflightReport(
                 f"preflight-{self.root.name}",
                 hard_blockers=(ConflictHardBlocker("blocked", "A controlled blocker."),),
             )
+            return self._conflict
         return None
+
+    def current_conflict_preflight(self):
+        return self._conflict
+
+    def resolve_conflict(self, selection):
+        self.commands.append(f"resolve:{selection.policy.value}")
+        status = (
+            ConflictResolutionStatus.ABORTED
+            if selection.policy.value == "abort"
+            else ConflictResolutionStatus.PROCEED
+        )
+        return ConflictResolutionResult(
+            selection.preflight_id, selection.policy, status, "Decisão registrada."
+        )
+
+    # --- what is still alive, asked the way production asks it --------------------
+
+    def surviving_services(self):
+        """This installation's managed processes its registry cannot prove gone."""
+        if self.root in self.world.unreadable_registry:
+            raise RuntimeError("managed-process registry is unreadable: controlled")
+        return ("ollama",) if self.root in self.world.survivors else ()
+
+    def endpoint_collisions(self, profile_id):
+        """The real collision rule over the listeners this world has on its ports."""
+        profile = next(p for p in load_profiles(PROJECT_ROOT / "profiles") if p.id == profile_id)
+        return endpoint_collisions(
+            self.options.endpoints_for(profile),
+            profile,
+            self.world.listeners(),
+            self.world.pids_of(self.root),
+        )
 
     # --- commands -----------------------------------------------------------
 
@@ -79,46 +160,34 @@ class RecordingBackend:
         self.commands.append("first_run")
         self.world.calls.append((self.root, "first_run", profile_id))
         if self.root in self.world.failing:
-            return SimpleNamespace(state=OperationState.FAILED, diagnostics=())
+            return failed(operation_id, "controlled installation failure")
         self.world.installed.add(self.root)
         # An installed stack writes its own configuration, which is what makes
         # the folder recognisable as an installation later.
         self.world.write_config(self.installation, profile_id)
-        return SimpleNamespace(state=OperationState.SUCCEEDED, diagnostics=())
+        return succeeded(operation_id)
 
     def _command(self, name, operation_id, profile_id, *, emit=None):
         self.commands.append(name)
         self.world.calls.append((self.root, name, profile_id))
-        return SimpleNamespace(state=OperationState.SUCCEEDED, diagnostics=())
+        return succeeded(operation_id)
 
     def start_stack(self, operation_id, profile_id, *, emit=None):
         return self._command("start_stack", operation_id, profile_id, emit=emit)
 
     def stop_stack(self, operation_id, profile_id, *, emit=None):
+        """What the real stop returns: an OperationResult, and nothing more."""
         self.commands.append("stop_stack")
         self.world.calls.append((self.root, "stop_stack", profile_id))
         if self.root in self.world.refuse_stop:
-            return SimpleNamespace(state=OperationState.FAILED, diagnostics=())
-        if self.root in self.world.leaves_running:
-            # Succeeded, and yet a managed process is still alive.
-            return SimpleNamespace(
-                state=OperationState.SUCCEEDED,
-                diagnostics=(),
-                left_running=(4242,),
-            )
+            return failed(operation_id, "service-not-stopped")
         self.world.running.discard(self.root)
-        return SimpleNamespace(state=OperationState.SUCCEEDED, diagnostics=(), left_running=())
-
-    def listening_ports(self):
-        """Which of this installation's ports still answer, as the controller reports."""
-        occupied = self.root in self.world.running or self.root in self.world.keeps_ports
-        return (11434, 8080, 8188) if occupied else ()
+        for hook in self.world.after_stop:
+            hook(self.root)
+        return succeeded(operation_id)
 
     def restart_stack(self, operation_id, profile_id, *, emit=None):
         return self._command("restart_stack", operation_id, profile_id, emit=emit)
-
-    def close(self) -> None:
-        pass
 
 
 class World:
@@ -132,10 +201,33 @@ class World:
         self.running: set[Path] = set()
         self.refuse_stop: set[Path] = set()
         # A stop can report success and still leave something behind, which is
-        # exactly what must not let a switch through.
-        self.leaves_running: set[Path] = set()
-        self.keeps_ports: set[Path] = set()
+        # exactly what must not let a switch through: a managed process its
+        # registry still finds alive, or a registry nobody can read.
+        self.survivors: set[Path] = set()
+        self.unreadable_registry: set[Path] = set()
+        # Listeners on the shared ports that belong to no installation.
+        self.external_ports: set[int] = set()
+        self.scan_unavailable = False
+        # Things that happen on the machine right after a stop returns.
+        self.after_stop: list = []
         self.backends: dict[Path, RecordingBackend] = {}
+
+    def pids_of(self, root: Path) -> frozenset[int]:
+        """The pids an installation can prove are its own, while it runs."""
+        index = sorted(str(item) for item in self.running | {root}).index(str(root))
+        return frozenset({1000 + index}) if root in self.running else frozenset()
+
+    def listeners(self) -> ListenerReport:
+        """The machine's listeners: every running installation's, and the strangers'."""
+        if self.scan_unavailable:
+            return ListenerReport(ScanOutcome.UNAVAILABLE, (), "controlled scan failure")
+        held = [
+            Listener("127.0.0.1", port, next(iter(self.pids_of(root))))
+            for root in self.running
+            for port in SHARED_PORTS
+        ]
+        strangers = [Listener("127.0.0.1", port, 9000 + port) for port in self.external_ports]
+        return ListenerReport(ScanOutcome.OK, tuple(held + strangers))
 
     def backend(self, installation) -> RecordingBackend:
         backend = RecordingBackend(installation, self)

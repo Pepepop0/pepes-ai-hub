@@ -30,6 +30,7 @@ from .external_conflict_contracts import (
     ConflictPolicySelection,
     ConflictResolutionResult,
     ConflictResolutionStatus,
+    ExternalConflictPolicy,
 )
 from .external_conflicts import ConflictResolutionRequired as _BackendConflictRequired
 from .installation import (
@@ -52,7 +53,17 @@ from .installations import (
 )
 from .layout import StackLayout
 from .model_catalog import model_catalog
-from .operation_contracts import OperationEvent, OperationEventSink, OperationSnapshot
+from .operation_contracts import (
+    OperationEvent,
+    OperationEventKind,
+    OperationEventSink,
+    OperationPhase,
+    OperationResult,
+    OperationSnapshot,
+    OperationState,
+    advance_operation,
+)
+from .operations import diagnostic, safe_text, utc_now
 from .profiles import Profile, load_profiles, offered_profiles
 from .stack_application import StackApplication, StackDependencies
 from .storage import enough_space, free_space, model_download_estimate
@@ -94,6 +105,111 @@ def _succeeded(result: object) -> bool:
     """Whether an operation result says it succeeded, however the backend spells it."""
     state = getattr(result, "state", None)
     return str(getattr(state, "value", state)) == "succeeded"
+
+
+# Said when the machine is not clear for the installation being switched to.
+HANDOVER_REFUSED = (
+    "Não foi possível trocar de instalação porque os serviços necessários ainda estão em uso."
+)
+# Said when a settle step failed in a way that has no message of its own.
+UNSETTLED = "Não foi possível concluir a operação. Nada foi alterado."
+
+
+class _Ending:
+    """One operation's events on their way to the screens, its ending held back.
+
+    The backend's terminal event says what the backend did. What that means
+    for the Hub -- committed, recorded, refused -- is decided after it, so the
+    ending reaches the screens only once that decision is final and the Hub is
+    idle again: whoever reads the Hub on seeing it reads the settled truth.
+    When the Hub refused what the backend did, the ending is rewritten to say
+    so; when the backend never produced one, one is made from its result.
+    Every launched operation ends exactly once.
+    """
+
+    def __init__(self, hub: HubApplicationAdapter, operation_id: str) -> None:
+        self.hub = hub
+        self.operation_id = operation_id
+        self.snapshot: OperationSnapshot | None = None
+        self.held: OperationEvent | None = None
+
+    def emit(self, event: OperationEvent) -> None:
+        if event.state.terminal:
+            self.held = event
+            return
+        self._deliver(event)
+
+    def close(self, result: object, refusal: str | None) -> None:
+        ending = self.held
+        if ending is None:
+            ending = self._made(result, refusal)
+        elif refusal is not None and ending.state is OperationState.SUCCEEDED:
+            ending = self._terminal(
+                OperationState.FAILED, ending.phase, refusal, sequence=ending.sequence
+            )
+        self._deliver(ending)
+
+    def _made(self, result: object, refusal: str | None) -> OperationEvent:
+        """An ending for a backend that returned without one."""
+        if self.snapshot is None:
+            self._deliver(
+                OperationEvent(
+                    operation_id=self.operation_id,
+                    sequence=1,
+                    kind=OperationEventKind.STATE,
+                    state=OperationState.PREPARING,
+                    timestamp=utc_now(),
+                    phase=OperationPhase.PREPARATION,
+                    message="Preparando",
+                )
+            )
+        phase = (
+            OperationPhase.PREPARATION if self.snapshot is None else self.snapshot.last_event.phase
+        )
+        if refusal is None and _succeeded(result):
+            return self._terminal(OperationState.SUCCEEDED, phase, "Concluído")
+        diagnostics = tuple(getattr(result, "diagnostics", ()) or ())
+        message = refusal or (
+            diagnostics[0].message if diagnostics else "A operação não foi concluída."
+        )
+        return self._terminal(OperationState.FAILED, phase, message)
+
+    def _terminal(
+        self,
+        state: OperationState,
+        phase: OperationPhase,
+        message: str,
+        *,
+        sequence: int | None = None,
+    ) -> OperationEvent:
+        last = None if self.snapshot is None else self.snapshot.last_event
+        number = sequence if sequence is not None else (1 if last is None else last.sequence + 1)
+        text = safe_text(message)
+        diagnostics = () if state is OperationState.SUCCEEDED else (diagnostic("hub", text),)
+        result = OperationResult(self.operation_id, state, diagnostics=diagnostics)
+        return OperationEvent(
+            operation_id=self.operation_id,
+            sequence=number,
+            kind=OperationEventKind.RESULT,
+            state=state,
+            timestamp=utc_now(),
+            phase=phase,
+            message=text,
+            diagnostic=diagnostics[0] if diagnostics else None,
+            result=result,
+        )
+
+    def _deliver(self, event: OperationEvent) -> None:
+        with self.hub._lock:
+            try:
+                self.snapshot = advance_operation(self.snapshot, event)
+            except ValueError:
+                # The reducer is the authority, as it is for the backend's own
+                # stream: an invalid transition never reaches an observer.
+                return
+            self.hub._snapshot = self.snapshot
+            for subscription in tuple(self.hub._subscriptions):
+                subscription.deliver(event)
 
 
 class HubApplicationAdapter:
@@ -296,9 +412,9 @@ class HubApplicationAdapter:
         if active is not None and root_key(active) != root_key(target):
             try:
                 status = self.backend.status(self._profile_id())
-                must_stop = status.stack_up
-            except Exception:  # noqa: BLE001 -- treat an unreadable stack as stopped
-                must_stop = False
+                must_stop = bool(status.stack_up)
+            except Exception:  # noqa: BLE001 -- a stack nobody can read may be running
+                must_stop = True
             if must_stop:
                 running_profile = self._profile_id()
         return SwitchPlan(
@@ -310,14 +426,14 @@ class HubApplicationAdapter:
             problems=tuple(problems),
         )
 
-    def _bind(self, root: Path, config: InstalledConfig, *, forgetting: Path | None = None) -> None:
-        """Make this installation the active one, as one transaction."""
+    def _target(self, root: Path, config: InstalledConfig) -> _Candidate:
+        """An existing installation as a candidate: its backend and its configuration."""
         installation = self.resolve(location_of_config(config, root))
         backend = self._backends.get(installation.root)
         if backend is None:
             backend = self.backend_factory(installation)
             self._backends[installation.root] = backend
-        candidate = _Candidate(
+        return _Candidate(
             InstallSelection(
                 config.profile_id,
                 config.installation.mode,
@@ -327,7 +443,10 @@ class HubApplicationAdapter:
             backend,
             config,
         )
-        self._commit(candidate, forgetting=forgetting)
+
+    def _bind(self, root: Path, config: InstalledConfig, *, forgetting: Path | None = None) -> None:
+        """Make this installation the active one, as one transaction."""
+        self._commit(self._target(root, config), forgetting=forgetting)
 
     def switch_installation(self, root: Path | str) -> None:
         """Make a known installation the active one. Stopped stacks only.
@@ -347,32 +466,30 @@ class HubApplicationAdapter:
                 raise HubError("Esta pasta não contém uma instalação que o Hub reconheça.")
             self._bind(Path(root), config)
 
-    def _stop_was_complete(self, backend, result) -> str | None:
-        """Why the target must not be bound yet, or None when the way is clear.
+    def _handover_refusal(
+        self, previous: StackApplication, result: object, target: _Candidate
+    ) -> str | None:
+        """Why the target must not be bound yet, or None when the machine is clear for it.
 
-        Two things have to be true after stopping: the Hub's own processes are
-        gone, and the addresses they held answer to nobody. Both are asked of
-        the runtime that already owns them; nothing is re-implemented here.
+        A stop that reports success is not the proof. After it, the stopped
+        installation's own registry must show nothing of it still alive, and
+        the target's endpoints must be free under the same rule the managed
+        preflight applies before anything starts -- external services,
+        leftovers and unknown listeners all count. Both answers come from the
+        real runtime, and an answer that cannot be read is a refusal.
         """
         if not _succeeded(result):
-            return "Não foi possível parar os serviços da instalação atual."
-        left = tuple(getattr(result, "left_running", ()) or ())
-        if left:
-            return (
-                "Alguns serviços gerenciados continuam em execução, então a troca foi "
-                "cancelada. Tente novamente ou reinicie a máquina."
-            )
-        listening = getattr(backend, "listening_ports", None)
+            return "Não foi possível parar os serviços da instalação atual. A troca foi cancelada."
         try:
-            ports = tuple(listening() or ()) if callable(listening) else ()
+            surviving = tuple(previous.surviving_services())
+            collisions = tuple(target.backend.endpoint_collisions(target.config.profile_id))
         except Exception:  # noqa: BLE001 -- an unreadable answer is not a proof of freedom
-            return "Não foi possível confirmar que as portas foram liberadas."
-        if ports:
-            spelled = ", ".join(str(port) for port in ports)
-            return (
-                f"As portas {spelled} continuam ocupadas, então a troca foi cancelada. "
-                "Processos externos não são encerrados pelo Hub."
-            )
+            return f"{HANDOVER_REFUSED} Não foi possível confirmar que eles pararam."
+        if surviving:
+            return f"{HANDOVER_REFUSED} Ainda em execução: {', '.join(surviving)}."
+        if collisions:
+            details = "; ".join(issue.detail for issue in collisions)
+            return f"{HANDOVER_REFUSED} Detalhes: {details}."
         return None
 
     def stop_and_switch(self, root: Path | str, *, replacing: Path | str | None = None) -> str:
@@ -390,36 +507,32 @@ class HubApplicationAdapter:
             if config is None:  # pragma: no cover - plan_switch already refused it
                 raise HubError("Esta pasta não contém uma instalação que o Hub reconheça.")
             operation_id = self._reserve()
-            previous = self.backend
-            profile_id = self._profile_id()
-            target = Path(root)
+            try:
+                previous = self.backend
+                profile_id = self._profile_id()
+                target = self._target(Path(root), config)
+            except Exception:
+                self._end_operation(None)
+                raise
+            forgetting = None if replacing is None else Path(replacing)
+            self._switch_refusal = None
 
-            def execute():
-                result = None
+            def settle(result: object) -> str | None:
                 try:
-                    result = previous.stop_stack(
-                        operation_id, profile_id, emit=self._publisher(previous)
-                    )
-                finally:
-                    with self._lock:
-                        refusal = self._stop_was_complete(previous, result)
-                        if refusal is None:
-                            try:
-                                self._bind(
-                                    target,
-                                    config,
-                                    forgetting=None if replacing is None else Path(replacing),
-                                )
-                            except HubError as exc:
-                                self._switch_refusal = str(exc)
-                        else:
-                            self._switch_refusal = refusal
-                        self._busy = False
-                        self._idle.set()
+                    refusal = self._handover_refusal(previous, result, target)
+                    if refusal is None:
+                        self._commit(target, forgetting=forgetting)
+                except HubError as exc:
+                    refusal = str(exc)
+                self._switch_refusal = refusal
+                return refusal
 
-            self._worker = threading.Thread(target=execute, name="hub-operation")
-            self._worker.start()
-            return operation_id
+            return self._launch(
+                operation_id,
+                lambda emit: previous.stop_stack(operation_id, profile_id, emit=emit),
+                settle,
+                candidate=target,
+            )
 
     def open_installation(self, root: Path | str) -> None:
         """Adopt a folder the person picked: validate it, remember it, switch to it."""
@@ -487,31 +600,22 @@ class HubApplicationAdapter:
             config = self.config
             root = self.active_root()
 
-            def execute():
-                result = None
-                try:
-                    result = backend.first_run(
-                        operation_id, config.profile_id, emit=self._publisher(backend)
-                    )
-                finally:
-                    with self._lock:
-                        if root is not None:
-                            self._persist(
-                                self.state.recording(
-                                    root,
-                                    REPAIR if _succeeded(result) else FAILURE,
-                                    result="succeeded" if _succeeded(result) else "",
-                                    summary=""
-                                    if _succeeded(result)
-                                    else "a verificação não pôde ser concluída",
-                                )
-                            )
-                        self._busy = False
-                        self._idle.set()
+            def settle(result: object) -> None:
+                if root is None:
+                    return
+                succeeded = _succeeded(result)
+                self._record(
+                    root,
+                    REPAIR if succeeded else FAILURE,
+                    result="succeeded" if succeeded else "",
+                    summary="" if succeeded else "a verificação não pôde ser concluída",
+                )
 
-            self._worker = threading.Thread(target=execute, name="hub-operation")
-            self._worker.start()
-            return operation_id
+            return self._launch(
+                operation_id,
+                lambda emit: backend.first_run(operation_id, config.profile_id, emit=emit),
+                settle,
+            )
 
     def installation(self) -> InstallationView:
         if self.config is None:
@@ -655,26 +759,8 @@ class HubApplicationAdapter:
                 subscription.deliver(self._snapshot.last_event)
             return subscription
 
-    def _publisher(self, backend: StackApplication) -> OperationEventSink:
-        """Events are observed from the session that produced them.
-
-        An installation runs on its candidate's backend, which is not the bound
-        one until it commits; asking the bound backend for the snapshot would
-        describe the wrong session -- or none at all.
-        """
-
-        def publish(event: OperationEvent) -> None:
-            with self._lock:
-                self._snapshot = backend.current_operation()
-                for subscription in tuple(self._subscriptions):
-                    subscription.deliver(event)
-
-        return publish
-
-    def _publish(self, event: OperationEvent) -> None:
-        self._publisher(self.backend)(event)
-
     def _reserve(self) -> str:
+        """Begin an operation: the Hub is busy from here until its one ending."""
         if self._closed:
             raise HubUnavailable("O Hub está encerrando.")
         if self._busy:
@@ -683,18 +769,77 @@ class HubApplicationAdapter:
         self._idle.clear()
         return uuid4().hex
 
-    def _schedule(self, operation_id: str, command: Callable) -> str:
-        def execute():
+    def _end_operation(self, candidate: _Candidate | None) -> None:
+        """End an operation: its candidate let go, the Hub not busy, idle signalled.
+
+        The only place any of the three is undone, so no path can undo one and
+        forget another. A candidate that belongs to a different attempt -- one
+        still waiting on a conflict decision -- is not this operation's to drop.
+        """
+        if candidate is not None and self._candidate is candidate:
+            self._candidate = None
+        self._busy = False
+        self._idle.set()
+
+    def _launch(
+        self,
+        operation_id: str,
+        run: Callable[[OperationEventSink], object],
+        settle: Callable[[object], str | None] | None = None,
+        *,
+        candidate: _Candidate | None = None,
+    ) -> str:
+        """Run one reserved operation on its own thread, with exactly one ending.
+
+        ``run`` does the backend's work and returns its result. ``settle``
+        decides what that result means for the Hub -- commit, record, refuse --
+        and returns why a success was not accepted, when it was not. Whatever
+        either does, raising included, the operation then ends the same way:
+        its candidate let go, the Hub idle, and only after that the screens'
+        one terminal event, rewritten as a failure when the Hub refused.
+        """
+        if candidate is not None:
+            self._candidate = candidate
+        ending = _Ending(self, operation_id)
+
+        def execute() -> None:
+            result = None
+            refusal = None
             try:
-                command(operation_id, self._profile_id(), emit=self._publish)
+                result = run(ending.emit)
+            except Exception:  # noqa: BLE001 -- the ending says it failed
+                result = None
             finally:
                 with self._lock:
-                    self._busy = False
-                    self._idle.set()
+                    try:
+                        refusal = settle(result) if settle is not None else None
+                    except HubError as exc:
+                        refusal = str(exc)
+                    except Exception:  # noqa: BLE001 -- nothing may skip the end
+                        refusal = UNSETTLED
+                    finally:
+                        self._end_operation(candidate)
+                ending.close(result, refusal)
 
-        self._worker = threading.Thread(target=execute, name="hub-operation")
-        self._worker.start()
+        worker = threading.Thread(target=execute, name="hub-operation")
+        try:
+            worker.start()
+        except Exception as exc:
+            self._end_operation(candidate)
+            raise HubError(UNSETTLED) from exc
+        self._worker = worker
         return operation_id
+
+    def _record(self, root: Path, kind: str, *, result: str = "", summary: str = "") -> None:
+        """Write one line of an installation's history, if the disk will have it.
+
+        History is kept on a best-effort basis: an installation that installed
+        or repaired did so whether or not the line describing it was saved.
+        """
+        try:
+            self._persist(self.state.recording(root, kind, result=result, summary=summary))
+        except HubError:
+            pass
 
     def _prepare(self, selection: InstallSelection) -> _Candidate:
         """Everything the selection implies, bound to nothing. Never touches the active one."""
@@ -766,7 +911,7 @@ class HubApplicationAdapter:
         """Write the Hub's state. Memory follows the disk, never the other way round."""
         try:
             write_state(self.selection_path, state)
-        except OSError as exc:
+        except Exception as exc:
             raise HubError("Não foi possível salvar a seleção do Hub. Nada foi alterado.") from exc
         self.state = state
         current = config if config is not None else self.config
@@ -802,11 +947,12 @@ class HubApplicationAdapter:
                 )
                 return self._schedule_install(operation_id, candidate)
             except _BackendConflictRequired as exc:
-                self._release()
+                # The candidate stays: the decision owed is about it.
+                self._end_operation(None)
                 raise ConflictResolutionRequired(exc.report) from exc
             except Exception as exc:
                 self._candidate = None
-                self._release()
+                self._end_operation(None)
                 if isinstance(exc, HubError):
                     raise
                 raise HubError(
@@ -814,44 +960,37 @@ class HubApplicationAdapter:
                 ) from exc
 
     def _schedule_install(self, operation_id: str, candidate: _Candidate) -> str:
-        def execute():
-            result = None
-            try:
-                result = candidate.backend.first_run(
-                    operation_id,
-                    candidate.config.profile_id,
-                    emit=self._publisher(candidate.backend),
-                )
-            finally:
-                with self._lock:
-                    if _succeeded(result):
-                        self._commit(candidate)
-                        # A run that installed nothing did not install anything:
-                        # "last installed" keeps saying when work was last done.
-                        report = getattr(candidate.backend, "last_first_run", None)
-                        if not getattr(report, "did_nothing", False):
-                            self._persist(
-                                self.state.recording(candidate.root, INSTALL, result="succeeded")
-                            )
-                    else:
-                        self._persist(
-                            self.state.recording(
-                                candidate.root,
-                                FAILURE,
-                                summary="a instalação não foi concluída",
-                            )
-                        )
-                    self._candidate = None
-                    self._busy = False
-                    self._idle.set()
+        def settle(result: object) -> None:
+            if not _succeeded(result):
+                self._record(candidate.root, FAILURE, summary="a instalação não foi concluída")
+                return
+            # Raises when the disk refuses: the installation is then not adopted.
+            self._commit(candidate)
+            # A run that installed nothing did not install anything: "last
+            # installed" keeps saying when work was last done.
+            report = getattr(candidate.backend, "last_first_run", None)
+            if not getattr(report, "did_nothing", False):
+                self._record(candidate.root, INSTALL, result="succeeded")
 
-        self._worker = threading.Thread(target=execute, name="hub-operation")
-        self._worker.start()
-        return operation_id
+        return self._launch(
+            operation_id,
+            lambda emit: candidate.backend.first_run(
+                operation_id, candidate.config.profile_id, emit=emit
+            ),
+            settle,
+            candidate=candidate,
+        )
 
-    def _release(self) -> None:
-        self._busy = False
-        self._idle.set()
+    def cancel_pending_installation(self) -> None:
+        """The person walked away from an installation waiting on a decision.
+
+        The candidate it was waiting with is let go. Nothing had started, so
+        nothing else changes; an installation already running is not touched
+        -- this version cannot cancel one safely.
+        """
+        with self._lock:
+            if not self._busy:
+                self._candidate = None
 
     def current_conflict_preflight(self):
         """The conflict ``install`` last raised, without scanning again.
@@ -885,12 +1024,17 @@ class HubApplicationAdapter:
         try:
             result = session.resolve_conflict(selection)
             if result.status is ConflictResolutionStatus.FAILED:
+                # The same decision may be tried again, about the same candidate.
                 session.check_conflicts(profile_id)
-            return result
         except Exception as exc:
+            if selection.policy is ExternalConflictPolicy.ABORT:
+                self.cancel_pending_installation()
             raise HubUnavailable(
                 "Não foi possível processar a decisão sobre os serviços externos."
             ) from exc
+        if result.status is ConflictResolutionStatus.ABORTED:
+            self.cancel_pending_installation()
+        return result
 
     def resolve_conflict(self, selection: ConflictPolicySelection) -> ConflictResolutionResult:
         """Compatibility alias for callers predating the consumer protocol name."""
@@ -899,12 +1043,11 @@ class HubApplicationAdapter:
     def _command(self, name: str) -> str:
         with self._lock:
             operation_id = self._reserve()
-            try:
-                return self._schedule(operation_id, getattr(self.backend, name))
-            except Exception:
-                self._busy = False
-                self._idle.set()
-                raise
+            backend, profile_id = self.backend, self._profile_id()
+            command = getattr(backend, name)
+            return self._launch(
+                operation_id, lambda emit: command(operation_id, profile_id, emit=emit)
+            )
 
     def start_stack(self) -> str:
         return self._command("start_stack")
@@ -918,8 +1061,10 @@ class HubApplicationAdapter:
     def open_webui_target(self) -> LaunchTarget | LaunchRefusal:
         with self._lock:
             operation_id = self._reserve()
+        ending = _Ending(self, operation_id)
+        launch = None
         try:
-            launch = self.backend.open_webui(operation_id, self._profile_id(), emit=self._publish)
+            launch = self.backend.open_webui(operation_id, self._profile_id(), emit=ending.emit)
             if not launch.ok:
                 diagnostics = launch.result.diagnostics
                 return LaunchRefusal(
@@ -929,8 +1074,8 @@ class HubApplicationAdapter:
             return LaunchTarget(launch.target.service_id, launch.target.url, "Open WebUI")
         finally:
             with self._lock:
-                self._busy = False
-                self._idle.set()
+                self._end_operation(None)
+            ending.close(None if launch is None else launch.result, None)
 
     def wait(self, timeout: float | None = None) -> None:
         if not self._idle.wait(timeout):

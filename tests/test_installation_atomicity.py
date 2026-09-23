@@ -137,7 +137,8 @@ def test_a_stop_that_leaves_processes_running_does_not_switch(tmp_path, world):
         install(adapter, custom(first))
         install(adapter, custom(second, "pepe-8gb"))
         world.running.add(second)
-        world.leaves_running.add(second)
+        # The stop reports success, and the registry still finds a process alive.
+        world.survivors.add(second)
 
         adapter.stop_and_switch(first)
         adapter.wait(10)
@@ -157,7 +158,8 @@ def test_a_stop_that_leaves_a_port_occupied_does_not_switch(tmp_path, world):
         install(adapter, custom(first))
         install(adapter, custom(second, "pepe-8gb"))
         world.running.add(second)
-        world.keeps_ports.add(second)
+        # Something that is no installation's holds a port the target needs.
+        world.external_ports.add(8080)
 
         adapter.stop_and_switch(first)
         adapter.wait(10)

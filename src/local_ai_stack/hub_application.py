@@ -151,6 +151,19 @@ class HubApplicationAdapter:
         """Custom install folders this machine attempted, newest first. At most five."""
         return self.state.general.recent_custom_roots
 
+    def _root_display(self) -> str | None:
+        """The folder every command reaches, as a screen may print it.
+
+        Portable and default name no root of their own, so the one they
+        resolved to is what a person needs to see: which installation this is.
+        """
+        root = self.active_root()
+        if root is not None:
+            return str(root)
+        backend = getattr(self.backend, "installation", None)
+        resolved = getattr(backend, "root", None)
+        return None if resolved is None else str(resolved)
+
     def active_root(self) -> Path | None:
         """The folder every command reaches right now. None before the first install."""
         return self.config.installation.root if self.config else None
@@ -177,8 +190,14 @@ class HubApplicationAdapter:
         layout = StackLayout.from_root(entry.root)
         path = config_path(layout)
         config = _installed_config(path)
-        if config is None and path.exists():
-            return "unreadable", "A configuração não pôde ser lida.", entry.last_known_profile
+        if config is None:
+            if path.exists():
+                return "unreadable", "A configuração não pôde ser lida.", entry.last_known_profile
+            return (
+                "unreadable",
+                "Sem a configuração do Hub nesta pasta.",
+                entry.last_known_profile,
+            )
         profile_id = config.profile_id if config else entry.last_known_profile
         if profile_id is not None and profile_id not in {p.id for p in self.profiles}:
             return "unreadable", f"O perfil {profile_id} não existe nesta versão.", profile_id
@@ -195,7 +214,7 @@ class HubApplicationAdapter:
                 if status.installation_ready
                 else ("stopped", "", profile_id)
             )
-        return ("ready" if config is not None else "unknown"), "", profile_id
+        return "ready", "", profile_id
 
     def installation_summaries(self) -> tuple[InstallationSummary, ...]:
         """Every known installation as a row, active one first, then most recent."""
@@ -241,7 +260,11 @@ class HubApplicationAdapter:
         else:
             config = _installed_config(config_path(StackLayout.from_root(target)))
             if config is None:
-                problems.append("Esta pasta não contém uma instalação que o Hub reconheça.")
+                problems.append(
+                    "Esta pasta parece uma instalação, mas não tem a configuração do Hub."
+                    if _looks_installed(target)
+                    else "Esta pasta não contém uma instalação que o Hub reconheça."
+                )
             else:
                 profile_id = config.profile_id
                 if profile_id not in {p.id for p in self.profiles}:
@@ -339,6 +362,12 @@ class HubApplicationAdapter:
                 raise HubError("A pasta escolhida não existe.")
             config = _installed_config(config_path(StackLayout.from_root(target)))
             if config is None:
+                if _looks_installed(target):
+                    raise HubError(
+                        "Esta pasta parece uma instalação, mas não tem a configuração do "
+                        "Hub (state\\config.yaml). Ela pode ter sido criada por outra "
+                        "versão ou fora do Hub. Instale nesta pasta para refazê-la."
+                    )
                 raise HubError(
                     "Esta pasta não contém uma instalação do Hub. "
                     "Escolha a pasta de uma instalação ou crie uma nova."
@@ -406,7 +435,10 @@ class HubApplicationAdapter:
                 "Não foi possível verificar a instalação. Tente novamente."
             ) from exc
         return InstallationView(
-            status.installation_ready, self.config.profile_id, self.config.installation.mode
+            status.installation_ready,
+            self.config.profile_id,
+            self.config.installation.mode,
+            self._root_display(),
         )
 
     def projections(self) -> tuple[InstallationView, ServicesSnapshot, VramSnapshot]:
@@ -421,7 +453,10 @@ class HubApplicationAdapter:
             InstallationView(False)
             if self.config is None
             else InstallationView(
-                status.installation_ready, self.config.profile_id, self.config.installation.mode
+                status.installation_ready,
+                self.config.profile_id,
+                self.config.installation.mode,
+                self._root_display(),
             )
         )
         services = ServicesSnapshot(
@@ -829,6 +864,11 @@ def location_of_config(config: InstalledConfig, root: Path) -> InstallLocation:
     if config.installation.mode is InstallLocationMode.CUSTOM:
         return InstallLocation.custom(root)
     return InstallLocation(config.installation.mode, None)
+
+
+def _looks_installed(root: Path) -> bool:
+    """Whether a folder holds what an installation holds, configuration aside."""
+    return any((root / name).is_dir() for name in ("apps", "models"))
 
 
 def _installed_config(path: Path) -> InstalledConfig | None:

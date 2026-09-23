@@ -165,6 +165,30 @@ def test_choosing_from_the_quick_switch_asks_the_application_to_switch():
     run(exercise)
 
 
+def test_asking_for_the_same_installation_twice_is_the_decision_to_stop_and_switch():
+    """The first request explains; the second is the person saying yes."""
+
+    async def exercise() -> None:
+        fake = installed()
+        fake.switch_requires_stop = True
+        app, _ = hub(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            panel = await open_installation_section(pilot)
+            panel.post_message(InstallPanel.SwitchRequested(PEPINHO))
+            await pilot.pause()
+            await pilot.pause()
+            assert [name for name, _ in fake.managed] == ["switch"]
+
+            panel.post_message(InstallPanel.SwitchRequested(PEPINHO))
+            await pilot.pause()
+            await pilot.pause()
+            # The second request checks again before stopping anything.
+            assert [name for name, _ in fake.managed] == ["switch", "switch", "stop_and_switch"]
+            assert fake.profile_id == "pepe-8gb"
+
+    run(exercise)
+
+
 def test_a_running_installation_is_not_stopped_by_choosing_another_one():
     async def exercise() -> None:
         fake = installed()

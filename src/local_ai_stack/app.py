@@ -550,6 +550,13 @@ class LocalAIStackApp(App):
             return
         try:
             opener(folder)
+        except SwitchRequiresStop as pending:
+            # The folder is now known; switching to it is what has to wait.
+            self._pending_switch = Path(folder)
+            if panel is not None:
+                panel.notice(self._stop_and_switch_question(pending))
+            self.refresh_projections()
+            return
         except HubError as exc:
             if panel is not None:
                 panel.notice(str(exc))
@@ -593,14 +600,20 @@ class LocalAIStackApp(App):
         try:
             switch(message.root)
         except SwitchRequiresStop as pending:
+            if self._pending_switch is not None and str(self._pending_switch) == str(message.root):
+                # Asked twice for the same installation: that is the decision.
+                self._pending_switch = None
+                self._operation_kind = "switch"
+                try:
+                    self.application.stop_and_switch(message.root)
+                except HubError as exc:
+                    self._operation_kind = None
+                    if panel is not None:
+                        panel.notice(str(exc))
+                return
             self._pending_switch = message.root
             if panel is not None:
-                panel.notice(
-                    f"{pending.plan.running_profile or 'A instalação atual'} ainda está em "
-                    "execução. Para trocar, o Hub precisa parar os serviços gerenciados e "
-                    "confirmar que as portas foram liberadas. Processos externos não serão "
-                    "encerrados. Pressione Trocar instalação novamente para parar e trocar."
-                )
+                panel.notice(self._stop_and_switch_question(pending))
             return
         except HubError as exc:
             if panel is not None:
@@ -609,6 +622,16 @@ class LocalAIStackApp(App):
         if panel is not None:
             panel.notice("")
         self._after_installation_change()
+
+    def _stop_and_switch_question(self, pending: SwitchRequiresStop) -> str:
+        """What has to happen before another installation can be used, in one paragraph."""
+        running = pending.plan.running_profile or "A instalação atual"
+        return (
+            f"{running} ainda está em execução. Para usar a outra instalação, o Hub precisa "
+            "parar os serviços gerenciados e confirmar que as portas foram liberadas. "
+            "Processos externos não serão encerrados. Escolha a mesma instalação novamente "
+            "para parar e trocar."
+        )
 
     def on_install_panel_open_folder_requested(
         self, message: InstallPanel.OpenFolderRequested

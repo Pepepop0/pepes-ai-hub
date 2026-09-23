@@ -1389,6 +1389,8 @@ def test_real_tui_stop_confirmation_uses_only_adapter_preflight_authority(compos
                 await settle(pilot)
                 await review(pilot, profile="test")
                 await click(pilot, "#wizard-next")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
                 assert app.screen.state.step is WizardStep.CONFLICT
                 assert adapter.current_operation() is None
 
@@ -1444,6 +1446,8 @@ def test_real_tui_unsafe_external_hides_stop_and_allows_alongside(composition):
                 await settle(pilot)
                 await review(pilot, profile="test")
                 await click(pilot, "#wizard-next")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
                 report = adapter.current_conflict_preflight()
                 assert report is not None and not report.conflicts[0].can_stop_safely
                 assert not app.screen.query_one("#wizard-conflict-stop", Button).display
@@ -1486,6 +1490,10 @@ def test_real_tui_blocked_alternate_endpoint_cancels_without_mutation(compositio
                 await settle(pilot)
                 await review(pilot, profile="test", mode="custom", root=custom_root)
                 await click(pilot, "#wizard-next")
+                # The preflight runs in the install worker: read its answer once
+                # the worker has given it, not while it may still be scanning.
+                await app.workers.wait_for_complete()
+                await pilot.pause()
                 report = adapter.current_conflict_preflight()
                 assert report is not None and report.disposition.value == "blocked"
                 first_id = report.preflight_id
@@ -1503,6 +1511,8 @@ def test_real_tui_blocked_alternate_endpoint_cancels_without_mutation(compositio
                 assert adapter.current_operation() is None
 
                 await click(pilot, "#wizard-next")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
                 retry = adapter.current_conflict_preflight()
                 assert retry is not None and retry.preflight_id != first_id
                 assert app.screen.state.step is WizardStep.CONFLICT

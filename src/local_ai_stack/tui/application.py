@@ -130,6 +130,22 @@ class InstallationSummary:
 
 
 @dataclass(frozen=True)
+class StorageEstimate:
+    """What an installation is known to download, and what the disk has for it.
+
+    ``complete`` is False when something the profile needs was pinned without a
+    recorded size, and the screen then says "at least". ``fits`` is None when
+    nothing can be said -- an unknown download, an unreadable volume -- and the
+    screen says nothing rather than guessing.
+    """
+
+    known_bytes: int = 0
+    complete: bool = True
+    free_bytes: int | None = None
+    fits: bool | None = None
+
+
+@dataclass(frozen=True)
 class SwitchPlan:
     """What switching to another installation would do, before anything is done."""
 
@@ -241,6 +257,7 @@ __all__ = [
     "LaunchTarget",
     "OperationBusy",
     "ProfileChoice",
+    "StorageEstimate",
     "SwitchPlan",
     "SwitchRequiresStop",
 ]

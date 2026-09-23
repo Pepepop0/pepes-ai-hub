@@ -28,7 +28,7 @@ from ..renderer import PetRenderer
 from ..runtime import StackRuntime
 from ..system import SystemFacts
 from .appearance import TuiAppearance
-from .application import InstallationView
+from .application import InstallationSummary, InstallationView
 from .navigation import (
     DEFAULT_ITEM,
     SECTION_ITEMS,
@@ -68,8 +68,8 @@ class InstallationLocationPanel(VerticalScroll):
         self.repo_root = repo_root
 
     def compose(self) -> ComposeResult:
-        yield Static("[b]Installation location[/b]", id="installation-location-title")
-        yield Label("Mode", id="installation-mode-label")
+        yield Static("[b]Pasta da instalação[/b]", id="installation-location-title")
+        yield Label("Como instalar", id="installation-mode-label")
         yield Select(
             self.OPTIONS,
             value=self.location.mode,
@@ -77,7 +77,7 @@ class InstallationLocationPanel(VerticalScroll):
             id="installation-location-mode",
         )
         custom = self.location.root if self.location.mode is InstallLocationMode.CUSTOM else None
-        yield Label("Absolute custom path", id="installation-custom-label")
+        yield Label("Pasta personalizada", id="installation-custom-label")
         yield Input(
             "" if custom is None else str(custom),
             placeholder=r"D:\PepitosAIHub",
@@ -86,7 +86,7 @@ class InstallationLocationPanel(VerticalScroll):
         yield Static("", id="installation-location-error")
         yield Static("", id="installation-location-preview")
         yield Static(
-            "Preview only. Resolving this location creates no directories.",
+            "Apenas visualização. Nada é criado ao resolver esta pasta.",
             id="installation-location-note",
         )
 
@@ -135,7 +135,7 @@ class InstallationLocationPanel(VerticalScroll):
         self.location = location
         self.query_one("#installation-location-error", Static).update("")
         self.query_one("#installation-location-preview", Static).update(
-            f"Resolved root\n[b]{display_path(resolved.root)}[/b]"
+            f"Pasta resolvida\n[b]{display_path(resolved.root)}[/b]"
         )
 
 
@@ -180,7 +180,7 @@ class InstallPlanPanel(VerticalScroll):
 
     def compose(self) -> ComposeResult:
         yield Static(self._plan_text(), id="install-plan-steps")
-        yield Button("Preview dry-run", id="plan-dry-run", variant="primary")
+        yield Button("Ver plano", id="plan-dry-run", variant="primary")
         yield Static(render_plan_execution(None), id="install-plan-dry-run")
         yield Static(
             "[dim]Esta prévia não altera a instalação. Use o assistente de instalação "
@@ -272,7 +272,7 @@ class InstallPlanPanel(VerticalScroll):
             return (
                 plan_text,
                 placeholder(
-                    "Dry-run preview",
+                    "Plano detalhado",
                     "The install location could not be resolved, so there is no plan to preview.",
                 ),
                 None,
@@ -475,11 +475,25 @@ class DashboardPanel(VerticalScroll):
         self.set_busy(view)
 
     def set_busy(self, view: OperationView | None) -> None:
-        """While an operation runs, nothing else may be asked for."""
+        """While an operation runs, nothing else may be asked for.
+
+        Outside an operation the stack decides what is worth offering: a
+        stopped stack is started, a running one is opened, restarted or
+        stopped. Nothing is hidden that a person may still need -- a degraded
+        stack can be restarted -- it is only ordered by what is useful now.
+        """
         busy = view is not None and not view.terminal
         ready = self.installation.ready
-        for button_id in ("dashboard-start", "dashboard-restart", "dashboard-stop"):
-            self.query_one(f"#{button_id}", Button).disabled = busy or not ready
+        state = stack_summary(self.services) if ready else ""
+        # Only what plainly does not apply is taken away: a stack that is
+        # already ready is not started, one that is plainly stopped is not
+        # stopped again. Anything in between stays available, because the
+        # application is the one that decides what a command can do.
+        self.query_one("#dashboard-start", Button).disabled = busy or not ready or state == "Pronta"
+        for button_id in ("dashboard-restart", "dashboard-stop"):
+            self.query_one(f"#{button_id}", Button).disabled = (
+                busy or not ready or state == "Parada"
+            )
         self.query_one("#dashboard-open-webui", Button).disabled = (
             busy or not ready or self.launching
         )
@@ -494,48 +508,282 @@ class DashboardPanel(VerticalScroll):
         self.query_one("#dashboard-notice", Static).update(text)
 
 
-class InstallPanel(VerticalScroll):
-    """The Installation section's front door: reopen the wizard, watch the last install."""
+# How an installation's observed state is written for a person.
+STATUS_WORDS = {
+    "ready": "Pronta",
+    "running": "Em execução",
+    "stopped": "Parada",
+    "missing": "Pasta indisponível",
+    "unreadable": "Configuração ilegível",
+    "unknown": "Estado desconhecido",
+}
 
-    def __init__(self, installation: InstallationView, profile_name: str) -> None:
+MODE_WORDS = {
+    InstallLocationMode.DEFAULT: "Padrão",
+    InstallLocationMode.PORTABLE: "Portátil",
+    InstallLocationMode.CUSTOM: "Personalizada",
+}
+
+
+def installation_label(summary: InstallationSummary) -> str:
+    """One short line for the quick switch: which profile, and which folder."""
+    name = summary.profile_name or summary.profile_id or "Instalação"
+    root = str(summary.root)
+    if len(root) > 46:
+        root = f"...{root[-43:]}"
+    return f"{name} - {root}"
+
+
+class InstallPanel(VerticalScroll):
+    """Where installations are managed: the one in use, and every one the Hub knows.
+
+    Four ways in, on purpose. The quick switch is for changing installation in
+    one movement; the list is for seeing what exists, what state it is in and
+    what can be done about it; the folder picker adopts an installation the Hub
+    has never seen or finds one whose folder moved; and a new installation
+    never replaces the one in use until it finishes.
+    """
+
+    class SwitchRequested(Message):
+        def __init__(self, root: Path) -> None:
+            super().__init__()
+            self.root = root
+
+    class OpenFolderRequested(Message):
+        """Pick a folder that already holds an installation."""
+
+    class LocateRequested(Message):
+        def __init__(self, root: Path) -> None:
+            super().__init__()
+            self.root = root
+
+    class ForgetRequested(Message):
+        def __init__(self, root: Path) -> None:
+            super().__init__()
+            self.root = root
+
+    class RepairRequested(Message):
+        """Check the installation in use and repair what is missing."""
+
+    class NewInstallationRequested(Message):
+        """Install another stack, keeping the one in use."""
+
+    class OpenRootRequested(Message):
+        def __init__(self, root: Path) -> None:
+            super().__init__()
+            self.root = root
+
+    def __init__(
+        self,
+        installation: InstallationView,
+        profile_name: str,
+        summaries: tuple[InstallationSummary, ...] = (),
+        *,
+        can_pick_folder: bool = False,
+    ) -> None:
         super().__init__(id=route_id(Section.INSTALLATION, "install"), classes="route-view")
         self.installation = installation
         self.profile_name = profile_name
+        self.summaries = summaries
+        self.can_pick_folder = can_pick_folder
+        self.selected_root: Path | None = None
+
+    # --- composition --------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Static(self._summary(), id="install-summary")
-        yield Button(self._button_label(), id="install-open-wizard", variant="primary")
-        yield OperationPanel("Nenhuma instalação em andamento.", id="install-operation")
-
-    def _button_label(self) -> str:
-        return "Reinstalar" if self.installation.ready else "Instalar"
-
-    def _summary(self) -> str:
-        if self.installation.checking:
-            return "[b]Instalação[/b]\n\n[dim]Verificando a instalação...[/dim]"
-        if not self.installation.ready:
-            return (
-                "[b]Instalação[/b]\n\n"
-                "Nenhuma stack instalada nesta máquina.\n"
-                "O assistente escolhe o perfil e o local e cuida do resto."
+        yield Static(self._current_text(), id="install-summary")
+        with Horizontal(id="install-quick-switch"):
+            yield Select(
+                self._switch_options(),
+                prompt="Trocar instalação",
+                allow_blank=True,
+                id="install-switch-select",
             )
-        lines = ["[b]Instalação[/b]", "", f"Perfil: [b]{escape(self.profile_name)}[/b]"]
-        if self.installation.mode is not None:
-            lines.append(f"Local: {escape(self.installation.mode.value)}")
-        if self.installation.root_display:
-            lines.append(f"Pasta: {escape(self.installation.root_display)}")
+        with Horizontal(id="install-current-actions"):
+            yield Button("Trocar instalação", id="install-change", variant="primary")
+            yield Button("Abrir pasta", id="install-open-root")
+            yield Button("Verificar e reparar", id="install-repair")
+        yield Static(self._known_text(), id="install-known")
+        with Horizontal(id="install-known-actions"):
+            yield Button("Abrir instalação existente", id="install-open-existing")
+            yield Button("Nova instalação", id="install-open-wizard")
+        with Horizontal(id="install-row-actions"):
+            yield Button("Localizar pasta", id="install-locate")
+            yield Button("Esquecer da lista", id="install-forget")
+        yield Static("", id="install-notice")
+        yield OperationPanel("Nenhuma operação em andamento.", id="install-operation")
+
+    def on_mount(self) -> None:
+        for indicator in self.query(".down-arrow"):
+            indicator.update("v")
+        for indicator in self.query(".up-arrow"):
+            indicator.update("^")
+        self._apply()
+
+    # --- what the screen says -----------------------------------------------
+
+    def _active(self) -> InstallationSummary | None:
+        return next((row for row in self.summaries if row.active), None)
+
+    def _others(self) -> tuple[InstallationSummary, ...]:
+        return tuple(row for row in self.summaries if not row.active)
+
+    def _switch_options(self) -> list[tuple[str, str]]:
+        return [(installation_label(row), str(row.root)) for row in self._others() if row.usable]
+
+    def _current_text(self) -> str:
+        if self.installation.checking:
+            return "[b]Instalação atual[/b]\n\n[dim]Verificando a instalação...[/dim]"
+        active = self._active()
+        if not self.installation.ready and active is None:
+            return (
+                "[b]Instalação atual[/b]\n\n"
+                "Nenhuma instalação nesta máquina.\n"
+                "O assistente escolhe o perfil e a pasta e cuida do resto."
+            )
+        name = (active.profile_name if active else None) or self.profile_name
+        lines = ["[b]Instalação atual[/b]", "", f"[b]{escape(name)}[/b]"]
+        if active is not None:
+            state = STATUS_WORDS.get(active.status, STATUS_WORDS["unknown"])
+            lines.append(f"{state} - {MODE_WORDS.get(active.mode, active.mode.value)}")
+            lines.append(escape(str(active.root)))
+        else:
+            if self.installation.mode is not None:
+                lines.append(MODE_WORDS.get(self.installation.mode, self.installation.mode.value))
+            if self.installation.root_display:
+                lines.append(escape(self.installation.root_display))
         return "\n".join(lines)
 
-    def refresh_installation(self, installation: InstallationView, profile_name: str) -> None:
+    def _known_text(self) -> str:
+        lines = ["[b]Instalações conhecidas[/b]", ""]
+        if not self.summaries:
+            lines.append("[dim]Nenhuma instalação conhecida ainda.[/dim]")
+            return "\n".join(lines)
+        for row in self.summaries:
+            mark = "[b]Atual[/b]" if row.active else (">" if self._is_selected(row) else " ")
+            name = escape(row.profile_name or row.profile_id or "Instalação")
+            state = STATUS_WORDS.get(row.status, STATUS_WORDS["unknown"])
+            lines.append(f"{mark:6} {name:10} {state:20} {escape(str(row.root))}")
+            if row.detail:
+                lines.append(f"       [dim]{escape(row.detail)}[/dim]")
+        lines.append("")
+        lines.append(
+            "[dim]Esquecer remove apenas esta instalação da lista. "
+            "Nenhum arquivo será apagado.[/dim]"
+        )
+        return "\n".join(lines)
+
+    def _is_selected(self, row: InstallationSummary) -> bool:
+        return self.selected_root is not None and str(row.root) == str(self.selected_root)
+
+    # --- state --------------------------------------------------------------
+
+    def refresh_installation(
+        self,
+        installation: InstallationView,
+        profile_name: str,
+        summaries: tuple[InstallationSummary, ...] | None = None,
+    ) -> None:
         self.installation = installation
         self.profile_name = profile_name
-        self.query_one("#install-summary", Static).update(self._summary())
-        self.query_one("#install-open-wizard", Button).label = self._button_label()
+        if summaries is not None:
+            self.summaries = summaries
+            known = {str(row.root) for row in summaries}
+            if self.selected_root is not None and str(self.selected_root) not in known:
+                self.selected_root = None
+        self._apply()
+
+    def notice(self, message: str) -> None:
+        self.query_one("#install-notice", Static).update(escape(message) if message else "")
+
+    def _apply(self) -> None:
+        self.query_one("#install-summary", Static).update(self._current_text())
+        self.query_one("#install-known", Static).update(self._known_text())
+        select = self.query_one("#install-switch-select", Select)
+        options = self._switch_options()
+        select.set_options(options)
+        select.disabled = not options
+        installed = self.installation.ready or self._active() is not None
+        self.query_one("#install-open-wizard", Button).label = (
+            "Nova instalação" if installed else "Instalar"
+        )
+        self.query_one("#install-change", Button).disabled = not options
+        self.query_one("#install-repair", Button).disabled = not installed
+        self.query_one("#install-open-root", Button).disabled = self._active() is None
+        self.query_one("#install-open-existing", Button).disabled = not self.can_pick_folder
+        selected = next(
+            (row for row in self.summaries if self._is_selected(row)),
+            None,
+        )
+        self.query_one("#install-locate", Button).disabled = not (
+            selected is not None and selected.missing and self.can_pick_folder
+        )
+        self.query_one("#install-forget", Button).disabled = selected is None or selected.active
+
+    def select_row(self, root: Path | str | None) -> None:
+        """Point at one known installation, so the row actions apply to it."""
+        self.selected_root = None if root is None else Path(str(root))
+        self._apply()
 
     def show_operation(self, view: OperationView | None, *, heading: str | None = None) -> None:
         self.query_one(OperationPanel).show(view, heading=heading)
         busy = view is not None and not view.terminal
-        self.query_one("#install-open-wizard", Button).disabled = busy
+        for button_id in (
+            "install-open-wizard",
+            "install-change",
+            "install-repair",
+            "install-open-existing",
+            "install-locate",
+            "install-forget",
+        ):
+            self.query_one(f"#{button_id}", Button).disabled = (
+                True if busy else self.query_one(f"#{button_id}", Button).disabled
+            )
+        if not busy:
+            self._apply()
+
+    # --- input --------------------------------------------------------------
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "install-switch-select":
+            return
+        value = event.value
+        if value is Select.BLANK or not value:
+            return
+        event.select.value = Select.BLANK
+        self.post_message(self.SwitchRequested(Path(str(value))))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id not in {
+            "install-change",
+            "install-open-root",
+            "install-repair",
+            "install-open-existing",
+            "install-open-wizard",
+            "install-locate",
+            "install-forget",
+        }:
+            return
+        event.stop()
+        if button_id == "install-change":
+            select = self.query_one("#install-switch-select", Select)
+            select.focus()
+            self.notice("Escolha a instalação para a qual quer trocar.")
+        elif button_id == "install-open-root":
+            active = self._active()
+            if active is not None:
+                self.post_message(self.OpenRootRequested(active.root))
+        elif button_id == "install-repair":
+            self.post_message(self.RepairRequested())
+        elif button_id == "install-open-existing":
+            self.post_message(self.OpenFolderRequested())
+        elif button_id == "install-open-wizard":
+            self.post_message(self.NewInstallationRequested())
+        elif button_id == "install-locate" and self.selected_root is not None:
+            self.post_message(self.LocateRequested(self.selected_root))
+        elif button_id == "install-forget" and self.selected_root is not None:
+            self.post_message(self.ForgetRequested(self.selected_root))
 
 
 class ServicesPanel(VerticalScroll):
@@ -580,11 +828,15 @@ class MainContent(ContentSwitcher):
         vram: VramSnapshot,
         integration: IntegrationSnapshot | None = None,
         executor_factory: PlanExecutorFactory | None = None,
+        summaries: tuple[InstallationSummary, ...] = (),
+        can_pick_folder: bool = False,
     ) -> None:
         super().__init__(
             id="main-content",
             initial=route_id(Section.DASHBOARD, DEFAULT_ITEM[Section.DASHBOARD]),
         )
+        self.summaries = summaries
+        self.can_pick_folder = can_pick_folder
         self.facts = facts
         self.runtime_snapshot = runtime
         self.profiles = profiles
@@ -612,7 +864,12 @@ class MainContent(ContentSwitcher):
         )
         yield ServicesPanel(self.runtime_snapshot, self.integration)
 
-        yield InstallPanel(self.installation, self.selected_profile.name)
+        yield InstallPanel(
+            self.installation,
+            self.selected_profile.name,
+            self.summaries,
+            can_pick_folder=self.can_pick_folder,
+        )
         yield ProfilePanel(self.profiles, self.selected_profile, self.facts)
         yield InstallationLocationPanel(self.config.installation, self.repo_root)
         yield InstallPlanPanel(
@@ -662,14 +919,20 @@ class MainContent(ContentSwitcher):
         self.query_one(InstallPlanPanel).refresh_plan(config=config)
 
     def refresh_overview(
-        self, installation: InstallationView, services: ServicesSnapshot, vram: VramSnapshot
+        self,
+        installation: InstallationView,
+        services: ServicesSnapshot,
+        vram: VramSnapshot,
+        summaries: tuple[InstallationSummary, ...] | None = None,
     ) -> None:
         self.installation = installation
         self.services = services
         self.vram = vram
+        if summaries is not None:
+            self.summaries = summaries
         name = self.selected_profile.name
         self.query_one(DashboardPanel).refresh_overview(installation, name, services, vram)
-        self.query_one(InstallPanel).refresh_installation(installation, name)
+        self.query_one(InstallPanel).refresh_installation(installation, name, self.summaries)
 
     def show_operation(self, view: OperationView | None, *, heading: str | None = None) -> None:
         self.query_one(DashboardPanel).show_operation(view, heading=heading)
@@ -735,6 +998,13 @@ class PetSlot(Static):
         self.update(text)
 
 
+# Below this width the rail is narrow; below the next, it is not drawn at all,
+# because an 80x24 terminal needs every column for what a person must reach.
+RAIL_NARROW_COLUMNS = 120
+RAIL_MINIMUM_COLUMNS = 90
+RAIL_MINIMUM_ROWS = 25
+
+
 class RightRail(Vertical):
     def __init__(
         self,
@@ -776,7 +1046,7 @@ class RightRail(Vertical):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="rail-content"):
-            yield Static("Profile", classes="rail-heading")
+            yield Static("Perfil", classes="rail-heading")
             yield Static(self.profile.name, id="rail-profile", classes="rail-value")
             yield PetSlot(
                 self.appearance.pet_text,
@@ -787,7 +1057,7 @@ class RightRail(Vertical):
             yield Static(self._gpu_text(), id="rail-gpu")
             yield Static("Stack", classes="rail-heading")
             yield Static(self._stack_text(), id="rail-stack", classes="rail-value")
-        yield Button("Expand" if self.is_collapsed else "Collapse", id="right-rail-toggle")
+        yield Button("Expandir" if self.is_collapsed else "Recolher", id="right-rail-toggle")
 
     def update_status(self, services: ServicesSnapshot, vram: VramSnapshot) -> None:
         """Fresh projections from the application; the rail only repeats them."""
@@ -804,10 +1074,26 @@ class RightRail(Vertical):
         """Give back rail width when the terminal cannot spare it."""
         self.set_class(narrow, "narrow")
 
+    def fit_to(self, width: int, height: int) -> None:
+        """Three sizes of terminal, three answers.
+
+        Wide enough: the rail as it is. Narrow: the rail, narrow, so the
+        content keeps the columns it needs. Small enough that the rail would
+        cost the content its buttons: no rail at all -- nothing critical is
+        ever only here, and ctrl+r brings it back.
+        """
+        hidden = width < RAIL_MINIMUM_COLUMNS or height < RAIL_MINIMUM_ROWS
+        self.display = not hidden
+        self.set_narrow(width < RAIL_NARROW_COLUMNS)
+        pet = self.query(PetSlot)
+        for slot in pet:
+            # A pet nobody can see does not animate.
+            slot.display = not hidden
+
     def toggle_collapsed(self) -> None:
         self.toggle_class("collapsed")
         self.query_one("#right-rail-toggle", Button).label = (
-            "Expand" if self.is_collapsed else "Collapse"
+            "Expandir" if self.is_collapsed else "Recolher"
         )
 
     def select_profile(self, profile: Profile, appearance: TuiAppearance) -> None:

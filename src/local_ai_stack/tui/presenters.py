@@ -15,6 +15,7 @@ from ..external_conflict_contracts import (
     ExternalConflictPolicy,
     ExternalServiceConflict,
 )
+from ..installation import InstallLocationMode
 from ..integration import ComponentIntegration
 from ..operation_contracts import (
     OperationActivity,
@@ -99,36 +100,36 @@ def render_profile_details(profile: Profile, facts: SystemFacts) -> str:
     report = evaluate_compatibility(facts, profile)
     requirement = profile.hardware
     status = (
-        "[bold green]COMPATIBLE[/bold green]"
+        "[bold green]COMPATÍVEL[/bold green]"
         if report.compatible
-        else "[bold red]INCOMPATIBLE[/bold red]"
+        else "[bold red]INCOMPATÍVEL[/bold red]"
     )
     lines = [
         f"[b]{escape(profile.name)}[/b]",
         "",
         escape(terminal_text(profile.description)),
         "",
-        "[b]Requirements[/b]",
-        f"OS: {escape(requirement.os)}",
-        f"GPU vendor: {escape(requirement.gpu_vendor)}",
-        f"Minimum VRAM: {requirement.min_vram_mib} MiB",
-        f"Recommended VRAM: {requirement.recommended_vram_mib} MiB",
-        f"VRAM reporting tolerance: {requirement.vram_tolerance_mib} MiB",
+        "[b]Requisitos[/b]",
+        f"Sistema: {escape(requirement.os)}",
+        f"Placa de vídeo: {escape(requirement.gpu_vendor)}",
+        f"VRAM mínima: {requirement.min_vram_mib} MiB",
+        f"VRAM recomendada: {requirement.recommended_vram_mib} MiB",
+        f"Tolerância de leitura da VRAM: {requirement.vram_tolerance_mib} MiB",
         "",
-        f"[b]Compatibility[/b]  {status}",
+        f"[b]Compatibilidade[/b]  {status}",
     ]
     if report.selected_gpu is not None:
         lines.append(
-            f"GPU used: {escape(report.selected_gpu.name)} - "
+            f"GPU detectada: {escape(report.selected_gpu.name)} - "
             f"{report.selected_gpu.vram_total_mib} MiB "
             f"({report.selected_gpu.vram_total_mib / MIB_PER_GIB:.1f} GiB displayed)"
         )
     for blocker in report.blockers:
-        lines.append(f"[red]BLOCKER - {escape(terminal_text(blocker.message))}[/red]")
+        lines.append(f"[red]Impedimento - {escape(terminal_text(blocker.message))}[/red]")
     for warning in report.warnings:
-        lines.append(f"[yellow]WARNING - {escape(terminal_text(warning.message))}[/yellow]")
+        lines.append(f"[yellow]Atenção - {escape(terminal_text(warning.message))}[/yellow]")
     if not report.blockers and not report.warnings:
-        lines.append("No compatibility issues detected.")
+        lines.append("Nenhum problema de compatibilidade.")
     lines.extend(["", render_install_plan(build_install_plan(profile))])
     return "\n".join(lines)
 
@@ -277,7 +278,7 @@ def render_install_stack(profile: Profile) -> str:
     lines = [
         "[b]Stack selection[/b]",
         "",
-        f"Profile: {escape(profile.name)}",
+        f"Perfil: {escape(profile.name)}",
         "Enabled services:",
     ]
     lines.extend(
@@ -295,33 +296,42 @@ def render_install_stack(profile: Profile) -> str:
 
 
 def render_general_settings(config: InstalledConfig) -> str:
+    """What this installation is, as a reading -- not as something to change here.
+
+    Changing the profile or the folder is an installation decision, and it is
+    made where installations are managed. This says which one is in use, with
+    the technical ids kept where they belong: in the details.
+    """
     return "\n".join(
         [
-            "[b]General settings[/b]",
+            "[b]Esta instalação[/b]",
             "",
-            f"Profile: {escape(config.profile_id)}",
+            f"Perfil: {escape(config.profile_id)}",
             f"Stack: {escape(config.stack_id)}",
-            f"Installation mode: {escape(config.installation.mode.value)}",
+            f"Como instalada: {escape(MODE_NAMES.get(config.installation.mode, ''))}",
             "",
-            "[dim]Configuration is active in memory only. Nothing is persisted yet.[/dim]",
+            "[dim]Para trocar de instalação, use a seção Instalação.[/dim]",
         ]
     )
 
 
 def render_interface_settings(config: InstalledConfig) -> str:
     ui = config.general.ui
-    theme = ui.theme or "Profile default"
-    pet = ui.pet or "Profile default"
+    theme = ui.theme or "Padrão do perfil"
+    pet = ui.pet or "Padrão do perfil"
     return "\n".join(
         [
-            "[b]Interface settings[/b]",
+            "[b]Interface[/b]",
             "",
-            f"Theme: {escape(theme)}",
-            f"Pet: {escape(pet)}",
-            f"Right rail visible: {'yes' if ui.right_rail_visible else 'no'}",
-            f"Right rail expanded: {'yes' if ui.right_rail_expanded else 'no'}",
+            f"Tema: {escape(theme)}",
+            f"Mascote: {escape(pet)}",
+            f"Barra lateral visível: {'sim' if ui.right_rail_visible else 'não'}",
+            f"Barra lateral expandida: {'sim' if ui.right_rail_expanded else 'não'}",
             "",
-            "[dim]Unset theme and pet values inherit the selected profile defaults.[/dim]",
+            (
+                "[dim]Tema e mascote sem valor seguem o padrão do perfil. "
+                "Ctrl+R mostra ou esconde a barra lateral.[/dim]"
+            ),
         ]
     )
 
@@ -335,10 +345,10 @@ def placeholder(title: str, message: str) -> str:
 # Service health as a person reads it. The vocabulary is the contract's; the
 # words are ours.
 HEALTH_LABELS: dict[str, str] = {
-    "UP": "Running",
-    "DOWN": "Stopped",
-    "DEGRADED": "Degraded",
-    "UNKNOWN": "Unknown",
+    "UP": "Em execução",
+    "DOWN": "Parada",
+    "DEGRADED": "Parcial",
+    "UNKNOWN": "Desconhecido",
 }
 
 SERVICE_NAMES: dict[str, str] = {
@@ -382,6 +392,15 @@ def render_vram(vram: VramSnapshot, gpu_name: str | None = None) -> str:
     return "\n".join(escape(line) for line in lines)
 
 
+# The install location, in the words the interface speaks. The value stored is
+# an id; this is the only place that turns it into something a person reads.
+MODE_NAMES = {
+    InstallLocationMode.DEFAULT: "Padrão",
+    InstallLocationMode.PORTABLE: "Portátil",
+    InstallLocationMode.CUSTOM: "Personalizada",
+}
+
+
 def render_overview(
     installation: InstallationView,
     profile_name: str,
@@ -389,8 +408,18 @@ def render_overview(
     vram: VramSnapshot,
     gpu_name: str | None,
 ) -> str:
-    """The Dashboard as the first thing a person sees: what is there, and whether it runs."""
-    lines = [f"Profile: [b]{escape(profile_name)}[/b]", ""]
+    """The Dashboard as the first thing a person sees: what is there, and whether it runs.
+
+    Which installation this is -- the profile, the folder, how it was installed
+    -- is part of the answer: a machine can hold several, and a person acting
+    on the wrong one is the mistake this heading exists to prevent.
+    """
+    lines = [f"Perfil: [b]{escape(profile_name)}[/b]"]
+    if installation.root_display:
+        lines.append(escape(installation.root_display))
+    if installation.mode is not None:
+        lines.append(MODE_NAMES.get(installation.mode, installation.mode.value))
+    lines.append("")
     if installation.checking:
         lines.append("[dim]Verificando a instalação...[/dim]")
         return "\n".join(lines)

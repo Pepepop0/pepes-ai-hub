@@ -103,7 +103,7 @@ def test_the_dashboard_draws_and_answers_keys_while_the_application_is_still_wor
             await settle(pilot)
             overview = text(app, "#dashboard-overview")
             assert "Verificando" not in overview
-            assert "Profile: [b]Capella[/b]" in overview
+            assert "Perfil: [b]Capella[/b]" in overview
             assert not app.query_one("#dashboard-open-webui", Button).disabled
 
     run(exercise)
@@ -132,7 +132,7 @@ def test_a_refresh_after_an_operation_does_not_block_the_screen():
         app = shell_for(slow)
         async with app.run_test(size=(100, 32)) as pilot:
             await settle(pilot)
-            assert "Profile: [b]Capella[/b]" in text(app, "#dashboard-overview")
+            assert "Perfil: [b]Capella[/b]" in text(app, "#dashboard-overview")
             slow.gate.clear()  # ...then every answer waits again
             slow.asked.clear()
             app.refresh_projections()

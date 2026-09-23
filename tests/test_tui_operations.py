@@ -163,8 +163,8 @@ def test_opening_with_an_installation_goes_straight_to_the_dashboard():
             await pilot.pause()
             assert not isinstance(app.screen, WizardScreen)
             overview = str(app.query_one("#dashboard-overview", Static).content)
-            assert "Profile: [b]Capella[/b]" in overview
-            assert overview.count("Running") == 3
+            assert "Perfil: [b]Capella[/b]" in overview
+            assert overview.count("Em execução") == 3
             assert "Stack: [b]Pronta[/b]" in overview
             assert not app.query_one("#dashboard-open-webui", Button).disabled
 
@@ -391,8 +391,8 @@ def test_a_successful_install_ends_on_done_with_open_webui():
             await click(pilot, "#wizard-finish")
             assert not isinstance(app.screen, WizardScreen)
             overview = str(app.query_one("#dashboard-overview", Static).content)
-            assert "Profile: [b]Capella[/b]" in overview
-            assert overview.count("Running") == 3
+            assert "Perfil: [b]Capella[/b]" in overview
+            assert overview.count("Em execução") == 3
             assert str(app.query_one("#rail-profile", Static).content) == "Capella"
             assert str(app.query_one("#rail-stack", Static).content) == "Pronta"
 
@@ -566,7 +566,7 @@ def test_the_dashboard_shows_profile_services_gpu_and_one_primary_action():
         async with app.run_test(size=(100, 32)) as pilot:
             await pilot.pause()
             overview = str(app.query_one("#dashboard-overview", Static).content)
-            assert "Profile: [b]Capella[/b]" in overview
+            assert "Perfil: [b]Capella[/b]" in overview
             for name in ("Ollama", "Open WebUI", "ComfyUI"):
                 assert name in overview
             assert "NVIDIA GeForce RTX 5070" in overview
@@ -592,7 +592,7 @@ def test_service_status_changes_are_reflected_after_a_refresh():
             app.refresh_projections()
             await pilot.pause()
             overview = str(app.query_one("#dashboard-overview", Static).content)
-            assert "Stopped" in overview and overview.count("Running") == 2
+            assert "Parada" in overview and overview.count("Em execução") == 2
             assert "Parcialmente disponível" in overview
             assert str(app.query_one("#rail-stack", Static).content) == "Parcialmente disponível"
 
@@ -619,15 +619,20 @@ def test_stack_commands_ask_the_application_and_follow_the_operation(button, com
             assert fake.calls == [(command, None)]
             await pump(pilot, fake, 2)
             panel = app.query_one(DashboardPanel)
-            assert panel.query_one("#dashboard-start", Button).disabled, "busy while it runs"
+            for button_id in ("dashboard-start", "dashboard-stop", "dashboard-restart"):
+                assert panel.query_one(f"#{button_id}", Button).disabled, "busy while it runs"
             assert "[b]Em andamento[/b]" in str(
                 app.query_one("#dashboard-operation", Static).content
             )
             await pump(pilot, fake)
-            assert not panel.query_one("#dashboard-start", Button).disabled
+            # The buttons follow the stack: a stopped one is started, a running
+            # one is restarted or stopped.
+            settled = "dashboard-restart" if health == "UP" else "dashboard-start"
+            assert not panel.query_one(f"#{settled}", Button).disabled
             overview = str(app.query_one("#dashboard-overview", Static).content)
-            expected = "Running" if health == "UP" else "Stopped"
-            assert overview.count(expected) == 3
+            # Once per service; the line that sums the stack up says "Pronta".
+            expected = "Em execução" if health == "UP" else "Parada"
+            assert overview.count(expected) == (3 if health == "UP" else 4)
 
     run(exercise)
 
@@ -843,12 +848,14 @@ def test_settings_show_only_real_options():
             await pilot.press("3")
             await pilot.pause()
             general = str(app.query_one("#view-settings-general", Static).content)
-            assert "Profile: capella" in general
-            assert "Installation mode:" in general
+            assert "Perfil: capella" in general
+            assert "Como instalada:" in general
+            # Settings describes the installation; changing it lives elsewhere.
+            assert "Instalação" in general
             await click(pilot, "#side-settings-interface")
             interface = str(app.query_one("#view-settings-interface", Static).content)
-            assert "Theme:" in interface and "Pet:" in interface
-            assert "Right rail" in interface
+            assert "Tema:" in interface and "Mascote:" in interface
+            assert "Barra lateral" in interface
             labels = [str(b.label) for b in app.query("#sidebar-settings Button")]
             assert labels == ["Geral", "Interface"]
 
@@ -862,8 +869,11 @@ def test_the_installation_section_reopens_the_wizard():
             await pilot.press("2")
             await pilot.pause()
             summary = str(app.query_one("#install-summary", Static).content)
-            assert "Perfil: [b]Capella[/b]" in summary
-            assert str(app.query_one("#install-open-wizard", Button).label) == "Reinstalar"
+            assert "[b]Capella[/b]" in summary
+            # Installing again is a new installation, not a reinstall of this one:
+            # checking and repairing what is here is its own action.
+            assert str(app.query_one("#install-open-wizard", Button).label) == "Nova instalação"
+            assert not app.query_one("#install-repair", Button).disabled
             await click(pilot, "#install-open-wizard")
             assert isinstance(app.screen, WizardScreen)
             await click(pilot, "#wizard-skip")
@@ -1254,7 +1264,7 @@ def test_custom_path_stays_correct_through_a_conflict_and_is_not_confused_for_in
             await click(pilot, "#wizard-finish")
             assert not isinstance(app.screen, WizardScreen)
             install_summary = str(app.query_one("#install-summary", Static).content)
-            assert InstallLocationMode.CUSTOM.value in install_summary
+            assert "Personalizada" in install_summary, "the mode, in the screen's words"
             assert r"C:\Users\Pedro\Desktop\loira-40k" in install_summary
 
     run(exercise)

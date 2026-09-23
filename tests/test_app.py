@@ -131,7 +131,7 @@ def make_app(
 def test_profile_details_include_compatibility_and_ascii_dry_run_plan():
     profile = load_profile(ROOT / "profiles" / "pepe.yaml")
     details = render_profile_details(profile, reference_facts())
-    assert "COMPATIBLE" in details
+    assert "COMPATÍVEL" in details
     assert "12227 MiB" in details
     assert "Install plan - DRY-RUN" in details
     assert "No commands or changes will be executed" in details
@@ -143,7 +143,7 @@ def test_profile_details_render_without_nvidia_smi():
     profile = load_profile(ROOT / "profiles" / "pepe.yaml")
     facts = SystemFacts("Windows", "10", "3.11.9", True, False, ())
     details = render_profile_details(profile, facts)
-    assert "INCOMPATIBLE" in details
+    assert "INCOMPATÍVEL" in details
     assert "nvidia-smi" in details
 
 
@@ -196,7 +196,7 @@ def test_sidebar_changes_route_within_current_section():
 def test_right_rail_is_persistent_and_can_collapse():
     async def exercise() -> None:
         app = make_app()
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(120, 40)) as pilot:
             # The shell repaints once its first projections arrive; a click
             # lands on the settled layout, as a person's would.
             await pilot.pause()
@@ -207,7 +207,7 @@ def test_right_rail_is_persistent_and_can_collapse():
             await pilot.click("#right-rail-toggle")
             await pilot.pause()
             assert rail.is_collapsed
-            assert str(app.query_one("#right-rail-toggle", Button).label) == "Expand"
+            assert str(app.query_one("#right-rail-toggle", Button).label) == "Expandir"
 
             await pilot.click("#nav-settings")
             await pilot.pause()
@@ -229,7 +229,7 @@ def test_dashboard_without_an_installation_says_so_and_points_at_installation():
         async with app.run_test() as pilot:
             await pilot.pause()
             dashboard = str(app.query_one("#dashboard-overview", Static).content)
-            assert "Profile: [b]Pepe[/b]" in dashboard
+            assert "Perfil: [b]Pepe[/b]" in dashboard
             assert "Nenhuma stack instalada ainda" in dashboard
             assert "Instalação" in dashboard
             for button_id in ("dashboard-open-webui", "dashboard-start", "dashboard-stop"):
@@ -265,14 +265,14 @@ def test_profile_selection_updates_compatibility_plan_and_right_rail():
             await pilot.click("#profile-capella")
             await pilot.pause()
             details = str(app.query_one("#profile-details", Static).content)
-            assert "INCOMPATIBLE" in details
+            assert "INCOMPATÍVEL" in details
             assert "Install plan - DRY-RUN" in details
             assert str(app.query_one("#rail-profile", Static).content) == "Capella"
 
             await pilot.click("#profile-pepe")
             await pilot.pause()
             details = str(app.query_one("#profile-details", Static).content)
-            assert "[bold green]COMPATIBLE[/bold green]" in details
+            assert "[bold green]COMPATÍVEL[/bold green]" in details
             assert str(app.query_one("#rail-profile", Static).content) == "Pepe"
 
     asyncio.run(exercise())
@@ -286,7 +286,7 @@ def test_ui_does_not_expose_real_user_name_and_pet_slot_is_text_only():
             text = " ".join(str(widget.content) for widget in app.query(Static))
             labels = " ".join(str(button.label) for button in app.query(Button))
             assert "Pedro" not in f"{text} {labels}"
-            assert "Profile" in text and "Pepe" in text
+            assert "Perfil" in text and "Pepe" in text
             assert not any(
                 unicodedata.category(character) == "So" for character in f"{text} {labels}"
             )
@@ -407,10 +407,10 @@ def test_ui_config_controls_rail_and_settings_views():
             assert app.selected_profile.id == "capella"
 
             interface = str(app.query_one("#view-settings-interface", Static).content)
-            assert "Theme: custom-theme" in interface
-            assert "Pet: custom-pet" in interface
-            assert "Right rail visible: no" in interface
-            assert "Right rail expanded: no" in interface
+            assert "Tema: custom-theme" in interface
+            assert "Mascote: custom-pet" in interface
+            assert "Barra lateral visível: não" in interface
+            assert "Barra lateral expandida: não" in interface
 
     asyncio.run(exercise())
 
@@ -492,7 +492,7 @@ def test_hello_kitty_keeps_the_rail_the_same_size_while_it_moves():
 def test_the_rail_gives_width_back_on_a_narrow_terminal():
     async def exercise() -> None:
         app = make_app()
-        async with app.run_test(size=(80, 24)) as pilot:
+        async with app.run_test(size=(100, 30)) as pilot:
             await pilot.press("2")
             await pilot.click("#side-installation-profile")
             await pilot.click("#profile-capella")
@@ -550,7 +550,7 @@ def test_the_pet_box_keeps_one_size_whatever_the_pet_is():
 def test_hello_kitty_survives_rail_collapse_and_expand():
     async def exercise() -> None:
         app = make_app()
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(120, 40)) as pilot:
             await pilot.press("2")
             await pilot.click("#side-installation-profile")
             await pilot.click("#profile-capella")
@@ -601,7 +601,7 @@ def test_general_appearance_override_wins_in_tui():
 def test_pet_animation_and_state_survive_rail_collapse():
     async def exercise() -> None:
         app = make_app()
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()  # the first projections repaint the shell
             pet = app.query_one(PetSlot)
             rail = app.query_one(RightRail)

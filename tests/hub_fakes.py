@@ -50,13 +50,18 @@ from local_ai_stack.tui.application import (
     INSUFFICIENT,
     RECOMMENDED,
     ConflictResolutionRequired,
+    HubError,
     HubUnavailable,
+    InstallationSummary,
     InstallationView,
     InstallSelection,
     LaunchRefusal,
     LaunchTarget,
     OperationBusy,
     ProfileChoice,
+    StorageEstimate,
+    SwitchPlan,
+    SwitchRequiresStop,
 )
 
 SERVICE_IDS = ("ollama", "open-webui", "comfyui")
@@ -462,6 +467,19 @@ class FakeHubApplication:
     unavailable: bool = False
     profile_choices_value: tuple[ProfileChoice, ...] = PROFILE_CHOICES
 
+    # The installations this Hub knows, and what managing them does. Every
+    # command records what it was asked for, and nothing happens by itself.
+    summaries: tuple[InstallationSummary, ...] = ()
+    switch_requires_stop: bool = False
+    switch_error: str | None = None
+    open_error: str | None = None
+    forget_error: str | None = None
+    managed: list[tuple[str, object]] = field(default_factory=list)
+    storage: StorageEstimate = field(
+        # Pepe's own figures on a machine with room for them.
+        default_factory=lambda: StorageEstimate(17_000_000_000, True, 84_000_000_000, True)
+    )
+
     # Set before calling install() to make the application pause with a
     # resolvable (or blocked) preflight instead of running straight through.
     conflict_report: ConflictPreflightReport | None = None
@@ -521,6 +539,70 @@ class FakeHubApplication:
     def installation(self) -> InstallationView:
         self._check_available()
         return InstallationView(self.ready, self.profile_id, self.mode, self.root_display)
+
+    def storage_estimate(self, profile_id, mode, custom_root=None) -> StorageEstimate:
+        self.managed.append(("storage", (profile_id, mode, custom_root)))
+        return self.storage
+
+    def installation_summaries(self) -> tuple[InstallationSummary, ...]:
+        return self.summaries
+
+    def switch_installation(self, root) -> None:
+        self.managed.append(("switch", Path(str(root))))
+        if self.switch_error is not None:
+            raise HubError(self.switch_error)
+        if self.switch_requires_stop:
+            raise SwitchRequiresStop(
+                SwitchPlan(
+                    Path(str(root)),
+                    "pepe-8gb",
+                    InstallLocationMode.CUSTOM,
+                    must_stop=True,
+                    running_profile="Pepe",
+                )
+            )
+        self._activate(Path(str(root)))
+
+    def stop_and_switch(self, root) -> str:
+        self.managed.append(("stop_and_switch", Path(str(root))))
+        self._activate(Path(str(root)))
+        return "op-stop-and-switch"
+
+    def open_installation(self, root) -> None:
+        self.managed.append(("open", Path(str(root))))
+        if self.open_error is not None:
+            raise HubError(self.open_error)
+        known = {str(row.root) for row in self.summaries}
+        if str(root) not in known:
+            self.summaries = (
+                *self.summaries,
+                InstallationSummary(
+                    Path(str(root)), "pepe", "Pepe", InstallLocationMode.CUSTOM, "ready"
+                ),
+            )
+        self._activate(Path(str(root)))
+
+    def forget_installation(self, root) -> None:
+        self.managed.append(("forget", Path(str(root))))
+        if self.forget_error is not None:
+            raise HubError(self.forget_error)
+        self.summaries = tuple(row for row in self.summaries if str(row.root) != str(root))
+
+    def repair(self) -> str:
+        """The same idempotent run the installer uses, on what is already here."""
+        self.managed.append(("repair", None))
+        return self._lifecycle("repair", "Verificando")
+
+    def _activate(self, root: Path) -> None:
+        self.summaries = tuple(
+            replace(row, active=str(row.root) == str(root)) for row in self.summaries
+        )
+        active = next((row for row in self.summaries if row.active), None)
+        if active is not None:
+            self.ready = active.status in {"ready", "running", "stopped"}
+            self.profile_id = active.profile_id
+            self.mode = active.mode
+            self.root_display = str(active.root)
 
     def profile_choices(self) -> tuple[ProfileChoice, ...]:
         self._check_available()

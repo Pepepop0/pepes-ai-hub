@@ -51,9 +51,11 @@ from .installations import (
     write_state,
 )
 from .layout import StackLayout
+from .model_catalog import model_catalog
 from .operation_contracts import OperationEvent, OperationEventSink, OperationSnapshot
 from .profiles import Profile, load_profiles, offered_profiles
 from .stack_application import StackApplication, StackDependencies
+from .storage import enough_space, free_space, model_download_estimate
 from .tui.application import (
     COMPATIBLE,
     INSUFFICIENT,
@@ -68,6 +70,7 @@ from .tui.application import (
     LaunchTarget,
     OperationBusy,
     ProfileChoice,
+    StorageEstimate,
     SwitchPlan,
     SwitchRequiresStop,
 )
@@ -131,6 +134,7 @@ class HubApplicationAdapter:
                 stack_id=self.config.stack_id,
             )
         self._candidate: _Candidate | None = None
+        self._catalog_specs: dict | None = None
         self._lock = threading.RLock()
         self._busy = False
         self._idle = threading.Event()
@@ -459,6 +463,43 @@ class HubApplicationAdapter:
             )
             for profile in sorted(offered, key=lambda item: item.hardware.min_vram_mib)
         )
+
+    def storage_estimate(
+        self, profile_id: str, mode: InstallLocationMode, custom_root: str | None = None
+    ) -> StorageEstimate:
+        """What installing this profile here is known to need, and whether it fits.
+
+        Cheap and honest: the sizes the manifests record, and the free space of
+        the volume the folder would be created in. Nothing is hashed, nothing
+        is created, and what is not known is reported as not known.
+        """
+        profile = next((item for item in self.profiles if item.id == profile_id), None)
+        if profile is None:
+            return StorageEstimate()
+        estimate = model_download_estimate(profile, self.catalog_specs())
+        try:
+            location = InstallLocation(mode, Path(custom_root) if custom_root else None)
+            root = self.resolve(location).root
+        except Exception:  # noqa: BLE001 -- an unresolvable folder simply has no number
+            return StorageEstimate(estimate.known_bytes, estimate.complete)
+        space = free_space(root)
+        return StorageEstimate(
+            estimate.known_bytes,
+            estimate.complete,
+            None if space is None else space.free_bytes,
+            enough_space(estimate, space),
+        )
+
+    def catalog_specs(self) -> dict:
+        """The model catalog, by canonical id, read once per adapter."""
+        if self._catalog_specs is None:
+            try:
+                self._catalog_specs = {
+                    str(key): value for key, value in model_catalog().specs.items()
+                }
+            except Exception:  # noqa: BLE001 -- without a catalog there is simply no estimate
+                self._catalog_specs = {}
+        return self._catalog_specs
 
     def recommended_profile(self) -> str | None:
         """Which profile a screen should start on. None when nothing fits."""

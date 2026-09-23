@@ -39,6 +39,7 @@ from .application import (
     RECOMMENDED,
     InstallSelection,
     ProfileChoice,
+    StorageEstimate,
 )
 from .operations import OperationView
 from .presenters import (
@@ -78,6 +79,12 @@ STANDING_LABELS = {
     COMPATIBLE: "Compatível",
     INSUFFICIENT: "Requer mais VRAM",
 }
+
+
+def gib(value: int) -> str:
+    """Bytes as a person reads them on a disk: whole GiB, one decimal under ten."""
+    amount = value / (1024**3)
+    return f"{amount:.1f} GiB" if amount < 10 else f"{amount:.0f} GiB"
 
 
 def profile_summary(choice: ProfileChoice) -> str:
@@ -199,6 +206,13 @@ class WizardScreen(Screen):
             super().__init__()
             self.selection = selection
 
+    class StepChanged(Message):
+        """The wizard moved. The app answers what only it can know for that step."""
+
+        def __init__(self, step: WizardStep) -> None:
+            super().__init__()
+            self.step = step
+
     class FolderPickRequested(Message):
         """Ask the app to open the system folder dialog. It answers with ``apply_picked_folder``."""
 
@@ -231,6 +245,11 @@ class WizardScreen(Screen):
         # underneath the answer.
         self.picker_busy: bool = False
         self._browse_had_focus: bool = False
+        # What the application says this installation will download. None until
+        # it has answered, and the review simply does not mention it.
+        self.storage: StorageEstimate | None = None
+        # Why the last attempt did not start, while the review still shows it.
+        self._review_refusal: str = ""
 
     # --- composition --------------------------------------------------------
 
@@ -321,8 +340,13 @@ class WizardScreen(Screen):
     # --- state --------------------------------------------------------------
 
     def _set_state(self, state: WizardState) -> None:
+        moved = state.step is not self.state.step
+        if moved:
+            self._review_refusal = ""
         self.state = state
         self._repaint()
+        if moved and self.is_mounted:
+            self.post_message(self.StepChanged(state.step))
 
     def go_to(self, step: WizardStep) -> None:
         self._set_state(replace(self.state, step=step))
@@ -452,6 +476,7 @@ class WizardScreen(Screen):
 
     def show_refusal(self, message: str) -> None:
         """The app could not start the installation; stay on the review step and say so."""
+        self._review_refusal = message
         self.query_one(step_pane_id(WizardStep.REVIEW, prefix="#"), Static).update(
             self._review_text() + f"\n\n[red]{escape(message)}[/red]"
         )
@@ -469,18 +494,49 @@ class WizardScreen(Screen):
             "[b]Revisar[/b]",
             "",
             f"Perfil: [b]{escape(chosen.name if chosen else '-')}[/b]",
-            f"Local: [b]{escape(mode_label)}[/b]",
         ]
+        if chosen is not None and chosen.required_vram_gb is not None:
+            lines.append(f"Placa de vídeo: {chosen.required_vram_gb} GB de VRAM")
+        lines.append(f"Local: [b]{escape(mode_label)}[/b]")
         if self.state.mode is InstallLocationMode.CUSTOM:
             lines.append(f"Pasta: {escape(self.state.custom_root.strip())}")
+        lines.extend(self._storage_lines())
         lines.extend(
             [
                 "",
                 "Ao instalar, o Hub baixa e configura tudo sozinho.",
-                "Pode demorar alguns minutos.",
+                "Em conexões lentas, a instalação pode levar bastante tempo.",
             ]
         )
         return "\n".join(lines)
+
+    def _storage_lines(self) -> list[str]:
+        """What this installation downloads, and whether the disk has room for it."""
+        estimate = self.storage
+        if estimate is None or not estimate.known_bytes:
+            return []
+        lines = ["", f"Downloads conhecidos: [b]{gib(estimate.known_bytes)}[/b]"]
+        if not estimate.complete:
+            lines[-1] = f"Downloads conhecidos: pelo menos [b]{gib(estimate.known_bytes)}[/b]"
+        if estimate.free_bytes is not None:
+            lines.append(f"Espaço livre: {gib(estimate.free_bytes)}")
+        if estimate.fits is False:
+            lines.append("[red]O espaço livre é menor que o necessário.[/red]")
+        return lines
+
+    def set_storage(self, estimate: StorageEstimate | None) -> None:
+        """What the application knows about the download and the disk, for the review."""
+        self.storage = estimate
+        if not (self.is_mounted and self.state.step is WizardStep.REVIEW):
+            return
+        if self._review_refusal:
+            # An answer that arrives later adds to the review; it never erases
+            # why the installation did not start.
+            self.show_refusal(self._review_refusal)
+            return
+        self.query_one(step_pane_id(WizardStep.REVIEW, prefix="#"), Static).update(
+            self._review_text()
+        )
 
     def _repaint(self) -> None:
         state = self.state

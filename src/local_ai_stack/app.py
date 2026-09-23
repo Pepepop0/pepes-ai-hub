@@ -50,12 +50,14 @@ from .tui.application import (
     HubApplication,
     HubError,
     HubUnavailable,
+    InstallationSummary,
     InstallationView,
     InstallSelection,
     LaunchRefusal,
     LaunchTarget,
     OperationBusy,
     ProfileChoice,
+    SwitchRequiresStop,
 )
 from .tui.navigation import DEFAULT_ITEM, SIDEBAR_ROUTES, Section
 from .tui.operations import OperationView, observe
@@ -66,6 +68,7 @@ from .tui.widgets import (
     DashboardPanel,
     FooterBar,
     InstallationLocationPanel,
+    InstallPanel,
     MainContent,
     RightRail,
     ServicesPanel,
@@ -142,6 +145,7 @@ class ProjectionsLoaded(Message):
         facts: SystemFacts,
         integration: IntegrationSnapshot,
         generation: int,
+        summaries: tuple[InstallationSummary, ...] = (),
     ) -> None:
         super().__init__()
         self.installation = installation
@@ -151,6 +155,7 @@ class ProjectionsLoaded(Message):
         self.facts = facts
         self.integration = integration
         self.generation = generation
+        self.summaries = summaries
 
 
 class LaunchResolved(Message):
@@ -272,7 +277,7 @@ class HubScreen(Screen):
     """The main screen. It is the one thing that is told when the terminal resizes."""
 
     def on_resize(self, event: Resize) -> None:
-        self.app.fit_to_width(event.size.width)  # type: ignore[attr-defined]
+        self.app.fit_to_width(event.size.width, event.size.height)  # type: ignore[attr-defined]
 
 
 class LocalAIStackApp(App):
@@ -283,8 +288,8 @@ class LocalAIStackApp(App):
         Binding("1", "show_section('dashboard')", "Dashboard"),
         Binding("2", "show_section('installation')", "Instalação"),
         Binding("3", "show_section('settings')", "Configurações"),
-        Binding("ctrl+r", "toggle_rail", "Right rail"),
-        Binding("q", "quit", "Quit"),
+        Binding("ctrl+r", "toggle_rail", "Barra lateral"),
+        Binding("q", "quit", "Sair"),
     ]
 
     def __init__(
@@ -323,6 +328,10 @@ class LocalAIStackApp(App):
         # Injected, never constructed here: the TUI must not know which
         # operating-system dialog, if any, stands behind it.
         self.folder_picker = folder_picker
+        # What the folder dialog is being opened for, when it is not the wizard.
+        self._folder_purpose: str | None = None
+        self._locating_root: Path | None = None
+        self._pending_switch: Path | None = None
         self._picking_folder = False
         self.operation_view: OperationView | None = None
         self.notices: list[str] = []
@@ -411,6 +420,7 @@ class LocalAIStackApp(App):
                 vram,
                 self.integration,
                 self.executor_factory,
+                can_pick_folder=self.folder_picker is not None,
             )
             yield RightRail(
                 self.selected_profile,
@@ -512,9 +522,158 @@ class LocalAIStackApp(App):
 
     def on_folder_picked(self, message: FolderPicked) -> None:
         self._picking_folder = False
+        purpose, self._folder_purpose = self._folder_purpose, None
         wizard = self.wizard
-        if wizard is not None:
+        if wizard is not None and purpose is None:
             wizard.apply_picked_folder(message.folder)
+            return
+        if message.folder is None:
+            return  # cancelled: nothing changes anywhere
+        if purpose == "open":
+            self._adopt_installation(message.folder)
+        elif purpose == "locate":
+            self._adopt_installation(message.folder, replacing=self._locating_root)
+
+    def _ask_for_folder(self, purpose: str, initial: Path | None = None) -> None:
+        """Open the system folder dialog for something other than the wizard."""
+        if self.folder_picker is None or self._picking_folder:
+            return
+        self._folder_purpose = purpose
+        self._picking_folder = True
+        self.run_worker(lambda: self._pick_folder(initial), thread=True, group="folder-picker")
+
+    def _adopt_installation(self, folder: Path, *, replacing: Path | None = None) -> None:
+        """Validate a folder a person picked and switch to it, or say why not."""
+        panel = self._install_panel()
+        opener = getattr(self.application, "open_installation", None)
+        if opener is None:
+            return
+        try:
+            opener(folder)
+        except HubError as exc:
+            if panel is not None:
+                panel.notice(str(exc))
+            return
+        if replacing is not None and str(replacing) != str(folder):
+            forget = getattr(self.application, "forget_installation", None)
+            if forget is not None:
+                try:
+                    forget(replacing)
+                except HubError:
+                    pass  # the old entry stays; the new one is already active
+        if panel is not None:
+            panel.select_row(None)
+            panel.notice("")
+        self._after_installation_change()
+
+    def _install_panel(self):
+        try:
+            return self.query_one(InstallPanel)
+        except NoMatches:
+            return None
+
+    def _after_installation_change(self) -> None:
+        """The active installation moved: every projection is now about another one."""
+        config = getattr(self.application, "config", None)
+        if config is not None:
+            self.config = config
+            self.query_one(MainContent).update_config(config)
+            profile = next((p for p in self.profiles if p.id == config.profile_id), None)
+            if profile is not None:
+                self.select_profile(profile.id)
+        self.refresh_projections()
+
+    # --- managing installations ---------------------------------------------
+
+    def on_install_panel_switch_requested(self, message: InstallPanel.SwitchRequested) -> None:
+        panel = self._install_panel()
+        switch = getattr(self.application, "switch_installation", None)
+        if switch is None:
+            return
+        try:
+            switch(message.root)
+        except SwitchRequiresStop as pending:
+            self._pending_switch = message.root
+            if panel is not None:
+                panel.notice(
+                    f"{pending.plan.running_profile or 'A instalação atual'} ainda está em "
+                    "execução. Para trocar, o Hub precisa parar os serviços gerenciados e "
+                    "confirmar que as portas foram liberadas. Processos externos não serão "
+                    "encerrados. Pressione Trocar instalação novamente para parar e trocar."
+                )
+            return
+        except HubError as exc:
+            if panel is not None:
+                panel.notice(str(exc))
+            return
+        if panel is not None:
+            panel.notice("")
+        self._after_installation_change()
+
+    def on_install_panel_open_folder_requested(
+        self, message: InstallPanel.OpenFolderRequested
+    ) -> None:
+        self._ask_for_folder("open")
+
+    def on_install_panel_locate_requested(self, message: InstallPanel.LocateRequested) -> None:
+        self._locating_root = message.root
+        self._ask_for_folder("locate", message.root.parent)
+
+    def on_install_panel_forget_requested(self, message: InstallPanel.ForgetRequested) -> None:
+        panel = self._install_panel()
+        forget = getattr(self.application, "forget_installation", None)
+        if forget is None:
+            return
+        try:
+            forget(message.root)
+        except HubError as exc:
+            if panel is not None:
+                panel.notice(str(exc))
+            return
+        if panel is not None:
+            panel.select_row(None)
+            panel.notice("A instalação saiu da lista. Nenhum arquivo foi apagado.")
+        self.refresh_projections()
+
+    def on_install_panel_repair_requested(self, message: InstallPanel.RepairRequested) -> None:
+        repair = getattr(self.application, "repair", None)
+        if repair is None:
+            return
+        self._operation_kind = "repair"
+        try:
+            repair()
+        except HubError as exc:
+            self._operation_kind = None
+            panel = self._install_panel()
+            if panel is not None:
+                panel.notice(str(exc))
+
+    def on_install_panel_new_installation_requested(
+        self, message: InstallPanel.NewInstallationRequested
+    ) -> None:
+        self.open_wizard()
+
+    def on_install_panel_open_root_requested(self, message: InstallPanel.OpenRootRequested) -> None:
+        panel = self._install_panel()
+        if self.open_browser(str(message.root)) is False and panel is not None:
+            panel.notice("Não foi possível abrir a pasta.")
+
+    def on_wizard_screen_step_changed(self, message: WizardScreen.StepChanged) -> None:
+        """The review says what the installation will download, once it is reached."""
+        if message.step is not WizardStep.REVIEW:
+            return
+        wizard = self.wizard
+        reader = getattr(self.application, "storage_estimate", None)
+        if wizard is None or reader is None:
+            return
+        state = wizard.state
+        if state.profile_id is None:
+            return
+        try:
+            estimate = reader(state.profile_id, state.mode, state.custom_root.strip() or None)
+        except Exception:  # noqa: BLE001 -- the review is shown with or without a number
+            estimate = None
+        wizard.set_storage(estimate)
 
     def on_wizard_screen_install_requested(self, message: WizardScreen.InstallRequested) -> None:
         self.select_profile(message.selection.profile_id)
@@ -691,9 +850,29 @@ class LocalAIStackApp(App):
             services, vram = self._services(), self._vram()
         else:
             installation, services, vram = projections()
+        summaries = self._installation_summaries()
         self.post_message(
-            ProjectionsLoaded(installation, services, vram, runtime, facts, integration, generation)
+            ProjectionsLoaded(
+                installation,
+                services,
+                vram,
+                runtime,
+                facts,
+                integration,
+                generation,
+                summaries,
+            )
         )
+
+    def _installation_summaries(self) -> tuple[InstallationSummary, ...]:
+        """Optional on the application, like conflict resolution: absent means no list."""
+        reader = getattr(self.application, "installation_summaries", None)
+        if reader is None:
+            return ()
+        try:
+            return tuple(reader())
+        except Exception:  # noqa: BLE001 -- the list never fails the screen
+            return ()
 
     def on_projections_failed(self, message: ProjectionsFailed) -> None:
         self._projection_running = False
@@ -722,7 +901,7 @@ class LocalAIStackApp(App):
         main.refresh_facts(message.facts)
         if installation.ready and installation.profile_id:
             self.select_profile(installation.profile_id)
-        main.refresh_overview(installation, message.services, message.vram)
+        main.refresh_overview(installation, message.services, message.vram, message.summaries)
         services_panel = main.query_one(ServicesPanel)
         services_panel.integration = message.integration
         services_panel.refresh_runtime(message.runtime)
@@ -872,10 +1051,11 @@ class LocalAIStackApp(App):
     def get_default_screen(self) -> Screen:
         return HubScreen()
 
-    def fit_to_width(self, width: int) -> None:
-        """Narrow terminals get a narrow rail; the pet scales itself to match."""
+    def fit_to_width(self, width: int, height: int | None = None) -> None:
+        """Narrow terminals get a narrow rail; small ones get none at all."""
+        rows = self.size.height if height is None else height
         for rail in self.query(RightRail):
-            rail.set_narrow(width < WIDE_TERMINAL_COLUMNS)
+            rail.fit_to(width, rows)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
@@ -895,8 +1075,6 @@ class LocalAIStackApp(App):
             self.open_webui()
         elif button_id in ("dashboard-start", "dashboard-stop", "dashboard-restart"):
             self.run_stack_command(button_id.removeprefix("dashboard-"))
-        elif button_id == "install-open-wizard":
-            self.open_wizard()
         event.stop()
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -908,6 +1086,40 @@ class LocalAIStackApp(App):
         if event.input.id == "installation-custom-root":
             self.validate_custom_installation(event.value)
             event.stop()
+
+    def action_quit(self) -> None:
+        """Closing the Hub does not stop the stack -- but it does not cancel an operation.
+
+        An installation or a switch keeps running in its own thread, and this
+        version has no safe way to cancel it, so leaving is refused while one
+        is in progress and the screen says what is happening. Everything else
+        closes at once, with a reminder that the services stay up.
+        """
+        view = self.operation_view
+        if view is not None and not view.terminal:
+            self._notify_exit_refused()
+            return
+        self.exit()
+
+    def _notify_exit_refused(self) -> None:
+        message = (
+            "Uma operação ainda está em andamento. Fechar o Hub agora não cancela "
+            "esta operação de forma segura. Aguarde o fim da operação."
+        )
+        panel = self._install_panel()
+        if panel is not None and self.active_section is Section.INSTALLATION:
+            panel.notice(message)
+            return
+        try:
+            self.query_one(DashboardPanel).show_notice(message, error=True)
+        except NoMatches:  # pragma: no cover - the shell is already gone
+            return
+
+    def exit_notice(self) -> str:
+        """What is true when the Hub closes: the stack keeps running without it."""
+        if self._installation_view.ready:
+            return "Fechar o Hub não para a stack. Os serviços continuam em execução."
+        return ""
 
     def action_show_section(self, section: str) -> None:
         self.show_section(Section(section))

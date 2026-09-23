@@ -371,11 +371,35 @@ async def settle(pilot):
     await pilot.pause()
 
 
+# How many rounds of "let the worker finish, let the app handle what it posted"
+# a wait below may take. A guard against something that never happens, never
+# the thing the tests wait on.
+ANSWER_ROUNDS = 200
+
+
 async def click(pilot, selector):
-    button = pilot.app.screen.query_one(selector, Button)
+    """Press a button the way a person does: once it is on screen to be pressed.
+
+    A button the last handled message made visible -- the conflict choices
+    appear when the preflight's answer arrives -- is only laid out on a later
+    refresh, and a click aimed at it before that lands on whatever is there.
+    So the press waits until the button is where the pointer will go, and the
+    click has to land on it.
+    """
+    screen = pilot.app.screen
+    button = screen.query_one(selector, Button)
     button.active_effect_duration = 0
     button.remove_class("-active")
-    await pilot.click(selector)
+    for _ in range(ANSWER_ROUNDS):
+        region = button.region
+        if button.display and region.area:
+            point = (region.x + region.width // 2, region.y + region.height // 2)
+            if screen.get_widget_at(*point)[0] is button:
+                break
+        await pilot.pause()
+    else:
+        raise AssertionError(f"{selector} never appeared where it could be pressed")
+    assert await pilot.click(selector), f"the click did not land on {selector}"
     await pilot.pause()
 
 
@@ -389,6 +413,42 @@ async def review(pilot, *, profile="capella", mode="default", root=None):
         await pilot.pause()
     await click(pilot, "#wizard-next")
     assert pilot.app.screen.state.step is WizardStep.REVIEW
+
+
+async def install_answered(pilot):
+    """Wait until the application has answered the wizard's install request.
+
+    Next on the review moves the wizard to PROGRESS and posts the request; the
+    app hands it to the install worker, which runs the conflict preflight off
+    the UI thread and posts its answer back. PROGRESS is legitimate until that
+    answer is handled, so the wait is for the answer itself: the request was
+    taken, and its submission has come back.
+    """
+    app = pilot.app
+    for _ in range(ANSWER_ROUNDS):
+        if app._pending_install_selection is not None and not app._submitting_install:
+            return
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+    raise AssertionError("the application never answered the install request")
+
+
+async def decision_answered(pilot):
+    """Wait until the application has answered the person's conflict decision.
+
+    The choice goes to the resolver worker; its answer comes back as a message
+    the app handles by taking the conflict off the wizard and -- to proceed --
+    submitting the installation again through the install worker. The wait is
+    for exactly that: no conflict left on the wizard, no submission in flight.
+    """
+    app = pilot.app
+    for _ in range(ANSWER_ROUNDS):
+        wizard = app.wizard
+        if wizard is not None and wizard.conflict is None and not app._submitting_install:
+            return
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+    raise AssertionError("the application never answered the conflict decision")
 
 
 async def finish(pilot, adapter):
@@ -999,6 +1059,7 @@ def test_real_failures_reach_the_wizard_as_terminal_diagnostics(
             await settle(pilot)
             await review(pilot)
             await click(pilot, "#wizard-next")
+            await install_answered(pilot)
             await finish(pilot, adapter)
             assert app.operation_view.failed
             assert expected in events[-1].message
@@ -1082,6 +1143,7 @@ def test_custom_location_flows_from_the_real_wizard_to_backend(composition):
             await settle(pilot)
             await review(pilot, mode="custom", root=root)
             await click(pilot, "#wizard-next")
+            await install_answered(pilot)
             await finish(pilot, adapter)
             assert app.operation_view.succeeded
             assert adapter.backend.installation.root == root
@@ -1281,6 +1343,7 @@ def test_real_tui_backend_alongside_custom_test_profile_and_second_run(compositi
                 await settle(pilot)
                 await review(pilot, profile="test", mode="custom", root=custom_root)
                 await click(pilot, "#wizard-next")
+                await install_answered(pilot)
 
                 assert app.screen.state.step is WizardStep.CONFLICT
                 assert app.operation_view is None
@@ -1295,8 +1358,7 @@ def test_real_tui_backend_alongside_custom_test_profile_and_second_run(compositi
                 assert alongside.display and alongside.variant == "primary"
 
                 await click(pilot, "#wizard-conflict-alongside")
-                await app.workers.wait_for_complete()
-                await pilot.pause()
+                await decision_answered(pilot)
                 await finish(pilot, adapter)
 
                 assert app.operation_view.succeeded
@@ -1389,8 +1451,7 @@ def test_real_tui_stop_confirmation_uses_only_adapter_preflight_authority(compos
                 await settle(pilot)
                 await review(pilot, profile="test")
                 await click(pilot, "#wizard-next")
-                await app.workers.wait_for_complete()
-                await pilot.pause()
+                await install_answered(pilot)
                 assert app.screen.state.step is WizardStep.CONFLICT
                 assert adapter.current_operation() is None
 
@@ -1398,8 +1459,7 @@ def test_real_tui_stop_confirmation_uses_only_adapter_preflight_authority(compos
                 assert app.screen.state.step is WizardStep.CONFLICT_CONFIRM
                 assert selections == [] and stopped == []
                 await click(pilot, "#wizard-confirm-stop")
-                await app.workers.wait_for_complete()
-                await pilot.pause()
+                await decision_answered(pilot)
                 await finish(pilot, adapter)
                 assert app.operation_view.succeeded
                 assert app.screen.state.step is WizardStep.DONE
@@ -1446,16 +1506,14 @@ def test_real_tui_unsafe_external_hides_stop_and_allows_alongside(composition):
                 await settle(pilot)
                 await review(pilot, profile="test")
                 await click(pilot, "#wizard-next")
-                await app.workers.wait_for_complete()
-                await pilot.pause()
+                await install_answered(pilot)
                 report = adapter.current_conflict_preflight()
                 assert report is not None and not report.conflicts[0].can_stop_safely
                 assert not app.screen.query_one("#wizard-conflict-stop", Button).display
                 assert app.screen.query_one("#wizard-conflict-alongside", Button).display
 
                 await click(pilot, "#wizard-conflict-alongside")
-                await app.workers.wait_for_complete()
-                await pilot.pause()
+                await decision_answered(pilot)
                 await finish(pilot, adapter)
                 assert app.operation_view.succeeded
 
@@ -1491,9 +1549,8 @@ def test_real_tui_blocked_alternate_endpoint_cancels_without_mutation(compositio
                 await review(pilot, profile="test", mode="custom", root=custom_root)
                 await click(pilot, "#wizard-next")
                 # The preflight runs in the install worker: read its answer once
-                # the worker has given it, not while it may still be scanning.
-                await app.workers.wait_for_complete()
-                await pilot.pause()
+                # the app has handled it, not while the worker may still be scanning.
+                await install_answered(pilot)
                 report = adapter.current_conflict_preflight()
                 assert report is not None and report.disposition.value == "blocked"
                 first_id = report.preflight_id
@@ -1504,15 +1561,13 @@ def test_real_tui_blocked_alternate_endpoint_cancels_without_mutation(compositio
                 assert adapter.current_operation() is None
 
                 await click(pilot, "#wizard-conflict-abort")
-                await app.workers.wait_for_complete()
-                await pilot.pause()
+                await decision_answered(pilot)
                 assert app.screen.state.step is WizardStep.REVIEW
                 assert app.screen.state.custom_root == str(custom_root)
                 assert adapter.current_operation() is None
 
                 await click(pilot, "#wizard-next")
-                await app.workers.wait_for_complete()
-                await pilot.pause()
+                await install_answered(pilot)
                 retry = adapter.current_conflict_preflight()
                 assert retry is not None and retry.preflight_id != first_id
                 assert app.screen.state.step is WizardStep.CONFLICT

@@ -50,6 +50,7 @@ from .tui.application import (
     HubApplication,
     HubError,
     HubUnavailable,
+    InstallationCheck,
     InstallationSummary,
     InstallationView,
     InstallSelection,
@@ -59,6 +60,7 @@ from .tui.application import (
     ProfileChoice,
     SwitchRequiresStop,
 )
+from .tui.dialogs import SwitchChoice, SwitchInstallationScreen, WelcomeScreen
 from .tui.navigation import DEFAULT_ITEM, SIDEBAR_ROUTES, Section
 from .tui.operations import OperationView, observe
 from .tui.presenters import render_profile_details
@@ -186,6 +188,15 @@ class ConflictResolved(Message):
     def __init__(self, result: ConflictResolutionResult) -> None:
         super().__init__()
         self.result = result
+
+
+class InstallationChecked(Message):
+    """A read-only check of the installation in use finished, off the render thread."""
+
+    def __init__(self, check: InstallationCheck | None, error: str | None = None) -> None:
+        super().__init__()
+        self.check = check
+        self.error = error
 
 
 class FolderPicked(Message):
@@ -348,6 +359,8 @@ class LocalAIStackApp(App):
         self._operation_pending = False
         self._pending_install_selection: InstallSelection | None = None
         self._submitting_install = False
+        # The welcome is offered at most once per session.
+        self._welcomed = False
 
         # The application is not asked anything yet: its answer can take as
         # long as the stack takes to answer, and the shell must be on screen
@@ -689,6 +702,52 @@ class LocalAIStackApp(App):
             panel.notice("A instalação saiu da lista. Nenhum arquivo foi apagado.")
         self.refresh_projections()
 
+    def on_install_panel_change_requested(self, message: InstallPanel.ChangeRequested) -> None:
+        """Every installation the Hub knows, the one in use included, to choose from."""
+        panel = self._install_panel()
+        summaries = panel.summaries if panel is not None else ()
+
+        def chosen(choice: SwitchChoice | None) -> None:
+            if choice is None:
+                return
+            if choice.action == "use" and choice.root is not None:
+                # The same request the list's own "Usar" sends: the approved
+                # switch path, stop confirmation and all.
+                self.post_message(InstallPanel.SwitchRequested(choice.root))
+            elif choice.action == "open-existing":
+                self._ask_for_folder("open")
+            elif choice.action == "new":
+                self.open_wizard()
+
+        self.push_screen(
+            SwitchInstallationScreen(summaries, can_pick_folder=self.folder_picker is not None),
+            chosen,
+        )
+
+    def on_install_panel_verify_requested(self, message: InstallPanel.VerifyRequested) -> None:
+        """Check the installation in use. Read-only, and off the render thread."""
+        verify = getattr(self.application, "verify_installation", None)
+        panel = self._install_panel()
+        if verify is None or panel is None:
+            return
+        panel.show_check(None, running=True)
+        self.run_worker(lambda: self._verify(verify), thread=True, group="verify")
+
+    def _verify(self, verify) -> None:
+        try:
+            self.post_message(InstallationChecked(verify()))
+        except HubError as exc:
+            self.post_message(InstallationChecked(None, str(exc)))
+        except Exception:  # noqa: BLE001 -- a check that fails is reported, never a crash
+            self.post_message(InstallationChecked(None, "Não foi possível verificar a instalação."))
+
+    def on_installation_checked(self, message: InstallationChecked) -> None:
+        panel = self._install_panel()
+        if panel is None:
+            return
+        panel.show_check(message.check)
+        panel.notice(message.error or "")
+
     def on_install_panel_repair_requested(self, message: InstallPanel.RepairRequested) -> None:
         repair = getattr(self.application, "repair", None)
         if repair is None:
@@ -989,8 +1048,26 @@ class LocalAIStackApp(App):
         rail.set_pet_state(pet_state_for_stack(message.runtime.state))
         if self._first_projections_pending:
             self._first_projections_pending = False
-            if self.first_run_wizard and not installation.ready and self.wizard is None:
+            nothing_configured = not installation.ready and installation.profile_id is None
+            if self.first_run_wizard and nothing_configured and self.wizard is None:
+                self.offer_first_installation()
+
+    def offer_first_installation(self) -> None:
+        """Ask, once per session, whether to start the first installation now.
+
+        An offer: "Agora não" leaves the person on the Hub, whose Dashboard
+        keeps the same invitation. Nothing is written for it -- a Hub opened
+        again with still nothing installed asks again, once.
+        """
+        if self._welcomed or self.wizard is not None:
+            return
+        self._welcomed = True
+
+        def answered(start: bool | None) -> None:
+            if start:
                 self.open_wizard()
+
+        self.push_screen(WelcomeScreen(), answered)
 
     def _begin_operation(self, kind: str) -> None:
         """A command has been launched: the Hub is busy from here, not from its
@@ -1200,6 +1277,8 @@ class LocalAIStackApp(App):
             self.query_one(MainContent).run_plan_dry_run()
         elif button_id == "dashboard-open-webui":
             self.open_webui()
+        elif button_id == "dashboard-install":
+            self.open_wizard()
         elif button_id in ("dashboard-start", "dashboard-stop", "dashboard-restart"):
             self.run_stack_command(button_id.removeprefix("dashboard-"))
         event.stop()

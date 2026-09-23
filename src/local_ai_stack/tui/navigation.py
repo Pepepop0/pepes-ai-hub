@@ -28,7 +28,10 @@ SECTION_ITEMS: dict[Section, tuple[NavigationItem, ...]] = {
         NavigationItem("services", "Serviços"),
     ),
     Section.INSTALLATION: (
+        # Instalar creates a new installation; Instalações manages the known
+        # ones. Perfil, Local and Plano are the details of a new one.
         NavigationItem("install", "Instalar"),
+        NavigationItem("installations", "Instalações"),
         NavigationItem("profile", "Perfil"),
         NavigationItem("location", "Local"),
         NavigationItem("plan", "Plano"),
@@ -41,7 +44,7 @@ SECTION_ITEMS: dict[Section, tuple[NavigationItem, ...]] = {
 
 DEFAULT_ITEM: dict[Section, str] = {
     Section.DASHBOARD: "overview",
-    Section.INSTALLATION: "install",
+    Section.INSTALLATION: "installations",
     Section.SETTINGS: "general",
 }
 

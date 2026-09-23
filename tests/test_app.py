@@ -169,7 +169,10 @@ def test_section_change_updates_contextual_sidebar_and_default_view():
             assert sidebar.active is Section.INSTALLATION
             assert app.query_one("#sidebar-installation").display
             assert not app.query_one("#sidebar-dashboard").display
-            assert app.query_one(MainContent).current == route_id(Section.INSTALLATION, "install")
+            # The section opens on the installations the Hub knows; Instalar is one item up.
+            assert app.query_one(MainContent).current == route_id(
+                Section.INSTALLATION, "installations"
+            )
             labels = [
                 str(button.label) for button in app.query_one("#sidebar-installation").query(Button)
             ]

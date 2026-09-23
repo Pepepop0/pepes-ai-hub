@@ -42,6 +42,7 @@ from local_ai_stack.tui.application import (
     InstallSelection,
     LaunchRefusal,
 )
+from local_ai_stack.tui.dialogs import WelcomeScreen
 from local_ai_stack.tui.navigation import SECTION_ITEMS, Section
 from local_ai_stack.tui.operations import observe
 from local_ai_stack.tui.presenters import render_operation
@@ -107,6 +108,19 @@ async def settle(pilot) -> None:
     await pilot.pause()
 
 
+async def through_welcome(pilot) -> None:
+    """A Hub with nothing installed offers the first installation; take it.
+
+    The first opening shows the welcome, not the wizard: the wizard is what
+    "Iniciar primeira instalação" opens. A Hub that already has an
+    installation shows no welcome, and this does nothing.
+    """
+    await settle(pilot)
+    if isinstance(pilot.app.screen, WelcomeScreen):
+        await click(pilot, "#welcome-start")
+        await pilot.pause()
+
+
 def wizard(app: LocalAIStackApp) -> WizardScreen:
     screen = app.screen
     assert isinstance(screen, WizardScreen), type(screen).__name__
@@ -118,6 +132,7 @@ def text(app: LocalAIStackApp, selector: str) -> str:
 
 
 async def walk_to_review(pilot, *, profile: str = "capella", mode: str = "default") -> None:
+    await through_welcome(pilot)
     await click(pilot, "#wizard-next")
     await click(pilot, f"#wizard-profile-{profile}")
     await click(pilot, "#wizard-next")
@@ -143,10 +158,14 @@ def test_the_fake_is_an_application_and_its_streams_are_valid():
 # --- first run --------------------------------------------------------------------
 
 
-def test_opening_without_an_installation_shows_the_wizard():
+def test_opening_without_an_installation_offers_the_first_one_and_opens_the_wizard_on_yes():
     async def exercise() -> None:
         app, _, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
+            await settle(pilot)
+            # An offer, not a detour: the wizard is not on screen by itself.
+            assert isinstance(app.screen, WelcomeScreen)
+            await click(pilot, "#welcome-start")
             await pilot.pause()
             screen = wizard(app)
             assert screen.state.step is WizardStep.WELCOME
@@ -176,7 +195,7 @@ def test_the_wizard_walks_welcome_profile_mode_review():
     async def exercise() -> None:
         app, _, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             seen = [screen.state.step]
             for _ in range(3):
@@ -198,7 +217,7 @@ def test_the_wizard_can_be_skipped_for_now():
     async def exercise() -> None:
         app, fake, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             await click(pilot, "#wizard-skip")
             assert not isinstance(app.screen, WizardScreen)
             assert fake.calls == []
@@ -218,7 +237,7 @@ def test_the_largest_profile_that_fits_is_preselected_and_the_others_are_offered
     async def exercise() -> None:
         app, _, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await click(pilot, "#wizard-next")
             labels = [str(b.label) for b in screen.query("#wizard-profile-buttons Button")]
@@ -234,7 +253,7 @@ def test_choosing_a_profile_updates_the_summary_and_the_selection():
     async def exercise() -> None:
         app, _, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await click(pilot, "#wizard-next")
             await click(pilot, "#wizard-profile-pepe-8gb")
@@ -257,7 +276,7 @@ def test_without_a_recommendation_nothing_is_preselected_and_continue_waits():
         )
         app, _, _ = hub(fake)
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await click(pilot, "#wizard-next")
             assert screen.state.profile_id is None
@@ -276,7 +295,7 @@ def test_default_and_portable_need_no_path(mode):
     async def exercise() -> None:
         app, fake, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_review(pilot, mode=mode)
             assert screen.state.mode is InstallLocationMode(mode)
@@ -292,7 +311,7 @@ def test_custom_needs_an_absolute_path_and_refuses_a_relative_one():
     async def exercise() -> None:
         app, fake, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await click(pilot, "#wizard-next")
             await click(pilot, "#wizard-next")
@@ -327,7 +346,7 @@ def test_install_shows_every_stage_the_producer_reports_in_order():
     async def exercise() -> None:
         app, fake, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
@@ -356,7 +375,7 @@ def test_progress_within_a_stage_is_shown_as_a_count_not_a_percentage():
     async def exercise() -> None:
         app, fake, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
             await pump(pilot, fake, 6)  # up to and including the first download tick
@@ -373,7 +392,7 @@ def test_a_successful_install_ends_on_done_with_open_webui():
     async def exercise() -> None:
         app, fake, opened = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
@@ -404,7 +423,7 @@ def test_a_failed_install_shows_a_short_reason_and_offers_a_retry():
     async def exercise() -> None:
         app, fake, _ = hub(FakeHubApplication(install_fail_at="Instalando ComfyUI"))
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
@@ -440,7 +459,7 @@ def test_pressing_install_twice_starts_one_operation():
     async def exercise() -> None:
         app, fake, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_review(pilot)
             button = screen.query_one("#wizard-next", Button)
@@ -458,7 +477,7 @@ def test_a_refused_install_stays_on_review_and_says_why():
     async def exercise() -> None:
         app, fake, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             fake.unavailable = True
             await walk_to_review(pilot)
@@ -524,7 +543,7 @@ def test_the_terminal_event_ends_the_operation_on_screen():
     async def exercise() -> None:
         app, fake, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
@@ -814,7 +833,7 @@ def test_the_rail_survives_a_resize_around_the_wizard_and_the_dashboard():
     async def exercise() -> None:
         app, _, _ = hub()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             await click(pilot, "#wizard-skip")
             rail = app.query_one(RightRail)
             assert not rail.has_class("narrow")
@@ -835,6 +854,7 @@ def test_the_three_sections_and_their_routes_stay_simple():
     assert [item.label for item in SECTION_ITEMS[Section.DASHBOARD]] == ["Visão geral", "Serviços"]
     assert [item.label for item in SECTION_ITEMS[Section.INSTALLATION]] == [
         "Instalar",
+        "Instalações",
         "Perfil",
         "Local",
         "Plano",
@@ -875,6 +895,9 @@ def test_the_installation_section_reopens_the_wizard():
             # checking and repairing what is here is its own action.
             assert str(app.query_one("#install-open-wizard", Button).label) == "Nova instalação"
             assert not app.query_one("#install-repair", Button).disabled
+            # Below the fold on this terminal: scrolled to, as a person would.
+            app.query_one("#install-open-wizard", Button).scroll_visible(animate=False)
+            await pilot.pause()
             await click(pilot, "#install-open-wizard")
             assert isinstance(app.screen, WizardScreen)
             await click(pilot, "#wizard-skip")
@@ -888,7 +911,7 @@ def test_no_emoji_anywhere_on_screen():
     async def exercise() -> None:
         app, fake, _ = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
             await pump(pilot, fake)
@@ -995,7 +1018,7 @@ def test_no_conflicts_is_the_ordinary_flow_untouched():
     async def exercise() -> None:
         app, fake, opened = hub()
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
@@ -1014,7 +1037,7 @@ def test_an_alongside_conflict_shows_the_choice_screen():
         report = conflict_report(alongside_conflict(), alongside_conflict(ComponentId.COMFYUI))
         app, fake, _ = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
 
@@ -1047,7 +1070,7 @@ def test_install_alongside_starts_the_first_real_operation_after_preflight():
         report = conflict_report(alongside_conflict())
         app, fake, opened = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
             assert app.operation_view is None
@@ -1084,7 +1107,7 @@ def test_stop_requires_confirmation_naming_exactly_what_the_application_can_stop
         )
         app, fake, _ = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
 
@@ -1110,7 +1133,7 @@ def test_confirming_stop_sends_only_the_frozen_selection_and_resumes():
         report = conflict_report(alongside_conflict())
         app, fake, _ = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
             await click(pilot, "#wizard-conflict-stop")
@@ -1137,7 +1160,7 @@ def test_an_unsafe_conflict_never_offers_stop_but_alongside_still_works():
         report = conflict_report(alongside_conflict(ComponentId.OLLAMA), unsafe_conflict())
         app, fake, _ = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
 
@@ -1162,7 +1185,7 @@ def test_abort_returns_to_review_without_installing_anything():
         report = conflict_report(alongside_conflict())
         app, fake, _ = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
 
@@ -1186,7 +1209,7 @@ def test_abort_can_be_followed_by_a_normal_install():
         report = conflict_report(alongside_conflict())
         app, fake, _ = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
             await click(pilot, "#wizard-conflict-abort")
@@ -1209,7 +1232,7 @@ def test_a_conflict_that_fails_to_resolve_stays_on_the_conflict_step():
             FakeHubApplication(conflict_report=report, conflict_resolution_fails=True)
         )
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
 
@@ -1230,7 +1253,7 @@ def test_custom_path_stays_correct_through_a_conflict_and_is_not_confused_for_in
         report = conflict_report(alongside_conflict())
         app, fake, _ = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await click(pilot, "#wizard-next")
             await click(pilot, "#wizard-profile-pepe-8gb")
@@ -1279,7 +1302,7 @@ def test_a_hard_blocker_offers_only_cancel():
         )
         app, fake, _ = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
 
@@ -1301,7 +1324,7 @@ def test_a_pressed_conflict_button_cannot_be_pressed_twice():
         report = conflict_report(alongside_conflict())
         app, fake, _ = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
 
@@ -1339,7 +1362,7 @@ def test_an_application_without_conflict_support_behaves_as_before():
 
         app, _, _ = hub(fake)
         async with app.run_test(size=(100, 32)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_review(pilot)
             await click(pilot, "#wizard-next")
@@ -1369,7 +1392,7 @@ def test_zero_emoji_in_the_conflict_screens():
         report = conflict_report(alongside_conflict(), unsafe_conflict())
         app, fake, _ = hub(FakeHubApplication(conflict_report=report))
         async with app.run_test(size=(110, 36)) as pilot:
-            await pilot.pause()
+            await through_welcome(pilot)
             screen = wizard(app)
             await walk_to_conflict(pilot, fake)
             shown = " ".join(str(w.content) for w in screen.query(Static))

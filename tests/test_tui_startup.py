@@ -20,6 +20,7 @@ from test_tui_operations import run, settle, text
 from textual.widgets import Button
 
 from local_ai_stack.app import LocalAIStackApp
+from local_ai_stack.tui.dialogs import WelcomeScreen
 from local_ai_stack.tui.navigation import Section
 from local_ai_stack.tui.wizard import WizardScreen
 
@@ -109,17 +110,18 @@ def test_the_dashboard_draws_and_answers_keys_while_the_application_is_still_wor
     run(exercise)
 
 
-def test_the_wizard_waits_for_the_answer_rather_than_guessing():
+def test_the_first_installation_is_offered_only_once_the_answer_is_in():
     application = BlockingApplication()  # nothing installed, but not known yet
 
     async def exercise() -> None:
         app = shell_for(application)
         async with app.run_test(size=(100, 32)) as pilot:
             await pilot.pause()
-            assert not isinstance(app.screen, WizardScreen)
+            assert not isinstance(app.screen, (WizardScreen, WelcomeScreen))
             application.gate.set()
             await settle(pilot)
-            assert isinstance(app.screen, WizardScreen)
+            # An offer, not the wizard itself.
+            assert isinstance(app.screen, WelcomeScreen)
 
     run(exercise)
 

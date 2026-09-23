@@ -44,6 +44,7 @@ from local_ai_stack.installation import InstallLocationMode, resolve_installatio
 from local_ai_stack.layout import ENV_ROOT
 from local_ai_stack.pets import unsafe_characters
 from local_ai_stack.tui.application import ConflictResolutionRequired, InstallSelection
+from local_ai_stack.tui.dialogs import WelcomeScreen
 from local_ai_stack.tui.wizard import (
     BROWSE_BUSY_LABEL,
     BROWSE_LABEL,
@@ -339,6 +340,10 @@ async def settle(pilot) -> None:
     await pilot.app.workers.wait_for_complete()
     await pilot.pause()
     await pilot.pause()
+    # A first opening offers the first installation; these tests say yes.
+    if isinstance(pilot.app.screen, WelcomeScreen):
+        await click(pilot, "#welcome-start")
+        await pilot.pause()
 
 
 SIZE = (110, 50)
@@ -660,7 +665,7 @@ def test_default_and_portable_attempts_do_not_enter_the_wizard_history():
     async def exercise() -> None:
         app, _ = hub_with(fake, picker=FakeFolderPicker())
         async with app.run_test(size=SIZE) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             screen = wizard(app)
             await click(pilot, "#wizard-next")
             await click(pilot, "#wizard-profile-capella")

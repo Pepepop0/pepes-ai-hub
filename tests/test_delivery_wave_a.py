@@ -46,6 +46,7 @@ from local_ai_stack.runtime import StackRuntime
 from local_ai_stack.services import ServiceState
 from local_ai_stack.stack_application import StackApplication
 from local_ai_stack.tui.application import HubApplication, InstallSelection, OperationBusy
+from local_ai_stack.tui.dialogs import WelcomeScreen
 from local_ai_stack.tui.widgets import RightRail
 from local_ai_stack.tui.wizard import WizardScreen, WizardStep
 
@@ -365,10 +366,14 @@ def assert_transfer_bar_fits(app, width: int) -> str:
 
 
 async def settle(pilot):
-    """The shell repaints, and may open the wizard, once its first refresh answers."""
+    """The shell repaints, and may offer the first installation, once its first refresh
+    answers. These tests accept the offer, which opens the wizard."""
     await pilot.app.workers.wait_for_complete()
     await pilot.pause()
     await pilot.pause()
+    if isinstance(pilot.app.screen, WelcomeScreen):
+        await click(pilot, "#welcome-start")
+        await pilot.pause()
 
 
 # How many rounds of "let the worker finish, let the app handle what it posted"

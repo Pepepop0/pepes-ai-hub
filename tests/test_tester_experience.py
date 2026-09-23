@@ -19,6 +19,7 @@ from textual.widgets import Button, Static
 
 from local_ai_stack.app import LocalAIStackApp
 from local_ai_stack.tui.application import StorageEstimate
+from local_ai_stack.tui.dialogs import WelcomeScreen
 from local_ai_stack.tui.navigation import Section
 from local_ai_stack.tui.widgets import DashboardPanel
 from local_ai_stack.tui.wizard import WizardScreen, WizardStep
@@ -49,7 +50,12 @@ def text_of(app, selector: str) -> str:
 
 
 async def walk_to_review(pilot) -> WizardScreen:
+    await pilot.app.workers.wait_for_complete()
     await pilot.pause()
+    # The first opening offers the first installation; the wizard is the yes.
+    if isinstance(pilot.app.screen, WelcomeScreen):
+        await click(pilot, "#welcome-start")
+        await pilot.pause()
     screen = pilot.app.screen
     assert isinstance(screen, WizardScreen)
     for _ in range(3):

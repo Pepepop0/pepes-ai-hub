@@ -19,6 +19,7 @@ from textual.widgets import Button, OptionList, Static
 from local_ai_stack.app import LocalAIStackApp
 from local_ai_stack.installation import InstallLocationMode
 from local_ai_stack.tui.application import InstallationSummary
+from local_ai_stack.tui.dialogs import SwitchInstallationScreen
 from local_ai_stack.tui.navigation import Section
 from local_ai_stack.tui.widgets import InstallPanel
 from local_ai_stack.tui.wizard import WizardScreen
@@ -98,10 +99,19 @@ def known_text(app) -> str:
     )
 
 
-def switch_options(app) -> set[str]:
-    """What the quick switch offers, as the folders behind the labels."""
-    panel = app.query_one(InstallPanel)
-    return {value for _, value in panel._switch_options()}
+async def open_switch_dialog(pilot) -> SwitchInstallationScreen:
+    """Press "Trocar instalação" and return the dialog it opens."""
+    await pilot.click("#install-change")
+    for _ in range(3):
+        await pilot.pause()
+    screen = pilot.app.screen
+    assert isinstance(screen, SwitchInstallationScreen), type(screen).__name__
+    return screen
+
+
+def dialog_rows(pilot) -> list[str]:
+    listing = pilot.app.screen.query_one("#switch-list", OptionList)
+    return [str(listing.get_option_at_index(i).prompt) for i in range(listing.option_count)]
 
 
 # --- what the screen shows ------------------------------------------------------
@@ -127,15 +137,18 @@ def test_the_screen_names_the_installation_in_use_and_lists_the_others():
     run(exercise)
 
 
-def test_the_quick_switch_offers_the_other_installations_and_not_the_one_in_use():
+def test_switching_lists_every_known_installation_the_one_in_use_included():
     async def exercise() -> None:
         fake = installed()
         app, _ = hub(fake)
         async with app.run_test(size=(120, 40)) as pilot:
             await open_installation_section(pilot)
-            options = switch_options(app)
-            assert str(PEPEH) not in options, "the one in use is not something to switch to"
-            assert options == {str(PEPINHO), str(CAPELLA)}
+            await open_switch_dialog(pilot)
+            rows = dialog_rows(pilot)
+            assert len(rows) == 3
+            assert "[Atual]" in rows[0] and str(PEPEH) in rows[0]
+            assert any(str(PEPINHO) in row for row in rows)
+            assert any(str(CAPELLA) in row for row in rows)
 
     run(exercise)
 
@@ -150,7 +163,16 @@ def test_an_installation_whose_folder_is_gone_is_shown_and_not_offered():
             known = known_text(app)
             assert "Pasta indisponível" in known
             assert "A pasta não está disponível." in known
-            assert str(CAPELLA) not in switch_options(app)
+            # In the switch dialog it is listed, and cannot be used.
+            dialog = await open_switch_dialog(pilot)
+            listing = dialog.query_one("#switch-list", OptionList)
+            listing.focus()
+            await pilot.press("down", "down")
+            await pilot.pause()
+            assert dialog.selected is not None and dialog.selected.root == CAPELLA
+            assert dialog.query_one("#switch-use", Button).disabled
+            await pilot.press("escape")
+            await pilot.pause()
 
             # Its way back is to find the folder, which is offered once selected.
             panel.select_row(CAPELLA)
@@ -324,17 +346,25 @@ def test_the_installation_in_use_cannot_be_forgotten_from_the_screen():
 # --- repair and new installation -------------------------------------------------
 
 
-def test_checking_and_repairing_runs_on_the_installation_in_use():
+def test_checking_only_checks_and_repairing_is_its_own_request():
     async def exercise() -> None:
         fake = installed()
         app, _ = hub(fake)
         async with app.run_test(size=(120, 40)) as pilot:
             await open_installation_section(pilot)
-            assert str(app.query_one("#install-repair", Button).label) == "Verificar e reparar"
-            await pilot.click("#install-repair")
-            for _ in range(6):
+            assert str(app.query_one("#install-verify", Button).label) == "Verificar instalação"
+            assert str(app.query_one("#install-repair", Button).label) == "Reparar"
+            await pilot.click("#install-verify")
+            await app.workers.wait_for_complete()
+            for _ in range(4):
                 await pilot.pause()
-            assert ("repair", None) in fake.managed
+            assert fake.managed == [("verify", None)], "a check repairs nothing"
+            assert "Nenhum problema encontrado" in text_of(app, "#install-check")
+
+            await pilot.click("#install-repair")
+            for _ in range(4):
+                await pilot.pause()
+            assert fake.managed[-1] == ("repair", None)
 
     run(exercise)
 

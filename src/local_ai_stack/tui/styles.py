@@ -52,7 +52,8 @@ Screen {
     width: 100%;
     min-width: 12;
     height: 3;
-    margin-bottom: 1;
+    /* No gap: five items must fit an 80x24 terminal. */
+    margin-bottom: 0;
     content-align: left middle;
 }
 
@@ -243,6 +244,102 @@ Screen {
     width: 100%;
     max-width: 40;
     min-width: 16;
+}
+
+/* Instalações: two actions per row, so a row fits a narrow terminal. */
+.install-actions {
+    height: auto;
+}
+
+.install-actions Button {
+    width: 1fr;
+    max-width: 30;
+    min-width: 16;
+    margin-right: 1;
+}
+
+#install-check {
+    height: auto;
+    margin-top: 1;
+}
+
+#install-known {
+    margin-top: 1;
+}
+
+#install-known-list {
+    height: auto;
+    max-height: 12;
+}
+
+/* Instalar */
+#new-install-summary {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#new-install-start {
+    width: 100%;
+    max-width: 40;
+    min-width: 16;
+}
+
+/* The empty Dashboard's invitation. */
+#dashboard-empty {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#dashboard-install {
+    width: 100%;
+    max-width: 40;
+    min-width: 20;
+}
+
+/* --- Dialogs --------------------------------------------------------------- */
+
+WelcomeScreen,
+SwitchInstallationScreen {
+    align: center middle;
+}
+
+.dialog {
+    width: 90%;
+    max-width: 76;
+    height: auto;
+    max-height: 90%;
+    overflow-y: auto;
+    padding: 1 2;
+    border: round $primary;
+    background: $surface;
+}
+
+#welcome-body {
+    margin: 1 0;
+}
+
+#switch-list {
+    height: auto;
+    max-height: 10;
+    margin: 1 0 0 0;
+}
+
+#switch-empty,
+#switch-hint {
+    height: auto;
+}
+
+.dialog-actions {
+    layout: grid;
+    grid-size: 2;
+    grid-gutter: 0 1;
+    grid-rows: 3;
+    height: auto;
+    margin-top: 1;
+}
+
+.dialog-actions Button {
+    width: 100%;
 }
 
 .service-card {

@@ -35,6 +35,7 @@ from local_ai_stack.external_conflict_contracts import (
 from local_ai_stack.installation import InstallLocationMode
 from local_ai_stack.operation_contracts import OperationEventKind, OperationState
 from local_ai_stack.pets import unsafe_characters
+from local_ai_stack.profiles import offered_profiles
 from local_ai_stack.tui.application import (
     COMPATIBLE,
     HubApplication,
@@ -909,8 +910,9 @@ def test_the_unwired_application_reads_the_machine_and_refuses_commands():
     assert not unwired.installation().ready
     assert {view.health for view in unwired.services_snapshot().services} == {"DOWN"}
     assert unwired.vram_snapshot().total_mib == 12227
+    # Even with nothing wired up, the offer follows the visibility policy.
     assert [choice.id for choice in unwired.profile_choices()] == [
-        profile.id for profile in all_profiles()
+        profile.id for profile in offered_profiles(all_profiles(), env={})
     ]
     with pytest.raises(Exception, match="não está conectada"):
         unwired.install(InstallSelection("capella"))

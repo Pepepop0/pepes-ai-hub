@@ -332,6 +332,8 @@ class LocalAIStackApp(App):
         self._folder_purpose: str | None = None
         self._locating_root: Path | None = None
         self._pending_switch: Path | None = None
+        # The entry a pending switch would replace, when it came from Locate.
+        self._pending_replacing: Path | None = None
         self._picking_folder = False
         self.operation_view: OperationView | None = None
         self.notices: list[str] = []
@@ -543,35 +545,38 @@ class LocalAIStackApp(App):
         self.run_worker(lambda: self._pick_folder(initial), thread=True, group="folder-picker")
 
     def _adopt_installation(self, folder: Path, *, replacing: Path | None = None) -> None:
-        """Validate a folder a person picked and switch to it, or say why not."""
+        """Validate a folder a person picked and switch to it, or say why not.
+
+        ``replacing`` is the entry this folder was found for: relocating one
+        installation, not adopting a second copy of it.
+        """
         panel = self._install_panel()
         opener = getattr(self.application, "open_installation", None)
+        relocate = getattr(self.application, "relocate_installation", None)
         if opener is None:
             return
         try:
-            opener(folder)
+            if replacing is not None and relocate is not None:
+                relocate(replacing, folder)
+            else:
+                opener(folder)
         except SwitchRequiresStop as pending:
-            # The folder is now known; switching to it is what has to wait.
+            # Nothing was adopted: switching to it is what has to wait.
             self._pending_switch = Path(folder)
+            self._pending_replacing = replacing
             if panel is not None:
                 panel.notice(self._stop_and_switch_question(pending))
-            self.refresh_projections()
+            self._adopt_active_installation()
             return
         except HubError as exc:
             if panel is not None:
                 panel.notice(str(exc))
+            self._adopt_active_installation()
             return
-        if replacing is not None and str(replacing) != str(folder):
-            forget = getattr(self.application, "forget_installation", None)
-            if forget is not None:
-                try:
-                    forget(replacing)
-                except HubError:
-                    pass  # the old entry stays; the new one is already active
         if panel is not None:
             panel.select_row(None)
             panel.notice("")
-        self._after_installation_change()
+        self._adopt_active_installation()
 
     def _install_panel(self):
         try:
@@ -579,15 +584,28 @@ class LocalAIStackApp(App):
         except NoMatches:
             return None
 
-    def _after_installation_change(self) -> None:
-        """The active installation moved: every projection is now about another one."""
+    def _adopt_active_installation(self) -> None:
+        """Read which installation is in use and make every surface say the same.
+
+        The application is the authority: what it reports after a commit is
+        what the configuration the screens read, the selected profile, the
+        Installation screen and the Dashboard describe. Called after anything
+        that may have moved the selection -- including the attempts that did
+        not, where it puts the screens back on the installation still in use.
+        """
         config = getattr(self.application, "config", None)
-        if config is not None:
-            self.config = config
-            self.query_one(MainContent).update_config(config)
-            profile = next((p for p in self.profiles if p.id == config.profile_id), None)
-            if profile is not None:
-                self.select_profile(profile.id)
+        if config is None:
+            self.refresh_projections()
+            return
+        self.installed_config = config
+        profile = next((item for item in self.profiles if item.id == config.profile_id), None)
+        if profile is not None and profile.id != self.selected_profile.id:
+            self.select_profile(profile.id)
+        try:
+            main = self.query_one(MainContent)
+        except NoMatches:  # pragma: no cover - the shell is being taken down
+            return
+        main.update_config(config)
         self.refresh_projections()
 
     # --- managing installations ---------------------------------------------
@@ -602,26 +620,30 @@ class LocalAIStackApp(App):
         except SwitchRequiresStop as pending:
             if self._pending_switch is not None and str(self._pending_switch) == str(message.root):
                 # Asked twice for the same installation: that is the decision.
+                replacing, self._pending_replacing = self._pending_replacing, None
                 self._pending_switch = None
                 self._operation_kind = "switch"
                 try:
-                    self.application.stop_and_switch(message.root)
+                    self.application.stop_and_switch(message.root, replacing=replacing)
                 except HubError as exc:
                     self._operation_kind = None
                     if panel is not None:
                         panel.notice(str(exc))
+                    self._adopt_active_installation()
                 return
             self._pending_switch = message.root
             if panel is not None:
                 panel.notice(self._stop_and_switch_question(pending))
+            self._adopt_active_installation()
             return
         except HubError as exc:
             if panel is not None:
                 panel.notice(str(exc))
+            self._adopt_active_installation()
             return
         if panel is not None:
             panel.notice("")
-        self._after_installation_change()
+        self._adopt_active_installation()
 
     def _stop_and_switch_question(self, pending: SwitchRequiresStop) -> str:
         """What has to happen before another installation can be used, in one paragraph."""

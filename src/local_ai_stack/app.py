@@ -38,7 +38,7 @@ from .installation import (
 )
 from .integration import IntegrationSnapshot, detect_integration, plan_executor, provision_context
 from .operation_contracts import OperationEvent, OperationSnapshot
-from .profiles import Profile, load_profiles
+from .profiles import Profile, load_profiles, offered_profiles
 from .resources import resource_root
 from .runtime import StackRuntime, stack_runtime
 from .services import ServiceState
@@ -241,7 +241,7 @@ class UnwiredHubApplication:
                 profile.description,
                 evaluate_compatibility(self.facts, profile).compatible,
             )
-            for profile in self.profiles
+            for profile in offered_profiles(self.profiles)
         )
 
     def install(self, selection: InstallSelection) -> str:
@@ -413,7 +413,7 @@ class LocalAIStackApp(App):
             yield MainContent(
                 self.facts,
                 self.runtime_snapshot,
-                self.profiles,
+                self.visible_profiles(),
                 self.selected_profile,
                 self.installed_config,
                 workspace_root(),
@@ -471,7 +471,7 @@ class LocalAIStackApp(App):
         except HubUnavailable:
             choices = tuple(
                 ProfileChoice(profile.id, profile.name, profile.description)
-                for profile in self.profiles
+                for profile in self.visible_profiles()
             )
         # The wizard starts on the largest profile this machine can run, which
         # the application works out from the detected hardware. No profile is
@@ -1062,6 +1062,27 @@ class LocalAIStackApp(App):
         self.query_one(MainContent).update_config(self.installed_config)
         self.query_one(RightRail).select_profile(profile, self.current_appearance)
         self._activate_theme(self.current_appearance)
+
+    def visible_profiles(self) -> tuple[Profile, ...]:
+        """The profiles the screens offer: the public ones, and the one in use.
+
+        An internal profile is not something to choose -- it exists for
+        development and for tests -- but an installation that already runs one
+        still has to be able to name it, so the profile in use is never hidden
+        from the screen that describes it.
+        """
+        offered = offered_profiles(self.profiles)
+        in_use = next(
+            (
+                profile
+                for profile in self.profiles
+                if profile.id == self.installed_config.profile_id
+            ),
+            None,
+        )
+        if in_use is not None and in_use not in offered:
+            return (*offered, in_use)
+        return offered
 
     def _resolve_appearance(self, profile: Profile) -> TuiAppearance:
         return resolve_tui_appearance(

@@ -391,10 +391,9 @@ class ProfilePanel(VerticalScroll):
         self.query_one("#profile-details", Static).update(
             render_profile_details(profile, self.facts)
         )
-        for candidate in self.profiles:
-            self.query_one(f"#profile-{candidate.id}", Button).variant = (
-                "primary" if candidate.id == profile.id else "default"
-            )
+        chosen = f"profile-{profile.id}"
+        for button in self.query(".profile-button").results(Button):
+            button.variant = "primary" if button.id == chosen else "default"
 
 
 class OperationPanel(Static):

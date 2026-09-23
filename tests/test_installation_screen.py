@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from hub_fakes import FakeFolderPicker, FakeHubApplication, ready_application
 from test_app import all_profiles, integration_snapshot, reference_facts, stopped_runtime
-from textual.widgets import Button, Static
+from textual.widgets import Button, OptionList, Static
 
 from local_ai_stack.app import LocalAIStackApp
 from local_ai_stack.installation import InstallLocationMode
@@ -85,6 +85,19 @@ def text_of(app, selector: str) -> str:
     return str(app.query_one(selector, Static).content)
 
 
+def known_text(app) -> str:
+    """Everything the list of known installations says, rows and help together."""
+    listing = app.query_one("#install-known-list", OptionList)
+    rows = [str(listing.get_option_at_index(i).prompt) for i in range(listing.option_count)]
+    return "\n".join(
+        [
+            str(app.query_one("#install-known", Static).content),
+            *rows,
+            str(app.query_one("#install-known-help", Static).content),
+        ]
+    )
+
+
 def switch_options(app) -> set[str]:
     """What the quick switch offers, as the folders behind the labels."""
     panel = app.query_one(InstallPanel)
@@ -105,7 +118,7 @@ def test_the_screen_names_the_installation_in_use_and_lists_the_others():
             assert str(PEPEH) in current
             assert "Personalizada" in current and "Pronta" in current
 
-            known = text_of(app, "#install-known")
+            known = known_text(app)
             for root in (PEPEH, PEPINHO, CAPELLA):
                 assert str(root) in known
             assert "Atual" in known
@@ -134,7 +147,7 @@ def test_an_installation_whose_folder_is_gone_is_shown_and_not_offered():
         app, _ = hub(fake, picker=FakeFolderPicker(PEPINHO))
         async with app.run_test(size=(120, 40)) as pilot:
             panel = await open_installation_section(pilot)
-            known = text_of(app, "#install-known")
+            known = known_text(app)
             assert "Pasta indisponível" in known
             assert "A pasta não está disponível." in known
             assert str(CAPELLA) not in switch_options(app)
@@ -238,7 +251,7 @@ def test_opening_an_existing_installation_uses_the_folder_picker():
             for _ in range(8):
                 await pilot.pause()
             assert ("open", picked) in fake.managed
-            assert str(picked) in text_of(app, "#install-known")
+            assert str(picked) in known_text(app)
 
     run(exercise)
 

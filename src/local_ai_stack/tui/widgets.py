@@ -7,7 +7,16 @@ from rich.markup import escape
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Button, ContentSwitcher, Input, Label, Select, Static
+from textual.widgets import (
+    Button,
+    ContentSwitcher,
+    Input,
+    Label,
+    OptionList,
+    Select,
+    Static,
+)
+from textual.widgets.option_list import Option
 
 from .. import PRODUCT_NAME, display_version
 from ..application_contracts import ServicesSnapshot, VramSnapshot
@@ -587,6 +596,10 @@ class InstallPanel(VerticalScroll):
         self.summaries = summaries
         self.can_pick_folder = can_pick_folder
         self.selected_root: Path | None = None
+        self._list_signature: tuple[str, ...] | None = None
+        # True while the screen is writing the list, so its own cursor
+        # movements are not mistaken for the person's.
+        self._filling = False
 
     # --- composition --------------------------------------------------------
 
@@ -603,7 +616,14 @@ class InstallPanel(VerticalScroll):
             yield Button("Trocar instalação", id="install-change", variant="primary")
             yield Button("Abrir pasta", id="install-open-root")
             yield Button("Verificar e reparar", id="install-repair")
-        yield Static(self._known_text(), id="install-known")
+        yield Static("[b]Instalações conhecidas[/b]", id="install-known")
+        yield OptionList(id="install-known-list")
+        yield Static(
+            "[dim]Escolha uma instalação na lista para localizar a pasta ou esquecê-la. "
+            "Esquecer remove apenas esta instalação da lista. "
+            "Nenhum arquivo será apagado.[/dim]",
+            id="install-known-help",
+        )
         with Horizontal(id="install-known-actions"):
             yield Button("Abrir instalação existente", id="install-open-existing")
             yield Button("Nova instalação", id="install-open-wizard")
@@ -654,27 +674,69 @@ class InstallPanel(VerticalScroll):
                 lines.append(escape(self.installation.root_display))
         return "\n".join(lines)
 
-    def _known_text(self) -> str:
-        lines = ["[b]Instalações conhecidas[/b]", ""]
-        if not self.summaries:
-            lines.append("[dim]Nenhuma instalação conhecida ainda.[/dim]")
-            return "\n".join(lines)
-        for row in self.summaries:
-            mark = "[b]Atual[/b]" if row.active else (">" if self._is_selected(row) else " ")
-            name = escape(row.profile_name or row.profile_id or "Instalação")
-            state = STATUS_WORDS.get(row.status, STATUS_WORDS["unknown"])
-            lines.append(f"{mark:6} {name:10} {state:20} {escape(str(row.root))}")
-            if row.detail:
-                lines.append(f"       [dim]{escape(row.detail)}[/dim]")
-        lines.append("")
-        lines.append(
-            "[dim]Esquecer remove apenas esta instalação da lista. "
-            "Nenhum arquivo será apagado.[/dim]"
-        )
-        return "\n".join(lines)
+    def _row_label(self, row: InstallationSummary) -> str:
+        """One installation as a row, the one in use marked as such."""
+        mark = "[b]Atual[/b]" if row.active else "     "
+        name = escape(row.profile_name or row.profile_id or "Instalação")
+        state = STATUS_WORDS.get(row.status, STATUS_WORDS["unknown"])
+        line = f"{mark} {name:12} {state:20} {escape(str(row.root))}"
+        return f"{line}\n      [dim]{escape(row.detail)}[/dim]" if row.detail else line
+
+    def _fill_list(self) -> None:
+        """Show the rows, and point at the chosen one.
+
+        The rows are rebuilt only when they actually changed: rebuilding moves
+        the cursor, and a cursor that moves by itself would undo the choice the
+        person just made with it. ``_filling`` says that any cursor movement
+        during this call is the screen's doing, not theirs.
+        """
+        listing = self.query_one("#install-known-list", OptionList)
+        signature = tuple(self._row_label(row) for row in self.summaries)
+        chosen = None if self.selected_root is None else str(self.selected_root)
+        self._filling = True
+        try:
+            if signature != self._list_signature:
+                self._list_signature = signature
+                listing.clear_options()
+                if not self.summaries:
+                    listing.add_option(Option("[dim]Nenhuma instalação conhecida ainda.[/dim]"))
+                    listing.disabled = True
+                    return
+                for row in self.summaries:
+                    listing.add_option(Option(self._row_label(row), id=str(row.root)))
+            listing.disabled = not self.summaries
+            if chosen is None:
+                # A list opens with its first row under the cursor, so moving
+                # from it is one key, not two.
+                if listing.highlighted is None:
+                    listing.highlighted = 0
+            else:
+                for index, row in enumerate(self.summaries):
+                    if str(row.root) == chosen:
+                        listing.highlighted = index
+                        break
+        finally:
+            self._filling = False
 
     def _is_selected(self, row: InstallationSummary) -> bool:
         return self.selected_root is not None and str(row.root) == str(self.selected_root)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        """A row chosen -- by Enter or by click -- is the row the actions apply to."""
+        if event.option_list.id != "install-known-list":
+            return
+        event.stop()
+        if not self._filling and event.option.id is not None:
+            self.select_row(event.option.id)
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        """Moving through the list is choosing: the actions follow the cursor."""
+        if event.option_list.id != "install-known-list":
+            return
+        event.stop()
+        if self._filling or event.option is None or event.option.id is None:
+            return
+        self.select_row(event.option.id)
 
     # --- state --------------------------------------------------------------
 
@@ -698,7 +760,7 @@ class InstallPanel(VerticalScroll):
 
     def _apply(self) -> None:
         self.query_one("#install-summary", Static).update(self._current_text())
-        self.query_one("#install-known", Static).update(self._known_text())
+        self._fill_list()
         select = self.query_one("#install-switch-select", Select)
         options = self._switch_options()
         select.set_options(options)

@@ -99,8 +99,20 @@ class RecordingBackend:
         self.world.calls.append((self.root, "stop_stack", profile_id))
         if self.root in self.world.refuse_stop:
             return SimpleNamespace(state=OperationState.FAILED, diagnostics=())
+        if self.root in self.world.leaves_running:
+            # Succeeded, and yet a managed process is still alive.
+            return SimpleNamespace(
+                state=OperationState.SUCCEEDED,
+                diagnostics=(),
+                left_running=(4242,),
+            )
         self.world.running.discard(self.root)
-        return SimpleNamespace(state=OperationState.SUCCEEDED, diagnostics=())
+        return SimpleNamespace(state=OperationState.SUCCEEDED, diagnostics=(), left_running=())
+
+    def listening_ports(self):
+        """Which of this installation's ports still answer, as the controller reports."""
+        occupied = self.root in self.world.running or self.root in self.world.keeps_ports
+        return (11434, 8080, 8188) if occupied else ()
 
     def restart_stack(self, operation_id, profile_id, *, emit=None):
         return self._command("restart_stack", operation_id, profile_id, emit=emit)
@@ -119,6 +131,10 @@ class World:
         self.conflicting: set[Path] = set()
         self.running: set[Path] = set()
         self.refuse_stop: set[Path] = set()
+        # A stop can report success and still leave something behind, which is
+        # exactly what must not let a switch through.
+        self.leaves_running: set[Path] = set()
+        self.keeps_ports: set[Path] = set()
         self.backends: dict[Path, RecordingBackend] = {}
 
     def backend(self, installation) -> RecordingBackend:

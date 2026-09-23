@@ -134,6 +134,8 @@ class HubApplicationAdapter:
                 stack_id=self.config.stack_id,
             )
         self._candidate: _Candidate | None = None
+        # Why the last stop-and-switch did not finish, for the screen to show.
+        self._switch_refusal: str | None = None
         self._catalog_specs: dict | None = None
         self._lock = threading.RLock()
         self._busy = False
@@ -165,8 +167,21 @@ class HubApplicationAdapter:
         return None if resolved is None else str(resolved)
 
     def active_root(self) -> Path | None:
-        """The folder every command reaches right now. None before the first install."""
-        return self.config.installation.root if self.config else None
+        """The folder every command reaches right now. None before the first install.
+
+        A portable or default installation names no root of its own -- it is
+        resolved where it is running -- so the folder its backend resolved to
+        is its identity: for the list, for the current marker, and for the
+        protection that refuses to forget the installation in use.
+        """
+        if self.config is None:
+            return None
+        named = self.config.installation.root
+        if named is not None:
+            return named
+        installation = getattr(self.backend, "installation", None)
+        resolved = getattr(installation, "root", None)
+        return None if resolved is None else Path(resolved)
 
     def active_profile(self) -> str | None:
         return self.config.profile_id if self.config else None
@@ -236,6 +251,11 @@ class HubApplicationAdapter:
             )
         return tuple(sorted(rows, key=lambda row: not row.active))
 
+    def last_switch_refusal(self) -> str | None:
+        """Why the last stop-and-switch did not happen. Read once, then cleared."""
+        refusal, self._switch_refusal = self._switch_refusal, None
+        return refusal
+
     def forget_installation(self, root: Path | str) -> None:
         """Remove the Hub's shortcut to an installation. Deletes nothing, stops nothing."""
         with self._lock:
@@ -290,15 +310,24 @@ class HubApplicationAdapter:
             problems=tuple(problems),
         )
 
-    def _bind(self, root: Path, config: InstalledConfig) -> None:
+    def _bind(self, root: Path, config: InstalledConfig, *, forgetting: Path | None = None) -> None:
+        """Make this installation the active one, as one transaction."""
         installation = self.resolve(location_of_config(config, root))
         backend = self._backends.get(installation.root)
         if backend is None:
             backend = self.backend_factory(installation)
             self._backends[installation.root] = backend
-        self.config = config
-        self.backend = backend
-        self._persist(self.state.activating(config))
+        candidate = _Candidate(
+            InstallSelection(
+                config.profile_id,
+                config.installation.mode,
+                str(root) if config.installation.mode is InstallLocationMode.CUSTOM else None,
+            ),
+            installation,
+            backend,
+            config,
+        )
+        self._commit(candidate, forgetting=forgetting)
 
     def switch_installation(self, root: Path | str) -> None:
         """Make a known installation the active one. Stopped stacks only.
@@ -318,7 +347,35 @@ class HubApplicationAdapter:
                 raise HubError("Esta pasta não contém uma instalação que o Hub reconheça.")
             self._bind(Path(root), config)
 
-    def stop_and_switch(self, root: Path | str) -> str:
+    def _stop_was_complete(self, backend, result) -> str | None:
+        """Why the target must not be bound yet, or None when the way is clear.
+
+        Two things have to be true after stopping: the Hub's own processes are
+        gone, and the addresses they held answer to nobody. Both are asked of
+        the runtime that already owns them; nothing is re-implemented here.
+        """
+        if not _succeeded(result):
+            return "Não foi possível parar os serviços da instalação atual."
+        left = tuple(getattr(result, "left_running", ()) or ())
+        if left:
+            return (
+                "Alguns serviços gerenciados continuam em execução, então a troca foi "
+                "cancelada. Tente novamente ou reinicie a máquina."
+            )
+        listening = getattr(backend, "listening_ports", None)
+        try:
+            ports = tuple(listening() or ()) if callable(listening) else ()
+        except Exception:  # noqa: BLE001 -- an unreadable answer is not a proof of freedom
+            return "Não foi possível confirmar que as portas foram liberadas."
+        if ports:
+            spelled = ", ".join(str(port) for port in ports)
+            return (
+                f"As portas {spelled} continuam ocupadas, então a troca foi cancelada. "
+                "Processos externos não são encerrados pelo Hub."
+            )
+        return None
+
+    def stop_and_switch(self, root: Path | str, *, replacing: Path | str | None = None) -> str:
         """Stop the managed services of the installation in use, then switch to another.
 
         Only processes this Hub can prove it owns are stopped; anything else on
@@ -345,8 +402,18 @@ class HubApplicationAdapter:
                     )
                 finally:
                     with self._lock:
-                        if _succeeded(result):
-                            self._bind(target, config)
+                        refusal = self._stop_was_complete(previous, result)
+                        if refusal is None:
+                            try:
+                                self._bind(
+                                    target,
+                                    config,
+                                    forgetting=None if replacing is None else Path(replacing),
+                                )
+                            except HubError as exc:
+                                self._switch_refusal = str(exc)
+                        else:
+                            self._switch_refusal = refusal
                         self._busy = False
                         self._idle.set()
 
@@ -374,15 +441,36 @@ class HubApplicationAdapter:
                 )
             if config.profile_id not in {p.id for p in self.profiles}:
                 raise HubError(f"O perfil {config.profile_id} não existe nesta versão do Hub.")
-            self._persist(
-                self.state.remembering(
-                    target,
-                    config.installation.mode,
-                    profile_id=config.profile_id,
-                    stack_id=config.stack_id,
-                )
-            )
+        # A folder becomes an installation the Hub knows when it becomes the one
+        # in use -- not when it was merely looked at and then abandoned.
         self.switch_installation(target)
+
+    def relocate_installation(self, old_root: Path | str, new_root: Path | str) -> None:
+        """An installation was found somewhere else: switch to it and replace its entry.
+
+        The old entry is kept until the new folder is actually in use, so a
+        relocation that is refused -- or that needs a stop nobody approved --
+        leaves the list exactly as it was.
+        """
+        with self._lock:
+            target = Path(new_root)
+            if not target.exists():
+                raise HubError("A pasta escolhida não existe.")
+            config = _installed_config(config_path(StackLayout.from_root(target)))
+            if config is None:
+                raise HubError(
+                    "Esta pasta parece uma instalação, mas não tem a configuração do Hub."
+                    if _looks_installed(target)
+                    else "Esta pasta não contém uma instalação que o Hub reconheça."
+                )
+            if config.profile_id not in {p.id for p in self.profiles}:
+                raise HubError(f"O perfil {config.profile_id} não existe nesta versão do Hub.")
+            plan = self.plan_switch(target)
+            if not plan.ok:
+                raise HubError(plan.problems[0])
+            if plan.must_stop:
+                raise SwitchRequiresStop(plan)
+            self._bind(target, config, forgetting=Path(old_root))
 
     def repair(self) -> str:
         """Check the active installation and repair what is missing, in place.
@@ -649,17 +737,43 @@ class HubApplicationAdapter:
             )
         self._persist(state)
 
-    def _commit(self, candidate: _Candidate) -> None:
-        """The candidate becomes the Hub's truth: binding, selection and history."""
+    def _commit(self, candidate: _Candidate, *, forgetting: Path | None = None) -> None:
+        """The candidate becomes the Hub's truth -- or nothing does.
+
+        The order is the guarantee: the new state is written first, and only a
+        write that succeeded moves the binding. If the disk refuses, memory,
+        the backend and the file still describe the installation that was in
+        use, and the caller is told.
+        """
+        previous_config, previous_backend, previous_state = self.config, self.backend, self.state
+        state = self.state.activating(candidate.config).reconciled(candidate.root)
+        if forgetting is not None and root_key(forgetting) != root_key(candidate.root):
+            # Relocation: the old folder stops being known once the new one is.
+            state = state.forgetting(forgetting)
+        try:
+            self._persist(state, config=candidate.config)
+        except HubError:
+            self.config, self.backend, self.state = (
+                previous_config,
+                previous_backend,
+                previous_state,
+            )
+            raise
         self.config = candidate.config
         self.backend = candidate.backend
-        self._persist(self.state.activating(candidate.config))
 
-    def _persist(self, state: HubState) -> None:
+    def _persist(self, state: HubState, *, config: InstalledConfig | None = None) -> None:
+        """Write the Hub's state. Memory follows the disk, never the other way round."""
+        try:
+            write_state(self.selection_path, state)
+        except OSError as exc:
+            raise HubError("Não foi possível salvar a seleção do Hub. Nada foi alterado.") from exc
         self.state = state
-        if self.config is not None and state.active is not None:
-            self.config = replace(self.config, general=state.general)
-        write_state(self.selection_path, state)
+        current = config if config is not None else self.config
+        if current is not None and state.active is not None:
+            self.config = replace(current, general=state.general)
+        elif config is not None:
+            self.config = config
 
     def install(self, selection: InstallSelection) -> str:
         with self._lock:

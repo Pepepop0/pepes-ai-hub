@@ -286,6 +286,28 @@ class HubState:
             used=moved,
         )
 
+    def reconciled(self, resolved_root: Path | None = None) -> HubState:
+        """The installation in use is always one the Hub knows about.
+
+        A state file can name an active installation and not list it -- written
+        by an older version, or edited by hand -- and an installation nobody
+        can find in the list is one nobody can switch back to, protect from
+        being forgotten, or read a history from. ``resolved_root`` is for the
+        modes that name no root of their own: the folder they resolved to on
+        this machine is their identity here.
+        """
+        if self.active is None:
+            return self
+        root = self.active.installation.root or resolved_root
+        if root is None or self.entry_for(root) is not None:
+            return self
+        return self.remembering(
+            root,
+            self.active.installation.mode,
+            profile_id=self.active.profile_id,
+            stack_id=self.active.stack_id,
+        )
+
     def forgetting(self, root: str | os.PathLike[str]) -> HubState:
         """Remove the Hub's shortcut to this installation. Deletes nothing on disk.
 
@@ -354,8 +376,10 @@ class HubState:
         )
         seen: dict[str, KnownInstallation] = {}
         for entry in known:
+            # A folder written twice, in two spellings, is one installation.
             seen[entry.key] = entry
-        return cls(active=active, known=tuple(seen.values()), general=general)
+        state = cls(active=active, known=tuple(seen.values()), general=general)
+        return state.reconciled()
 
 
 def dumps_state(state: HubState) -> str:

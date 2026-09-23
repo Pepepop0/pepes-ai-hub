@@ -563,10 +563,19 @@ class FakeHubApplication:
             )
         self._activate(Path(str(root)))
 
-    def stop_and_switch(self, root) -> str:
+    def stop_and_switch(self, root, *, replacing=None) -> str:
         self.managed.append(("stop_and_switch", Path(str(root))))
+        if replacing is not None:
+            self.summaries = tuple(row for row in self.summaries if str(row.root) != str(replacing))
         self._activate(Path(str(root)))
         return "op-stop-and-switch"
+
+    def relocate_installation(self, old_root, new_root) -> None:
+        self.managed.append(("relocate", (Path(str(old_root)), Path(str(new_root)))))
+        if self.open_error is not None:
+            raise HubError(self.open_error)
+        self.summaries = tuple(row for row in self.summaries if str(row.root) != str(old_root))
+        self.open_installation(new_root)
 
     def open_installation(self, root) -> None:
         self.managed.append(("open", Path(str(root))))
@@ -592,6 +601,19 @@ class FakeHubApplication:
         """The same idempotent run the installer uses, on what is already here."""
         self.managed.append(("repair", None))
         return self._lifecycle("repair", "Verificando")
+
+    @property
+    def config(self):
+        """What the screens read: the installation in use, as this fake has it."""
+        from local_ai_stack.config import InstalledConfig
+        from local_ai_stack.installation import InstallLocation
+
+        location = (
+            InstallLocation.custom(self.root_display)
+            if self.mode is InstallLocationMode.CUSTOM and self.root_display
+            else InstallLocation(self.mode, None)
+        )
+        return InstalledConfig(self.profile_id or "pepe", installation=location)
 
     def _activate(self, root: Path) -> None:
         self.summaries = tuple(

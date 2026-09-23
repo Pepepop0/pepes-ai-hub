@@ -7,6 +7,7 @@ from rich.markup import escape
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
+from textual.timer import Timer
 from textual.widgets import (
     Button,
     ContentSwitcher,
@@ -1023,9 +1024,38 @@ class PetSlot(Static):
     ) -> None:
         super().__init__(text, markup=False, id=id)
         self.animator = animator
+        self._frames: Timer | None = None
+        self._animating = False
 
     def on_mount(self) -> None:
-        self.set_interval(self.REFRESH_INTERVAL, self.refresh_frame)
+        self._frames = self.set_interval(self.REFRESH_INTERVAL, self.refresh_frame)
+        self._animating = True
+        if not self.display:
+            self.pause_frames()
+
+    def on_show(self) -> None:
+        """Back on screen: the pet picks up where the person can see it."""
+        self.resume_frames()
+
+    def on_hide(self) -> None:
+        """Scrolled away, collapsed or hidden: a pet nobody can see costs nothing."""
+        self.pause_frames()
+
+    def pause_frames(self) -> None:
+        if self._frames is not None and self._animating:
+            self._frames.pause()
+            self._animating = False
+
+    def resume_frames(self) -> None:
+        if self._frames is not None and not self._animating:
+            self._frames.resume()
+            self._animating = True
+            self.refresh_frame()
+
+    @property
+    def animating(self) -> bool:
+        """Whether frames are being drawn at all."""
+        return self._animating
 
     def on_resize(self) -> None:
         """Let the art re-fit the slot. A renderer without art ignores this."""
@@ -1148,8 +1178,10 @@ class RightRail(Vertical):
         self.set_narrow(width < RAIL_NARROW_COLUMNS)
         pet = self.query(PetSlot)
         for slot in pet:
-            # A pet nobody can see does not animate.
+            # A pet nobody can see does not animate: hiding it stops its frames.
             slot.display = not hidden
+            if hidden:
+                slot.pause_frames()
 
     def toggle_collapsed(self) -> None:
         self.toggle_class("collapsed")

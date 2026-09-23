@@ -343,6 +343,9 @@ class LocalAIStackApp(App):
         # an install gets the frozen installation heading; a lifecycle command
         # that fails is not "an installation that did not conclude".
         self._operation_kind: str | None = None
+        # True from the moment a command is launched. Its first event can take
+        # seconds to arrive, and the Hub is already busy in that gap.
+        self._operation_pending = False
         self._pending_install_selection: InstallSelection | None = None
         self._submitting_install = False
 
@@ -622,11 +625,11 @@ class LocalAIStackApp(App):
                 # Asked twice for the same installation: that is the decision.
                 replacing, self._pending_replacing = self._pending_replacing, None
                 self._pending_switch = None
-                self._operation_kind = "switch"
+                self._begin_operation("switch")
                 try:
                     self.application.stop_and_switch(message.root, replacing=replacing)
                 except HubError as exc:
-                    self._operation_kind = None
+                    self._end_operation()
                     if panel is not None:
                         panel.notice(str(exc))
                     self._adopt_active_installation()
@@ -684,11 +687,11 @@ class LocalAIStackApp(App):
         repair = getattr(self.application, "repair", None)
         if repair is None:
             return
-        self._operation_kind = "repair"
+        self._begin_operation("repair")
         try:
             repair()
         except HubError as exc:
-            self._operation_kind = None
+            self._end_operation()
             panel = self._install_panel()
             if panel is not None:
                 panel.notice(str(exc))
@@ -730,7 +733,7 @@ class LocalAIStackApp(App):
         if self._submitting_install:
             return
         self._submitting_install = True
-        self._operation_kind = "install"
+        self._begin_operation("install")
         self.run_worker(lambda: self._submit_install(selection), thread=True, group="install")
 
     def _submit_install(self, selection: InstallSelection) -> None:
@@ -760,7 +763,7 @@ class LocalAIStackApp(App):
                 # The attempt has just been recorded; a retry should already offer it.
                 wizard.update_recent_roots(self._recent_custom_roots())
         except ConflictResolutionRequired as conflict:
-            self._operation_kind = None
+            self._end_operation()
             report = conflict.report
             checker = getattr(self.application, "current_conflict_preflight", None)
             if checker is not None:
@@ -771,7 +774,7 @@ class LocalAIStackApp(App):
             if wizard is not None:
                 wizard.show_conflict(report)
         except HubError as error:
-            self._operation_kind = None
+            self._end_operation()
             if wizard is not None:
                 wizard.go_to(WizardStep.REVIEW)
                 wizard.show_refusal(str(error))
@@ -793,6 +796,8 @@ class LocalAIStackApp(App):
         if view is self.operation_view:
             return
         self.operation_view = view
+        if view is not None and view.terminal:
+            self._operation_pending = False
         heading = None
         if view is not None and view.terminal and self._operation_kind == "install":
             heading = installation_outcome_heading(view.state)
@@ -846,7 +851,7 @@ class LocalAIStackApp(App):
         if wizard is not None:
             wizard.apply_resolution(message.result)
         if message.result.status is ConflictResolutionStatus.ABORTED:
-            self._operation_kind = None
+            self._end_operation()
             self._pending_install_selection = None
         elif message.result.status is ConflictResolutionStatus.PROCEED:
             selection = self._pending_install_selection
@@ -960,6 +965,24 @@ class LocalAIStackApp(App):
             if self.first_run_wizard and not installation.ready and self.wizard is None:
                 self.open_wizard()
 
+    def _begin_operation(self, kind: str) -> None:
+        """A command has been launched: the Hub is busy from here, not from its
+        first event."""
+        self._operation_kind = kind
+        self._operation_pending = True
+
+    def _end_operation(self) -> None:
+        """The command never started, or will not finish: nothing is pending."""
+        self._operation_kind = None
+        self._operation_pending = False
+
+    def busy_with_operation(self) -> bool:
+        """Whether an operation is under way, launched or already reporting."""
+        view = self.operation_view
+        if view is not None and not view.terminal:
+            return True
+        return self._operation_pending
+
     def run_stack_command(self, verb: str) -> None:
         """Start, stop or restart, if the application will have it."""
         command = {
@@ -968,11 +991,14 @@ class LocalAIStackApp(App):
             "restart": self.application.restart_stack,
         }[verb]
         try:
-            self._operation_kind = verb
+            self._begin_operation(verb)
             command()
         except OperationBusy as error:
+            # Something else is already running: this command never started.
+            self._end_operation()
             self._notice(str(error))
         except HubError as error:
+            self._end_operation()
             self._notice(str(error), error=True)
         else:
             self._notice("")
@@ -1161,8 +1187,7 @@ class LocalAIStackApp(App):
         is in progress and the screen says what is happening. Everything else
         closes at once, with a reminder that the services stay up.
         """
-        view = self.operation_view
-        if view is not None and not view.terminal:
+        if self.busy_with_operation():
             self._notify_exit_refused()
             return
         self.exit()

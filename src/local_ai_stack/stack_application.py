@@ -66,11 +66,13 @@ from .integration import (
     IntegrationSnapshot,
     ManagedPlanPhases,
     ManagedPreflightCode,
+    ManagedPreflightIssue,
     ManagedPreflightReport,
     build_service_controller,
     default_install_actions,
     default_provisioners,
     detect_integration,
+    endpoint_collisions,
     plan_executor,
     preflight_managed_stack,
     provision_context,
@@ -118,7 +120,7 @@ from .profiles import (
     load_profiles,
 )
 from .provisioning import ProvisionContext, ProvisionEvent, ProvisionOutcome
-from .registry import ManagedProcessRegistry
+from .registry import IdentityVerdict, ManagedProcessRegistry
 from .resources import resource_root
 from .runner import CommandRunner
 from .service_config import (
@@ -591,6 +593,47 @@ class StackApplication:
             if status.live:
                 pids.update(launcher.tree_pids(status.service_id, status.entry.pid) or ())
         return frozenset(pids)
+
+    def surviving_services(self) -> tuple[str, ...]:
+        """Services this installation started that it cannot prove are gone.
+
+        Asked of the managed-process registry, the authority on what this
+        installation owns: an entry whose process is still alive -- or whose
+        process can no longer be inspected -- is a service still running as
+        far as anyone can prove. An entry whose process is gone, or whose pid
+        now belongs to a stranger, is not. A registry that cannot be read
+        proves nothing, so it raises instead of answering "none".
+        """
+        registry = self.registry()
+        snapshot = registry.load()
+        if not snapshot.ok:
+            raise RuntimeError(f"managed-process registry is unreadable: {snapshot.error}")
+        if not snapshot.entries:
+            return ()
+        statuses = registry.statuses(processes=self.deps.list_processes())
+        return tuple(
+            sorted(
+                service_id
+                for service_id, status in statuses.items()
+                if status.verdict in (IdentityVerdict.LIVE, IdentityVerdict.UNKNOWN)
+            )
+        )
+
+    def endpoint_collisions(self, profile_id: str) -> tuple[ManagedPreflightIssue, ...]:
+        """What holds this profile's endpoints right now, as the preflight sees it.
+
+        The port half of :meth:`preflight`, with the same rule and the same
+        scans: an unreadable listener scan is an issue, and a port held by
+        anything this installation cannot prove it started is a collision.
+        Read-only; safe to ask before another installation takes the ports.
+        """
+        profile = self.profile(profile_id)
+        return endpoint_collisions(
+            self.options.endpoints_for(profile),
+            profile,
+            self.deps.list_listeners(),
+            self.managed_pids(),
+        )
 
     def preflight(self, profile: Profile) -> ManagedPreflightReport:
         # A managed port held by a process proved to be ours is the stack
@@ -1129,6 +1172,16 @@ class StackApplication:
             result = controller.stop(service_id)
             if not result.stopped:
                 problems.append(diagnostic("service-not-stopped", f"{service_id}: {result.detail}"))
+                continue
+            if result.left_running:
+                # The registered process is gone, but members of its tree proved
+                # to be ours are not: the service has not stopped.
+                problems.append(
+                    diagnostic(
+                        "service-left-running",
+                        f"{service_id}: {len(result.left_running)} process(es) still running",
+                    )
+                )
                 continue
             stopped.append(service_id)
         if not finish:

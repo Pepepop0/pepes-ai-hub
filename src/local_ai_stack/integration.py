@@ -264,6 +264,50 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+def endpoint_collisions(
+    endpoints: StackEndpoints,
+    profile: Profile,
+    listeners: ListenerReport,
+    managed_pids: frozenset[int] = frozenset(),
+) -> tuple[ManagedPreflightIssue, ...]:
+    """What holds this profile's enabled endpoints: the port half of the preflight.
+
+    A listener scan that cannot be read proves nothing, so it is an issue of
+    its own. Otherwise every enabled endpoint held by a process ``managed_pids``
+    does not name -- an external service, another installation's leftover, a
+    listener nobody can identify -- is a collision.
+    """
+    if listeners.outcome is ScanOutcome.UNAVAILABLE:
+        return (
+            ManagedPreflightIssue(
+                ManagedPreflightCode.LISTENER_SCAN,
+                f"could not prove managed ports are free: {listeners.detail}",
+            ),
+        )
+    issues: list[ManagedPreflightIssue] = []
+    for component_id, service in profile.services.items():
+        if not service.enabled:
+            continue
+        spec = endpoints.spec(component_id)
+        collisions = [
+            listener
+            for listener in listeners.on_port(spec.port, spec.host)
+            if listener.pid is None or listener.pid not in managed_pids
+        ]
+        if not collisions:
+            continue
+        pids = sorted({listener.pid for listener in collisions if listener.pid is not None})
+        suffix = f" (pids: {', '.join(map(str, pids))})" if pids else ""
+        issues.append(
+            ManagedPreflightIssue(
+                ManagedPreflightCode.ENDPOINT_COLLISION,
+                f"managed endpoint {spec.host}:{spec.port} for {spec.id} is occupied{suffix}",
+                component_id=spec.id,
+            )
+        )
+    return tuple(issues)
+
+
 def preflight_managed_stack(
     context: ProvisionContext,
     profile: Profile,
@@ -359,31 +403,7 @@ def preflight_managed_stack(
         occupied[key] = spec.id
 
     listeners = listener_report or list_listeners()
-    if listeners.outcome is ScanOutcome.UNAVAILABLE:
-        issues.append(
-            ManagedPreflightIssue(
-                ManagedPreflightCode.LISTENER_SCAN,
-                f"could not prove managed ports are free: {listeners.detail}",
-            )
-        )
-    else:
-        for spec in enabled_specs:
-            collisions = [
-                listener
-                for listener in listeners.on_port(spec.port, spec.host)
-                if listener.pid is None or listener.pid not in managed_pids
-            ]
-            if not collisions:
-                continue
-            pids = sorted({listener.pid for listener in collisions if listener.pid is not None})
-            suffix = f" (pids: {', '.join(map(str, pids))})" if pids else ""
-            issues.append(
-                ManagedPreflightIssue(
-                    ManagedPreflightCode.ENDPOINT_COLLISION,
-                    f"managed endpoint {spec.host}:{spec.port} for {spec.id} is occupied{suffix}",
-                    component_id=spec.id,
-                )
-            )
+    issues.extend(endpoint_collisions(endpoints, profile, listeners, managed_pids))
 
     return ManagedPreflightReport(
         endpoints=endpoints,

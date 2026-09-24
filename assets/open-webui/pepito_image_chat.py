@@ -1,7 +1,7 @@
 """
 title: Pepito Image Chat
 author: Pepito's AI Hub
-version: 0.5.1
+version: 0.5.2
 required_open_webui_version: 0.11.3
 description: Send every Image turn through Open WebUI's own image generation or editing, and decide which from the user's words.
 """
@@ -131,8 +131,8 @@ _SUCCESS_CONTEXT = re.compile(r"<context>[^<]*" + re.escape(SUCCESS_MARK) + r"[^
 # the policy: an explicit reference to the earlier picture, then a request
 # that opens with an editing verb, then a request phrased as a new picture,
 # then an editing verb anywhere, then a verb that only edits when it points
-# at something ("make it blue", "faça o fundo preto"). Anything undecided is
-# a new picture.
+# at something ("make it blue", "faça o fundo preto", "dê um chapéu para ela").
+# Anything undecided is a new picture.
 _W = r"(?<![\w])(?:{})(?![\w])"
 _THE_IMAGE = re.compile(
     _W.format(
@@ -165,29 +165,39 @@ _EDIT_VERB = re.compile(
     ),
     re.IGNORECASE,
 )
-# Verbs that edit only when they point at something already there. "a" is an
-# English article and a Portuguese pointer, so each language keeps its own.
+
+
+# Verbs that edit only when they point at something already there: a
+# determiner right after the verb ("make the apple green", "faça o fundo
+# preto"), or an object pronoun anywhere ("give it a hat", "dê um chapéu para
+# ela"). A determiner further on belongs to a new picture's own description
+# ("make a cat on the table", "faça um gato na praia"). English "her" is a
+# possessive as often as an object, so it points only right after the verb or
+# at the end of a clause ("make her blonde", "give a hat to her") and never
+# in "make a girl hugging her cat". Portuguese "dê" is written with its
+# accent: unaccented, "de" is the preposition of "um castelo de pedra". "a"
+# is an English article and a Portuguese pointer, so each language keeps its
+# own words.
+def _pointing(verbs: str, determiners: str, objects: str) -> tuple:
+    verb = _W.format(verbs)
+    return (
+        re.compile(verb, re.IGNORECASE),
+        re.compile(verb + r"\s+" + _W.format(determiners), re.IGNORECASE),
+        re.compile(_W.format(objects), re.IGNORECASE),
+    )
+
+
 _POINTING = (
-    (
-        re.compile(_W.format(r"make|turn|give|paint|colou?r|set|fill|leave"), re.IGNORECASE),
-        re.compile(_W.format(r"it|its|this|that|these|those|them|the"), re.IGNORECASE),
+    _pointing(
+        r"make|turn|give|paint|colou?r|set|fill|leave",
+        r"the|this|that|these|those|its|her",
+        r"it|them|him|her(?=\s*(?:[^\w\s]|$))",
     ),
-    (
-        re.compile(_W.format(r"fa[cç]a|faz|fazer|pinte|pinta|pintar|d[eê]"), re.IGNORECASE),
-        re.compile(
-            _W.format(
-                r"ele|ela|eles|elas|isso|isto|aquilo|nele|nela|neles|nelas|nisso|nisto|"
-                r"o|a|os|as|no|na|nos|nas|do|da|dos|das|ao|à|esse|essa|este|esta|desse|dessa"
-            ),
-            re.IGNORECASE,
-        ),
+    _pointing(
+        r"fa[cç]a|faz|fazer|pinte|pinta|pintar|dê",
+        r"o|a|os|as|no|na|nos|nas|do|da|dos|das|ao|à|esse|essa|este|esta|desse|dessa",
+        r"ele|ela|eles|elas|isso|isto|aquilo|nele|nela|neles|nelas|nisso|nisto",
     ),
-)
-# Someone already in the picture: "make her blonde", "turn him into a knight".
-# Only right after the verb -- elsewhere "her" is a possessive in a new
-# picture's description ("make a girl hugging her cat").
-_POINTED_PERSON = re.compile(
-    _W.format(r"(?:make|turn|give|paint|colou?r|set|fill|leave) (?:her|him)"), re.IGNORECASE
 )
 _LEADING_FILLER = re.compile(
     r"^(?:(?:now|then|next|ok|okay|please|and|also|so|well|hmm|agora|ent[aã]o|depois|"
@@ -212,9 +222,12 @@ def edit_intent(text: str) -> bool:
         return True
     if _NEW_IMAGE.search(words):
         return False
-    if _EDIT_VERB.search(words) or _POINTED_PERSON.search(words):
+    if _EDIT_VERB.search(words):
         return True
-    return any(verb.search(words) and pointer.search(words) for verb, pointer in _POINTING)
+    return any(
+        determined.search(words) or (verb.search(words) and pointed.search(words))
+        for verb, determined, pointed in _POINTING
+    )
 
 
 # The model's acknowledgement, without any picture it made up.

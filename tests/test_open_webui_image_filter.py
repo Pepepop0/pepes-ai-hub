@@ -277,6 +277,17 @@ def test_the_filter_is_a_bundled_resource_not_a_package_module():
         "Generate an image of a stone castle at night.",
         "Make a girl hugging her cat",
         "A knight and his horse",
+        # Once edits (browser, 8GB root, filter 0.5.1): "de" read as "dê", and
+        # an article anywhere read as pointing at the earlier picture.
+        "Gere um castelo de pedra à noite.",
+        "Crie uma casa de madeira na praia.",
+        "Gere uma paisagem de montanha ao amanhecer.",
+        "Faça um gato na praia.",
+        "Pinte um pôr do sol na praia.",
+        "Paint a sunset over the sea.",
+        "Make a cat on the table.",
+        "Gere uma imagem de uma mulher ruiva.",
+        "Make a dog that looks happy",
     ],
 )
 def test_these_ask_for_a_new_picture(text):
@@ -318,6 +329,16 @@ def test_these_ask_for_a_new_picture(text):
         "make him taller",
         "Turn him into a knight",
         "Make the apple green.",
+        "Deixe o cabelo dela loiro.",
+        "Deixe a maçã verde.",
+        "Deixe ela verde.",
+        "Dê um chapéu para ela.",
+        "Make her green.",
+        "Change the mug to red.",
+        "Change it to red.",
+        "Give a hat to her.",
+        "Give it a red hat",
+        "Faça a maçã ficar verde",
     ],
 )
 def test_these_ask_to_change_the_picture_in_the_chat(text):

@@ -53,13 +53,19 @@ fresh image is recoverable, a silently altered old one is not.
 4. an editing verb anywhere (change, edit, remove, replace, add, put, keep,
    crop… / mude, altere, remova, troque, adicione, coloque, deixe,
    transforme, mantenha…) → edit;
-5. a pointing verb with a pointer, per language ("make **it** blue", "paint
-   **the** sky", "faça **o** fundo preto") → edit; in English also a
-   pointing verb directly followed by **her**/**him** ("make her blonde",
-   "turn him into a knight") → edit — only directly after the verb, since
-   elsewhere "her" is a possessive in a new picture ("make a girl hugging her
-   cat"). Filter 0.5.1; before it, "make her green" and "Make her blonde"
-   generated new pictures on the Pepe root (2026-09-23);
+5. a pointing verb that points at something already there, per language:
+   a determiner **right after** the verb ("make **the** apple green", "paint
+   **the** sky", "faça **o** fundo preto") or an object pronoun anywhere
+   ("make **it** blue", "turn **him** into a knight", "dê um chapéu para
+   **ela**") → edit. A determiner further on is part of a new picture's
+   description ("make a cat on **the** table", "faça um gato **na** praia"
+   → new picture). English "her" points only right after the verb or at the
+   end of a clause ("make her blonde", "give a hat to her"), never as a
+   possessive ("make a girl hugging her cat"). Portuguese "dê" needs its
+   accent: "de" is the preposition of "um castelo de pedra". Filter 0.5.2.
+   Before it (0.5.1 and earlier), "Gere um castelo de pedra à noite." edited
+   the green apple before it on the 8GB root (2026-09-23), and 0.5.0 turned
+   "make her green" and "Make her blonde" into new pictures on the Pepe root;
 6. anything else → new picture ("Generate a castle at night", "A dragon
    flying over mountains", "the same but at night").
 

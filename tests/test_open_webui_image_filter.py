@@ -273,6 +273,10 @@ def test_the_filter_is_a_bundled_resource_not_a_package_module():
         "A dragon flying over mountains",
         "the same but at night",
         "",
+        "Generate an image of a red apple on a white background.",
+        "Generate an image of a stone castle at night.",
+        "Make a girl hugging her cat",
+        "A knight and his horse",
     ],
 )
 def test_these_ask_for_a_new_picture(text):
@@ -309,6 +313,11 @@ def test_these_ask_for_a_new_picture(text):
         "Make the previous image darker",
         "Pinte o céu de vermelho",
         "Mantenha a caneca, mas mude a mesa",
+        "make her green",
+        "Make her blonde",
+        "make him taller",
+        "Turn him into a knight",
+        "Make the apple green.",
     ],
 )
 def test_these_ask_to_change_the_picture_in_the_chat(text):

@@ -54,7 +54,12 @@ fresh image is recoverable, a silently altered old one is not.
    crop… / mude, altere, remova, troque, adicione, coloque, deixe,
    transforme, mantenha…) → edit;
 5. a pointing verb with a pointer, per language ("make **it** blue", "paint
-   **the** sky", "faça **o** fundo preto") → edit;
+   **the** sky", "faça **o** fundo preto") → edit; in English also a
+   pointing verb directly followed by **her**/**him** ("make her blonde",
+   "turn him into a knight") → edit — only directly after the verb, since
+   elsewhere "her" is a possessive in a new picture ("make a girl hugging her
+   cat"). Filter 0.5.1; before it, "make her green" and "Make her blonde"
+   generated new pictures on the Pepe root (2026-09-23);
 6. anything else → new picture ("Generate a castle at night", "A dragon
    flying over mountains", "the same but at night").
 

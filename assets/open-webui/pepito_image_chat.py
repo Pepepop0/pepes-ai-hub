@@ -1,7 +1,7 @@
 """
 title: Pepito Image Chat
 author: Pepito's AI Hub
-version: 0.5.0
+version: 0.5.1
 required_open_webui_version: 0.11.3
 description: Send every Image turn through Open WebUI's own image generation or editing, and decide which from the user's words.
 """
@@ -183,6 +183,12 @@ _POINTING = (
         ),
     ),
 )
+# Someone already in the picture: "make her blonde", "turn him into a knight".
+# Only right after the verb -- elsewhere "her" is a possessive in a new
+# picture's description ("make a girl hugging her cat").
+_POINTED_PERSON = re.compile(
+    _W.format(r"(?:make|turn|give|paint|colou?r|set|fill|leave) (?:her|him)"), re.IGNORECASE
+)
 _LEADING_FILLER = re.compile(
     r"^(?:(?:now|then|next|ok|okay|please|and|also|so|well|hmm|agora|ent[aã]o|depois|"
     r"por favor|e|tamb[eé]m|bem)[,.!:]?\s+)+",
@@ -206,7 +212,7 @@ def edit_intent(text: str) -> bool:
         return True
     if _NEW_IMAGE.search(words):
         return False
-    if _EDIT_VERB.search(words):
+    if _EDIT_VERB.search(words) or _POINTED_PERSON.search(words):
         return True
     return any(verb.search(words) and pointer.search(words) for verb, pointer in _POINTING)
 

@@ -70,8 +70,12 @@ then through the Functions API: creates the function if absent, updates it if
 the shipped source differs, enables it if disabled, and reads it back. Same
 source → nothing written. A function under our id whose description was not
 written by the Hub is refused and left alone; every other function is never
-touched. Before the first administrator exists the sync reports `no-admin` and
-is retried on the next start. An unreachable or refusing instance is a warning
+touched. Before the first administrator exists the sync reports `no-admin`;
+while the Hub is open it then looks for that account every few seconds and
+syncs as soon as it exists, and otherwise the next start does. (A new
+installation's first start always comes before its first account: without
+the catch-up, the whole first session ran with no filter, no chat model
+record and image editing off.) An unreachable or refusing instance is a warning
 on the operation, not a failure. A change counts as work for that run; an
 unchanged filter keeps a second run a no-op.
 

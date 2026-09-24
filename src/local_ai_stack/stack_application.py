@@ -35,6 +35,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from .application_contracts import (
     OperationSubscription,
@@ -93,7 +94,12 @@ from .model_installer import ModelInstaller
 from .model_resolver import StackModelResolver, unresolved_roles
 from .models import ManagedModelPaths, OllamaModelSource
 from .ollama_models import HttpOllamaClient
-from .open_webui_filters import FilterSync, FilterSyncReport, sync_image_chat_filter
+from .open_webui_filters import (
+    FilterSync,
+    FilterSyncReport,
+    first_admin_id,
+    sync_image_chat_filter,
+)
 from .open_webui_image_edit import sync_image_edit
 from .open_webui_models import sync_chat_model
 from .operation_contracts import (
@@ -206,6 +212,8 @@ class StackDependencies:
     model_sync: Callable[..., FilterSyncReport] = sync_chat_model
     # Keeps that Open WebUI's image editing pointed at the profile's edit workflow.
     image_edit_sync: Callable[[Path, str, ImageEditSettings], FilterSyncReport] = sync_image_edit
+    # Whether that Open WebUI has its first account yet, read from its own database.
+    first_admin: Callable[[Path], str | None] = first_admin_id
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], datetime] = utc_now
@@ -318,6 +326,9 @@ class StackApplication:
         self._operation: OperationSnapshot | None = None
         self._subscribers: list[_Subscription] = []
         self._active_profile: str | None = None
+        # The profile whose Open WebUI was integrated before it had an account,
+        # so nothing was synced; see complete_open_webui_integration.
+        self._awaiting_admin: str | None = None
         self._facts: SystemFacts | None = None
         self._installers: dict[str, ModelInstaller] = {}
         self._registry: ManagedProcessRegistry | None = None
@@ -1053,7 +1064,56 @@ class StackApplication:
                 f"Open WebUI: {subject} "
                 f"{_INTEGRATION_WORDS.get(report.outcome.value, report.outcome.value)}",
             )
+        waiting = any(report.outcome is FilterSync.NO_ADMIN for report in reports)
+        self._awaiting_admin = profile.id if waiting else None
         return _combined_report(reports)
+
+    def open_webui_integration_waiting(self) -> bool:
+        """Whether the running Open WebUI was integrated before it had an account."""
+        return self._awaiting_admin is not None
+
+    def open_webui_integration_due(self) -> bool:
+        """Waiting, and the first account now exists. Reads one row, writes nothing."""
+        return (
+            self._awaiting_admin is not None
+            and self.deps.first_admin(self.layout.open_webui_data) is not None
+        )
+
+    def complete_open_webui_integration(self) -> bool:
+        """Sync what an integration without an account could not. Whether it still waits.
+
+        Open WebUI has no account until someone makes the first one in the
+        browser, and every sync goes through that administrator. So a new
+        installation's first start always integrates too early, and the chat
+        it opens has no image filter, no chat model record and no image edit
+        settings: every picture request is generated, never edited, and a
+        small model is offered Open WebUI's builtin tools. Asked again once
+        the account exists, this syncs them into the Open WebUI running now.
+        With it stopped there is nothing to sync into; its next start does it.
+        """
+        profile_id = self._awaiting_admin
+        if profile_id is None:
+            return False
+        with self._lock:
+            if self._busy:
+                # An operation is running; it integrates, or the next call does.
+                return True
+            self._busy = True
+        try:
+            profile = self.profile(profile_id)
+            service_id = str(ComponentId.OPEN_WEBUI)
+            if self._controller(profile).status(service_id).health.state is not ServiceState.UP:
+                self._awaiting_admin = None
+                return False
+            stream = OperationStream(
+                uuid4().hex, clock=self.deps.clock, monotonic=self.deps.monotonic
+            )
+            stream.begin("Integrando o Open WebUI")
+            self.integrate_open_webui(stream, profile)
+        finally:
+            with self._lock:
+                self._busy = False
+        return self._awaiting_admin is not None
 
     def _image_edit_sync(
         self, profile: Profile, endpoints: StackEndpoints
@@ -1220,6 +1280,9 @@ class StackApplication:
                 )
                 continue
             stopped.append(service_id)
+        if str(ComponentId.OPEN_WEBUI) in stopped:
+            # Nothing left to sync into; the next start integrates again.
+            self._awaiting_admin = None
         if not finish:
             return problems
         if problems:

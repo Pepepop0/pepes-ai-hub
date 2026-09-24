@@ -17,6 +17,7 @@ installation, the ones it knows about, and what each last did.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -122,6 +123,8 @@ UNCHECKED_MODELS = (
 )
 # Said when a settle step failed in a way that has no message of its own.
 UNSETTLED = "Não foi possível concluir a operação. Nada foi alterado."
+# How often the Hub looks for Open WebUI's first account while an integration waits.
+INTEGRATION_POLL_SECONDS = 3.0
 
 
 def _pending(status) -> tuple[tuple[str, ...], bool]:
@@ -295,7 +298,11 @@ class HubApplicationAdapter:
         self._idle = threading.Event()
         self._idle.set()
         self._closed = False
+        self._closing = threading.Event()
         self._worker: threading.Thread | None = None
+        # Watches for Open WebUI's first account while an integration waits on it.
+        self._integration_watch: threading.Thread | None = None
+        self.integration_poll_seconds = INTEGRATION_POLL_SECONDS
         self._snapshot: OperationSnapshot | None = None
         self._subscriptions: list[_Subscription] = []
 
@@ -978,6 +985,60 @@ class HubApplicationAdapter:
             self._candidate = None
         self._busy = False
         self._idle.set()
+        self._watch_integration()
+
+    def _watch_integration(self) -> None:
+        """Keep one watcher while the running Open WebUI waits for its first account.
+
+        A new installation's Open WebUI is integrated before anyone has made an
+        account in it, so nothing is synced (``complete_open_webui_integration``).
+        The person makes that account in the browser, not here, and may never
+        come back to the Hub before chatting; so the Hub looks for it itself.
+        Called with the lock held.
+        """
+        if self._closed or self._integration_watch is not None:
+            return
+        if not _awaits_open_webui_admin(self.backend):
+            return
+        watch = threading.Thread(
+            target=self._integration_loop, name="hub-open-webui-integration", daemon=True
+        )
+        self._integration_watch = watch
+        watch.start()
+
+    def _integration_loop(self) -> None:
+        """Until nothing waits: look for the account, and sync once it exists.
+
+        Looking reads one row and holds nothing. Syncing is the Hub's only work
+        for its second or so: an operation asked for meanwhile is told to wait,
+        exactly as for any other, and closing the Hub waits for it to end.
+        """
+        while not self._closing.wait(self.integration_poll_seconds):
+            with self._lock:
+                backend = self.backend
+                if self._closed or not _awaits_open_webui_admin(backend):
+                    self._integration_watch = None
+                    return
+            try:
+                due = backend.open_webui_integration_due()
+            except Exception:  # noqa: BLE001 -- an unreadable database is looked at again
+                due = False
+            if not due:
+                continue
+            with self._lock:
+                if self._closed or self._busy or backend is not self.backend:
+                    continue
+                self._busy = True
+                self._idle.clear()
+            try:
+                # Whatever goes wrong, it still waits, and the next look tries again.
+                with contextlib.suppress(Exception):
+                    backend.complete_open_webui_integration()
+            finally:
+                with self._lock:
+                    self._end_operation(None)
+        with self._lock:
+            self._integration_watch = None
 
     def _launch(
         self,
@@ -1287,6 +1348,7 @@ class HubApplicationAdapter:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            self._closing.set()
             for subscription in tuple(self._subscriptions):
                 subscription.close()
         self.wait()
@@ -1309,6 +1371,11 @@ class _Subscription:
             if not self.closed:
                 self.closed = True
                 self.app._subscriptions.remove(self)
+
+
+def _awaits_open_webui_admin(backend: object) -> bool:
+    waiting = getattr(backend, "open_webui_integration_waiting", None)
+    return waiting is not None and bool(waiting())
 
 
 def location_of_config(config: InstalledConfig, root: Path) -> InstallLocation:

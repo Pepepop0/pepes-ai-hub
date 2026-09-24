@@ -1,54 +1,67 @@
-# Local AI Stack Manager
+# Pepe's AI Hub
 
-Provisionador local de IA com TUI, orientado a **Windows 10 + NVIDIA**, para instalar, configurar, validar e iniciar uma stack com Ollama, Open WebUI e ComfyUI.
+Hub local para instalar e gerenciar uma stack de IA local: Ollama, Open WebUI e ComfyUI.
 
-## Perfis iniciais
+## O que é
 
-- **Pepe** — RTX 5070 12 GB. Modelos compactos e política agressiva de VRAM.
-- **Pepinho** — GPUs NVIDIA de 8 GB. A mesma stack completa (chat, geração e edição de imagem) com o modelo de chat menor e imagens mais modestas.
-- **Capella** — RTX 5090 32 GB, single GPU. Chat de 27B com visão e ferramentas, imagens a 1024×1024, tudo residente na GPU.
-- **Test** — perfil leve para validar instalação, APIs, visão, tool calling e imagem.
+Uma aplicação para Windows que cria, opera e mantém instalações locais de IA a partir de uma interface única.
 
-## O que este starter contém
+- instala e gerencia **Ollama**, **Open WebUI** e **ComfyUI**
+- configura cada instalação a partir de um perfil pronto
+- permite ter mais de uma instalação e alternar entre elas
+- interface em **PT-BR**
 
-- PRD, SPEC, arquitetura e estado atual do setup manual;
-- roadmap e plano da primeira noite;
-- profiles YAML e manifests;
-- prompts separados para Codex e dois Claudes;
-- skeleton Python executável;
-- TUI inicial e `--doctor`;
-- testes e configuração do VS Code.
+## Recursos atuais
 
-## Quick start
+- criação e gerenciamento de instalações
+- troca entre instalações
+- exclusão / desinstalação de instalações
+- perfis prontos para diferentes níveis de hardware
+- iniciar, parar e reiniciar a stack
+- abrir o Open WebUI pelo Hub
+- verificação e reparo da instalação
+- chat local
+- geração de imagem
+- edição de imagem
 
-```bat
-bootstrap-dev.bat
-run.bat
-```
+## Screenshots
 
-Diagnóstico:
+### Dashboard
 
-```bat
-doctor.bat
-```
+Instalação atual, estado dos serviços e ações principais.
 
-Testes:
+![Dashboard](assets/screenshots/dashboard.png)
 
-```powershell
-pytest
-ruff check .
-```
+### Instalações
 
-## Leia nesta ordem
+Instalações conhecidas, troca de instalação e manutenção.
 
-1. `HANDOFF.md`
-2. `docs/CURRENT_STATE.md`
-3. `docs/PRD.md`
-4. `docs/SPEC.md`
-5. `docs/ARCHITECTURE.md`
-6. `docs/NIGHT_ONE_PLAN.md`
-7. `docs/AGENT_WORKFLOW.md`
+![Instalações](assets/screenshots/installations.png)
 
-## Regra de ouro
+## Perfis disponíveis
 
-O projeto deve ser **reproduzível, idempotente e profile-driven**. O detector detecta; o profile declara; o compatibility engine decide.
+| Perfil | Faixa | Validação |
+| --- | --- | --- |
+| **Pepinho** | 8 GB | orçamento de 8 GB validado; ainda não testado em GPU física de 8 GB |
+| **Pepe** | 12 GB | validado em RTX 5070 real |
+| **Capella** | 32 GB | pronto no código; validação em RTX 5090 física pendente |
+
+Os recursos disponíveis (chat, geração e edição de imagem) e os modelos usados dependem do perfil.
+
+## Coming next
+
+Épicos e frentes do backlog, sem data definida:
+
+- nova UI / UX
+- expansão da biblioteca de modelos
+- melhorias de tool calling
+- atualização gerenciada do Open WebUI
+- atualização automática do Hub
+- melhor empacotamento da aplicação
+- assinatura de código
+- validação em mais configurações de hardware
+- melhorias de qualidade de vida baseadas em feedback
+
+## Status
+
+**v0.1.0-rc1** — pré-versão destinada a testes. Download na página de [Releases](https://github.com/Pepepop0/pepes-ai-hub/releases).

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .controller import ServiceControlSpec
-from .launcher import DEFAULT_STARTUP_TIMEOUT, DEFAULT_STOP_TIMEOUT, ProcessLaunchSpec
+from .launcher import DEFAULT_STOP_TIMEOUT, ProcessLaunchSpec
 from .logs import LogFiles, service_log_files
 from .processes import (
     COMFYUI_PROCESS,
@@ -50,6 +50,11 @@ COMFYUI_SERVE_ARGS: tuple[str, ...] = ()
 # A readiness wait that gives up sooner would report FAILED on a healthy start.
 OPEN_WEBUI_STARTUP_TIMEOUT = 120.0
 COMFYUI_STARTUP_TIMEOUT = 180.0
+# Ollama listens within a second, but answers no request until it has probed
+# every GPU. On a machine with a second adapter -- an integrated AMD GPU it
+# probes through Vulkan and then drops -- that took 13 s on one start and 27 s
+# on the next on the reference machine. The wait ends as soon as it answers.
+OLLAMA_STARTUP_TIMEOUT = 90.0
 
 
 def _aligned(spec: ServiceSpec, host: str, port: int) -> ServiceSpec:
@@ -74,7 +79,7 @@ def ollama_launch_spec(
     env: Mapping[str, str] | None = None,
     logs: LogFiles | None = None,
     cwd: Path | None = None,
-    startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
+    startup_timeout: float = OLLAMA_STARTUP_TIMEOUT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
     allow_force_kill: bool = True,
 ) -> ProcessLaunchSpec:
@@ -113,7 +118,7 @@ def ollama_control_spec(
     env: Mapping[str, str] | None = None,
     logs: LogFiles | None = None,
     cwd: Path | None = None,
-    startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
+    startup_timeout: float = OLLAMA_STARTUP_TIMEOUT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
     allow_force_kill: bool = True,
 ) -> ServiceControlSpec:

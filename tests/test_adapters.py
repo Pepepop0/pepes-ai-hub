@@ -213,3 +213,14 @@ def test_paths_survive_as_strings(tmp_path):
     spec = open_webui_launch_spec(executable)
     assert spec.argv[0] == str(executable)
     assert Path(spec.argv[0]).name == "app.exe"
+
+
+def test_ollama_is_given_time_to_probe_every_gpu_before_it_answers():
+    """Measured: 13 s and then 27 s of GPU discovery on one machine with an
+    integrated AMD GPU next to the NVIDIA one; a 20 s wait failed a healthy start."""
+    from local_ai_stack.adapters import OLLAMA_STARTUP_TIMEOUT, ollama_control_spec
+
+    spec = ollama_control_spec("ollama.exe")
+    assert spec.launch is not None
+    assert spec.launch.startup_timeout == OLLAMA_STARTUP_TIMEOUT
+    assert OLLAMA_STARTUP_TIMEOUT >= 60

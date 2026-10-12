@@ -5,8 +5,8 @@ ui:
   default_pet: hello-kitty
   default_theme: capella
 description: >-
-  RTX 5090 32 GB — perfil principal: chat com visão e ferramentas num modelo
-  de 27B, geração e edição de imagem a 1024×1024, tudo residente na mesma GPU.
+  RTX 5090 32 GB — perfil principal NSFW: chat multimodal uncensored de 27B e
+  geração/edição de imagem com FLUX.2 Klein 9B FP8, alternados na mesma GPU.
 
 hardware:
   os: windows
@@ -18,9 +18,10 @@ hardware:
   # profile is for.
   vram_tolerance_mib: 256
   notes: >-
-    Single RTX 5090 (32 GB, 32607 MiB reportados). O modelo de chat (17 GB) e
-    os modelos de imagem (12 GB) cabem juntos na VRAM. RAM: 32 GB é o mínimo
-    operacional, 64 GB o recomendado. Multi-GPU fora do escopo v0.1.
+    Single RTX 5090 (32 GB, 32607 MiB reportados). Chat e imagem não ficam
+    residentes juntos: a troca descarrega Ollama antes do FLUX e libera o
+    ComfyUI ao terminar. RAM: 32 GB é o mínimo operacional, 64 GB o recomendado.
+    Multi-GPU fora do escopo v0.1.
 
 services:
   ollama: {enabled: true, port: 11434}
@@ -36,26 +37,25 @@ features:
 
 models:
   chat:
-    primary: ollama/qwen3_5_27b
+    primary: ollama/qwen3_8_27b_uncensored_q5
     status: candidate
-    alternatives: [ollama/qwen3_5_9b]
-    # Qwen3.5 reasons before it answers unless told not to. Measured on the
-    # reference machine: 5-10x the tokens of the answer on a plain chat turn,
-    # 2,684 tokens to write one image prompt. Open WebUI applies this to every
-    # call for the model, its own background tasks included.
-    params: {think: false}
+    alternatives: [ollama/qwen3_5_27b]
+    params: {think: false, num_ctx: 16384}
   image:
-    diffusion: comfyui/flux2_klein_fp8
-    text_encoder: comfyui/qwen_3_4b_encoder
-    vae: comfyui/flux2_vae
+    diffusion: comfyui/flux2_klein_9b_fp8
+    text_encoder: comfyui/qwen_3_8b_fp8mixed_encoder
+    vae: comfyui/flux2_small_decoder
 
 workflows:
-  # The card has the room: FLUX.2 Klein at its native megapixel, not the
-  # 512x512 Open WebUI defaults to. The step count is the profile's, too.
-  text_to_image: {manifest_id: flux2_klein_t2i, size: 1024x1024, steps: 20}
-  image_edit: {manifest_id: flux2_klein_edit}
+  # The distilled 9B runs at its native four steps. Image generation and edit
+  # use the same pinned model set, but never share VRAM residency with Ollama.
+  text_to_image: {manifest_id: flux2_klein_9b_t2i, size: 1024x1024, steps: 4}
+  image_edit: {manifest_id: flux2_klein_9b_edit}
 
 runtime:
-  aggressive_vram_unload: false
-  prefer_single_heavy_model_resident: false
+  aggressive_vram_unload: true
+  prefer_single_heavy_model_resident: true
+  # Chat (27B Q5) and FLUX.2 Klein 9B alternate on the card: the image filter
+  # unloads Ollama before each image and frees ComfyUI after it.
+  exclusive_image_vram: true
   open_browser: true

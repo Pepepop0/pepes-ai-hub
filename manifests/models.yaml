@@ -72,6 +72,17 @@ ollama:
     status: candidate
     size_bytes: 17420432252
 
+  # Uncensored multimodal 27B Q5_K_M selected for Capella. The full registry
+  # manifest digest is pinned; size includes the model and vision projector.
+  qwen3_8_27b_uncensored_q5:
+    kind: chat
+    reference: orcarouter/Qwen3.8-27B-Uncensored:q5_K_M
+    digest: 1cedf9ccb8f4338ce4e55f7478df808e900e1d405261cfa11c7e14aade50f2fd
+    aliases: [ollama/qwen3-8-27b-uncensored-q5]
+    capabilities: {text: true, tools: true, vision: true}
+    status: candidate
+    size_bytes: 20466847626
+
   qwen3_8b:
     kind: chat
     reference: qwen3:8b
@@ -132,3 +143,35 @@ comfyui:
     size_bytes: 336213556
     version: ab9055628ea245000e610f2aa2c96f4746093546
     status: manually_tested
+
+  # Distilled FLUX.2 Klein 9B FP8. This repository is gated: downloads need a
+  # Hugging Face account that accepted the non-commercial license.
+  flux2_klein_9b_fp8:
+    kind: diffusion
+    placement: diffusion_models
+    filename: flux-2-klein-9b-fp8.safetensors
+    url: https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8/resolve/902d9d510b51533e07729f19211414a3648b77d2/flux-2-klein-9b-fp8.safetensors
+    sha256: 865ba09f5b4c3cbd3468a4bd3acb9fcb2f8740c54317482f0bcd4ed1d3655cee
+    size_bytes: 9433061528
+    version: 902d9d510b51533e07729f19211414a3648b77d2
+    status: candidate
+
+  qwen_3_8b_fp8mixed_encoder:
+    kind: text-encoder
+    placement: text_encoders
+    filename: qwen_3_8b_fp8mixed.safetensors
+    url: https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/resolve/3f62d9d8ae1fec33c6e91453d5c712855b096b55/split_files/text_encoders/qwen_3_8b_fp8mixed.safetensors
+    sha256: abad16806e0cbabc54e0325d6565847443fe396d5f0be38bb3cd3fe75a1201d6
+    size_bytes: 8664848742
+    version: 3f62d9d8ae1fec33c6e91453d5c712855b096b55
+    status: candidate
+
+  flux2_small_decoder:
+    kind: vae
+    placement: vae
+    filename: full_encoder_small_decoder.safetensors
+    url: https://huggingface.co/black-forest-labs/FLUX.2-small-decoder/resolve/a3efc24f613ef42d9428af62fdbd6f5fd8856c4a/full_encoder_small_decoder.safetensors
+    sha256: ea4273f02d1fafbf8e1d1c2cf6018ed8748652eb0bf34f2dd91171f16f15ab62
+    size_bytes: 249519092
+    version: a3efc24f613ef42d9428af62fdbd6f5fd8856c4a
+    status: candidate

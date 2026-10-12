@@ -35,6 +35,7 @@ from ..models import (
     ModelProvider,
     ModelSpec,
 )
+from ..profiles import load_profile, load_profiles
 from ..workflows import WorkflowParameter, load_workflow_manifest
 from .seams import Injection, InjectionPlan
 from .tracking import EXTERNAL_PREFIX, REPO_PREFIX, forget, make
@@ -76,29 +77,43 @@ FIXTURE_MODELS = (
 
 MODEL_URL = "https://controlled.invalid/models/{filename}"
 
-# The shipped image profiles' own model names, backed by fixture weights. The
-# ids are the real ones from manifests/models.yaml; only the bytes are small.
-SHIPPED_IMAGE_MODELS = (
-    (
-        "image.diffusion",
-        "flux2_klein_fp8",
-        ModelKind.DIFFUSION,
-        ModelPlacement.DIFFUSION_MODELS,
-        "flux2-klein-fp8.safetensors",
-    ),
-    (
-        "image.text_encoder",
-        "qwen_3_4b_encoder",
-        ModelKind.TEXT_ENCODER,
-        ModelPlacement.TEXT_ENCODERS,
-        "qwen-3-4b-encoder.safetensors",
-    ),
-    ("image.vae", "flux2_vae", ModelKind.VAE, ModelPlacement.VAE, "flux2-vae.safetensors"),
-)
+# The image roles a shipped profile declares; each resolves to a file model.
+IMAGE_ROLES = ("image.diffusion", "image.text_encoder", "image.vae")
 
-# The workflow the image profile declares, and therefore the graph the
-# workflow-source seam corrupts.
-IMAGE_WORKFLOW_ID = "flux2_klein_t2i"
+
+def shipped_image_models(profile_ids=None) -> tuple[tuple, ...]:
+    """The shipped profiles' own image models, in :data:`FIXTURE_MODELS` shape.
+
+    Read from the shipped profiles and the shipped catalog, so a profile that
+    changes its image models is still installable offline: the ids, kinds,
+    placements and filenames are the real ones from manifests/models.yaml; only
+    the bytes :func:`fixture_model_catalog` serves for them are small.
+    ``profile_ids`` narrows the result to those profiles' models.
+    """
+    catalog = model_catalog()
+    models: dict[ModelId, tuple] = {}
+    for profile in load_profiles(detect_repo_root() / "profiles"):
+        if profile_ids is not None and profile.id not in profile_ids:
+            continue
+        for requirement in profile.model_requirements:
+            if requirement.role not in IMAGE_ROLES or requirement.model_id in models:
+                continue
+            spec = catalog.require(requirement.model_id)
+            models[requirement.model_id] = (
+                requirement.role,
+                requirement.model_id.name,
+                spec.kind,
+                spec.source.placement,
+                spec.source.artifact.filename,
+            )
+    return tuple(models.values())
+
+
+# Every shipped profile's image models, backed by fixture weights.
+SHIPPED_IMAGE_MODELS = shipped_image_models()
+
+# The workflow role whose graph the workflow-source seam corrupts.
+IMAGE_WORKFLOW_ROLE = "text_to_image"
 
 # Where each provisioner looks for an installation it does not own. These
 # are the provisioner's own hints, so an external fixture is found by the
@@ -391,15 +406,17 @@ def repo_fixture(
         shutil.copytree(origin / name, root / name)
     profiles = root / "profiles"
     profiles.mkdir()
-    (profiles / f"{profile_id}.yaml").write_text(body, encoding="utf-8")
+    profile_path = profiles / f"{profile_id}.yaml"
+    profile_path.write_text(body, encoding="utf-8")
 
     broken = ()
     if plan.active(Injection.INVALID_WORKFLOW):
-        broken = break_workflow_template(root)
+        declared = load_profile(profile_path).workflows[IMAGE_WORKFLOW_ROLE]
+        broken = break_workflow_template(root, workflow=declared.manifest_id)
     return RepoFixture(path=root, profile_id=profile_id, broken_nodes=broken)
 
 
-def break_workflow_template(root: Path, *, workflow: str = IMAGE_WORKFLOW_ID) -> tuple[str, ...]:
+def break_workflow_template(root: Path, *, workflow: str) -> tuple[str, ...]:
     """Remove the node the manifest's model binding addresses.
 
     A structural defect, not a missing model: the manifest still declares
@@ -432,7 +449,8 @@ __all__ = [
     "EXTERNAL_LAYOUT",
     "FIXTURE_MODELS",
     "FIXTURE_PREFIX",
-    "IMAGE_WORKFLOW_ID",
+    "IMAGE_ROLES",
+    "IMAGE_WORKFLOW_ROLE",
     "PROFILE_YAML",
     "SHIPPED_IMAGE_MODELS",
     "STACK_PROFILE",
@@ -443,4 +461,5 @@ __all__ = [
     "fixture_model_catalog",
     "fixture_model_payload",
     "repo_fixture",
+    "shipped_image_models",
 ]

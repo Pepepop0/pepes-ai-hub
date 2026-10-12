@@ -556,7 +556,7 @@ def test_request_uses_existing_profile_selection_and_workflow_parameters():
     root = Path(__file__).resolve().parents[1]
     profile = load_profile(root / "profiles" / "capella.yaml")
     request = ImageGenerationRequest(profile.id, "A small lighthouse")
-    assert profile.workflows[request.workflow].manifest_id == "flux2_klein_t2i"
+    assert profile.workflows[request.workflow].manifest_id == "flux2_klein_9b_t2i"
     defaults = WorkflowParameters(prompt=request.prompt)
     for name in ("prompt", "width", "height", "steps", "seed"):
         assert getattr(request, name) == getattr(defaults, name)

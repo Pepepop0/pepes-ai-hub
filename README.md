@@ -48,6 +48,16 @@ Instalações conhecidas, troca de instalação e manutenção.
 
 Os recursos disponíveis (chat, geração e edição de imagem) e os modelos usados dependem do perfil.
 
+### Capella e Hugging Face
+
+Capella usa o FLUX.2 Klein 9B FP8, um repositório *gated* (licença não comercial). Antes de instalar:
+
+1. com a sua conta do Hugging Face, aceite a licença em <https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8>;
+2. rode `local-ai-stack --hf-login` (ou `PepitosAIHub.exe --hf-login`) e cole um token *read* de <https://huggingface.co/settings/tokens>. O token é validado, guardado criptografado pelo Windows (DPAPI) e enviado só para `https://huggingface.co`;
+3. `--hf-status` confirma identidade e acesso ao modelo; `--hf-logout` apaga a credencial. `HF_TOKEN` no ambiente tem precedência sobre a credencial salva.
+
+Na RTX 5090 o chat (27B) e o FLUX não ficam residentes juntos: cada turno de imagem descarrega o Ollama antes do ComfyUI e libera o ComfyUI antes da resposta do chat.
+
 ## Coming next
 
 Épicos e frentes do backlog, sem data definida:
@@ -55,7 +65,7 @@ Os recursos disponíveis (chat, geração e edição de imagem) e os modelos usa
 - nova UI / UX
 - expansão da biblioteca de modelos
 - melhorias de tool calling
-- atualização gerenciada do Open WebUI
+- atualização do Open WebUI pela interface do Hub
 - atualização automática do Hub
 - melhor empacotamento da aplicação
 - assinatura de código

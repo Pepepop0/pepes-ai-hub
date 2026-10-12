@@ -170,10 +170,14 @@ def data_dir(tmp_path: Path, *, admin: bool = True, secret: str | None = "s3cret
         (directory / ".webui_secret_key").write_text(secret, encoding="utf-8")
     connection = sqlite3.connect(directory / "webui.db")
     connection.execute("create table user (id text, role text, created_at integer)")
+    connection.execute("create table auth (id text, active integer, session_stamp text)")
     if admin:
         connection.execute("insert into user values ('user-2', 'user', 1)")
         connection.execute("insert into user values ('admin-1', 'admin', 2)")
         connection.execute("insert into user values ('admin-9', 'admin', 3)")
+        connection.execute("insert into auth values ('user-2', 1, 'stamp-user')")
+        connection.execute("insert into auth values ('admin-1', 1, 'stamp-admin')")
+        connection.execute("insert into auth values ('admin-9', 1, 'stamp-other')")
     connection.commit()
     connection.close()
     return directory
@@ -196,6 +200,9 @@ def test_the_token_is_signed_with_the_instance_secret_for_the_first_admin(tmp_pa
     assert json.loads(unpad(header)) == {"alg": "HS256", "typ": "JWT"}
     claims = json.loads(unpad(payload))
     assert claims["id"] == "admin-1" and claims["exp"] - claims["iat"] == 60 and claims["jti"]
+    # Open WebUI 0.12 rejects a bearer whose stamp differs from the account's,
+    # and accepts only declared token types.
+    assert claims["session_stamp"] == "stamp-admin" and claims["typ"] == "automation"
     expected = hmac.new(b"s3cret", f"{header}.{payload}".encode(), hashlib.sha256).digest()
     assert unpad(signature) == expected
 
@@ -204,6 +211,15 @@ def test_no_secret_or_no_admin_means_no_token(tmp_path):
     assert local_admin_token(data_dir(tmp_path, secret=None)) is None
     assert local_admin_token(data_dir(tmp_path / "b", admin=False)) is None
     assert local_admin_token(data_dir(tmp_path / "c", secret="  ")) is None
+
+
+def test_a_revoked_or_unstamped_admin_gets_no_token(tmp_path):
+    directory = data_dir(tmp_path)
+    connection = sqlite3.connect(directory / "webui.db")
+    connection.execute("update auth set session_stamp = null where id = 'admin-1'")
+    connection.commit()
+    connection.close()
+    assert local_admin_token(directory) is None
 
 
 # --- sync: the product-facing outcome --------------------------------------------

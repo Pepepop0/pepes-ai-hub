@@ -194,10 +194,10 @@ def test_pepe_configures_its_chat_model_for_tool_calling_once_open_webui_answers
 def test_capella_asks_its_chat_model_not_to_think_through_the_same_record():
     """The profile's models.chat.params reach the record sync; Pepe, declaring none,
     keeps the call exactly as it was (the test above)."""
-    from first_run_support import CAPELLA, RTX_5090_MIB, capella_yaml
+    from first_run_support import CAPELLA, CHAT_REFERENCE, RTX_5090_MIB, capella_yaml
 
     sync = RecordingSync(FilterSync.UNCHANGED)
-    model_sync = RecordingSync(FilterSync.INSTALLED, subject="qwen3.5:27b")
+    model_sync = RecordingSync(FilterSync.INSTALLED, subject=CHAT_REFERENCE)
     built = controlled_stack(profile_yaml=capella_yaml(), profile_id=CAPELLA, vram_mib=RTX_5090_MIB)
     built.app.deps.filter_sync = sync
     built.app.deps.model_sync = model_sync
@@ -209,8 +209,8 @@ def test_capella_asks_its_chat_model_not_to_think_through_the_same_record():
             (
                 built.app.layout.open_webui_data,
                 "http://127.0.0.1:8080",
-                "qwen3.5:27b",
-                {"params": {"think": False}},
+                CHAT_REFERENCE,
+                {"params": {"think": False, "num_ctx": 16384}},
             )
         ]
     finally:
@@ -220,11 +220,11 @@ def test_capella_asks_its_chat_model_not_to_think_through_the_same_record():
 def test_declared_chat_parameters_are_synced_even_with_tools_off():
     """models.chat.params is a request-time contract of its own: a profile that
     declares one gets its record written whether or not it enables tools."""
-    from first_run_support import CAPELLA, RTX_5090_MIB, capella_yaml
+    from first_run_support import CAPELLA, CHAT_REFERENCE, RTX_5090_MIB, capella_yaml
 
     yaml_text = capella_yaml().replace("  tools: true\n", "  tools: false\n")
     assert "tools: false" in yaml_text
-    model_sync = RecordingSync(FilterSync.INSTALLED, subject="qwen3.5:27b")
+    model_sync = RecordingSync(FilterSync.INSTALLED, subject=CHAT_REFERENCE)
     built = controlled_stack(profile_yaml=yaml_text, profile_id=CAPELLA, vram_mib=RTX_5090_MIB)
     built.app.deps.filter_sync = RecordingSync(FilterSync.UNCHANGED)
     built.app.deps.model_sync = model_sync
@@ -236,8 +236,8 @@ def test_declared_chat_parameters_are_synced_even_with_tools_off():
             (
                 built.app.layout.open_webui_data,
                 "http://127.0.0.1:8080",
-                "qwen3.5:27b",
-                {"params": {"think": False}},
+                CHAT_REFERENCE,
+                {"params": {"think": False, "num_ctx": 16384}},
             )
         ]
     finally:
@@ -246,12 +246,12 @@ def test_declared_chat_parameters_are_synced_even_with_tools_off():
 
 def test_a_profile_that_declares_neither_tools_nor_parameters_leaves_the_record_alone():
     """Nothing to configure on the record, so it is never touched."""
-    from first_run_support import CAPELLA, RTX_5090_MIB, capella_yaml
+    from first_run_support import CAPELLA, CHAT_REFERENCE, RTX_5090_MIB, capella_yaml
 
     yaml_text = capella_yaml().replace("  tools: true\n", "  tools: false\n")
-    yaml_text = yaml_text.replace("    params: {think: false}\n", "")
+    yaml_text = yaml_text.replace("    params: {think: false, num_ctx: 16384}\n", "")
     assert "params:" not in yaml_text
-    model_sync = RecordingSync(FilterSync.INSTALLED, subject="qwen3.5:27b")
+    model_sync = RecordingSync(FilterSync.INSTALLED, subject=CHAT_REFERENCE)
     built = controlled_stack(profile_yaml=yaml_text, profile_id=CAPELLA, vram_mib=RTX_5090_MIB)
     built.app.deps.filter_sync = RecordingSync(FilterSync.UNCHANGED)
     built.app.deps.model_sync = model_sync

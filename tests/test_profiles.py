@@ -94,10 +94,10 @@ def test_profiles_expose_only_active_canonical_model_requirements():
         ("image.vae", "comfyui/flux2_vae"),
     }
     assert {str(item.model_id) for item in profiles["capella"].model_requirements} == {
-        "ollama/qwen3_5_27b",
-        "comfyui/flux2_klein_fp8",
-        "comfyui/qwen_3_4b_encoder",
-        "comfyui/flux2_vae",
+        "ollama/qwen3_8_27b_uncensored_q5",
+        "comfyui/flux2_klein_9b_fp8",
+        "comfyui/qwen_3_8b_fp8mixed_encoder",
+        "comfyui/flux2_small_decoder",
     }
     assert profiles["test"].model_requirements == ()
     assert {str(item.model_id) for item in profiles["pepe-8gb"].model_requirements} == {
@@ -174,7 +174,7 @@ def test_chat_model_parameters_must_be_named_scalars(params, field):
 
 def test_chat_model_parameters_are_read_as_declared_and_default_to_none():
     profiles = {p.id: p for p in load_profiles(ROOT / "profiles")}
-    assert profiles["capella"].chat_params == {"think": False}
+    assert profiles["capella"].chat_params == {"think": False, "num_ctx": 16384}
     assert profiles["pepe"].chat_params == {} and profiles["pepe-8gb"].chat_params == {}
     data = copy.deepcopy(profiles["pepe"].raw)
     data["models"]["chat"]["params"] = {"think": False, "num_ctx": 8192, "system": "Be terse."}

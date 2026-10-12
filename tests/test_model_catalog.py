@@ -309,6 +309,27 @@ SHIPPED_COMFYUI = {
         "d64f3a68e1cc4f9f4e29b6e0da38a0204fe9a49f2d4053f0ec1fa1ca02f9c4b5",
         336213556,
     ),
+    "comfyui/flux2_klein_9b_fp8": (
+        "black-forest-labs/FLUX.2-klein-9b-fp8",
+        "902d9d510b51533e07729f19211414a3648b77d2",
+        "flux-2-klein-9b-fp8.safetensors",
+        "865ba09f5b4c3cbd3468a4bd3acb9fcb2f8740c54317482f0bcd4ed1d3655cee",
+        9433061528,
+    ),
+    "comfyui/qwen_3_8b_fp8mixed_encoder": (
+        "Comfy-Org/vae-text-encorder-for-flux-klein-9b",
+        "3f62d9d8ae1fec33c6e91453d5c712855b096b55",
+        "qwen_3_8b_fp8mixed.safetensors",
+        "abad16806e0cbabc54e0325d6565847443fe396d5f0be38bb3cd3fe75a1201d6",
+        8664848742,
+    ),
+    "comfyui/flux2_small_decoder": (
+        "black-forest-labs/FLUX.2-small-decoder",
+        "a3efc24f613ef42d9428af62fdbd6f5fd8856c4a",
+        "full_encoder_small_decoder.safetensors",
+        "ea4273f02d1fafbf8e1d1c2cf6018ed8748652eb0bf34f2dd91171f16f15ab62",
+        249519092,
+    ),
 }
 
 

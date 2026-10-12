@@ -60,6 +60,7 @@ from .external_conflicts import (
     merged_options,
     terminate_by_pid,
 )
+from .huggingface_auth import request_headers as huggingface_request_headers
 from .install_actions import InstallActionHandlers
 from .installation import ResolvedInstallation
 from .integration import (
@@ -130,6 +131,7 @@ from .registry import IdentityVerdict, ManagedProcessRegistry
 from .resources import resource_root
 from .runner import CommandRunner
 from .service_config import (
+    EXCLUSIVE_VRAM_RUNTIME_KEY,
     ImageEditSettings,
     StackConfiguration,
     declared_capability_problems,
@@ -510,7 +512,9 @@ class StackApplication:
                 else HttpOllamaClient(endpoint)
             )
             downloader = (
-                self.deps.downloader() if self.deps.downloader is not None else Downloader()
+                self.deps.downloader()
+                if self.deps.downloader is not None
+                else Downloader(request_headers=huggingface_request_headers)
             )
             installer = ModelInstaller(
                 ManagedModelPaths.from_layout(self.layout), downloader=downloader, ollama=ollama
@@ -1144,7 +1148,12 @@ class StackApplication:
                     "; ".join(problems)
                 )
                 return lambda: FilterSyncReport(FilterSync.UNAVAILABLE, detail)
-        settings, problems = open_webui_image_edit_settings(endpoints, resolution, graph)
+        settings, problems = open_webui_image_edit_settings(
+            endpoints,
+            resolution,
+            graph,
+            exclusive_vram=bool(profile.runtime.get(EXCLUSIVE_VRAM_RUNTIME_KEY)),
+        )
         if settings is None:
             detail = "; ".join(problems)
             return lambda: FilterSyncReport(FilterSync.UNAVAILABLE, detail)

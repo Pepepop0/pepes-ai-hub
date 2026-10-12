@@ -82,7 +82,8 @@ def test_the_catalog_loads_without_touching_the_network(monkeypatch):
     monkeypatch.setattr(httpx.Client, "stream", explode)
     catalog = model_catalog()
     assert catalog.unpinned == {}
-    assert len(catalog.for_provider(ModelProvider.COMFYUI)) == 3
+    # The 4B set pepe and pepe-8gb use, plus Capella's 9B set.
+    assert len(catalog.for_provider(ModelProvider.COMFYUI)) == 6
 
 
 def test_no_role_is_unresolvable_any_more(pepe):

@@ -164,24 +164,58 @@ def first_admin_id(data_dir: Path) -> str | None:
     return str(row[0]) if row and row[0] else None
 
 
-def local_admin_token(data_dir: Path, ttl: int = TOKEN_TTL_SECONDS) -> str | None:
-    """A token the instance accepts for its first administrator, or None.
+def first_admin_auth(data_dir: Path) -> tuple[str, str] | None:
+    """Return the first administrator and its Open WebUI 0.12 session stamp."""
+    database = data_dir / DATABASE_FILE
+    if not database.is_file():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        row = connection.execute(
+            "select user.id, auth.session_stamp "
+            "from user join auth on auth.id = user.id "
+            "where user.role = 'admin' and auth.active = 1 "
+            "order by user.created_at limit 1"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        connection.close()
+    if not row or not row[0] or not row[1]:
+        return None
+    return str(row[0]), str(row[1])
 
-    Signed with the instance's own secret key exactly as the instance signs
-    its sessions (HS256). Short-lived and never persisted.
+
+def local_admin_token(data_dir: Path, ttl: int = TOKEN_TTL_SECONDS) -> str | None:
+    """A short-lived Open WebUI 0.12 automation token, or None.
+
+    Open WebUI 0.12 binds every bearer to the account's ``session_stamp`` and
+    accepts only declared token types. This token uses ``automation`` so it
+    never pretends to be an interactive browser session.
     """
     secret_file = data_dir / SECRET_KEY_FILE
     if not secret_file.is_file():
         return None
-    admin_id = first_admin_id(data_dir)
-    if admin_id is None:
+    admin = first_admin_auth(data_dir)
+    if admin is None:
         return None
+    admin_id, session_stamp = admin
     secret = secret_file.read_text(encoding="utf-8").strip()
     if not secret:
         return None
     now = int(time.time())
     header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    claims = {"id": admin_id, "iat": now, "exp": now + ttl, "jti": str(uuid.uuid4())}
+    claims = {
+        "id": admin_id,
+        "typ": "automation",
+        "session_stamp": session_stamp,
+        "iat": now,
+        "exp": now + ttl,
+        "jti": str(uuid.uuid4()),
+    }
     payload = _b64(json.dumps(claims, separators=(",", ":")).encode())
     signature = hmac.new(secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()
     return f"{header}.{payload}.{_b64(signature)}"
@@ -230,6 +264,7 @@ __all__ = [
     "FilterSyncReport",
     "filter_path",
     "filter_source",
+    "first_admin_auth",
     "first_admin_id",
     "install_image_chat_filter",
     "local_admin_token",

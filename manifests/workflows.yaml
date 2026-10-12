@@ -31,3 +31,29 @@ workflows:
       prompt: {node_id: "75:74", key: text}
       model: {node_id: "75:70", key: unet_name}
       seed: {node_id: "75:73", key: noise_seed}
+
+  flux2_klein_9b_t2i:
+    file: workflows/flux2-klein-9b-t2i-api.json
+    status: mapped_and_embedded
+    models:
+      required: [image.diffusion, image.text_encoder, image.vae]
+      parameter: image.diffusion
+    mapping:
+      prompt: {node_id: "76", key: value}
+      model: {node_id: "75:70", key: unet_name}
+      width: {node_id: "75:68", key: value}
+      height: {node_id: "75:69", key: value}
+      steps: {node_id: "75:62", key: steps}
+      seed: {node_id: "75:73", key: noise_seed}
+
+  flux2_klein_9b_edit:
+    file: workflows/flux2-klein-9b-edit-api.json
+    status: mapped_and_embedded
+    models:
+      required: [image.diffusion, image.text_encoder, image.vae]
+      parameter: image.diffusion
+    mapping:
+      image: {node_id: "76", key: image}
+      prompt: {node_id: "75:74", key: text}
+      model: {node_id: "75:70", key: unet_name}
+      seed: {node_id: "75:73", key: noise_seed}

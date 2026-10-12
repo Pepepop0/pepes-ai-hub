@@ -194,6 +194,17 @@ class OpenWebUIProvisioner(Provisioner):
     def _read_marker(self, context: ProvisionContext) -> ManagedMarker | None:
         return read_marker(self.managed_dir(context), component=self.component_id)
 
+    def _installed_version(self, context: ProvisionContext) -> str | None:
+        return distribution_version(context.runner, self.environment(context), DISTRIBUTION)
+
+    def _is_at_pin(self, context: ProvisionContext, detection: Detection) -> bool:
+        return (
+            detection.is_managed
+            and detection.is_usable
+            and self.version is not None
+            and self._installed_version(context) == self.version
+        )
+
     # --- verificacao -------------------------------------------------------
 
     def verify(self, context: ProvisionContext) -> Detection:
@@ -226,7 +237,7 @@ class OpenWebUIProvisioner(Provisioner):
     def plan(self, context: ProvisionContext) -> ProvisionPlan:
         detection = self.detect(context)
 
-        if detection.is_managed and detection.is_usable:
+        if self._is_at_pin(context, detection):
             return ProvisionPlan(self.component_id, (), detection)
         if detection.is_external and not self.install_alongside_external:
             return ProvisionPlan(self.component_id, (), detection)
@@ -249,27 +260,31 @@ class OpenWebUIProvisioner(Provisioner):
             )
 
         environment = self.environment(context)
-        return ProvisionPlan(
-            self.component_id,
-            (
+        upgrading = detection.is_managed and detection.is_usable
+        steps = []
+        if not upgrading:
+            steps.append(
                 ProvisionStep(
                     action="create-venv",
                     target=str(environment.root),
                     summary=f"Create a Python {describe_range(PYTHON_MINIMUM, PYTHON_BELOW)} environment.",
-                ),
+                )
+            )
+        steps.extend(
+            (
                 ProvisionStep(
-                    action="install-package",
+                    action="upgrade-package" if upgrading else "install-package",
                     target=requirement,
-                    summary=f"Install {requirement} into the environment.",
+                    summary=f"Install {requirement} into the managed environment.",
                 ),
                 ProvisionStep(
                     action="mark-managed",
                     target=str(self.marker_path(context)),
-                    summary="Write the managed marker so this install is provably ours.",
+                    summary="Record the exact installed pin after verification.",
                 ),
-            ),
-            detection,
+            )
         )
+        return ProvisionPlan(self.component_id, tuple(steps), detection)
 
     # --- aplicacao ---------------------------------------------------------
 
@@ -284,8 +299,10 @@ class OpenWebUIProvisioner(Provisioner):
         plan = self.plan(context)
         detection = plan.detection
 
-        if detection.is_managed and detection.is_usable:
-            return self.skipped(detection, "A managed Open WebUI is already installed.")
+        if self._is_at_pin(context, detection):
+            return self.skipped(
+                detection, f"Managed Open WebUI {self.version} is already installed."
+            )
 
         if detection.is_external and not self.install_alongside_external:
             return self.skipped(

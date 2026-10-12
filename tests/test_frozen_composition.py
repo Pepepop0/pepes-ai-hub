@@ -183,4 +183,9 @@ def test_the_image_edit_graph_is_read_from_the_bundle(frozen_build):
     assert load_workflow_graph(resolution)["76"]["class_type"] == "LoadImage"
     report = smoke_report()
     assert report["ok"], report["problems"]
-    assert report["workflows"]["embedded"] == ["flux2_klein_edit", "flux2_klein_t2i"]
+    assert report["workflows"]["embedded"] == [
+        "flux2_klein_9b_edit",
+        "flux2_klein_9b_t2i",
+        "flux2_klein_edit",
+        "flux2_klein_t2i",
+    ]

@@ -24,6 +24,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="check that this build finds its application, resources and state path",
     )
+    auth = parser.add_mutually_exclusive_group()
+    auth.add_argument(
+        "--hf-login",
+        action="store_true",
+        help="authorize gated Hugging Face model downloads",
+    )
+    auth.add_argument(
+        "--hf-status",
+        action="store_true",
+        help="verify Hugging Face identity and Capella model access",
+    )
+    auth.add_argument(
+        "--hf-logout",
+        action="store_true",
+        help="remove the locally stored Hugging Face credential",
+    )
     parser.add_argument("--version", action="version", version=f"{PRODUCT_NAME} {__version__}")
     args = parser.parse_args(argv)
     if args.doctor:
@@ -35,6 +51,25 @@ def main(argv: list[str] | None = None) -> int:
         report = smoke_report()
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0 if report["ok"] else 1
+    if args.hf_login or args.hf_status or args.hf_logout:
+        from .huggingface_auth import (
+            HuggingFaceAuthError,
+            check_status,
+            clear_token,
+            interactive_login,
+        )
+
+        try:
+            if args.hf_logout:
+                clear_token()
+                print("Hugging Face credential removed.")
+                return 0
+            status = interactive_login() if args.hf_login else check_status()
+        except HuggingFaceAuthError as exc:
+            print(f"Hugging Face: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(status.as_dict(), indent=2, ensure_ascii=False))
+        return 0 if status.authenticated and status.capella_model_access is not False else 1
     from .app import run_tui
 
     run_tui()

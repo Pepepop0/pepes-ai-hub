@@ -232,7 +232,7 @@ arbitrary manifest or graph. Only that existing selection is accepted in this
 wave. The application resolves
 `profile.workflows[request.workflow].manifest_id`; models come from the profile's
 existing `image.diffusion`, `image.text_encoder` and `image.vae` requirements and
-the manifest's required roles. For Capella this selects `flux2_klein_t2i`.
+the manifest's required roles. For Capella this selects `flux2_klein_9b_t2i`.
 The request's shape validation does not load or validate a profile's existence.
 The coordinator must resolve the profile, model availability and structural
 workflow validity with existing domain code before submission. No node IDs,

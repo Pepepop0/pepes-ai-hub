@@ -104,7 +104,7 @@ def test_every_shipped_profile_completes_a_first_run(profile_id):
 
 
 def test_an_invalid_profile_never_reaches_installation():
-    yaml_text = capella_yaml().replace("primary: ollama/qwen3_5_27b", "primary: TBD")
+    yaml_text = capella_yaml().replace("primary: ollama/qwen3_8_27b_uncensored_q5", "primary: TBD")
     assert "primary: TBD" in yaml_text
     with pytest.raises(Exception, match="chat"):
         controlled_stack(profile_yaml=yaml_text)

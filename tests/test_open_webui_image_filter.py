@@ -236,7 +236,7 @@ def test_the_shown_context_keeps_what_happened_and_the_success_mark(claim, verb)
 
 
 def test_the_shipped_source_declares_the_pinned_open_webui_version():
-    assert "required_open_webui_version: 0.11.3" in SOURCE
+    assert "required_open_webui_version: 0.12.0" in SOURCE
     assert "title: Pepito Image Chat" in SOURCE
 
 
@@ -424,3 +424,82 @@ def test_a_chat_that_is_not_saved_is_read_from_the_request_like_the_handler_does
         )
         is False
     )
+
+
+# --- exclusive VRAM: chat and image models alternate on one card ---------------
+
+
+class FakeServices:
+    """Ollama and ComfyUI as the filter's urllib calls reach them."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict | None]] = []
+
+    def __call__(self, request, timeout=None):
+        import io
+        import json
+
+        url = request if isinstance(request, str) else request.full_url
+        body = None if isinstance(request, str) else json.loads(request.data)
+        self.calls.append((url, body))
+        payload = b"{}"
+        if url.endswith("/api/ps"):
+            payload = json.dumps({"models": [{"name": "chat:27b"}]}).encode()
+        return io.BytesIO(payload)
+
+
+def test_an_image_turn_unloads_ollama_before_the_image_and_frees_comfyui_after(monkeypatch):
+    import urllib.request
+
+    services = FakeServices()
+    monkeypatch.setattr(urllib.request, "urlopen", services)
+    monkeypatch.setenv("PEPITO_EXCLUSIVE_VRAM", "true")
+    monkeypatch.setenv("PEPITO_OLLAMA_URL", "http://127.0.0.1:11434")
+    monkeypatch.setenv("PEPITO_COMFYUI_URL", "http://127.0.0.1:8188")
+    filter_ = load_filter()
+    metadata = ui_metadata()
+    body = {"model": "chat:27b", "messages": [{"role": "user", "content": "an apple"}]}
+
+    run(filter_.inlet(body, metadata))
+    assert services.calls == [
+        ("http://127.0.0.1:11434/api/ps", None),
+        ("http://127.0.0.1:11434/api/generate", {"model": "chat:27b", "keep_alive": 0}),
+    ]
+
+    services.calls.clear()
+    run(filter_.request(body, metadata))
+    assert services.calls == [
+        ("http://127.0.0.1:8188/free", {"unload_models": True, "free_memory": True})
+    ]
+
+
+def test_without_exclusive_vram_nothing_is_unloaded(monkeypatch):
+    import urllib.request
+
+    services = FakeServices()
+    monkeypatch.setattr(urllib.request, "urlopen", services)
+    monkeypatch.delenv("PEPITO_EXCLUSIVE_VRAM", raising=False)
+    filter_ = load_filter()
+    metadata = ui_metadata()
+    body = {"model": "m", "messages": [{"role": "user", "content": "an apple"}]}
+    run(filter_.inlet(body, metadata))
+    run(filter_.request(body, metadata))
+    assert services.calls == []
+
+
+def test_an_unreachable_service_never_breaks_the_turn(monkeypatch):
+    import urllib.request
+
+    def refuse(request, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    monkeypatch.setenv("PEPITO_EXCLUSIVE_VRAM", "true")
+    monkeypatch.setenv("PEPITO_OLLAMA_URL", "http://127.0.0.1:11434")
+    monkeypatch.setenv("PEPITO_COMFYUI_URL", "http://127.0.0.1:8188")
+    metadata = ui_metadata()
+    body = {"model": "m", "messages": [{"role": "user", "content": "an apple"}]}
+    filter_ = load_filter()
+    assert run(filter_.inlet(body, metadata)) is body
+    assert run(filter_.request(body, metadata)) is body
+    assert metadata["params"]["function_calling"] == "legacy"

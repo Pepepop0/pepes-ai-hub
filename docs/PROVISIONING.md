@@ -93,11 +93,31 @@ string.
 | componente | distribuição | pin |
 |---|---|---|
 | ollama | zip portable | `v0.33.2` + SHA-256 (`artifacts.yaml`) |
-| open-webui | pacote PyPI | `open-webui==0.11.3` (`packages.yaml`) |
+| open-webui | pacote PyPI | `open-webui==0.12.0` (`packages.yaml`) |
 | comfyui | checkout Git | tag `v0.34.0` + commit `12d5279…` (`repositories.yaml`) |
 
 Nada resolve `latest`. Subir versão é editar manifest, revisado como qualquer
 mudança. `catalog.py` lê os manifests e não toca a rede.
+
+Uma instalação gerenciada do Open WebUI com versão diferente do pin é
+atualizada no lugar: o plano vira `upgrade-package` + `mark-managed` no mesmo
+venv, sem recriar o ambiente e sem tocar em `DATA_DIR`. A partir da 0.12 o
+Open WebUI amarra todo bearer ao `auth.session_stamp` da conta e aceita só
+tipos declarados; o token local que o Hub assina para o primeiro admin leva
+`typ: automation` e o `session_stamp` atual, e um admin sem stamp não recebe
+token.
+
+## Downloads gated do Hugging Face
+
+`Downloader(request_headers=...)` pede cabeçalhos por URL; a aplicação usa
+`huggingface_auth.request_headers`, que só devolve `Authorization: Bearer`
+para `https://huggingface.co` (nunca para outro host, http, ou o CDN de LFS
+para onde o Hub redireciona). A credencial vem de `HF_TOKEN` /
+`HUGGING_FACE_HUB_TOKEN` ou de `%APPDATA%\PepitosAIHub\hf-token.dpapi`,
+cifrada com DPAPI do usuário. `--hf-login` usa OAuth device flow quando
+`PEPITOS_HF_CLIENT_ID` aponta um app OAuth público (escopo `gated-repos`);
+sem ele, pede um token read sem eco. Nenhum caminho imprime ou registra o
+token.
 
 ## Ollama — estratégia e limitação
 

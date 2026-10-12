@@ -27,7 +27,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -81,6 +81,7 @@ class DownloadProgress:
 
 ProgressCallback = Callable[[DownloadProgress], None]
 CancelCheck = Callable[[], bool]
+RequestHeaders = Callable[[str], Mapping[str, str]]
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,7 @@ class Downloader:
         self,
         *,
         client_factory: Callable[[], httpx.Client] | None = None,
+        request_headers: RequestHeaders | None = None,
         layout: StackLayout | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
@@ -159,6 +161,7 @@ class Downloader:
         if timeout <= 0:
             raise ValueError("timeout deve ser > 0")
         self.client_factory = client_factory
+        self.request_headers = request_headers
         self.layout = layout
         self.timeout = timeout
         self.max_attempts = max_attempts
@@ -294,9 +297,10 @@ class Downloader:
     ) -> tuple[str, int]:
         digest = hashlib.sha256()
         written = 0
+        headers = dict(self.request_headers(spec.url)) if self.request_headers is not None else {}
         with (
             self._client() as client,
-            client.stream("GET", spec.url, timeout=self.timeout) as response,
+            client.stream("GET", spec.url, headers=headers, timeout=self.timeout) as response,
         ):
             response.raise_for_status()
             total = _content_length(response) or spec.size_bytes

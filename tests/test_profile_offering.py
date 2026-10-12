@@ -165,7 +165,9 @@ def test_every_shipped_profile_can_say_what_it_downloads():
     assert estimates["capella"].known_bytes > estimates["pepe"].known_bytes
     assert estimates["pepe"].known_bytes > estimates["pepe-8gb"].known_bytes
     assert 13 < estimates["pepe-8gb"].known_gib < 15
-    assert 27 < estimates["capella"].known_gib < 29
+    # Capella ships the 27B Q5 chat model (20.47 GB) with the FLUX.2 Klein 9B set
+    # (9.43 + 8.66 + 0.25 GB): about 36.1 GiB in all.
+    assert 35 < estimates["capella"].known_gib < 37
 
 
 def test_a_model_without_a_recorded_size_is_named_not_guessed():

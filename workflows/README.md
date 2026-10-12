@@ -19,6 +19,13 @@ Workflows **ComfyUI API format**, não o JSON visual comum.
   `flux2-vae.safetensors`). Largura e altura vêm da imagem de entrada
   (escalada para 1 megapixel, depois `GetImageSize`); o modelo destilado
   roda 4 passos com CFG 1.
+- `flux2-klein-9b-t2i-api.json` / `flux2-klein-9b-edit-api.json` — os mesmos
+  dois grafos, com os mesmos node ids e o mesmo mapping, apontando para o
+  conjunto do FLUX.2 Klein 9B usado pela Capella:
+  `flux-2-klein-9b-fp8.safetensors`, `qwen_3_8b_fp8mixed.safetensors`
+  (encoder Qwen3 8B) e `full_encoder_small_decoder.safetensors` (VAE com
+  decoder pequeno). O 9B é destilado: 4 passos, CFG 1. Ainda não rodou numa
+  RTX 5090 real (ver `docs/testing/capella-5090-checklist.md`).
 
 O mapping dos node ids de ambos está em `manifests/workflows.yaml` e é
 validado contra estes arquivos pelos testes.

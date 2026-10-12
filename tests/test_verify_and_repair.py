@@ -9,6 +9,7 @@ and the Ollama store's records; "nothing written" is the files themselves.
 
 from __future__ import annotations
 
+from first_run_support import CHAT_REFERENCE
 from test_delivery_wave_a import composition  # noqa: F401 -- the real composition fixture
 
 from local_ai_stack.config import config_path
@@ -60,7 +61,7 @@ def test_verifying_a_stopped_installation_starts_downloads_and_writes_nothing(co
 
 def test_verifying_reports_what_a_repair_would_fix(composition):  # noqa: F811
     world, adapter = installed_and_stopped(composition)
-    chat = next(entry for entry in world.ollama.installed if "qwen" in entry.name)
+    chat = next(entry for entry in world.ollama.installed if entry.name == CHAT_REFERENCE)
     world.ollama.installed.remove(chat)
     before = fingerprint(world, adapter)
 
@@ -105,7 +106,7 @@ def test_repairing_a_stopped_installation_leaves_it_stopped(composition):  # noq
 
 def test_an_explicit_repair_still_repairs(composition):  # noqa: F811
     world, adapter = installed_and_stopped(composition)
-    chat = next(entry for entry in world.ollama.installed if "qwen" in entry.name)
+    chat = next(entry for entry in world.ollama.installed if entry.name == CHAT_REFERENCE)
     world.ollama.installed.remove(chat)
     assert not adapter.verify_installation().ok
 

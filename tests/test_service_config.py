@@ -39,10 +39,14 @@ from local_ai_stack.service_config import (
     ENV_DEFAULT_MODELS,
     ENV_ENABLE_IMAGE_GENERATION,
     ENV_ENABLE_OLLAMA_API,
+    ENV_EXCLUSIVE_VRAM,
     ENV_IMAGE_GENERATION_MODEL,
+    ENV_IMAGE_PROMPT_GENERATION,
     ENV_IMAGE_SIZE,
     ENV_IMAGE_STEPS,
     ENV_OLLAMA_BASE_URL,
+    ENV_PEPITO_COMFYUI_URL,
+    ENV_PEPITO_OLLAMA_URL,
     build_stack_configuration,
     comfyui_search_paths,
     comfyui_search_paths_document,
@@ -432,6 +436,24 @@ def stage_graph(tmp_path) -> None:
     template.write_text(SHIPPED_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+def stage_profile_graphs(specs, profile, tmp_path) -> dict[str, dict]:
+    """Stage every graph the profile's workflows name, as a checkout holds them.
+
+    Returns the graphs by manifest id, the shape ``build_stack_configuration``
+    takes them in, so a profile is composed from its own workflows."""
+    graphs = {}
+    for declared in profile.workflows.values():
+        spec = specs.get(declared.manifest_id)
+        if spec is None:
+            continue
+        text = (REPO / spec.file).read_text(encoding="utf-8")
+        template = tmp_path / spec.file
+        template.parent.mkdir(parents=True, exist_ok=True)
+        template.write_text(text, encoding="utf-8")
+        graphs[spec.id] = json.loads(text)
+    return graphs
+
+
 def test_a_profile_produces_a_complete_configuration(specs, layout, tmp_path):
     profile = profile_named("pepe")
     stage_graph(tmp_path)
@@ -460,10 +482,10 @@ def test_a_size_asked_of_a_workflow_that_cannot_take_it_fails_the_whole_composit
     """The edit graph maps neither width nor steps. A profile that asks it for them
     is refused by the composition itself -- not only by the text-to-image helper --
     and nothing is configured from it."""
-    stage_graph(tmp_path)
     data = deepcopy(profile_named("capella").raw)
     data["workflows"]["image_edit"].update(size="1024x1024", steps=20)
     profile = validate_profile_data(data)
+    graphs = stage_profile_graphs(specs, profile, tmp_path)
 
     configuration = build_stack_configuration(
         profile,
@@ -471,12 +493,13 @@ def test_a_size_asked_of_a_workflow_that_cannot_take_it_fails_the_whole_composit
         layout,
         workflow_specs=specs,
         repo_root=tmp_path,
-        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
+        graphs=graphs,
     )
 
     assert not configuration.ok
     problems = "\n".join(configuration.problems)
-    assert "workflows.image_edit" in problems and "flux2_klein_edit" in problems
+    edit = profile.workflows["image_edit"].manifest_id
+    assert "workflows.image_edit" in problems and edit in problems
     assert "maps no width and height" in problems and "maps no step count" in problems
 
 
@@ -515,9 +538,8 @@ def test_a_workflow_manifest_that_does_not_exist_invalidates_the_configuration(
 
 
 def test_the_shipped_capella_asks_only_what_its_workflows_map(specs, layout, tmp_path):
-    """The valid half of the contraproof: 1024x1024 and 20 steps on the text-to-image
-    workflow, nothing asked of the edit workflow."""
-    stage_graph(tmp_path)
+    """The valid half of the contraproof: the distilled 9B's 1024x1024 at its native
+    four steps on the text-to-image workflow, nothing asked of the edit workflow."""
     profile = profile_named("capella")
     assert profile.workflows["image_edit"].size is None
     assert profile.workflows["image_edit"].steps is None
@@ -528,12 +550,12 @@ def test_the_shipped_capella_asks_only_what_its_workflows_map(specs, layout, tmp
         layout,
         workflow_specs=specs,
         repo_root=tmp_path,
-        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
+        graphs=stage_profile_graphs(specs, profile, tmp_path),
     )
 
     assert configuration.ok, configuration.problems
     open_webui = configuration.service(ComponentId.OPEN_WEBUI)
-    assert (open_webui.env[ENV_IMAGE_SIZE], open_webui.env[ENV_IMAGE_STEPS]) == ("1024x1024", "20")
+    assert (open_webui.env[ENV_IMAGE_SIZE], open_webui.env[ENV_IMAGE_STEPS]) == ("1024x1024", "4")
 
 
 def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_path):
@@ -542,7 +564,6 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
     Pepe and Capella select different chat models; Test selects none.
     Each configuration uses the reference returned by this fixture's resolver.
     """
-    stage_graph(tmp_path)
     built = {}
     for name in ("pepe", "capella", "test"):
         profile = profile_named(name)
@@ -552,7 +573,7 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
             layout,
             workflow_specs=specs,
             repo_root=tmp_path,
-            graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
+            graphs=stage_profile_graphs(specs, profile, tmp_path),
         )
 
     pepe = built["pepe"].service(ComponentId.OPEN_WEBUI)
@@ -561,11 +582,11 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
     assert pepe.env[ENV_ENABLE_IMAGE_GENERATION] == "true"
 
     capella = built["capella"].service(ComponentId.OPEN_WEBUI)
-    assert capella.env[ENV_DEFAULT_MODELS] == "qwen3-5-27b"
+    assert capella.env[ENV_DEFAULT_MODELS] == "qwen3-8-27b-uncensored-q5"
     assert capella.problems == ()
     assert capella.env[ENV_ENABLE_IMAGE_GENERATION] == "true", "images still work"
     # Capella asks its workflow for the card's room; Pepe leaves the defaults alone.
-    assert (capella.env[ENV_IMAGE_SIZE], capella.env[ENV_IMAGE_STEPS]) == ("1024x1024", "20")
+    assert (capella.env[ENV_IMAGE_SIZE], capella.env[ENV_IMAGE_STEPS]) == ("1024x1024", "4")
     assert ENV_IMAGE_SIZE not in pepe.env and ENV_IMAGE_STEPS not in pepe.env
 
     test = built["test"].service(ComponentId.OPEN_WEBUI)
@@ -577,6 +598,52 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
     assert test.problems == ()
     assert built["test"].ok, built["test"].problems
     assert built["test"].service(ComponentId.COMFYUI).documents == ()
+
+
+EXCLUSIVE_VRAM_ENV = (
+    ENV_EXCLUSIVE_VRAM,
+    ENV_PEPITO_OLLAMA_URL,
+    ENV_PEPITO_COMFYUI_URL,
+    ENV_IMAGE_PROMPT_GENERATION,
+)
+
+
+def test_exclusive_vram_reaches_open_webui_only_from_a_profile_that_asks_for_it(
+    specs, layout, tmp_path
+):
+    """``runtime.exclusive_image_vram`` hands the image filter the two services
+    it unloads between, and turns off Open WebUI's own prompt generation, which
+    would load the chat model back beside the image model. The same profile
+    without the flag gets none of it, and still generates images. Profiles
+    validated without the swap (Pepe, Pepe 8 GB) do not opt in."""
+    capella = profile_named("capella")
+    assert not profile_named("pepe").runtime.get("exclusive_image_vram")
+    assert not profile_named("pepe-8gb").runtime.get("exclusive_image_vram")
+    shared = replace(capella, runtime={**capella.runtime, "exclusive_image_vram": False})
+    graphs = stage_profile_graphs(specs, capella, tmp_path)
+    env = {
+        key: build_stack_configuration(
+            profile,
+            resolver_for(profile, tmp_path),
+            layout,
+            workflow_specs=specs,
+            repo_root=tmp_path,
+            graphs=graphs,
+        )
+        .service(ComponentId.OPEN_WEBUI)
+        .env
+        for key, profile in (("exclusive", capella), ("shared", shared))
+    }
+
+    endpoints = StackEndpoints.from_profile(capella)
+    assert {name: env["exclusive"][name] for name in EXCLUSIVE_VRAM_ENV} == {
+        ENV_EXCLUSIVE_VRAM: "true",
+        ENV_PEPITO_OLLAMA_URL: endpoints.ollama,
+        ENV_PEPITO_COMFYUI_URL: endpoints.comfyui,
+        ENV_IMAGE_PROMPT_GENERATION: "false",
+    }
+    assert not set(EXCLUSIVE_VRAM_ENV) & set(env["shared"])
+    assert env["shared"][ENV_ENABLE_IMAGE_GENERATION] == "true"
 
 
 def test_a_port_moved_in_a_profile_moves_the_generated_configuration(specs, layout, tmp_path):

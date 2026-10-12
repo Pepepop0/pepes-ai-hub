@@ -1,3 +1,8 @@
+> **Superseded (2026-10).** Capella moved to `orcarouter/Qwen3.8-27B-Uncensored:q5_K_M`
+> and FLUX.2 Klein 9B FP8 with alternating VRAM residency; see
+> `capella-5090-checklist.md`. The record below describes the earlier
+> `qwen3.5:27b` + Klein 4B profile and is kept as history.
+
 # Capella: the 32 GB profile, finalised
 
 What the Capella profile was, what it is now, how its chat model and image

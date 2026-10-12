@@ -1158,14 +1158,12 @@ def test_custom_location_flows_from_the_real_wizard_to_backend(composition):
 
 
 def test_missing_model_is_pending_and_retry_acquires_only_that_model(composition):
-    from local_ai_stack.models import ModelId
-
     world, adapter, _ = composition()
     adapter.install(InstallSelection("capella"))
     adapter.wait(10)
     backend = adapter.backend
     profile = backend.profile("capella")
-    spec = backend.catalog().require(ModelId("comfyui/flux2_vae"))
+    spec = backend.catalog().require(profile.model_for("image.vae"))
     missing = backend.model_installer(profile).detect(spec).path
     assert missing.is_file()
     missing.unlink()  # only this test-owned fixture model

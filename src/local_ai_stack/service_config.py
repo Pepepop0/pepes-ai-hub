@@ -76,6 +76,17 @@ ENV_IMAGE_GENERATION_MODEL = "IMAGE_GENERATION_MODEL"
 ENV_IMAGE_SIZE = "IMAGE_SIZE"
 ENV_IMAGE_STEPS = "IMAGE_STEPS"
 ENV_DEFAULT_MODELS = "DEFAULT_MODELS"
+# Read by the Hub's image chat filter inside Open WebUI: when set, every Image
+# turn unloads Ollama before ComfyUI runs and frees ComfyUI before the chat
+# model answers, so a 20 GB chat model and an 18 GB image set alternate on one
+# 32 GB card instead of fighting over it.
+ENV_EXCLUSIVE_VRAM = "PEPITO_EXCLUSIVE_VRAM"
+ENV_PEPITO_OLLAMA_URL = "PEPITO_OLLAMA_URL"
+ENV_PEPITO_COMFYUI_URL = "PEPITO_COMFYUI_URL"
+# Opt-in, not inferred: the older ``prefer_single_heavy_model_resident`` flag
+# is set on profiles validated without the swap, so it must not turn it on.
+EXCLUSIVE_VRAM_RUNTIME_KEY = "exclusive_image_vram"
+ENV_IMAGE_PROMPT_GENERATION = "ENABLE_IMAGE_PROMPT_GENERATION"
 
 CHAT_ROLE = CHAT_PRIMARY_ROLE
 
@@ -381,12 +392,18 @@ class ImageEditSettings:
     model: str
     workflow: Mapping[str, object]
     nodes: tuple[Mapping[str, object], ...]
+    # Chat and image models never share the card: Open WebUI must not call the
+    # task model to rewrite an image prompt, which would reload Ollama between
+    # its unload and the ComfyUI run.
+    exclusive_vram: bool = False
 
 
 def open_webui_image_edit_settings(
     endpoints: StackEndpoints,
     resolution: WorkflowResolution,
     graph: Mapping[str, object] | None,
+    *,
+    exclusive_vram: bool = False,
 ) -> tuple[ImageEditSettings | None, tuple[str, ...]]:
     """The edit settings for a ready workflow, or the reasons there are none.
 
@@ -429,6 +446,7 @@ def open_webui_image_edit_settings(
         model=resolution.runtime_name,
         workflow=dict(graph),
         nodes=tuple(open_webui_workflow_nodes(resolution)),
+        exclusive_vram=exclusive_vram,
     )
     return settings, ()
 
@@ -634,6 +652,11 @@ def build_stack_configuration(
                 steps=declared.steps,
             )
             env.update(image.env)
+            if image.env and profile.runtime.get(EXCLUSIVE_VRAM_RUNTIME_KEY):
+                env[ENV_EXCLUSIVE_VRAM] = "true"
+                env[ENV_PEPITO_OLLAMA_URL] = endpoints.ollama
+                env[ENV_PEPITO_COMFYUI_URL] = endpoints.comfyui
+                env[ENV_IMAGE_PROMPT_GENERATION] = "false"
             open_webui_documents.extend(image.documents)
             problems.extend(image.problems)
             manual.extend(image.manual_steps)
@@ -691,6 +714,7 @@ __all__: Sequence[str] = (
     "COMFYUI_SEARCH_PATHS_FILE",
     "COMFYUI_WORKFLOW_FILE",
     "COMFYUI_WORKFLOW_NODES_FILE",
+    "EXCLUSIVE_VRAM_RUNTIME_KEY",
     "OPEN_WEBUI_EDIT_PARAMETERS",
     "OPEN_WEBUI_ENV_FILE",
     "ImageEditSettings",

@@ -1,8 +1,8 @@
 """
 title: Pepito Image Chat
 author: Pepito's AI Hub
-version: 0.5.2
-required_open_webui_version: 0.11.3
+version: 0.6.0
+required_open_webui_version: 0.12.0
 description: Send every Image turn through Open WebUI's own image generation or editing, and decide which from the user's words.
 """
 
@@ -68,9 +68,21 @@ description: Send every Image turn through Open WebUI's own image generation or 
 # picture through Open WebUI's own ``image_generations`` -- the same call the
 # handler makes, with the same statuses, the same file attachment and the same
 # context -- from the current message alone, so no earlier image is an input.
+#
+# On a card that cannot hold the chat model and the image models together
+# (Capella: a 20 GB chat model, an 18 GB FLUX.2 Klein 9B set, 32 GB of VRAM)
+# the Hub launches Open WebUI with PEPITO_EXCLUSIVE_VRAM. Every Image turn
+# then unloads Ollama's resident models at ``inlet``, before the image step,
+# and asks ComfyUI to free its models at ``request``, after the image step and
+# before the chat model is asked to acknowledge. Both calls are best effort:
+# a failed unload leaves the turn to run slower, never to fail.
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import re
+import urllib.request
 
 FEATURE = "image_generation"
 FORCED_MODE = "legacy"
@@ -121,6 +133,61 @@ MAX_TEXT = 65536
 # open_webui/utils/chat_id.py: the chats Open WebUI does not persist, whose
 # messages therefore travel in the request.
 NOT_SAVED_CHAT_PREFIXES = ("temporary:", "local:", "channel:")
+EXCLUSIVE_VRAM_ENV = "PEPITO_EXCLUSIVE_VRAM"
+OLLAMA_URL_ENV = "PEPITO_OLLAMA_URL"
+COMFYUI_URL_ENV = "PEPITO_COMFYUI_URL"
+VRAM_TIMEOUT_SECONDS = 30
+
+
+def exclusive_vram() -> bool:
+    return os.environ.get(EXCLUSIVE_VRAM_ENV, "").strip().lower() == "true"
+
+
+def _post_json(url: str, payload: dict) -> bytes:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=VRAM_TIMEOUT_SECONDS) as response:
+        return response.read()
+
+
+def _unload_ollama_sync(base_url: str) -> None:
+    with urllib.request.urlopen(f"{base_url}/api/ps", timeout=VRAM_TIMEOUT_SECONDS) as response:
+        loaded = json.loads(response.read() or b"{}").get("models") or []
+    for model in loaded:
+        name = model.get("name") or model.get("model")
+        if name:
+            _post_json(f"{base_url}/api/generate", {"model": name, "keep_alive": 0})
+
+
+def _free_comfyui_sync(base_url: str) -> None:
+    _post_json(f"{base_url}/free", {"unload_models": True, "free_memory": True})
+
+
+async def unload_ollama() -> None:
+    """Drop every model Ollama holds, so the image models get the card."""
+    base_url = os.environ.get(OLLAMA_URL_ENV, "").rstrip("/")
+    if not base_url:
+        return
+    try:
+        await asyncio.to_thread(_unload_ollama_sync, base_url)
+    except Exception:  # noqa: BLE001, S110 - a slower turn beats a failed one
+        pass
+
+
+async def free_comfyui() -> None:
+    """Release ComfyUI's models, so the chat model gets the card back."""
+    base_url = os.environ.get(COMFYUI_URL_ENV, "").rstrip("/")
+    if not base_url:
+        return
+    try:
+        await asyncio.to_thread(_free_comfyui_sync, base_url)
+    except Exception:  # noqa: BLE001, S110 - a slower turn beats a failed one
+        pass
+
 
 _SUCCESS_CONTEXT = re.compile(r"<context>[^<]*" + re.escape(SUCCESS_MARK) + r"[^<]*</context>")
 
@@ -486,6 +553,9 @@ class Filter:
         params["function_calling"] = FORCED_MODE
         state: dict = {"text": ""}
         metadata[STATE_KEY] = state
+        if exclusive_vram():
+            await unload_ollama()
+            state["swapped"] = True
         messages = body.get("messages")
         if not isinstance(messages, list):
             return body
@@ -523,6 +593,8 @@ class Filter:
             )
             if context is not None:
                 body["messages"] = messages = with_system_context(messages, context)
+        if state.pop("swapped", False):
+            await free_comfyui()
         system = claimed_success(messages)
         if system is None:
             return body

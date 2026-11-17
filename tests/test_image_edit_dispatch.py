@@ -1436,8 +1436,12 @@ def consenting(routed, monkeypatch, tmp_path):
     turn, comfyui, files, ollama = routed
     ollama.answers.update(
         {
-            "edição sensível de teste": flagged("edit_image", "A sensitive test edit.", explicit=True),
-            "outra edição sensível de teste": flagged("edit_image", "Another sensitive test edit.", explicit=True),
+            "edição sensível de teste": flagged(
+                "edit_image", "A sensitive test edit.", explicit=True
+            ),
+            "outra edição sensível de teste": flagged(
+                "edit_image", "Another sensitive test edit.", explicit=True
+            ),
             "deixa o fundo azul": edit("Make the background blue."),
         }
     )

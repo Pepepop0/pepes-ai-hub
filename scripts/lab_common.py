@@ -301,5 +301,3 @@ def retain_attempt(records: dict, variant_id: str, attempt: dict) -> None:
         previous["last_attempt"] = attempt
     else:
         records[variant_id] = attempt
-
-

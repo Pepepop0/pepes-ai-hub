@@ -24,23 +24,14 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from enum import Enum
 
 from .components import ComponentId
 from .inventory import ListenerReport, list_listeners
 from .probes import DEFAULT_TIMEOUT, ProbeOutcome, ProbeResult, http_probe, tcp_probe
+from .service_state import ServiceState
 
 HttpProbe = Callable[[str, float], ProbeResult]
 TcpProbe = Callable[[str, int, float], ProbeResult]
-
-
-class ServiceState(str, Enum):
-    """Aggregated health verdict for one service or for the whole stack."""
-
-    UP = "UP"
-    DOWN = "DOWN"
-    DEGRADED = "DEGRADED"
-    UNKNOWN = "UNKNOWN"
 
 
 @dataclass(frozen=True)

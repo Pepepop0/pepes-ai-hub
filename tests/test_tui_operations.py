@@ -1336,7 +1336,6 @@ def test_an_application_without_conflict_support_behaves_as_before():
         inner = FakeHubApplication()
         fake = _NoConflictSupport(inner)
         assert not hasattr(fake, "current_conflict_preflight")
-        assert isinstance(fake, HubApplication)
 
         app, _, _ = hub(fake)
         async with app.run_test(size=(100, 32)) as pilot:

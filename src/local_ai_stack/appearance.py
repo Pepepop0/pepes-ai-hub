@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 from .pets import PetState
 from .profiles import Profile
-from .services import ServiceState
+from .service_state import ServiceState
 
 STACK_PET_STATES: Mapping[ServiceState, PetState] = {
     ServiceState.UP: PetState.IDLE,

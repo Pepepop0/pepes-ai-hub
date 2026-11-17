@@ -18,6 +18,7 @@ import pytest
 from helpers import NOTHING_LISTENING, http_failing, listening, running, tcp_answering
 
 from local_ai_stack.catalog import repository_for
+from local_ai_stack.comfyui import CUSTOM_NODE_COMPONENT
 from local_ai_stack.execution import PlanExecutor
 from local_ai_stack.installation import InstallLocation, resolve_installation
 from local_ai_stack.integration import (
@@ -89,6 +90,8 @@ class FakeRunner(CommandRunner):
         # which torch the environment holds. Defaults satisfy the shipped pin.
         pin = repository_for("comfyui")
         self.head_commit = head_commit or (pin.commit if pin else "")
+        # Each pinned custom node answers with its own commit, by folder.
+        self.node_heads = {node.id: node.commit for node in pin.custom_nodes} if pin else {}
         self.torch_version = torch_version
         self.calls: list[tuple[str, ...]] = []
 
@@ -102,7 +105,11 @@ class FakeRunner(CommandRunner):
         items = tuple(str(a) for a in argv)
         self.calls.append(items)
         if "rev-parse" in items:
-            return CommandResult(argv=items, returncode=0, stdout=f"{self.head_commit}\n")
+            cwd = Path(str(kwargs.get("cwd") or ""))
+            head = self.head_commit
+            if cwd.parent.name == "custom_nodes":
+                head = self.node_heads.get(cwd.name, head)
+            return CommandResult(argv=items, returncode=0, stdout=f"{head}\n")
         if "-c" in items and "importlib.metadata" in items[items.index("-c") + 1]:
             body = "" if self.torch_version is None else f"{self.torch_version}\n"
             return CommandResult(argv=items, returncode=0, stdout=body)
@@ -640,6 +647,16 @@ def test_preexisting_managed_comfyui_handoff_drives_its_runtime_spec(tmp_path):
         version=provisioner.revision,
         checksum=provisioner.commit,
     )
+    for node in provisioner.custom_nodes:
+        node_dir = provisioner.custom_node_dir(context, node)
+        (node_dir / ".git").mkdir(parents=True)
+        write_marker(
+            node_dir,
+            component=CUSTOM_NODE_COMPONENT,
+            source_id=node.url,
+            version=node.revision,
+            checksum=node.commit,
+        )
 
     snapshot = detect_integration(context, {"comfyui": provisioner})
     handoff = snapshot.by_component("comfyui")

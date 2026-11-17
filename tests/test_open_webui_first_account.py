@@ -49,6 +49,8 @@ class OpenWebUIAccounts:
         deps.filter_sync = lambda *_args, **_kwargs: self._sync("filter")
         deps.model_sync = lambda *_args, **_kwargs: self._sync("model")
         deps.image_edit_sync = lambda *_args, **_kwargs: self._sync("image-edit")
+        deps.web_search_sync = lambda *_args, **_kwargs: self._sync("web-search")
+        deps.background_task_sync = lambda *_args, **_kwargs: self._sync("background-tasks")
 
 
 def installed_before_the_first_account(composition):  # noqa: F811 -- the fixture, passed in

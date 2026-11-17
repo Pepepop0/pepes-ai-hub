@@ -53,9 +53,9 @@ def _string(value: Any, source: Path | str, field: str) -> str:
 class Artifact:
     """One downloadable file, identified and (ideally) checksummed.
 
-    `sha256` is optional in the schema because not every upstream publishes
-    one, but when it is present the downloader treats it as mandatory: bytes
-    that do not match are never promoted to the destination.
+    `sha256` is required by the manifest schema; the dataclass keeps it optional
+    only for artifacts built in code. When it is present the downloader treats it
+    as mandatory: bytes that do not match are never promoted to the destination.
     """
 
     id: str
@@ -65,6 +65,8 @@ class Artifact:
     size_bytes: int | None = None
     version: str | None = None
     component: str | None = None
+    platform: str | None = None
+    architecture: str | None = None
 
     @property
     def has_checksum(self) -> bool:
@@ -84,16 +86,30 @@ class Artifact:
             data["version"] = self.version
         if self.component is not None:
             data["component"] = self.component
+        if self.platform is not None:
+            data["platform"] = self.platform
+        if self.architecture is not None:
+            data["architecture"] = self.architecture
         return data
 
     @classmethod
     def from_dict(cls, data: Any, source: Path | str = "<artifact>") -> Artifact:
         record = _mapping(data, source, "artifact")
-        allowed = {"id", "url", "filename", "sha256", "size_bytes", "version", "component"}
+        allowed = {
+            "id",
+            "url",
+            "filename",
+            "sha256",
+            "size_bytes",
+            "version",
+            "component",
+            "platform",
+            "architecture",
+        }
         unknown = sorted((str(key) for key in record if key not in allowed), key=str.casefold)
         if unknown:
             raise _error(source, "artifact", f"unknown fields: {', '.join(unknown)}")
-        for required in ("id", "url", "filename"):
+        for required in ("id", "url", "filename", "sha256"):
             if required not in record:
                 raise _error(source, required, "is required")
 
@@ -113,11 +129,9 @@ class Artifact:
         if "/" in filename or "\\" in filename or filename in {".", ".."}:
             raise _error(source, "filename", "must be a bare file name without any path separator")
 
-        sha256 = record.get("sha256")
-        if sha256 is not None:
-            sha256 = _string(sha256, source, "sha256").lower()
-            if not _SHA256_RE.match(sha256):
-                raise _error(source, "sha256", "must be 64 hexadecimal characters")
+        sha256 = _string(record["sha256"], source, "sha256").lower()
+        if not _SHA256_RE.match(sha256):
+            raise _error(source, "sha256", "must be 64 hexadecimal characters")
 
         size_bytes = record.get("size_bytes")
         if size_bytes is not None and (
@@ -132,6 +146,16 @@ class Artifact:
         component = record.get("component")
         if component is not None:
             component = normalize_component_id(_string(component, source, "component"))
+        platform = record.get("platform")
+        if platform is not None and (
+            not isinstance(platform, str) or platform not in {"windows", "linux"}
+        ):
+            raise _error(source, "platform", "must be 'windows' or 'linux'")
+        architecture = record.get("architecture")
+        if architecture is not None and (
+            not isinstance(architecture, str) or architecture not in {"amd64", "arm64"}
+        ):
+            raise _error(source, "architecture", "must be 'amd64' or 'arm64'")
 
         return cls(
             id=artifact_id,
@@ -141,6 +165,8 @@ class Artifact:
             size_bytes=size_bytes,
             version=version,
             component=component,
+            platform=platform,
+            architecture=architecture,
         )
 
 

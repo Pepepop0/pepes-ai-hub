@@ -594,8 +594,9 @@ def test_an_interrupted_download_writes_bytes_before_it_fails(tmp_path):
     assert max(written) < (spec.size_bytes or 0), "the whole body arrived; nothing was interrupted"
     assert artifacts.delivered[spec.url] == max(written)
 
-    # And the domain cleaned up after itself: no .part, no promoted file.
-    assert not downloader.part_path(target.destination).exists()
+    # Nothing was promoted, and the bytes that arrived are kept for the next attempt to
+    # resume from rather than fetch again.
+    assert downloader.part_path(target.destination).stat().st_size == max(written)
     assert not target.destination.exists()
 
 

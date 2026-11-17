@@ -58,6 +58,17 @@ class WorkflowParameter(StrEnum):
     STEPS = "steps"
     SEED = "seed"
     IMAGE = "image"
+    # The LoRA file a pose edit loads: chosen per request by the image filter from the
+    # adapters the stack carries; Open WebUI's edit path has no input for it.
+    LORA = "lora"
+    # The strength of a generation's style slider: the image filter sets it in the graph
+    # itself from the "Arte digital" / "Fotorrealista" switches or the request's words.
+    STYLE = "style"
+    # How strongly a Krea edit holds to its source picture (Krea2EditModelPatch's
+    # ref_boost): the image filter sets it per job, e.g. weaker for a restyle.
+    STRENGTH = "strength"
+    # Grounded text encoding resolution, applied to positive and negative branches.
+    GROUNDING = "grounding"
 
 
 # Which parameter is filled from a resolved model rather than by the caller.
@@ -66,14 +77,26 @@ MODEL_PARAMETERS: frozenset[WorkflowParameter] = frozenset({WorkflowParameter.MO
 
 @dataclass(frozen=True)
 class NodeBinding:
-    """One parameter's address inside the graph: a node and a field on it."""
+    """One parameter's address inside the graph: a node and a field on it.
+
+    An input image may be fed to several nodes (``additional_node_ids``): a
+    workflow that edits with two references loads each from its own node, and
+    Open WebUI's ComfyUI path hands its image list over by position.
+    """
 
     node_id: str
     key: str
+    additional_node_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.node_id or not self.key:
             raise WorkflowError("a node binding needs both a node id and a key")
+        if len(set(self.node_ids)) != len(self.node_ids) or not all(self.node_ids):
+            raise WorkflowError("a node binding cannot name the same node twice")
+
+    @property
+    def node_ids(self) -> tuple[str, ...]:
+        return (self.node_id, *self.additional_node_ids)
 
 
 @dataclass(frozen=True)
@@ -93,6 +116,12 @@ class WorkflowSpec:
     parameter_role: str
     status: str = ""
     unresolved: tuple[str, ...] = ()
+    # How an edit workflow's instruction names its input images: "indexed" for
+    # an encoder that reads <image1>, <image2> (Qwen-Image), "plain" for one
+    # that only reads words. Empty for a workflow that takes a single image.
+    reference_syntax: str = ""
+    family: str = ""
+    reference_policy: str = ""
 
     def __post_init__(self) -> None:
         if not self.required_roles:
@@ -102,6 +131,19 @@ class WorkflowSpec:
                 f"workflow {self.id!r}: parameter role {self.parameter_role!r} is not one of "
                 f"the required roles ({', '.join(self.required_roles)})"
             )
+        if self.reference_policy not in ("", "single", "generic", "scene_character"):
+            raise WorkflowError(f"workflow {self.id!r}: invalid reference_policy")
+        if self.reference_policy == "single" and self.reference_count != 1:
+            raise WorkflowError(f"workflow {self.id!r}: single reference_policy needs one image")
+        if self.reference_policy == "scene_character" and self.reference_count != 2:
+            raise WorkflowError(
+                f"workflow {self.id!r}: scene_character reference_policy needs two images"
+            )
+
+    @property
+    def reference_count(self) -> int:
+        binding = self.bindings.get(WorkflowParameter.IMAGE)
+        return len(binding.node_ids) if binding is not None else 0
 
     @property
     def complete(self) -> bool:
@@ -131,15 +173,19 @@ class WorkflowParameters:
     height: int = 1024
     steps: int = 20
     seed: int = 0
+    grounding: int | None = None
 
     def as_mapping(self) -> dict[WorkflowParameter, Any]:
-        return {
+        values = {
             WorkflowParameter.PROMPT: self.prompt,
             WorkflowParameter.WIDTH: self.width,
             WorkflowParameter.HEIGHT: self.height,
             WorkflowParameter.STEPS: self.steps,
             WorkflowParameter.SEED: self.seed,
         }
+        if self.grounding is not None:
+            values[WorkflowParameter.GROUNDING] = self.grounding
+        return values
 
 
 class WorkflowState(StrEnum):
@@ -232,25 +278,48 @@ def _model_roles(
 
 
 def _binding(value: Any, workflow_id: str, parameter: str) -> NodeBinding | None:
-    """Parse one mapping entry. ``TBD`` means declared but not yet known."""
+    """Parse one mapping entry. ``TBD`` means declared but not yet known.
+
+    ``{node_id, key}``, or ``{node_ids: [first, ...], key}`` for a parameter
+    that several nodes carry (an edit's input images, in order).
+    """
     if isinstance(value, str) and value.strip().upper() == UNRESOLVED:
         return None
     if not isinstance(value, dict):
         raise WorkflowError(
             f"workflow {workflow_id!r}: mapping.{parameter} must be a node binding or {UNRESOLVED}"
         )
-    unknown = sorted(str(key) for key in value if str(key) not in {"node_id", "key"})
+    unknown = sorted(str(key) for key in value if str(key) not in {"node_id", "node_ids", "key"})
     if unknown:
         raise WorkflowError(
             f"workflow {workflow_id!r}: mapping.{parameter} has unknown fields: "
             f"{', '.join(unknown)}"
         )
-    missing = [field_name for field_name in ("node_id", "key") if field_name not in value]
+    if "node_id" in value and "node_ids" in value:
+        raise WorkflowError(
+            f"workflow {workflow_id!r}: mapping.{parameter} names node_id or node_ids, not both"
+        )
+    ids = value.get("node_ids")
+    if ids is not None:
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or not all(isinstance(item, (str, int)) for item in ids)
+        ):
+            raise WorkflowError(
+                f"workflow {workflow_id!r}: mapping.{parameter}.node_ids must be a non-empty list"
+            )
+        value = {
+            "node_id": ids[0],
+            "key": value.get("key"),
+            "rest": [str(item) for item in ids[1:]],
+        }
+    missing = [field_name for field_name in ("node_id", "key") if value.get(field_name) is None]
     if missing:
         raise WorkflowError(
             f"workflow {workflow_id!r}: mapping.{parameter} is missing {', '.join(missing)}"
         )
-    return NodeBinding(str(value["node_id"]), str(value["key"]))
+    return NodeBinding(str(value["node_id"]), str(value["key"]), tuple(value.get("rest", ())))
 
 
 def parse_workflow_manifest(
@@ -260,7 +329,11 @@ def parse_workflow_manifest(
     if not isinstance(data, dict):
         raise WorkflowError(f"{source}: workflow manifest must be a mapping")
     version = data.get("schema_version")
-    if version != WORKFLOW_SCHEMA_VERSION:
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != WORKFLOW_SCHEMA_VERSION
+    ):
         raise WorkflowError(
             f"{source}: unsupported workflow schema_version {version!r}; "
             f"expected {WORKFLOW_SCHEMA_VERSION}"
@@ -307,8 +380,48 @@ def parse_workflow_manifest(
             parameter_role=roles.get(str(workflow_id), parameter_role),
             status=str(entry.get("status", "")),
             unresolved=tuple(sorted(unresolved)),
+            reference_syntax=_reference_syntax(entry.get("reference_syntax", ""), str(workflow_id)),
+            family=_family(entry.get("family", ""), str(workflow_id)),
+            reference_policy=str(entry.get("reference_policy", "") or ""),
         )
     return specs
+
+
+REFERENCE_SYNTAXES = ("indexed", "plain")
+
+
+def _reference_syntax(value: Any, workflow_id: str) -> str:
+    if value in ("", None):
+        return ""
+    if value not in REFERENCE_SYNTAXES:
+        raise WorkflowError(
+            f"workflow {workflow_id!r}: reference_syntax must be one of "
+            f"{', '.join(REFERENCE_SYNTAXES)}"
+        )
+    return str(value)
+
+
+def _family(value: Any, workflow_id: str) -> str:
+    if value in ("", None):
+        return ""
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise WorkflowError(f"workflow {workflow_id!r}: family must be a non-empty string")
+    return value
+
+
+WORKFLOW_MANIFEST = "workflows.yaml"
+EXTRA_WORKFLOW_DIRECTORY = "workflows.d"
+
+
+def workflow_manifest_files(path: Path) -> tuple[Path, ...]:
+    """The manifest and, beside it, the extra ``workflows.d/*.yaml`` files that add to it.
+
+    Extras are only looked for next to a manifest named ``workflows.yaml``: that is how an
+    optional pack adds workflows without editing the shipped file.
+    """
+    if path.name != WORKFLOW_MANIFEST:
+        return (path,)
+    return (path, *sorted((path.parent / EXTRA_WORKFLOW_DIRECTORY).glob("*.yaml")))
 
 
 def load_workflow_manifest(
@@ -316,11 +429,22 @@ def load_workflow_manifest(
 ) -> dict[str, WorkflowSpec]:
     if not path.is_file():
         raise WorkflowError(f"{path}: workflow manifest not found")
-    return parse_workflow_manifest(
-        yaml.safe_load(path.read_text(encoding="utf-8")),
-        source=str(path),
-        model_roles=model_roles,
-    )
+    specs: dict[str, WorkflowSpec] = {}
+    owners: dict[str, Path] = {}
+    for file in workflow_manifest_files(path):
+        try:
+            data = yaml.safe_load(file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise WorkflowError(f"{file}: could not read workflow manifest: {exc}") from exc
+        additions = parse_workflow_manifest(data, source=str(file), model_roles=model_roles)
+        for workflow_id, spec in additions.items():
+            if workflow_id in owners:
+                raise WorkflowError(
+                    f"{file}: workflow {workflow_id!r} is already declared in {owners[workflow_id]}"
+                )
+            owners[workflow_id] = file
+            specs[workflow_id] = spec
+    return specs
 
 
 # --- resolution -------------------------------------------------------------
@@ -419,18 +543,17 @@ def resolve_workflows(
 
 
 def _assign(graph: dict[str, Any], binding: NodeBinding, value: Any, workflow_id: str) -> None:
-    node = graph.get(binding.node_id)
-    if not isinstance(node, dict):
-        raise WorkflowError(
-            f"workflow {workflow_id!r}: node {binding.node_id!r} is not in the graph"
-        )
-    inputs = node.get("inputs")
-    target = inputs if isinstance(inputs, dict) else node
-    if binding.key not in target:
-        raise WorkflowError(
-            f"workflow {workflow_id!r}: node {binding.node_id!r} has no field {binding.key!r}"
-        )
-    target[binding.key] = value
+    for node_id in binding.node_ids:
+        node = graph.get(node_id)
+        if not isinstance(node, dict):
+            raise WorkflowError(f"workflow {workflow_id!r}: node {node_id!r} is not in the graph")
+        inputs = node.get("inputs")
+        target = inputs if isinstance(inputs, dict) else node
+        if binding.key not in target:
+            raise WorkflowError(
+                f"workflow {workflow_id!r}: node {node_id!r} has no field {binding.key!r}"
+            )
+        target[binding.key] = value
 
 
 def render_workflow(
@@ -481,14 +604,15 @@ def verify_workflow_references(
     problems: list[str] = []
     for parameter in resolution.spec.parameters:
         binding = resolution.spec.binding(parameter)
-        node = graph.get(binding.node_id)
-        if not isinstance(node, dict):
-            problems.append(f"{parameter.value}: node {binding.node_id} is missing")
-            continue
-        inputs = node.get("inputs")
-        target = inputs if isinstance(inputs, dict) else node
-        if binding.key not in target:
-            problems.append(f"{parameter.value}: node {binding.node_id} has no field {binding.key}")
+        for node_id in binding.node_ids:
+            node = graph.get(node_id)
+            if not isinstance(node, dict):
+                problems.append(f"{parameter.value}: node {node_id} is missing")
+                continue
+            inputs = node.get("inputs")
+            target = inputs if isinstance(inputs, dict) else node
+            if binding.key not in target:
+                problems.append(f"{parameter.value}: node {node_id} has no field {binding.key}")
     return tuple(problems)
 
 
@@ -508,4 +632,5 @@ __all__: Sequence[str] = (
     "resolve_workflow",
     "resolve_workflows",
     "verify_workflow_references",
+    "workflow_manifest_files",
 )

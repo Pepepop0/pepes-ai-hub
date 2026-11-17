@@ -84,7 +84,7 @@ def test_status_sanitizes_whatever_a_source_hands_it(serve):
     class LeakySource:
         def snapshot(self):
             return {
-                "system": {"root": r"C:\Users\Pedro\AppData\Local", "token": "s3cret"},
+                "system": {"root": r"C:\Users\User\AppData\Local", "token": "s3cret"},
                 "services": {"ollama": "http://127.0.0.1:11434", "telemetry": "https://api.x.io"},
             }
 

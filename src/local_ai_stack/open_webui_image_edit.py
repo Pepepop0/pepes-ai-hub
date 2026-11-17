@@ -59,7 +59,7 @@ def managed_workflow(settings: ImageEditSettings) -> dict:
 
 def desired_fields(settings: ImageEditSettings) -> dict:
     """The edit fields the Hub owns, as the admin form names them."""
-    return {
+    fields = {
         "ENABLE_IMAGE_EDIT": True,
         "IMAGE_EDIT_ENGINE": ENGINE,
         "IMAGE_EDIT_MODEL": settings.model,
@@ -67,6 +67,11 @@ def desired_fields(settings: ImageEditSettings) -> dict:
         "IMAGES_EDIT_COMFYUI_WORKFLOW": json.dumps(managed_workflow(settings)),
         "IMAGES_EDIT_COMFYUI_WORKFLOW_NODES": [dict(node) for node in settings.nodes],
     }
+    if settings.exclusive_vram:
+        # The env var only seeds a fresh database; an instance that started
+        # once keeps its saved value, so the Hub writes it with the edit form.
+        fields["ENABLE_IMAGE_PROMPT_GENERATION"] = False
+    return fields
 
 
 def _parsed_workflow(value: object) -> dict | None:

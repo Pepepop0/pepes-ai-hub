@@ -242,12 +242,41 @@ def test_start_is_idempotent_for_a_process_we_already_manage(tmp_path, registry)
     assert report.process_state is RuntimeProcessState.RUNNING
 
 
+def test_start_waits_for_an_already_managed_process_to_become_healthy(tmp_path, registry):
+    registry.register(
+        ManagedProcess("ollama", OLLAMA_PROC.pid, OLLAMA_EXE, create_time=OLLAMA_PROC.create_time)
+    )
+    probes = iter((UNREACHABLE, HEALTHY))
+
+    def http(url, timeout):
+        return next(probes)(url, timeout)
+
+    controller = make_controller(
+        tmp_path,
+        registry,
+        http=http,
+        processes=running(OLLAMA_PROC),
+        listeners=listening(11434, pid=OLLAMA_PROC.pid),
+    )
+    report = controller.start("ollama", wait=True, timeout=5)
+
+    assert report.outcome is LaunchOutcome.ALREADY_MANAGED
+    assert report.ready
+    assert "readiness elapsed=1.000s" in report.detail
+    assert report.detail in (tmp_path / "logs" / "hub-events.log").read_text(encoding="utf-8")
+
+
 def test_start_waits_for_health_and_reports_running(tmp_path, registry):
     controller = make_controller(tmp_path, registry, http=HEALTHY, listeners=listening(11434))
     report = controller.start("ollama", wait=True, timeout=5)
     assert report.process_state is RuntimeProcessState.RUNNING
     assert report.health.state is ServiceState.UP
     assert report.ready
+    assert "readiness elapsed=2.000s" in report.detail
+    assert report.detail in (tmp_path / "logs" / "hub-events.log").read_text(encoding="utf-8")
+    # Never into the running service's own log: its inherited handle would write over it.
+    service_log = (tmp_path / "logs" / "ollama.log").read_text(encoding="utf-8")
+    assert "starting process" in service_log and "readiness" not in service_log
 
 
 def test_start_reports_failed_when_the_process_exits_during_startup(tmp_path, registry):
@@ -259,6 +288,8 @@ def test_start_reports_failed_when_the_process_exits_during_startup(tmp_path, re
     report = controller.start("ollama", wait=True, timeout=5)
     assert report.process_state is RuntimeProcessState.FAILED
     assert "exited during startup" in report.detail
+    assert "readiness elapsed=" in report.detail
+    assert report.detail in (tmp_path / "logs" / "hub-events.log").read_text(encoding="utf-8")
     assert not report.ready
 
 
@@ -268,6 +299,8 @@ def test_start_reports_failed_when_health_never_comes_up(tmp_path, registry):
     assert report.process_state is RuntimeProcessState.FAILED
     assert "did not become healthy" in report.detail
     assert report.health.state is ServiceState.DOWN
+    assert "readiness elapsed=" in report.detail
+    assert report.detail in (tmp_path / "logs" / "hub-events.log").read_text(encoding="utf-8")
     # The process is still ours and still registered, so it can be stopped.
     assert registry.load().get("ollama") is not None
 

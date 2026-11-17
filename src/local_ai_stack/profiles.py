@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,9 @@ from .components import ComponentId, normalize_component_id
 from .models import ModelContractError, ModelId, ModelRequirement
 
 PROFILE_SCHEMA_VERSION = 1
+# A profile's own release number, MAJOR.MINOR.PATCH: MAJOR when its model stack changes,
+# MINOR when it gains a capability, PATCH for a fix. Shown wherever a profile is chosen.
+PROFILE_VERSION_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 MIB_PER_GIB = 1024
 
 # Who a profile is offered to. A profile is part of the product unless it says
@@ -38,6 +42,52 @@ FEATURE_IMAGE_EDITING = "image_editing"
 CHAT_PRIMARY_ROLE = "chat.primary"
 TEXT_TO_IMAGE_WORKFLOW = "text_to_image"
 IMAGE_EDIT_WORKFLOW = "image_edit"
+# A chat variant's image models live in the ``models`` group it names (``images``): its
+# own set, with the LoRAs or auxiliary models its workflows load. The roles are free
+# names; the workflow manifest says which ones a workflow needs.
+VARIANT_ROLE_PATTERN = re.compile(r"[a-z][a-z0-9_]*")
+# An edit with more input images is its own workflow, chosen by how many the
+# turn has: ``image_edit_2`` for two, ``image_edit_3`` for three.
+IMAGE_EDIT_REFERENCE_WORKFLOWS = {2: "image_edit_2", 3: "image_edit_3"}
+# Workflows only the image filter drives, chosen by the router's answer, and the stack
+# key each one becomes: restaging the chat's character (Identity Edit with the person
+# beside the canvas), a removal, and a pose edit (one pose adapter). The filter sets
+# what Open WebUI cannot in the graph.
+FILTER_STACK_WORKFLOWS = {"restage_edit": "restage", "remove_edit": "remove", "pose_edit": "pose"}
+# The "high quality" generation a variant offers next to its text_to_image.
+TEXT_TO_IMAGE_HQ_WORKFLOW = "text_to_image_hq"
+# A model role named ``pose_<adapter>`` is one of a pose edit's adapters.
+POSE_ROLE_PREFIX = "pose_"
+# Shared analysis/generation passes for character swaps, available on every chat stack.
+CHARACTER_SWAP_PARTS = ("reference", "marked", "scene", "segment", "depth")
+# ``scene`` (the identity edit that puts a character into a scene) is optional: a profile
+# without it swaps with the Qwen passes alone.
+CHARACTER_SWAP_REQUIRED_PARTS = tuple(part for part in CHARACTER_SWAP_PARTS if part != "scene")
+# A profile overlay (``profiles/<name>.overlay.yaml``) extends a base profile by id and may
+# add to these keys only.
+OVERLAY_SUFFIX = ".overlay.yaml"
+OVERLAY_KEYS = frozenset({"extends", "models", "variants", "character_swap", "behavior"})
+CHARACTER_SWAP_MODEL_GROUP = "swap"
+# The runtime flag that has the Hub own Open WebUI's web search settings (on or off,
+# the engine, its address and key), set from the Hub's own web search settings.
+WEB_SEARCH_RUNTIME_KEY = "web_search"
+# The runtime flag that has the image chat filter route every Image turn (and
+# so make every picture itself). A chat variant needs it: Open WebUI's own
+# handler knows only one workflow, so without the filter the variant's
+# pictures would come from the profile's models.
+IMAGE_ROUTER_RUNTIME_KEY = "image_router"
+# The runtime flag that switches off Open WebUI's follow-up and tag generation
+# (title generation is kept): two extra chat-model calls after every answer that,
+# on a card the chat and image models share, can land beside a running picture.
+QUIET_BACKGROUND_TASKS_RUNTIME_KEY = "quiet_background_tasks"
+# The runtime flag that has the Hub load the chat model into the GPU once the services are
+# up, and the Ollama keep-alive (a string, not a flag) that keeps it there between turns.
+PRELOAD_CHAT_MODEL_RUNTIME_KEY = "preload_chat_model"
+CHAT_KEEP_ALIVE_RUNTIME_KEY = "chat_keep_alive"
+# Hours a file stays in ComfyUI's input and output folders before the Hub removes it
+# (a number, not a flag); absent: nothing is ever removed.
+COMFYUI_RETENTION_RUNTIME_KEY = "comfyui_retention_hours"
+KEEP_ALIVE_PATTERN = re.compile(r"-1|[0-9]+|(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|µs|ms|s|m|h))+")
 
 # A capability that only refines another one: vision and tool calling are
 # things a chat model does, and editing an image is image generation plus an
@@ -51,7 +101,7 @@ FEATURE_REFINES: dict[str, str] = {
 
 @dataclass(frozen=True)
 class HardwareRequirement:
-    os: str
+    os: tuple[str, ...]
     gpu_vendor: str
     min_vram_mib: int
     recommended_vram_mib: int
@@ -89,6 +139,40 @@ class WorkflowConfig:
 
 
 @dataclass(frozen=True)
+class PoseBehavior:
+    """A named pose: the adapter (a role of the models group) and the sentence it was
+    trained on, which the image filter sends as the edit's instruction."""
+
+    adapter: str
+    prompt: str
+
+
+@dataclass(frozen=True)
+class Behavior:
+    """What a profile or variant adds to the image filter's behaviour: extra rules for
+    its router and the named poses it offers. Empty means the filter's defaults only."""
+
+    router_rules: tuple[str, ...] = ()
+    poses: dict[str, PoseBehavior] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ChatVariant:
+    """Another Open WebUI model on the same chat model with its own image workflows.
+
+    It appears in Open WebUI's model list as ``name`` (record id ``id``) and
+    makes and edits pictures with ``workflows`` instead of the profile's own.
+    Its image models are the roles of ``models.<images>``.
+    """
+
+    id: str
+    name: str
+    images: str
+    workflows: dict[str, WorkflowConfig]
+    behavior: Behavior = field(default_factory=Behavior)
+
+
+@dataclass(frozen=True)
 class ProfileUiDefaults:
     default_pet: str | None = None
     default_theme: str | None = None
@@ -99,6 +183,7 @@ class Profile:
     schema_version: int
     id: str
     name: str
+    version: str
     description: str
     visibility: str
     ui: ProfileUiDefaults
@@ -109,7 +194,13 @@ class Profile:
     model_requirements: tuple[ModelRequirement, ...]
     workflows: dict[str, WorkflowConfig]
     runtime: dict[str, bool]
+    # Ollama's keep-alive for the chat model (``"60m"``, ``"-1"``); None leaves its default.
+    chat_keep_alive: str | None
     raw: dict[str, Any]
+    variants: tuple[ChatVariant, ...] = ()
+    comfyui_retention_hours: float | None = None
+    character_swap: dict[str, WorkflowConfig] = field(default_factory=dict)
+    behavior: Behavior = field(default_factory=Behavior)
 
     @property
     def internal(self) -> bool:
@@ -128,12 +219,32 @@ class Profile:
         """The model a role names, or None when it is absent or TBD."""
         return next((item.model_id for item in self.model_requirements if item.role == role), None)
 
+    def workflow(self, key: str) -> WorkflowConfig | None:
+        """The declaration a plan step names: ``<id>`` or ``variant.<variant>.<id>``."""
+        if key.startswith("character_swap."):
+            return self.character_swap.get(key.removeprefix("character_swap."))
+        if key.startswith("variant."):
+            variant_id, _, workflow_id = key[8:].partition(".")
+            variant = next((item for item in self.variants if item.id == variant_id), None)
+            return None if variant is None else variant.workflows.get(workflow_id)
+        return self.workflows.get(key)
+
     @property
     def chat_params(self) -> dict[str, bool | int | float | str]:
         """What the profile asks of its chat model at every request: Open WebUI's
         own model parameters (``think``, ``num_ctx``, ...), validated on load.
         Empty when the profile leaves the model's defaults alone."""
         return dict(self.models.get("chat", {}).get("params") or {})
+
+    @property
+    def chat_system_prompt(self) -> str | None:
+        """The system prompt the chat model starts with in Open WebUI, or None.
+
+        A seed, not a setting the Hub keeps enforcing: it is written only into
+        a model record that has no system prompt yet, so an administrator's own
+        edit in Admin → Models survives every later start."""
+        value = self.models.get("chat", {}).get("system_prompt")
+        return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 class ProfileError(ValueError):
@@ -172,7 +283,56 @@ def capability_problems(profile: Profile) -> tuple[str, ...]:
         problems.append(
             "features.image_editing is enabled but workflows.image_edit is not declared"
         )
+
+    # No router check: a profile with the router off loads with no swap at all (see
+    # ``validate_profile_data``), since only the router could offer it.
+    if profile.character_swap and not profile.enables(FEATURE_IMAGE_EDITING):
+        problems.append("character_swap is declared but features.image_editing is not enabled")
+
+    for variant in profile.variants:
+        where = f"variants[{variant.id}]"
+        if not profile.enables(FEATURE_CHAT):
+            problems.append(f"{where} is declared but features.chat is not enabled")
+        if not profile.enables(FEATURE_IMAGE_GENERATION):
+            problems.append(f"{where} is declared but features.image_generation is not enabled")
+        elif TEXT_TO_IMAGE_WORKFLOW not in variant.workflows:
+            problems.append(
+                f"features.image_generation is enabled but {where}.workflows.text_to_image "
+                "is not declared"
+            )
+        if profile.enables(FEATURE_IMAGE_EDITING) and IMAGE_EDIT_WORKFLOW not in variant.workflows:
+            problems.append(
+                f"features.image_editing is enabled but {where}.workflows.image_edit "
+                "is not declared"
+            )
+        if not profile.runtime.get(IMAGE_ROUTER_RUNTIME_KEY):
+            problems.append(
+                f"{where} is declared but runtime.{IMAGE_ROUTER_RUNTIME_KEY} is not enabled"
+            )
     return tuple(problems)
+
+
+def declared_workflows(profile: Profile) -> tuple[tuple[str, str, WorkflowConfig], ...]:
+    """Every workflow the profile declares: (key, field, declaration).
+
+    The profile's own are keyed by their workflow id, a variant's by
+    ``variant.<variant>.<id>``; ``field`` is where the declaration is written.
+    """
+    own = tuple((key, f"workflows.{key}", value) for key, value in profile.workflows.items())
+    variants = tuple(
+        (
+            f"variant.{variant.id}.{key}",
+            f"variants[{variant.id}].workflows.{key}",
+            value,
+        )
+        for variant in profile.variants
+        for key, value in variant.workflows.items()
+    )
+    swap = tuple(
+        (f"character_swap.{key}", f"character_swap.{key}", value)
+        for key, value in profile.character_swap.items()
+    )
+    return own + variants + swap
 
 
 def _gib_value(vram_mib: int) -> int | float:
@@ -242,22 +402,34 @@ def _model_id(value: Any, source: Path | str, field: str) -> ModelId | None:
 
 
 def _model_contract(
-    models: dict[str, dict[str, Any]], source: Path | str
+    models: dict[str, dict[str, Any]],
+    source: Path | str,
+    variant_groups: Sequence[str] = (),
 ) -> tuple[ModelRequirement, ...]:
     """Validate current profile roles without changing their public YAML shape."""
     requirements: list[ModelRequirement] = []
-    active_roles = {
+    active_roles: dict[str, Sequence[str]] = {
         "chat": ("primary",),
         "image": ("diffusion", "text_encoder", "vae"),
     }
+    for group in variant_groups:
+        roles = tuple(models.get(group, {}))
+        for role in roles:
+            if not isinstance(role, str) or not VARIANT_ROLE_PATTERN.fullmatch(role):
+                raise _error(
+                    source,
+                    f"models.{group}",
+                    f"role {role!r} must be lowercase letters, digits or '_' and start with a letter",
+                )
+        active_roles[group] = roles
     for group, fields in active_roles.items():
         values = models.get(group, {})
-        for field in fields:
-            if field not in values:
+        for role_name in fields:
+            if role_name not in values:
                 continue
-            model_id = _model_id(values[field], source, f"models.{group}.{field}")
+            model_id = _model_id(values[role_name], source, f"models.{group}.{role_name}")
             if model_id is not None:
-                requirements.append(ModelRequirement(f"{group}.{field}", model_id))
+                requirements.append(ModelRequirement(f"{group}.{role_name}", model_id))
 
     chat_alternatives = models.get("chat", {}).get("alternatives", [])
     if not isinstance(chat_alternatives, list):
@@ -278,7 +450,172 @@ def _model_contract(
             raise _error(
                 source, f"models.chat.params.{key}", "must be a boolean, a number or a string"
             )
+    system_prompt = models.get("chat", {}).get("system_prompt")
+    if system_prompt is not None and (
+        not isinstance(system_prompt, str) or not system_prompt.strip()
+    ):
+        raise _error(source, "models.chat.system_prompt", "must be a non-empty string")
     return tuple(requirements)
+
+
+@lru_cache(maxsize=4)
+def _shipped_workflow_roles(
+    path: Path, versions: tuple[tuple[str, int], ...]
+) -> dict[str, tuple[str, ...]]:
+    """Each manifest workflow's required model roles, read once per manifest version.
+
+    ``versions`` (every manifest file with its mtime) only keys the cache, so a pack added
+    or removed beside the manifest is seen.
+    """
+    from .workflows import WorkflowError, load_workflow_manifest
+
+    try:
+        specs = load_workflow_manifest(path)
+    except WorkflowError as exc:
+        raise ProfileError(f"{path}: {exc}") from exc
+    return {workflow_id: spec.required_roles for workflow_id, spec in specs.items()}
+
+
+def _swap_requirements(
+    models: dict[str, dict[str, Any]],
+    source: Path | str,
+    character_swap: Mapping[str, WorkflowConfig],
+    requirements: tuple[ModelRequirement, ...],
+) -> tuple[ModelRequirement, ...]:
+    """The contract plus every role the swap's workflows load, whichever group it is in.
+
+    A swap part may run another stack's workflow (a pack's ``scene`` is a
+    Krea 2 identity edit), so its roles are required even when no variant names that
+    group; a role the profile does not declare at all is refused here, not at first run.
+    The roles come from the shipped workflow manifest; a name it does not declare is
+    reported where the manifest is checked against the profile.
+    """
+    from .resources import resource_root
+    from .workflows import workflow_manifest_files
+
+    path = resource_root() / "manifests" / "workflows.yaml"
+    if not path.is_file():
+        return requirements
+    versions = tuple((str(file), file.stat().st_mtime_ns) for file in workflow_manifest_files(path))
+    roles = _shipped_workflow_roles(path, versions)
+    active = {item.role for item in requirements}
+    added: list[ModelRequirement] = []
+    for part, declared in character_swap.items():
+        for role in roles.get(declared.manifest_id, ()):
+            if role in active:
+                continue
+            group, _, name = role.partition(".")
+            values = models.get(group)
+            if not isinstance(values, dict) or name not in values:
+                raise _error(
+                    source,
+                    f"models.{role}",
+                    f"character_swap.{part} ({declared.manifest_id}) needs role {role!r}, "
+                    "which the profile does not declare",
+                )
+            active.add(role)
+            model_id = _model_id(values[name], source, f"models.{role}")
+            if model_id is not None:
+                added.append(ModelRequirement(role, model_id))
+    return requirements + tuple(added)
+
+
+def _workflow_configs(value: Any, source: Path | str, field: str) -> dict[str, WorkflowConfig]:
+    workflows_data = _mapping(value, source, field)
+    workflows: dict[str, WorkflowConfig] = {}
+    for workflow_id, workflow_value in workflows_data.items():
+        prefix = f"{field}.{workflow_id}"
+        workflow = _mapping(workflow_value, source, prefix)
+        _reject_unknown(workflow, {"manifest_id", "size", "steps"}, source, prefix)
+        _required(workflow, ("manifest_id",), source, prefix)
+        size = workflow.get("size")
+        if size is not None:
+            size = _string(size, source, f"{prefix}.size")
+            if not IMAGE_SIZE_PATTERN.match(size):
+                raise _error(source, f"{prefix}.size", "must be WIDTHxHEIGHT, e.g. 1024x1024")
+        steps = workflow.get("steps")
+        if steps is not None:
+            steps = _integer(steps, source, f"{prefix}.steps", minimum=1)
+        workflows[_string(workflow_id, source, f"{field} key")] = WorkflowConfig(
+            manifest_id=_string(workflow["manifest_id"], source, f"{prefix}.manifest_id"),
+            size=size,
+            steps=steps,
+        )
+    return workflows
+
+
+def _behavior(value: Any, source: Path | str, field: str, models: Mapping[str, Any]) -> Behavior:
+    """``router_rules`` and ``poses``; a pose names an adapter of ``models``."""
+    data = _mapping(value, source, field)
+    _reject_unknown(data, {"router_rules", "poses"}, source, field)
+    rules_value = data.get("router_rules", [])
+    if not isinstance(rules_value, list):
+        raise _error(source, f"{field}.router_rules", "must be a list of strings")
+    rules = tuple(
+        _string(rule, source, f"{field}.router_rules[{index}]").strip()
+        for index, rule in enumerate(rules_value)
+    )
+    poses: dict[str, PoseBehavior] = {}
+    for name, pose_value in _mapping(data.get("poses", {}), source, f"{field}.poses").items():
+        label = f"{field}.poses.{name}"
+        if not isinstance(name, str) or not VARIANT_ROLE_PATTERN.fullmatch(name):
+            raise _error(source, label, "pose names use lowercase letters, digits and '_'")
+        pose = _mapping(pose_value, source, label)
+        _reject_unknown(pose, {"adapter", "prompt"}, source, label)
+        _required(pose, ("adapter", "prompt"), source, label)
+        adapter = _string(pose["adapter"], source, f"{label}.adapter")
+        if adapter not in models:
+            raise _error(source, f"{label}.adapter", "must name a role of the models group it uses")
+        poses[name] = PoseBehavior(
+            adapter, _string(pose["prompt"], source, f"{label}.prompt").strip()
+        )
+    return Behavior(router_rules=rules, poses=poses)
+
+
+def _chat_variants(
+    value: Any, source: Path | str, models: Mapping[str, Mapping[str, Any]]
+) -> tuple[ChatVariant, ...]:
+    if not isinstance(value, list) or not value:
+        raise _error(source, "variants", "must be a non-empty list")
+    variants: list[ChatVariant] = []
+    for index, item in enumerate(value):
+        field = f"variants[{index}]"
+        data = _mapping(item, source, field)
+        _reject_unknown(data, {"id", "name", "images", "workflows", "behavior"}, source, field)
+        _required(data, ("id", "name", "images", "workflows"), source, field)
+        variant_id = _string(data["id"], source, f"{field}.id")
+        if not variant_id[0].isalpha() or not all(
+            c.islower() or c.isdigit() or c == "-" for c in variant_id
+        ):
+            raise _error(
+                source,
+                f"{field}.id",
+                "must use lowercase letters, digits or '-' and start with a letter",
+            )
+        images = _string(data["images"], source, f"{field}.images")
+        if images in ("chat", "image") or not VARIANT_ROLE_PATTERN.fullmatch(images):
+            raise _error(
+                source,
+                f"{field}.images",
+                "must name its own models group (lowercase letters, digits, '_'), "
+                "not 'chat' or 'image'",
+            )
+        variants.append(
+            ChatVariant(
+                id=variant_id,
+                name=_string(data["name"], source, f"{field}.name").strip(),
+                images=images,
+                workflows=_workflow_configs(data["workflows"], source, f"{field}.workflows"),
+                behavior=_behavior(
+                    data.get("behavior", {}), source, f"{field}.behavior", models.get(images, {})
+                ),
+            )
+        )
+    for attribute in ("id", "name", "images"):
+        seen = [getattr(variant, attribute) for variant in variants]
+        if len(set(seen)) != len(seen):
+            raise _error(source, "variants", f"duplicate variant {attribute}")
+    return tuple(variants)
 
 
 def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profile:
@@ -289,6 +626,7 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
             "schema_version",
             "id",
             "name",
+            "version",
             "description",
             "visibility",
             "ui",
@@ -298,6 +636,9 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
             "models",
             "workflows",
             "runtime",
+            "variants",
+            "character_swap",
+            "behavior",
         },
         source,
         "profile root",
@@ -308,6 +649,7 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
             "schema_version",
             "id",
             "name",
+            "version",
             "hardware",
             "services",
             "features",
@@ -393,9 +735,16 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
     )
     if tolerance_mib > MIB_PER_GIB:
         raise _error(source, "hardware.vram_tolerance_mib", f"must be <= {MIB_PER_GIB}")
-    os_name = _string(hardware_data["os"], source, "hardware.os").lower()
-    if os_name != "windows":
-        raise _error(source, "hardware.os", "only 'windows' is supported")
+    raw_os = hardware_data["os"]
+    os_values = [raw_os] if isinstance(raw_os, str) else raw_os
+    if not isinstance(os_values, list) or not os_values:
+        raise _error(source, "hardware.os", "must name one or more supported operating systems")
+    os_names = tuple(_string(value, source, "hardware.os").lower() for value in os_values)
+    if len(set(os_names)) != len(os_names) or any(
+        value not in {"windows", "linux"} for value in os_names
+    ):
+        raise _error(source, "hardware.os", "must contain unique 'windows' or 'linux' values")
+    os_name = os_names
     gpu_vendor = _string(hardware_data["gpu_vendor"], source, "hardware.gpu_vendor").lower()
     if gpu_vendor != "nvidia":
         raise _error(source, "hardware.gpu_vendor", "only 'nvidia' is supported")
@@ -438,44 +787,73 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
         _string(key, source, "models key"): _mapping(value, source, f"models.{key}")
         for key, value in models_data.items()
     }
-    model_requirements = _model_contract(models, source)
+    variants = _chat_variants(root["variants"], source, models) if "variants" in root else ()
+    behavior = _behavior(root.get("behavior", {}), source, "behavior", models.get("image", {}))
+    for variant in variants:
+        if not models.get(variant.images):
+            raise _error(
+                source, f"models.{variant.images}", f"variant {variant.id!r} names no models here"
+            )
+    character_swap = (
+        _workflow_configs(root["character_swap"], source, "character_swap")
+        if "character_swap" in root
+        else {}
+    )
+    groups = [item.images for item in variants]
+    if "character_swap" in root:
+        _reject_unknown(root["character_swap"], set(CHARACTER_SWAP_PARTS), source, "character_swap")
+        _required(root["character_swap"], CHARACTER_SWAP_REQUIRED_PARTS, source, "character_swap")
+        if not models.get(CHARACTER_SWAP_MODEL_GROUP):
+            raise _error(source, "models.swap", "character_swap names no models here")
 
-    workflows_data = _mapping(root.get("workflows", {}), source, "workflows")
-    workflows: dict[str, WorkflowConfig] = {}
-    for workflow_id, workflow_value in workflows_data.items():
-        workflow = _mapping(workflow_value, source, f"workflows.{workflow_id}")
-        _reject_unknown(
-            workflow,
-            {"manifest_id", "size", "steps"},
-            source,
-            f"workflows.{workflow_id}",
-        )
-        _required(workflow, ("manifest_id",), source, f"workflows.{workflow_id}")
-        size = workflow.get("size")
-        if size is not None:
-            size = _string(size, source, f"workflows.{workflow_id}.size")
-            if not IMAGE_SIZE_PATTERN.match(size):
-                raise _error(
-                    source, f"workflows.{workflow_id}.size", "must be WIDTHxHEIGHT, e.g. 1024x1024"
-                )
-        steps = workflow.get("steps")
-        if steps is not None:
-            steps = _integer(steps, source, f"workflows.{workflow_id}.steps", minimum=1)
-        workflows[_string(workflow_id, source, "workflows key")] = WorkflowConfig(
-            manifest_id=_string(
-                workflow["manifest_id"],
-                source,
-                f"workflows.{workflow_id}.manifest_id",
-            ),
-            size=size,
-            steps=steps,
-        )
+    workflows = _workflow_configs(root.get("workflows", {}), source, "workflows")
 
     runtime_data = _mapping(root["runtime"], source, "runtime")
+    keep_alive_value = runtime_data.get(CHAT_KEEP_ALIVE_RUNTIME_KEY)
+    chat_keep_alive = None
+    if keep_alive_value is not None:
+        chat_keep_alive = _string(
+            keep_alive_value, source, f"runtime.{CHAT_KEEP_ALIVE_RUNTIME_KEY}"
+        )
+        if not KEEP_ALIVE_PATTERN.fullmatch(chat_keep_alive):
+            raise _error(
+                source,
+                f"runtime.{CHAT_KEEP_ALIVE_RUNTIME_KEY}",
+                'must be an Ollama duration such as "60m" or "-1"',
+            )
+    retention_value = runtime_data.get(COMFYUI_RETENTION_RUNTIME_KEY)
+    comfyui_retention_hours = None
+    if retention_value is not None:
+        if (
+            not isinstance(retention_value, int | float)
+            or isinstance(retention_value, bool)
+            or not retention_value > 0
+        ):
+            raise _error(
+                source,
+                f"runtime.{COMFYUI_RETENTION_RUNTIME_KEY}",
+                "must be a number of hours > 0",
+            )
+        comfyui_retention_hours = float(retention_value)
     runtime = {
         _string(key, source, "runtime key"): _boolean(value, source, f"runtime.{key}")
         for key, value in runtime_data.items()
+        if key not in (CHAT_KEEP_ALIVE_RUNTIME_KEY, COMFYUI_RETENTION_RUNTIME_KEY)
     }
+    # The swap is reached only through the image router: without it nothing could offer
+    # the swap, so the profile still loads but its parts and weights are neither planned
+    # nor installed.
+    if not runtime.get(IMAGE_ROUTER_RUNTIME_KEY):
+        character_swap = {}
+    if character_swap:
+        groups.append(CHARACTER_SWAP_MODEL_GROUP)
+    model_requirements = _model_contract(models, source, tuple(dict.fromkeys(groups)))
+    if character_swap:
+        model_requirements = _swap_requirements(models, source, character_swap, model_requirements)
+
+    version = _string(root["version"], source, "version")
+    if not PROFILE_VERSION_PATTERN.fullmatch(version):
+        raise _error(source, "version", "must be MAJOR.MINOR.PATCH, e.g. 1.0.0")
 
     visibility = _string(root.get("visibility", VISIBILITY_PUBLIC), source, "visibility")
     if visibility not in VISIBILITIES:
@@ -485,6 +863,7 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
         schema_version=schema_version,
         id=profile_id,
         name=_string(root["name"], source, "name"),
+        version=version,
         description=_string(root.get("description", ""), source, "description", allow_empty=True),
         visibility=visibility,
         ui=ProfileUiDefaults(
@@ -510,7 +889,12 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
         model_requirements=model_requirements,
         workflows=workflows,
         runtime=runtime,
+        chat_keep_alive=chat_keep_alive,
+        comfyui_retention_hours=comfyui_retention_hours,
         raw=root,
+        variants=variants,
+        character_swap=character_swap,
+        behavior=behavior,
     )
     problems = capability_problems(profile)
     if problems:
@@ -518,11 +902,77 @@ def validate_profile_data(data: Any, source: Path | str = "<profile>") -> Profil
     return profile
 
 
-def load_profile(path: Path) -> Profile:
+def _read_profile_data(path: Path) -> Any:
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
         raise ProfileError(f"{path}: could not read profile: {exc}") from exc
+
+
+def _merge_overlay(base: Any, overlay: Any) -> Any:
+    """Deep merge: mappings merge key by key, anything else is replaced by the overlay."""
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        merged = dict(base)
+        for key, value in overlay.items():
+            merged[key] = _merge_overlay(base[key], value) if key in base else value
+        return merged
+    return overlay
+
+
+def _apply_overlay(base: dict[str, Any], overlay: dict[str, Any], source: Path) -> dict[str, Any]:
+    """The base profile with one overlay laid over it.
+
+    ``variants`` is a list: the overlay's entries are matched to the base's by ``id`` (merged
+    when both have it, appended otherwise).
+    """
+    merged = dict(base)
+    for key, value in overlay.items():
+        if key == "extends":
+            continue
+        if key == "variants":
+            if not isinstance(value, list):
+                raise _error(source, "variants", "must be a list")
+            variants = list(merged.get("variants") or [])
+            for index, item in enumerate(value):
+                entry = _mapping(item, source, f"variants[{index}]")
+                position = next(
+                    (i for i, known in enumerate(variants) if known.get("id") == entry.get("id")),
+                    None,
+                )
+                if position is None:
+                    variants.append(entry)
+                else:
+                    variants[position] = _merge_overlay(variants[position], entry)
+            merged["variants"] = variants
+        else:
+            merged[key] = _merge_overlay(merged.get(key), value)
+    return merged
+
+
+def _overlay_files(directory: Path) -> list[tuple[Path, dict[str, Any]]]:
+    """Every ``*.overlay.yaml`` of ``directory``, read and checked, in name order."""
+    overlays: list[tuple[Path, dict[str, Any]]] = []
+    for path in sorted(directory.glob(f"*{OVERLAY_SUFFIX}")):
+        data = _mapping(_read_profile_data(path), path, "overlay root")
+        _reject_unknown(data, OVERLAY_KEYS, path, "overlay root")
+        _required(data, ("extends",), path, "overlay root")
+        _string(data["extends"], path, "extends")
+        overlays.append((path, data))
+    return overlays
+
+
+def _with_overlays(data: Any, overlays: Sequence[tuple[Path, dict[str, Any]]]) -> Any:
+    if not isinstance(data, dict):
+        return data
+    for overlay_path, overlay in overlays:
+        if overlay["extends"] == data.get("id"):
+            data = _apply_overlay(data, overlay, overlay_path)
+    return data
+
+
+def load_profile(path: Path) -> Profile:
+    """One profile, with every overlay beside it that extends it laid over it."""
+    data = _with_overlays(_read_profile_data(path), _overlay_files(path.parent))
     return validate_profile_data(data, path)
 
 
@@ -547,9 +997,25 @@ def offered_profiles(
 
 
 def load_profiles(directory: Path) -> list[Profile]:
-    """Every profile in ``directory``, ordered by id so a file's name decides nothing."""
+    """Every profile in ``directory``, ordered by id so a file's name decides nothing.
+
+    ``*.overlay.yaml`` files are not profiles: each extends the profile whose id it names
+    (an id that no profile has is an error).
+    """
+    overlays = _overlay_files(directory)
+    loaded: list[tuple[Path, Any]] = [
+        (path, _read_profile_data(path))
+        for path in sorted(directory.glob("*.yaml"))
+        if not path.name.endswith(OVERLAY_SUFFIX)
+    ]
+    known = {data.get("id") for _, data in loaded if isinstance(data, dict)}
+    for overlay_path, overlay in overlays:
+        if overlay["extends"] not in known:
+            raise _error(
+                overlay_path, "extends", f"no profile with id {overlay['extends']!r} to extend"
+            )
     profiles = sorted(
-        (load_profile(path) for path in sorted(directory.glob("*.yaml"))),
+        (validate_profile_data(_with_overlays(data, overlays), path) for path, data in loaded),
         key=lambda profile: profile.id,
     )
     seen: set[str] = set()

@@ -6,15 +6,14 @@ The two forms come from the same string so a release can never show one
 number in the footer and another in the file properties.
 """
 
-__version__ = "0.1.0"
+__version__ = "1.19.39"
 
 PRODUCT_NAME = "Pepito's AI Hub"
 
 
 def display_version(version: str = __version__) -> str:
-    """``0.1.0`` on screen is ``v0.1``: major and minor, nothing more."""
-    major, minor = version.split(".")[:2]
-    return f"v{major}.{minor}"
+    """Return the full public version used in the UI."""
+    return f"v{version}"
 
 
 def product_title(version: str = __version__) -> str:

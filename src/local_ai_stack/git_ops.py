@@ -19,9 +19,12 @@ place a known revision of a repository at a known path.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
-from collections.abc import Callable
+import shutil
+import stat
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +32,10 @@ from .runner import CommandResult, CommandRunner, OutputSink
 
 GIT = "git"
 DEFAULT_GIT_TIMEOUT = 300.0
+# A full ComfyUI clone is about 100 MB of history: 48 s on the reference
+# connection, past the generic five minutes below about 350 KB/s. The clone
+# reports its own progress, so a slow link is visible rather than silent.
+CLONE_TIMEOUT = 30 * 60.0
 DEFAULT_REMOTE = "origin"
 
 
@@ -87,12 +94,13 @@ class GitClient:
         dry_run: bool | None = None,
         check: bool = False,
         on_output: OutputSink | None = None,
+        timeout: float | None = None,
     ) -> CommandResult:
         is_dry = self.dry_run if dry_run is None else dry_run
         result = self.runner.run(
             [GIT, *args],
             cwd=cwd,
-            timeout=self.timeout,
+            timeout=self.timeout if timeout is None else timeout,
             dry_run=is_dry,
             on_output=on_output,
         )
@@ -137,15 +145,25 @@ class GitClient:
         result = self._run(["remote", "get-url", remote], cwd=Path(path), dry_run=False)
         return result.stdout.strip() if result.ok else None
 
-    def is_dirty(self, path: Path) -> bool:
-        """True when the working tree has staged or unstaged changes."""
+    def is_dirty(self, path: Path, *, ignore: Sequence[str] = ()) -> bool:
+        """True when the working tree has staged, unstaged or untracked changes.
+
+        ``ignore`` holds glob patterns for top-level entries the caller itself
+        owns inside the checkout -- the Hub's ownership marker, its virtual
+        environment. They are the caller's files, not local edits to protect,
+        so they never make the tree count as dirty. Anything else still does.
+        """
         result = self._run(
             ["status", "--porcelain", "--untracked-files=normal"],
             cwd=Path(path),
             dry_run=False,
             check=True,
         )
-        return bool(result.stdout.strip())
+        return any(
+            not _owned_by_caller(line, ignore)
+            for line in result.stdout.splitlines()
+            if line.strip()
+        )
 
     def status(self, path: Path, remote: str = DEFAULT_REMOTE) -> GitStatus:
         """One read-only snapshot. Never raises for a non-repository path."""
@@ -180,6 +198,12 @@ class GitClient:
         checkout is never clobbered. ``--progress`` forces Git to report
         transfer progress even though output is captured rather than a real
         terminal; ``on_output`` sees it live, one line at a time, when given.
+
+        A clone that fails or times out leaves nothing behind: the destination
+        was empty or absent before, so whatever is in it came from this call.
+        Git removes its own partial clone on an ordinary failure, but not when
+        it is killed at the timeout, and a leftover half-clone would block
+        every later attempt as a non-empty destination.
         """
         target = Path(destination)
         is_dry = self.dry_run if dry_run is None else dry_run
@@ -203,7 +227,19 @@ class GitClient:
             args += ["--depth", str(depth)]
         args += ["--", url, str(target)]
 
-        result = self._run(args, dry_run=is_dry, check=not is_dry, on_output=on_output)
+        existed = target.is_dir()
+        try:
+            result = self._run(
+                args,
+                dry_run=is_dry,
+                check=not is_dry,
+                on_output=on_output,
+                timeout=CLONE_TIMEOUT,
+            )
+        except GitError:
+            if not is_dry:
+                _discard_partial_clone(target, keep_directory=existed)
+            raise
         if revision is not None and not is_dry:
             self.checkout(target, revision)
         return result
@@ -214,6 +250,7 @@ class GitClient:
         revision: str,
         *,
         allow_dirty: bool = False,
+        ignore: Sequence[str] = (),
         dry_run: bool | None = None,
     ) -> CommandResult:
         """Check out an explicit commit, tag or branch. Refuses a dirty tree."""
@@ -222,7 +259,7 @@ class GitClient:
             raise GitError("revision must not be empty")
         is_dry = self.dry_run if dry_run is None else dry_run
         if not is_dry:
-            self._require_clean(target, "checkout", allow_dirty)
+            self._require_clean(target, "checkout", allow_dirty, ignore)
         return self._run(
             ["checkout", "--detach", revision], cwd=target, dry_run=is_dry, check=not is_dry
         )
@@ -233,25 +270,36 @@ class GitClient:
         *,
         remote: str = DEFAULT_REMOTE,
         allow_dirty: bool = False,
+        ignore: Sequence[str] = (),
         dry_run: bool | None = None,
     ) -> CommandResult:
         """Fetch from a remote. Never merges, rebases or resets."""
         target = Path(path)
         is_dry = self.dry_run if dry_run is None else dry_run
         if not is_dry:
-            self._require_clean(target, "fetch", allow_dirty)
+            self._require_clean(target, "fetch", allow_dirty, ignore)
         return self._run(
             ["fetch", "--tags", "--prune", remote], cwd=target, dry_run=is_dry, check=not is_dry
         )
 
-    def _require_clean(self, path: Path, operation: str, allow_dirty: bool) -> None:
+    def _require_clean(
+        self, path: Path, operation: str, allow_dirty: bool, ignore: Sequence[str] = ()
+    ) -> None:
         if allow_dirty:
             return
-        if self.is_dirty(path):
+        if self.is_dirty(path, ignore=ignore):
             raise DirtyWorkingTreeError(
                 f"refusing to {operation} in {path}: the working tree has uncommitted changes. "
                 "Commit, stash or discard them first."
             )
+
+
+def _owned_by_caller(line: str, ignore: Sequence[str]) -> bool:
+    """Whether one ``status --porcelain`` entry is a caller-owned top-level file or folder."""
+    if not ignore or not line.startswith("?? "):
+        return False
+    entry = line[3:].strip().strip('"').rstrip("/")
+    return "/" not in entry and any(fnmatch.fnmatchcase(entry, pattern) for pattern in ignore)
 
 
 def clone_argv(url: str, destination: Path, *, depth: int | None = None) -> list[str]:
@@ -260,6 +308,97 @@ def clone_argv(url: str, destination: Path, *, depth: int | None = None) -> list
     if depth is not None:
         args += ["--depth", str(depth)]
     return [*args, "--", url, str(Path(os.fspath(destination)))]
+
+
+def _discard_partial_clone(target: Path, *, keep_directory: bool) -> None:
+    """Best effort: remove what a failed clone wrote. Read-only Git objects included."""
+
+    def writable_retry(function, path, _exc_info) -> None:
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            function(path)
+        except OSError:
+            pass
+
+    if not target.is_dir():
+        return
+    if not keep_directory:
+        shutil.rmtree(target, onerror=writable_retry)
+        return
+    for child in target.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, onerror=writable_retry)
+        else:
+            try:
+                child.unlink()
+            except OSError:
+                pass
+
+
+# Causes Git states plainly enough to name. Matched against Git's own output;
+# the first match wins. What leaves is this module's wording only -- never a
+# line of Git's output, which may hold a path, a URL or a credential.
+_GIT_SIGNALS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"clone destination is not empty", re.IGNORECASE),
+        "the destination folder already holds files from an earlier attempt",
+    ),
+    (
+        re.compile(r"detected dubious ownership|safe\.directory", re.IGNORECASE),
+        "Git refused the folder because it is owned by another Windows user",
+    ),
+    (
+        re.compile(r"Filename too long", re.IGNORECASE),
+        "a file path is longer than Windows allows; use a shorter installation folder",
+    ),
+    (
+        re.compile(r"No space left on device|not enough space|disk quota", re.IGNORECASE),
+        "there is not enough disk space for the checkout",
+    ),
+    (
+        re.compile(
+            r"Permission denied|Access is denied|unable to create file|could not create",
+            re.IGNORECASE,
+        ),
+        "Git could not write into the installation folder (permission or antivirus lock)",
+    ),
+    (
+        re.compile(r"SSL certificate problem|schannel|certificate verify", re.IGNORECASE),
+        "the connection to GitHub could not be verified over TLS (proxy or antivirus)",
+    ),
+    (
+        re.compile(
+            r"Could not resolve host|Failed to connect|Connection (?:timed out|reset|refused)"
+            r"|unable to access|RPC failed|early EOF|remote end hung up|Operation timed out",
+            re.IGNORECASE,
+        ),
+        "GitHub could not be reached or the download was interrupted",
+    ),
+    (
+        re.compile(r"did not match any file\(s\) known to git|unknown revision", re.IGNORECASE),
+        "the pinned version was not found in the repository",
+    ),
+    (
+        re.compile(r"uncommitted changes", re.IGNORECASE),
+        "the existing checkout has local changes and was left untouched",
+    ),
+)
+
+
+def describe_git_failure(error: GitError) -> str:
+    """A short, safe cause for a failed Git operation, for public diagnostics."""
+    if isinstance(error, GitNotAvailableError):
+        return "Git was not found"
+    result = error.result
+    if result is not None and result.timed_out:
+        return "the download from GitHub took longer than the time limit"
+    output = str(error)
+    if result is not None:
+        output = f"{output}\n{result.stderr}\n{result.stdout}"
+    for pattern, summary in _GIT_SIGNALS:
+        if pattern.search(output):
+            return summary
+    return "Git failed without a cause it stated plainly"
 
 
 # --- observacao de clone -----------------------------------------------------

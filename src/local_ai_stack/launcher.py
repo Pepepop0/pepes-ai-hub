@@ -14,11 +14,10 @@ Whether the service actually serves is a health question, answered by
 
 Launching is generic: it knows argv, cwd, env and log files, not services.
 
-**A tree is stopped only where it can be proved, and only when force is
-allowed.** A managed process is launched into a kernel job (see
-:mod:`local_ai_stack.jobs`), the only thing on Windows that can answer "did I
-start this process?" for a child we never saw being created. Membership is a
-kernel lookup, never an inference from parent pids.
+**A tree is stopped only where it can be proved.** On Windows a managed
+process is launched into a kernel job (see :mod:`local_ai_stack.jobs`), which
+answers \"did I start this process?\" for children we never saw being created.
+Membership is a kernel lookup, never an inference from historical parent pids.
 
 Terminating that job is not graceful — it is ``TerminateProcess`` applied to
 every member at once — so it is an escalation, never the normal path:
@@ -32,24 +31,34 @@ every member at once — so it is an escalation, never the normal path:
   reopen the same kernel proof; without proof, the escalation degrades to the
   single process whose identity the registry verifies, and the result says so.
 
+On Linux the same explicit ``allow_force_kill`` launch opt-in creates persistent
+subreaper sentinels instead (see :mod:`local_ai_stack.posix_runtime`). Separate
+controllers authenticate the live supervisor, not stored PID/PGID numbers.
+Normal stop gracefully signals the private live group and adopted children;
+only an allowed escalation uses pidfd SIGKILL. A timed-out non-force stop keeps
+the sentinels and ownership record alive. Root/sentinel crashes clean up under
+the launch opt-in, including workers which double-fork or create new sessions.
+
 See docs/INTEGRATION.md for the two boundaries and what closing them would cost.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from . import jobs
+from . import jobs, posix_runtime
 from .inventory import LookupOutcome, ProcessReport, lookup_process
 from .jobs import Membership, ProcessJob
-from .logs import LogFiles
+from .logs import LogFiles, append_service_event
 from .registry import IdentityVerdict, ManagedProcess, ManagedProcessRegistry, build_entry
 
 logger = logging.getLogger("local_ai_stack.launcher")
@@ -112,6 +121,11 @@ class ProcessLaunchSpec:
         """The child's environment. os.environ is read, never written."""
         source = os.environ if base is None else base
         merged = dict(source) if self.inherit_env else {}
+        if self.inherit_env and sys.platform == "linux":
+            # Installer credentials belong to the downloading controller, not
+            # long-lived apps. Explicit per-service env remains an opt-in.
+            for name in posix_runtime.INSTALL_CREDENTIAL_ENV:
+                merged.pop(name, None)
         merged.update(self.env)
         return merged
 
@@ -247,6 +261,18 @@ class ProcessLauncher:
         processes: ProcessReport | None = None,
         dry_run: bool | None = None,
     ) -> LaunchResult:
+        """Serialize ownership check, spawn, registry persistence, and commit."""
+        is_dry = self.dry_run if dry_run is None else dry_run
+        with self.registry.service_lock(spec.service_id, dry_run=is_dry):
+            return self._start_locked(spec, processes=processes, dry_run=is_dry)
+
+    def _start_locked(
+        self,
+        spec: ProcessLaunchSpec,
+        *,
+        processes: ProcessReport | None = None,
+        dry_run: bool | None = None,
+    ) -> LaunchResult:
         """Spawn the process, then register it. Never registers a failed spawn."""
         is_dry = self.dry_run if dry_run is None else dry_run
 
@@ -257,6 +283,18 @@ class ProcessLauncher:
                 spec.service_id,
                 existing.entry.pid,
                 f"already running as pid {existing.entry.pid}",
+                existing.entry,
+            )
+        if (
+            existing is not None
+            and existing.entry.posix_session is not None
+            and existing.verdict is IdentityVerdict.UNKNOWN
+        ):
+            return LaunchResult(
+                LaunchOutcome.SPAWN_FAILED,
+                spec.service_id,
+                existing.entry.pid,
+                "refusing to replace an unauthenticated Linux ownership record",
                 existing.entry,
             )
 
@@ -283,15 +321,30 @@ class ProcessLauncher:
             )
 
         job = jobs.create_job(jobs.new_job_name(spec.service_id))
+        pending: posix_runtime.PendingSession | None = None
+        # Written before spawn so even imports and migrations before the service's own
+        # logger starts have a wall-clock boundary. Never include argv or environment secrets.
+        append_service_event(spec.logs, spec.service_id, "starting process", before_spawn=True)
         streams = _open_logs(spec.logs)
         try:
-            spawned = self._spawn(
-                spec.argv,
-                cwd=str(spec.cwd) if spec.cwd is not None else None,
-                env=spec.child_env(),
-                stdout=streams.stdout,
-                stderr=streams.stderr,
-            )
+            if sys.platform == "linux" and spec.allow_force_kill and self._spawn is default_spawn:
+                pending = posix_runtime.launch(
+                    spec.argv,
+                    cwd=str(spec.cwd) if spec.cwd is not None else None,
+                    env=spec.child_env(),
+                    stdout=streams.stdout,
+                    stderr=streams.stderr,
+                    startup_timeout=spec.startup_timeout,
+                )
+                spawned = SpawnedProcess(pending.proof.root_pid)
+            else:
+                spawned = self._spawn(
+                    spec.argv,
+                    cwd=str(spec.cwd) if spec.cwd is not None else None,
+                    env=spec.child_env(),
+                    stdout=streams.stdout,
+                    stderr=streams.stderr,
+                )
             # Adopt before anything else runs. The child is already executing,
             # so this window is small but not zero: see _adopt.
             job = self._adopt(
@@ -302,6 +355,8 @@ class ProcessLauncher:
             )
         except (OSError, ValueError) as exc:
             jobs.close(job)
+            if pending is not None:
+                pending.abort()
             return LaunchResult(
                 LaunchOutcome.SPAWN_FAILED,
                 spec.service_id,
@@ -317,9 +372,18 @@ class ProcessLauncher:
             spec.argv,
             log_file=spec.logs.stdout if spec.logs is not None else None,
             job_name=job.name if job is not None else None,
+            posix_session=pending.proof if pending is not None else None,
             clock=self._clock,
         )
-        self.registry.register(entry)
+        try:
+            self.registry.register(entry)
+            if pending is not None:
+                pending.commit()
+        except (OSError, ValueError, RuntimeError, KeyboardInterrupt):
+            if pending is not None:
+                pending.abort()
+                self.registry.unregister(spec.service_id, expected=entry)
+            raise
         self.log.info("started %s as pid %s", spec.service_id, spawned.pid)
         return LaunchResult(
             LaunchOutcome.STARTED,
@@ -378,10 +442,20 @@ class ProcessLauncher:
     def tree_pids(self, service_id: str, pid: int) -> tuple[int, ...] | None:
         """Every process the kernel proves belongs to the tree we started.
 
-        ``None`` means unprovable, which is not the same as "no children". An
-        opted-in root can retain the job across manager sessions; ordinary jobs
-        and hosts without Job Objects still fall back to the verified root.
+        ``None`` means unprovable, which is not the same as \"no children\".
+        Linux opted-in launches authenticate persistent subreapers; Windows
+        opted-in roots retain jobs across manager sessions. Linux session
+        members and current adopted children are proved without ancestry walks;
+        escaped descendants become actionable when the kernel reparents them.
         """
+        entry = self.registry.load().get(service_id)
+        if entry is not None and entry.posix_session is not None:
+            if entry.pid != pid:
+                return None
+            try:
+                return posix_runtime.inspect(entry.posix_session).pids
+            except posix_runtime.SessionError:
+                return None
         job = self._job_for(service_id)
         if job is None or jobs.membership(job, pid) is not Membership.MEMBER:
             return None
@@ -389,6 +463,14 @@ class ProcessLauncher:
 
     def owns(self, service_id: str, pid: int) -> Membership:
         """Can this manager prove ``pid`` is part of the tree it started?"""
+        entry = self.registry.load().get(service_id)
+        if entry is not None and entry.posix_session is not None:
+            members = self.tree_pids(service_id, entry.pid)
+            if members is None:
+                return Membership.UNPROVABLE
+            # Escaped workers are not guessed from ancestry. They become
+            # provable if Linux later adopts them into the live subreaper.
+            return Membership.MEMBER if pid in members else Membership.UNPROVABLE
         return jobs.membership(self._job_for(service_id), pid)
 
     def _job_for(self, service_id: str) -> ProcessJob | None:
@@ -415,8 +497,9 @@ class ProcessLauncher:
     def close_all(self) -> None:
         """Release every job handle this launcher holds.
 
-        Members keep running. An opted-in root retains its own handle and proof;
-        an ordinary job keeps the original session-only behavior.
+        Members keep running. An opted-in root retains its Windows job handle;
+        Linux subreapers remain independent of this controller. Ordinary
+        Windows jobs keep their original session-only behavior.
         """
         for service_id in list(self._jobs):
             self.forget_job(service_id)
@@ -445,6 +528,26 @@ class ProcessLauncher:
         processes: ProcessReport | None = None,
         dry_run: bool | None = None,
     ) -> StopResult:
+        """Serialize stop against starts/stops for the same service."""
+        is_dry = self.dry_run if dry_run is None else dry_run
+        with self.registry.service_lock(service_id, dry_run=is_dry):
+            return self._stop_locked(
+                service_id,
+                timeout=timeout,
+                allow_force=allow_force,
+                processes=processes,
+                dry_run=is_dry,
+            )
+
+    def _stop_locked(
+        self,
+        service_id: str,
+        *,
+        timeout: float = DEFAULT_STOP_TIMEOUT,
+        allow_force: bool = False,
+        processes: ProcessReport | None = None,
+        dry_run: bool | None = None,
+    ) -> StopResult:
         """Stop a process we own. Anything else is refused, not killed."""
         is_dry = self.dry_run if dry_run is None else dry_run
         status = self.registry.status(service_id, processes=processes)
@@ -458,13 +561,13 @@ class ProcessLauncher:
         pid = status.entry.pid
         if status.verdict is IdentityVerdict.STALE:
             if not is_dry:
-                self._release(service_id)
+                self._release(service_id, status.entry)
             return StopResult(
                 StopOutcome.NOT_RUNNING, service_id, pid, "process already gone, entry cleaned"
             )
         if status.verdict is IdentityVerdict.MISMATCH:
             if not is_dry:
-                self._release(service_id)
+                self._release(service_id, status.entry)
             return StopResult(
                 StopOutcome.IDENTITY_MISMATCH,
                 service_id,
@@ -484,6 +587,9 @@ class ProcessLauncher:
                 StopOutcome.DRY_RUN, service_id, pid, f"[dry-run] would stop pid {pid}"
             )
 
+        if status.entry.posix_session is not None:
+            return self._stop_posix(status.entry, timeout, allow_force)
+
         # Proof is read before anything is terminated, so a tree the kernel
         # vouches for is known even when policy forbids acting on it.
         proved = self.tree_pids(service_id, pid)
@@ -496,7 +602,7 @@ class ProcessLauncher:
             )
 
         if self._wait_for_exit(pid, timeout):
-            return self._root_exited(service_id, pid, proved, timeout, allow_force)
+            return self._root_exited(service_id, pid, proved, timeout, allow_force, status.entry)
 
         if not allow_force:
             return StopResult(
@@ -509,7 +615,7 @@ class ProcessLauncher:
 
         # Force was allowed: escalate as widely as ownership can be proved.
         if proved:
-            return self._terminate_tree(service_id, pid, proved, timeout)
+            return self._terminate_tree(service_id, pid, proved, timeout, status.entry)
 
         try:
             _kill(pid)
@@ -518,16 +624,78 @@ class ProcessLauncher:
                 StopOutcome.FAILED, service_id, pid, f"kill failed: {exc.__class__.__name__}"
             )
         if self._wait_for_exit(pid, timeout):
-            self._release(service_id)
+            self._release(service_id, status.entry)
             return StopResult(StopOutcome.STOPPED, service_id, pid, "force killed", forced=True)
         return StopResult(
             StopOutcome.FAILED, service_id, pid, f"pid {pid} survived force kill", forced=True
         )
 
-    def _release(self, service_id: str) -> None:
-        """A service is no longer ours: drop the record and the proof together."""
-        self.registry.unregister(service_id)
-        self.forget_job(service_id)
+    def _stop_posix(self, entry: ManagedProcess, timeout: float, allow_force: bool) -> StopResult:
+        """Delegate to authenticated live subreapers, never a stored PGID/PID."""
+        proof = entry.posix_session
+        assert proof is not None
+        try:
+            result = posix_runtime.stop(proof, timeout=timeout, allow_force=allow_force)
+        except posix_runtime.SessionGone:
+            try:
+                alive = posix_runtime.root_alive(proof) or posix_runtime.guardian_alive(proof)
+            except OSError:
+                alive = True
+            if not alive:
+                self._release(entry.service_id, entry)
+                return StopResult(
+                    StopOutcome.NOT_RUNNING,
+                    entry.service_id,
+                    entry.pid,
+                    "Linux managed session already exited",
+                )
+            return StopResult(
+                StopOutcome.IDENTITY_UNKNOWN,
+                entry.service_id,
+                entry.pid,
+                "Linux supervisor disappeared; refusing single-PID fallback",
+            )
+        except posix_runtime.SessionError:
+            return StopResult(
+                StopOutcome.FAILED,
+                entry.service_id,
+                entry.pid,
+                "Linux session control failed; no unproved process was signalled",
+            )
+        if result.stopped:
+            self._release(entry.service_id, entry)
+            detail = (
+                "force terminated the Linux process tree we started"
+                if result.forced
+                else "terminated the Linux process tree gracefully"
+            )
+            return StopResult(
+                StopOutcome.STOPPED,
+                entry.service_id,
+                entry.pid,
+                detail,
+                forced=result.forced,
+                tree_pids=result.pids,
+            )
+        detail = f"Linux process tree still alive after {timeout:.1f}s; " + (
+            "force termination did not finish" if result.forced else "force kill not allowed"
+        )
+        return StopResult(
+            StopOutcome.TIMEOUT,
+            entry.service_id,
+            entry.pid,
+            detail,
+            forced=result.forced,
+            tree_pids=result.pids,
+            left_running=result.left_running,
+        )
+
+    def _release(self, service_id: str, expected: ManagedProcess) -> None:
+        """Retire only this exact ownership record, never its replacement."""
+        removed = self.registry.unregister(service_id, expected=expected)
+        current = self._jobs.get(service_id)
+        if removed or (current is not None and current.name == expected.job_name):
+            self.forget_job(service_id)
 
     def _root_exited(
         self,
@@ -536,11 +704,12 @@ class ProcessLauncher:
         proved: tuple[int, ...] | None,
         timeout: float,
         allow_force: bool,
+        expected: ManagedProcess,
     ) -> StopResult:
         """The registered process is gone. Decide what to do about its tree."""
         leftovers = self.surviving_members(proved, pid)
         if leftovers and allow_force:
-            attempt = self._terminate_tree(service_id, pid, proved or (), timeout)
+            attempt = self._terminate_tree(service_id, pid, proved or (), timeout, expected)
             if attempt.outcome is StopOutcome.STOPPED:
                 return attempt
             # The tree could not be terminated, but the root is confirmed gone.
@@ -549,7 +718,7 @@ class ProcessLauncher:
             # behind. The surviving descendants are reported and nothing else
             # is tried: a failed termination must not widen this manager's
             # authority into guessing at them by another route.
-            self._release(service_id)
+            self._release(service_id, expected)
             return StopResult(
                 StopOutcome.STOPPED,
                 service_id,
@@ -561,8 +730,8 @@ class ProcessLauncher:
                 ),
                 left_running=leftovers,
             )
-        detail = self._single_detail(self.registry.load().get(service_id), leftovers)
-        self._release(service_id)
+        detail = self._single_detail(expected, leftovers)
+        self._release(service_id, expected)
         return StopResult(StopOutcome.STOPPED, service_id, pid, detail, left_running=leftovers)
 
     def _single_detail(self, entry: ManagedProcess | None, leftovers: tuple[int, ...] = ()) -> str:
@@ -585,7 +754,12 @@ class ProcessLauncher:
         return base
 
     def _terminate_tree(
-        self, service_id: str, pid: int, proved: tuple[int, ...], timeout: float
+        self,
+        service_id: str,
+        pid: int,
+        proved: tuple[int, ...],
+        timeout: float,
+        expected: ManagedProcess,
     ) -> StopResult:
         """Force-terminate exactly the processes the kernel says are in our job.
 
@@ -610,7 +784,7 @@ class ProcessLauncher:
                 tree_pids=proved,
                 left_running=survivors,
             )
-        self._release(service_id)
+        self._release(service_id, expected)
         others = len(proved) - 1
         detail = "force terminated the process tree we started"
         if others > 0:
@@ -622,6 +796,7 @@ class ProcessLauncher:
     def _wait_for_exit(self, pid: int, timeout: float) -> bool:
         deadline = self._monotonic() + timeout
         while True:
+            _reap_own_child(pid)
             if lookup_process(pid).outcome is LookupOutcome.NOT_FOUND:
                 return True
             if self._monotonic() >= deadline:
@@ -632,11 +807,24 @@ class ProcessLauncher:
         """Wait until every kernel-proved member is gone, under one deadline."""
         deadline = self._monotonic() + timeout
         while True:
+            for pid in pids:
+                _reap_own_child(pid)
             if all(lookup_process(pid).outcome is LookupOutcome.NOT_FOUND for pid in pids):
                 return True
             if self._monotonic() >= deadline:
                 return False
             self._sleep(STOP_POLL_INTERVAL)
+
+
+def _reap_own_child(pid: int) -> None:
+    """Collect an exited direct child; a POSIX zombie would otherwise look alive.
+
+    waitpid only accepts this process's own children, so it cannot affect anyone else's.
+    """
+    if os.name == "nt":
+        return
+    with contextlib.suppress(ChildProcessError, OSError):
+        os.waitpid(pid, os.WNOHANG)
 
 
 @dataclass

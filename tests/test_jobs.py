@@ -182,6 +182,7 @@ def test_a_job_name_is_unique_per_start():
     assert first.startswith("PepitosAIHub-ollama-")
 
 
+@WINDOWS_ONLY
 def test_terminate_takes_a_job_not_a_pid():
     """There is no call here that could ever be handed a stranger's pid."""
     with pytest.raises(AttributeError):
@@ -335,17 +336,26 @@ def test_opted_in_tree_proof_survives_manager_restart_and_stops_the_runner(tmp_p
 
 
 @WINDOWS_ONLY
-def test_comfyui_tree_proof_survives_manager_restart_and_stops_the_listener(tmp_path, reaper):
-    """ComfyUI's Python runtime must remain provable after the first Hub exits."""
-    from local_ai_stack.adapters import comfyui_control_spec
+@pytest.mark.parametrize("service", ["comfyui", "open-webui"])
+def test_a_python_server_tree_survives_manager_restart_and_stops_the_listener(
+    tmp_path, reaper, service
+):
+    """The Python that serves the port is a descendant, not the registered root.
+
+    ComfyUI's runtime and Open WebUI's server (started by its console-script
+    launcher) must remain provable after the first Hub exits, and a stop must
+    end the listener, not only the root. Regression for Open WebUI on the RTX
+    5090 rig: the launcher stopped and the server stayed up."""
+    from local_ai_stack.adapters import comfyui_control_spec, open_webui_control_spec
     from local_ai_stack.launcher import ProcessLauncher, ProcessLaunchSpec, StopOutcome
     from local_ai_stack.registry import ManagedProcessRegistry
 
+    spec_for = {"comfyui": comfyui_control_spec, "open-webui": open_webui_control_spec}[service]
     registry = ManagedProcessRegistry(tmp_path / "state" / "managed.json")
-    policy = comfyui_control_spec(PYTHON).launch.allow_force_kill
+    policy = spec_for(PYTHON).launch.allow_force_kill
     first = ProcessLauncher(registry)
     hand = ListenerHandshake(tmp_path)
-    started = first.start(ProcessLaunchSpec("comfyui", hand.argv, allow_force_kill=policy))
+    started = first.start(ProcessLaunchSpec(service, hand.argv, allow_force_kill=policy))
     reaper.append(started.pid)
     hand.wait_until_up()
     hand.release()
@@ -354,15 +364,15 @@ def test_comfyui_tree_proof_survives_manager_restart_and_stops_the_listener(tmp_
     assert any(
         item.pid == runtime_pid and item.laddr.port == port for item in psutil.net_connections()
     )
-    assert runtime_pid in (first.tree_pids("comfyui", started.pid) or ())
+    assert runtime_pid in (first.tree_pids(service, started.pid) or ())
 
     first.close_all()  # normal Hub exit; the managed service must remain up
     assert alive(started.pid)
     assert alive(runtime_pid)
 
     later = ProcessLauncher(registry)
-    assert runtime_pid in (later.tree_pids("comfyui", started.pid) or ())
-    result = later.stop("comfyui", timeout=10, allow_force=policy)
+    assert runtime_pid in (later.tree_pids(service, started.pid) or ())
+    result = later.stop(service, timeout=10, allow_force=policy)
 
     assert result.outcome is StopOutcome.STOPPED
     assert runtime_pid in result.tree_pids

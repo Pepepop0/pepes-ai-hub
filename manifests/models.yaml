@@ -72,6 +72,18 @@ ollama:
     status: candidate
     size_bytes: 17420432252
 
+  # Multimodal 27B Q5_K_M selected for Capella. The full registry
+  # manifest digest is pinned; size includes the model and vision projector.
+  qwen3_8_27b_q5:
+    kind: chat
+    reference: orcarouter/Qwen3.8-27B-Uncensored:q5_K_M
+    display_name: Qwen3.8 27B Q5_K_M
+    digest: 1cedf9ccb8f4338ce4e55f7478df808e900e1d405261cfa11c7e14aade50f2fd
+    aliases: [ollama/qwen3_8_27b_uncensored_q5, ollama/qwen3-8-27b-uncensored-q5]
+    capabilities: {text: true, tools: true, vision: true}
+    status: candidate
+    size_bytes: 20466847626
+
   qwen3_8b:
     kind: chat
     reference: qwen3:8b
@@ -132,3 +144,61 @@ comfyui:
     size_bytes: 336213556
     version: ab9055628ea245000e610f2aa2c96f4746093546
     status: manually_tested
+
+  # Qwen-Image-2.1, one model that generates and edits. Comfy-Org's ComfyUI
+  # repackaging, INT8 ConvRot, which needs ComfyUI 0.37 or newer. Licence:
+  # Qwen Research (non-commercial).
+  qwen_image_2_1_int8:
+    kind: diffusion
+    placement: diffusion_models
+    filename: qwen_image_2.1_int8_convrot.safetensors
+    url: https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/df94239739eef7205973a145ffa6f441f7b64e84/diffusion_models/qwen_image_2.1_int8_convrot.safetensors
+    sha256: cb74113cb03faecd79611b01fd7fd642f0aa60d6f0b95086abee214d75eaa57d
+    size_bytes: 7256783064
+    version: df94239739eef7205973a145ffa6f441f7b64e84
+    status: candidate
+
+  qwen3vl_8b_int8_encoder:
+    kind: text-encoder
+    placement: text_encoders
+    filename: qwen3vl_8b_int8_convrot.safetensors
+    url: https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/df94239739eef7205973a145ffa6f441f7b64e84/text_encoders/qwen3vl_8b_int8_convrot.safetensors
+    sha256: 8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f
+    size_bytes: 9350798360
+    version: df94239739eef7205973a145ffa6f441f7b64e84
+    status: candidate
+
+  qwen_image_2_1_vae:
+    kind: vae
+    placement: vae
+    filename: qwen_image_2.1_vae_bf16.safetensors
+    url: https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/df94239739eef7205973a145ffa6f441f7b64e84/vae/qwen_image_2.1_vae_bf16.safetensors
+    sha256: bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9
+    size_bytes: 675509688
+    version: df94239739eef7205973a145ffa6f441f7b64e84
+    status: candidate
+
+  # Native SAM 3.1 people segmentation, Comfy-Org's official checkpoint.
+  # Licence: Meta SAM License ("other"), not gated. SHA-256 is the pinned LFS
+  # oid; size is the LFS object's size, not the pointer's size.
+  sam3_1_multiplex:
+    kind: auxiliary
+    placement: checkpoints
+    filename: sam3.1_multiplex_fp16.safetensors
+    url: https://huggingface.co/Comfy-Org/sam3.1/resolve/7bb8374780a725b4353ed31f3a9395c9742b5621/checkpoints/sam3.1_multiplex_fp16.safetensors
+    sha256: 9ba99c92703c2e8b4f47de2d34a539bb8e18923049e238b780d70dbe6368eb03
+    size_bytes: 1745546848
+    version: 7bb8374780a725b4353ed31f3a9395c9742b5621
+    status: candidate
+
+  # Depth Anything 3 Mono Large, the native DA3 blueprint's checkpoint.
+  # Licence: Apache-2.0. SHA-256 and size are the pinned LFS oid and object size.
+  depth_anything_3_mono_large:
+    kind: auxiliary
+    placement: geometry_estimation
+    filename: depth_anything_3_mono_large.safetensors
+    url: https://huggingface.co/Comfy-Org/Depth-Anything-3/resolve/8265be070134dc7459217308cdc03109bde199b0/geometry_estimation/depth_anything_3_mono_large.safetensors
+    sha256: 9b44eda5bedba5b4e125686fdb79d1db309c1b9785277576eb930f885b008f96
+    size_bytes: 1336748056
+    version: 8265be070134dc7459217308cdc03109bde199b0
+    status: candidate

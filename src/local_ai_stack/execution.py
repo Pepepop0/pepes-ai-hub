@@ -26,6 +26,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .installation_control import installation_checkpoint
 from .layout import LayoutError
 from .planning import InstallPlan, PlanAction, PlanStep
 from .provisioning import (
@@ -161,6 +162,8 @@ class PlanExecutor:
         unsupported: list[ExecutionStep] = []
 
         for entry in self.resolve(plan):
+            if not dry_run:
+                installation_checkpoint()
             if not entry.supported:
                 unsupported.append(entry)
                 continue
@@ -174,6 +177,8 @@ class PlanExecutor:
             handler = self.action_handlers[entry.action]
             action_results.append(handler(plan, entry.step, dry_run))
 
+        if not dry_run:
+            installation_checkpoint()
         return ExecutionReport(
             plan_profile_id=plan.profile_id,
             dry_run=dry_run,

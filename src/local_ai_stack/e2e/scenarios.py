@@ -600,15 +600,17 @@ def _verify_interrupted_download(report: TestRunReport, world: ControlledWorld) 
     if acquire.outcome is not TestPhaseOutcome.FAILED:
         problems.append(f"an interrupted download did not fail acquisition: {acquire.outcome}")
 
+    # Nothing half-done is ever promoted. The `.part` stays on purpose: the next attempt
+    # resumes from the bytes it holds.
     paths = ManagedModelPaths.from_layout(world.root.installation.layout)
     if paths.root.exists():
-        files = [item for item in paths.root.rglob("*") if item.is_file()]
-        partial = [item for item in files if item.suffix == ".part"]
-        finished = [item for item in files if item.suffix != ".part"]
+        finished = [
+            item
+            for item in paths.root.rglob("*")
+            if item.is_file() and not item.name.endswith((".part", ".part.json"))
+        ]
         if finished:
             problems.append(f"a partial download was promoted: {finished}")
-        if partial:
-            problems.append(f"a .part file survived: {partial}")
 
     # Nothing became available, and a retry is still the proposed next step.
     installer = _installer(world)

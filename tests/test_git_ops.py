@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from local_ai_stack.git_ops import (
+    CLONE_TIMEOUT,
     DirtyWorkingTreeError,
     GitClient,
     GitCloneEvent,
@@ -20,6 +21,7 @@ from local_ai_stack.git_ops import (
     GitError,
     GitNotAvailableError,
     clone_argv,
+    describe_git_failure,
 )
 from local_ai_stack.runner import CommandResult, CommandRunner
 
@@ -251,6 +253,79 @@ def test_clone_failure_raises_a_command_error(tmp_path):
     assert exc.value.result is not None
 
 
+class PartialCloneRunner(FakeRunner):
+    """Writes a half clone, then answers like a clone killed at the time limit."""
+
+    def run(self, argv: Sequence[str], **kwargs: object) -> CommandResult:
+        items = tuple(str(a) for a in argv)
+        if len(items) > 1 and items[1] == "clone":
+            self.calls.append(items)
+            self.kwargs.append(dict(kwargs))
+            objects = Path(items[-1]) / ".git" / "objects" / "pack"
+            objects.mkdir(parents=True)
+            pack = objects / "tmp_pack_partial"
+            pack.write_bytes(b"partial")
+            pack.chmod(0o444)
+            return CommandResult(argv=items, returncode=-1, timed_out=True)
+        return super().run(argv, **kwargs)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_a_killed_clone_leaves_nothing_that_blocks_the_next_attempt(tmp_path, existing):
+    destination = tmp_path / "dest"
+    if existing:
+        destination.mkdir()
+    runner = PartialCloneRunner(CLEAN)
+    client = GitClient(runner)
+
+    with pytest.raises(GitCommandError) as caught:
+        client.clone("https://example.invalid/r.git", destination, revision="v1")
+
+    assert runner.kwargs[0]["timeout"] == CLONE_TIMEOUT
+    assert describe_git_failure(caught.value) == (
+        "the download from GitHub took longer than the time limit"
+    )
+    assert destination.is_dir() is existing
+    if existing:
+        assert list(destination.iterdir()) == []
+    assert runner.argv_for("checkout") is None
+
+
+@pytest.mark.parametrize(
+    ("stderr", "summary"),
+    [
+        (
+            "fatal: unable to access 'https://github.com/x.git/': Could not resolve host",
+            "GitHub could not be reached or the download was interrupted",
+        ),
+        (
+            "fatal: detected dubious ownership in repository at 'C:/Users/Admin/x'",
+            "Git refused the folder because it is owned by another Windows user",
+        ),
+        (
+            "error: unable to create file comfy/a.py: Filename too long",
+            "a file path is longer than Windows allows; use a shorter installation folder",
+        ),
+        (
+            "fatal: unable to access 'https://github.com/x.git/': SSL certificate problem",
+            "the connection to GitHub could not be verified over TLS (proxy or antivirus)",
+        ),
+        (
+            "fatal: something new C:/Users/Admin/secret",
+            "Git failed without a cause it stated plainly",
+        ),
+    ],
+)
+def test_git_failures_are_named_without_repeating_git_output(tmp_path, stderr, summary):
+    client, _ = client_with(clone=fail(stderr))
+    with pytest.raises(GitCommandError) as caught:
+        client.clone("https://example.invalid/r.git", tmp_path / "dest")
+
+    described = describe_git_failure(caught.value)
+    assert described == summary
+    assert "Admin" not in described and "github.com" not in described
+
+
 # --- repositorio existente -------------------------------------------------
 
 
@@ -325,6 +400,21 @@ def test_clean_working_tree(tmp_path):
 def test_dirty_working_tree(tmp_path):
     client, _ = client_with(status=ok(" M src/file.py\n"))
     assert client.is_dirty(tmp_path) is True
+
+
+@pytest.mark.parametrize(
+    ("status", "dirty"),
+    [
+        ("?? .pepito-managed.json\n?? .venv/\n", False),
+        ('?? ".pepito-managed.json.tmp"\n', False),
+        ("?? .pepito-managed.json\n?? notes.txt\n", True),
+        (" M .pepito-managed.json\n", True),
+        ("?? sub/.pepito-managed.json\n", True),
+    ],
+)
+def test_only_untracked_top_level_entries_the_caller_owns_are_ignored(tmp_path, status, dirty):
+    client, _ = client_with(status=ok(status))
+    assert client.is_dirty(tmp_path, ignore=(".pepito-managed.json*", ".venv")) is dirty
 
 
 def test_checkout_refuses_a_dirty_tree(tmp_path):

@@ -187,6 +187,18 @@ def test_the_shipped_aliases_all_resolve():
         assert catalog.is_declared(target)
 
 
+def test_the_capella_chat_model_has_a_neutral_id_a_display_name_and_keeps_its_old_ids():
+    catalog = model_catalog()
+    model_id = ModelId("ollama/qwen3_8_27b_q5")
+    spec = catalog.require(model_id)
+    assert spec.display_name == "Qwen3.8 27B Q5_K_M"
+    assert not spec.uncensored
+    assert spec.source.reference == "orcarouter/Qwen3.8-27B-Uncensored:q5_K_M"
+    for old in ("ollama/qwen3_8_27b_uncensored_q5", "ollama/qwen3-8-27b-uncensored-q5"):
+        assert catalog.normalize(old) == model_id
+    assert not any("uncensored" in str(declared) for declared in catalog.declared_ids)
+
+
 # --- duplicatas ------------------------------------------------------------
 
 
@@ -284,7 +296,7 @@ def test_a_non_https_model_url_is_rejected():
 
 def test_an_unknown_placement_is_rejected():
     with pytest.raises(ModelCatalogError, match="placement"):
-        validate_model_manifest(manifest(comfyui={"demo": file_entry(placement="loras")}))
+        validate_model_manifest(manifest(comfyui={"demo": file_entry(placement="upscale_models")}))
 
 
 SHIPPED_COMFYUI = {
@@ -308,6 +320,41 @@ SHIPPED_COMFYUI = {
         "flux2-vae.safetensors",
         "d64f3a68e1cc4f9f4e29b6e0da38a0204fe9a49f2d4053f0ec1fa1ca02f9c4b5",
         336213556,
+    ),
+    "comfyui/qwen_image_2_1_int8": (
+        "Comfy-Org/Qwen-Image-2.1",
+        "df94239739eef7205973a145ffa6f441f7b64e84",
+        "qwen_image_2.1_int8_convrot.safetensors",
+        "cb74113cb03faecd79611b01fd7fd642f0aa60d6f0b95086abee214d75eaa57d",
+        7256783064,
+    ),
+    "comfyui/qwen3vl_8b_int8_encoder": (
+        "Comfy-Org/Qwen-Image-2.1",
+        "df94239739eef7205973a145ffa6f441f7b64e84",
+        "qwen3vl_8b_int8_convrot.safetensors",
+        "8bfd0f6e12abf2d2d697ecc888e5e90b0d6741d6708f05799f53afa560452e8f",
+        9350798360,
+    ),
+    "comfyui/qwen_image_2_1_vae": (
+        "Comfy-Org/Qwen-Image-2.1",
+        "df94239739eef7205973a145ffa6f441f7b64e84",
+        "qwen_image_2.1_vae_bf16.safetensors",
+        "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9",
+        675509688,
+    ),
+    "comfyui/sam3_1_multiplex": (
+        "Comfy-Org/sam3.1",
+        "7bb8374780a725b4353ed31f3a9395c9742b5621",
+        "sam3.1_multiplex_fp16.safetensors",
+        "9ba99c92703c2e8b4f47de2d34a539bb8e18923049e238b780d70dbe6368eb03",
+        1745546848,
+    ),
+    "comfyui/depth_anything_3_mono_large": (
+        "Comfy-Org/Depth-Anything-3",
+        "8265be070134dc7459217308cdc03109bde199b0",
+        "depth_anything_3_mono_large.safetensors",
+        "9b44eda5bedba5b4e125686fdb79d1db309c1b9785277576eb930f885b008f96",
+        1336748056,
     ),
 }
 
@@ -374,7 +421,7 @@ def test_placements_are_unchanged():
 def test_the_shipped_model_ids_are_unchanged():
     catalog = model_catalog()
     comfy = {str(m) for m in catalog.declared_ids if m.provider is ModelProvider.COMFYUI}
-    assert comfy == set(SHIPPED_COMFYUI)
+    assert set(SHIPPED_COMFYUI) <= comfy
 
 
 def test_every_pinned_file_model_has_a_checksum():
@@ -409,3 +456,22 @@ def test_an_empty_catalog_is_a_valid_value():
     empty = ModelCatalog()
     assert empty.declared_ids == frozenset()
     assert empty.get(ModelId("ollama/demo_8b")) is None
+
+
+@pytest.mark.parametrize(
+    ("model_id", "placement"),
+    [
+        ("comfyui/sam3_1_multiplex", ModelPlacement.CHECKPOINTS),
+        ("comfyui/depth_anything_3_mono_large", ModelPlacement.GEOMETRY_ESTIMATION),
+    ],
+)
+def test_swap_weights_land_in_native_comfyui_categories(tmp_path, model_id, placement):
+    from local_ai_stack.models import ManagedModelPaths
+
+    spec = model_catalog().require(ModelId(model_id))
+    assert spec.kind is ModelKind.AUXILIARY
+    assert spec.source.placement is placement
+    paths = ManagedModelPaths(tmp_path.resolve())
+    assert paths.destination_for(spec) == (
+        tmp_path / "comfyui" / placement.value / spec.source.artifact.filename
+    )

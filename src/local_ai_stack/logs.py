@@ -11,6 +11,7 @@ for the last N lines and gets exactly that, whatever the file size.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 DEFAULT_TAIL_LINES = 200
@@ -35,6 +36,37 @@ class LogFiles:
     def ensure_parents(self) -> None:
         for path in self.paths:
             path.parent.mkdir(parents=True, exist_ok=True)
+
+
+# The Hub's own record of service lifecycle events, beside the services' logs (so a log
+# export carries it). No service ever holds this file open.
+HUB_EVENTS_LOG = "hub-events.log"
+
+
+def append_service_event(
+    logs: LogFiles | None, service_id: str, detail: str, *, before_spawn: bool = False
+) -> None:
+    """Timestamp a lifecycle boundary without making logging a launch gate.
+
+    Always into ``hub-events.log``. Into the service's own log files only before the
+    service is spawned: once it runs, it writes through a handle it inherited with its
+    own file position, and its next write lands over anything appended here.
+    """
+    if logs is None:
+        return
+    timestamp = datetime.now(UTC).isoformat(timespec="milliseconds")
+    line = f"[{timestamp}] [Pepito Hub] {service_id}: {detail}\n"
+    targets = [logs.stdout.parent / HUB_EVENTS_LOG]
+    if before_spawn:
+        targets += logs.paths
+    for path in targets:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(line if path.name == HUB_EVENTS_LOG else f"\n{line}")
+        except OSError:
+            # A locked or unwritable log must not prevent a service starting or becoming ready.
+            continue
 
 
 def service_log_files(layout, service_id: str, *, split_stderr: bool = True) -> LogFiles:

@@ -37,6 +37,7 @@ from .application import (
     COMPATIBLE,
     INSUFFICIENT,
     RECOMMENDED,
+    UNAVAILABLE,
     InstallSelection,
     ProfileChoice,
     StorageEstimate,
@@ -78,6 +79,7 @@ STANDING_LABELS = {
     RECOMMENDED: "Recomendado",
     COMPATIBLE: "Compatível",
     INSUFFICIENT: "Requer mais VRAM",
+    UNAVAILABLE: "Requisito ausente",
 }
 
 

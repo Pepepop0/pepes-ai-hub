@@ -52,6 +52,9 @@ _OLLAMA_FIELDS = {
     "capabilities",
     "status",
     "size_bytes",
+    "uncensored",
+    "params",
+    "display_name",
 }
 _COMFYUI_FIELDS = {
     "kind",
@@ -184,6 +187,23 @@ def _reject_unknown(
         raise _error(source, field_name, f"unknown fields: {', '.join(unknown)}")
 
 
+def _chat_params(value: Any, source: Path | str, field_name: str) -> tuple:
+    """Named scalars Open WebUI's model record can hold, as sorted pairs."""
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise _error(source, field_name, "must be a mapping")
+    pairs = []
+    for key, item in value.items():
+        _string(key, source, f"{field_name} key")
+        if not isinstance(item, (bool, int, float, str)) or (
+            isinstance(item, str) and not item.strip()
+        ):
+            raise _error(source, f"{field_name}.{key}", "must be a boolean, a number or a string")
+        pairs.append((key, item))
+    return tuple(sorted(pairs))
+
+
 def _ollama_spec(
     model_id: ModelId, record: dict[str, Any], source: Path | str, field_name: str
 ) -> tuple[ModelSpec | None, str | None]:
@@ -209,12 +229,21 @@ def _ollama_spec(
         not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0
     ):
         raise _error(source, f"{field_name}.size_bytes", "must be a positive integer")
+    display_name = record.get("display_name")
+    if display_name is not None:
+        display_name = _string(display_name, source, f"{field_name}.display_name")
+    uncensored = record.get("uncensored", False)
+    if not isinstance(uncensored, bool):
+        raise _error(source, f"{field_name}.uncensored", "must be true or false")
     try:
         source_record = OllamaModelSource(reference=reference, digest=digest, size_bytes=size_bytes)
         return ModelSpec(
             id=model_id,
             kind=_kind(record.get("kind", "chat"), source, f"{field_name}.kind"),
             source=source_record,
+            uncensored=uncensored,
+            params=_chat_params(record.get("params"), source, f"{field_name}.params"),
+            display_name=display_name,
         ), None
     except ModelContractError as exc:
         raise _error(source, field_name, str(exc)) from exc
@@ -330,13 +359,69 @@ def validate_model_manifest(data: Any, source: Path | str = "<models>") -> Model
     return ModelCatalog(specs=specs, unpinned=unpinned, aliases=aliases)
 
 
-def load_model_catalog(path: Path) -> ModelCatalog:
-    """Read and validate a model manifest file. Downloads nothing."""
+EXTRA_MODEL_DIRECTORY = "models.d"
+
+
+def model_manifest_files(path: Path) -> tuple[Path, ...]:
+    """The manifest and, beside it, the extra ``models.d/*.yaml`` files that add to it.
+
+    Extras are only looked for next to a manifest named ``models.yaml``: that is how an
+    optional pack adds models without editing the shipped file.
+    """
+    path = Path(path)
+    if path.name != MODEL_MANIFEST:
+        return (path,)
+    return (path, *sorted((path.parent / EXTRA_MODEL_DIRECTORY).glob("*.yaml")))
+
+
+def _read_manifest(path: Path) -> Any:
     try:
-        data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
         raise ModelCatalogError(f"{path}: could not read model manifest: {exc}") from exc
-    return validate_model_manifest(data, path)
+
+
+def load_model_catalog(path: Path) -> ModelCatalog:
+    """Read and validate a model manifest file and its extras. Downloads nothing.
+
+    The files are merged before validation, so an extra can alias a model of the main
+    manifest; a model declared twice is an error.
+    """
+    files = model_manifest_files(path)
+    merged = _read_manifest(files[0])
+    validate_model_manifest(merged, files[0])
+    owners: dict[tuple[str, Any], Path] = {}
+    if isinstance(merged, dict):
+        merged = dict(merged)
+        for provider in ModelProvider:
+            section = merged.get(provider.value)
+            if isinstance(section, dict):
+                merged[provider.value] = dict(section)
+                owners.update(dict.fromkeys(((provider.value, name) for name in section), files[0]))
+    for file in files[1:]:
+        extra = _read_manifest(file)
+        validate_model_manifest(extra, file)
+        if not isinstance(merged, dict) or not isinstance(extra, dict):
+            raise _error(file, "manifest root", "must be a mapping")
+        if extra.get("schema_version") != merged.get("schema_version"):
+            raise _error(file, "schema_version", f"must match {files[0].name}")
+        for key, value in extra.items():
+            if key == "schema_version":
+                continue
+            if key not in {provider.value for provider in ModelProvider}:
+                merged[key] = value  # reported by validation as an unknown root key
+                continue
+            if not isinstance(value, dict) or not isinstance(merged.get(key, {}), dict):
+                raise _error(file, key, "must be a mapping")
+            section = merged.setdefault(key, {})
+            for name, record in value.items():
+                if (key, name) in owners:
+                    raise _error(
+                        file, f"{key}.{name}", f"already declared in {owners[(key, name)]}"
+                    )
+                owners[(key, name)] = file
+                section[name] = record
+    return validate_model_manifest(merged, path)
 
 
 @lru_cache(maxsize=1)
@@ -365,5 +450,6 @@ __all__ = [
     "clear_cache",
     "load_model_catalog",
     "model_catalog",
+    "model_manifest_files",
     "validate_model_manifest",
 ]

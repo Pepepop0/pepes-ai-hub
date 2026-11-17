@@ -198,9 +198,10 @@ TEST_PROFILE = "test"
 
 
 def shipped_test_yaml() -> str:
-    from local_ai_stack.installation import detect_repo_root
+    import yaml
+    from test_service_config import disabled_profile
 
-    return (detect_repo_root() / "profiles" / "test.yaml").read_text(encoding="utf-8")
+    return yaml.safe_dump(disabled_profile().raw)
 
 
 @pytest.fixture

@@ -1,0 +1,93 @@
+{
+  "1": {
+    "inputs": {"image": "input.png"},
+    "class_type": "LoadImage",
+    "_meta": {"title": "Load Image"}
+  },
+  "2": {
+    "inputs": {"ckpt_name": "sam3.1_multiplex_fp16.safetensors"},
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {"title": "Load SAM 3.1 Checkpoint"}
+  },
+  "3": {
+    "inputs": {"clip": ["2", 1], "text": "person:1000"},
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "People Detection Prompt"}
+  },
+  "4": {
+    "inputs": {
+      "model": ["2", 0],
+      "image": ["1", 0],
+      "conditioning": ["3", 0],
+      "threshold": 0.5,
+      "refine_iterations": 2,
+      "individual_masks": true
+    },
+    "class_type": "SAM3_Detect",
+    "_meta": {"title": "Detect Individual People"}
+  },
+  "5": {
+    "inputs": {"mask": ["4", 0]},
+    "class_type": "MaskToImage",
+    "_meta": {"title": "Masks to Images"}
+  },
+  "6": {
+    "inputs": {"images": ["5", 0], "filename_prefix": "PepitoSwap/people"},
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save People Masks"}
+  },
+  "7": {
+    "inputs": {"clip": ["2", 1], "text": "speech bubble:1000"},
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Speech Bubble Detection Prompt"}
+  },
+  "8": {
+    "inputs": {
+      "model": ["2", 0],
+      "image": ["1", 0],
+      "conditioning": ["7", 0],
+      "threshold": 0.5,
+      "refine_iterations": 2,
+      "individual_masks": false
+    },
+    "class_type": "SAM3_Detect",
+    "_meta": {"title": "Detect Speech Bubbles (one union mask)"}
+  },
+  "9": {
+    "inputs": {"mask": ["8", 0]},
+    "class_type": "MaskToImage",
+    "_meta": {"title": "Speech Bubble Mask to Image"}
+  },
+  "10": {
+    "inputs": {"images": ["9", 0], "filename_prefix": "PepitoSwap/overlay_bubble"},
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save Speech Bubble Mask"}
+  },
+  "11": {
+    "inputs": {"clip": ["2", 1], "text": "text:1000"},
+    "class_type": "CLIPTextEncode",
+    "_meta": {"title": "Text Detection Prompt"}
+  },
+  "12": {
+    "inputs": {
+      "model": ["2", 0],
+      "image": ["1", 0],
+      "conditioning": ["11", 0],
+      "threshold": 0.5,
+      "refine_iterations": 2,
+      "individual_masks": false
+    },
+    "class_type": "SAM3_Detect",
+    "_meta": {"title": "Detect Text (one union mask)"}
+  },
+  "13": {
+    "inputs": {"mask": ["12", 0]},
+    "class_type": "MaskToImage",
+    "_meta": {"title": "Text Mask to Image"}
+  },
+  "14": {
+    "inputs": {"images": ["13", 0], "filename_prefix": "PepitoSwap/overlay_text"},
+    "class_type": "SaveImage",
+    "_meta": {"title": "Save Text Mask"}
+  }
+}

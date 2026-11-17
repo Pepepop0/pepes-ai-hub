@@ -90,12 +90,19 @@ def model_download_estimate(
 
     A managed file carries its size in the artifact the manifest pins; a model
     pulled from a provider carries the size that provider's manifest records.
-    Anything pinned without one is named as unknown rather than guessed at.
+    Anything pinned without one is named as unknown rather than guessed at. A model
+    several roles name (the Capella presets share most of theirs) is downloaded and
+    counted once.
     """
     known = 0
     unknown: list[str] = []
+    counted: set[str] = set()
     for requirement in profile.model_requirements:
-        spec = (specs or {}).get(str(requirement.model_id))
+        model_key = str(requirement.model_id)
+        if model_key in counted:
+            continue
+        counted.add(model_key)
+        spec = (specs or {}).get(model_key)
         source = getattr(spec, "source", None)
         artifact: Artifact | None = getattr(source, "artifact", None)
         if isinstance(source, FileModelSource) and artifact is not None and artifact.size_bytes:
@@ -105,7 +112,7 @@ def model_download_estimate(
         if size:
             known += size
             continue
-        unknown.append(str(requirement.model_id))
+        unknown.append(model_key)
     return DownloadEstimate(known, tuple(unknown))
 
 

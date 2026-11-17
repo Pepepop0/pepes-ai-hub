@@ -18,7 +18,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_service_config import resolver_for
+from test_service_config import disabled_profile, resolver_for
 from test_workflows import SHIPPED_GRAPH
 
 from local_ai_stack.components import ComponentId
@@ -45,6 +45,7 @@ from local_ai_stack.workflows import load_workflow_manifest
 
 REPO = Path(__file__).resolve().parents[1]
 SHIPPED = {profile.id: profile for profile in load_profiles(REPO / "profiles")}
+SHIPPED["test"] = disabled_profile()
 
 
 @pytest.fixture

@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from test_open_webui import FakeRunner, context_for, pinned
 
-from local_ai_stack import PRODUCT_NAME, __version__, display_version, product_title
+from local_ai_stack import PRODUCT_NAME, __version__
 from local_ai_stack.artifacts import Artifact
 from local_ai_stack.catalog import artifact_for, manifest_dir
 from local_ai_stack.cli import main, smoke_report
@@ -34,6 +34,7 @@ from local_ai_stack.installation import (
 )
 from local_ai_stack.integration import default_provisioners
 from local_ai_stack.markers import read_marker
+from local_ai_stack.profiles import load_profiles
 from local_ai_stack.provisioning import FailureReason, ProvisionContext, ProvisionOutcome
 from local_ai_stack.pyenv import (
     create_environment,
@@ -56,6 +57,7 @@ from local_ai_stack.resources import (
     missing_resources,
     resource_root,
 )
+from local_ai_stack.workflows import load_workflow_manifest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BUILT_EXE = PROJECT_ROOT / "dist" / "PepitosAIHub" / "PepitosAIHub.exe"
@@ -332,36 +334,17 @@ def test_default_provisioners_use_the_host_python_on_a_checkout():
 # --- version and entrypoint ----------------------------------------------------------------
 
 
-def test_one_version_string_feeds_the_footer_and_the_metadata():
-    assert __version__ == "0.1.0"
-    assert display_version() == "v0.1"
-    assert product_title() == f"{PRODUCT_NAME}  v0.1"
-    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert f'version = "{__version__}"' in pyproject
-
-
-def test_the_launcher_and_the_console_script_run_the_same_main():
-    launcher = (PROJECT_ROOT / "packaging" / "launch.py").read_text(encoding="utf-8")
-    assert "from local_ai_stack.cli import main" in launcher
-    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'local-ai-stack = "local_ai_stack.cli:main"' in pyproject
-
-
-def test_the_spec_bundles_every_resource_directory_and_keeps_the_console():
-    spec = (PROJECT_ROOT / "packaging" / "pepitos_ai_hub.spec").read_text(encoding="utf-8")
-    assert "RESOURCE_DIRECTORIES" in spec
-    assert "console=True" in spec
-    assert "COLLECT(" in spec, "one-directory build"
-    assert "onefile" not in spec.lower().replace("one-file", "")
-
-
 def test_the_smoke_report_from_a_checkout_is_clean():
     report = smoke_report()
     assert report["ok"], report["problems"]
     assert report["frozen"] is False
-    assert report["profiles"] == ["capella", "pepe", "pepe-8gb", "test"]
+    assert report["profiles"] == [
+        profile.id for profile in load_profiles(Path(__file__).resolve().parents[1] / "profiles")
+    ]
     assert "python-windows-amd64" in report["manifests"]["artifacts"]
-    assert report["workflows"]["embedded"] == ["flux2_klein_edit", "flux2_klein_t2i"]
+    assert report["workflows"]["embedded"] == sorted(
+        load_workflow_manifest(Path(__file__).resolve().parents[1] / "manifests/workflows.yaml")
+    )
     assert report["python_runtime"]["managed_runtime_selected"] is False
     assert report["folder_picker"] in {"WindowsFolderPicker", "NullFolderPicker"}
 

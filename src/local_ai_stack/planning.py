@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .endpoints import StackEndpoints
 from .installation import ResolvedInstallation
-from .profiles import Profile
+from .profiles import Profile, declared_workflows
 from .stacks import StackDefinition
 
 
@@ -96,13 +96,12 @@ def build_install_plan(
             )
         )
 
-    for workflow_id in sorted(profile.workflows):
-        manifest_id = profile.workflows[workflow_id].manifest_id
+    for workflow_id, _field, declaration in sorted(declared_workflows(profile)):
         pending.append(
             (
                 PlanAction.APPLY_WORKFLOW,
                 workflow_id,
-                f"Apply workflow manifest {manifest_id}.",
+                f"Apply workflow manifest {declaration.manifest_id}.",
             )
         )
 

@@ -76,7 +76,12 @@ def test_save_is_atomic_and_leaves_no_temporary_file(tmp_path):
     registry = make_registry(tmp_path)
     registry.register(ENTRY)
     registry.register(ManagedProcess("comfyui", 11, "comfy.exe"))
-    leftovers = [p.name for p in registry.path.parent.iterdir() if p != registry.path]
+    # The cross-process mutation lock sidecar is intentionally persistent.
+    leftovers = [
+        p.name
+        for p in registry.path.parent.iterdir()
+        if p != registry.path and not p.name.endswith(".mutation-lock")
+    ]
     assert leftovers == []
     assert set(registry.load().entries) == {"ollama", "comfyui"}
 
@@ -93,7 +98,11 @@ def test_failed_save_does_not_destroy_the_previous_file(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         registry.register(ManagedProcess("comfyui", 11, "comfy.exe"))
     assert registry.path.read_text(encoding="utf-8") == original
-    assert [p for p in registry.path.parent.iterdir() if p != registry.path] == []
+    assert [
+        p
+        for p in registry.path.parent.iterdir()
+        if p != registry.path and not p.name.endswith(".mutation-lock")
+    ] == []
 
 
 def test_dry_run_never_writes(tmp_path):

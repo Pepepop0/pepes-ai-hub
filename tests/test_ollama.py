@@ -1,9 +1,10 @@
-"""Tests for the Ollama provisioner.
+"""Tests for the Windows portable-ZIP Ollama provisioner.
 
 Nothing here installs Ollama, downloads an archive, touches PATH or the
 registry, kills a process or reads the real Ollama install. The CommandRunner
 is faked, HTTP is served by an httpx MockTransport, and every path is inside
-tmp_path.
+tmp_path. The Linux tar.zst layout is covered by tests/test_linux_bench.py and
+by provisioning the real pinned archive on Linux.
 """
 
 from __future__ import annotations
@@ -11,11 +12,13 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import httpx
+import pytest
 
 from local_ai_stack.artifacts import Artifact
 from local_ai_stack.download import Downloader
@@ -30,6 +33,8 @@ from local_ai_stack.provisioning import (
     ProvisionOutcome,
 )
 from local_ai_stack.runner import CommandResult, CommandRunner
+
+pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows portable ZIP layout")
 
 VERSION_OUTPUT = "ollama version is 0.5.4\n"
 

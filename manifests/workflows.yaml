@@ -31,3 +31,97 @@ workflows:
       prompt: {node_id: "75:74", key: text}
       model: {node_id: "75:70", key: unet_name}
       seed: {node_id: "75:73", key: noise_seed}
+
+  # Qwen-Image 2.1 (Comfy-Org templates, see workflows/README.md). The prompt
+  # enhancer branch of the templates is dropped: the prompt goes straight to
+  # TextEncodeQwenImage21, exactly as the templates run with refine off.
+  qwen_image_2_1_t2i:
+    file: workflows/qwen-image-2.1-t2i-api.json
+    status: mapped_and_embedded
+    family: qwen21
+    models:
+      required: [image.diffusion, image.text_encoder, image.vae]
+      parameter: image.diffusion
+    mapping:
+      prompt: {node_id: "484", key: value}
+      model: {node_id: "459:451", key: unet_name}
+      width: {node_id: "485", key: value}
+      height: {node_id: "486", key: value}
+      steps: {node_id: "459:458", key: steps}
+      seed: {node_id: "459:458", key: seed}
+
+  # The filter prepares bounded same-aspect references, or a transparent padded base for
+  # explicit reframing. Resolution 0 keeps that first reference's canvas (multiples of 32).
+  qwen_image_2_1_edit:
+    file: workflows/qwen-image-2.1-edit-api.json
+    status: mapped_and_embedded
+    family: qwen21
+    reference_policy: generic
+    models:
+      required: [image.diffusion, image.text_encoder, image.vae]
+      parameter: image.diffusion
+    mapping:
+      image: {node_id: "470", key: image}
+      prompt: {node_id: "459:474", key: prompt}
+      model: {node_id: "459:451", key: unet_name}
+      seed: {node_id: "459:458", key: seed}
+
+  # The same edit with two and three input images. TextEncodeQwenImage21 splices
+  # them in slot order (image_1 is the picture being edited) and the instruction
+  # names them <image1>, <image2>, <image3>. Open WebUI hands its image list over
+  # by position, one LoadImage node per image.
+  qwen_image_2_1_edit_2:
+    file: workflows/qwen-image-2.1-edit-2-api.json
+    status: mapped_and_embedded
+    reference_syntax: indexed
+    family: qwen21
+    reference_policy: generic
+    models:
+      required: [image.diffusion, image.text_encoder, image.vae]
+      parameter: image.diffusion
+    mapping:
+      image: {node_ids: ["470", "471"], key: image}
+      prompt: {node_id: "459:474", key: prompt}
+      model: {node_id: "459:451", key: unet_name}
+      seed: {node_id: "459:458", key: seed}
+
+  qwen_image_2_1_edit_3:
+    file: workflows/qwen-image-2.1-edit-3-api.json
+    status: mapped_and_embedded
+    reference_syntax: indexed
+    family: qwen21
+    reference_policy: generic
+    models:
+      required: [image.diffusion, image.text_encoder, image.vae]
+      parameter: image.diffusion
+    mapping:
+      image: {node_ids: ["470", "471", "472"], key: image}
+      prompt: {node_id: "459:474", key: prompt}
+      model: {node_id: "459:451", key: unet_name}
+      seed: {node_id: "459:458", key: seed}
+
+  # Native ComfyUI v0.39.0 analysis passes for automatic character swaps.
+  sam3_people:
+    file: workflows/sam3-people-api.json
+    status: mapped_and_embedded
+    family: sam3
+    reference_policy: single
+    models:
+      required: [swap.segment]
+      parameter: swap.segment
+    mapping:
+      image: {node_id: "1", key: image}
+      model: {node_id: "2", key: ckpt_name}
+      prompt: {node_id: "3", key: text}
+
+  da3_depth:
+    file: workflows/da3-depth-api.json
+    status: mapped_and_embedded
+    family: da3
+    reference_policy: single
+    models:
+      required: [swap.depth]
+      parameter: swap.depth
+    mapping:
+      image: {node_id: "1", key: image}
+      model: {node_id: "2", key: model_name}

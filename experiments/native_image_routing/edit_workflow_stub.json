@@ -1,0 +1,28 @@
+{
+ "6": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "text": "",
+   "clip": [
+    "4",
+    0
+   ]
+  }
+ },
+ "10": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": ""
+  }
+ },
+ "9": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "filename_prefix": "edit",
+   "images": [
+    "10",
+    0
+   ]
+  }
+ }
+}

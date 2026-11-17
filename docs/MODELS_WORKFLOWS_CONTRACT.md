@@ -93,6 +93,27 @@ recebe `ResolvedModel`, chama `require_location()` e usa:
 
 IC6 não importa catálogo, downloader, URLs, hashes ou lógica de instalação.
 
+Um parâmetro de imagem de entrada pode nomear vários nodes, em ordem:
+`image: {node_ids: ["470", "471"], key: image}` (um `LoadImage` por imagem; o Open WebUI entrega a
+lista de imagens por posição). A entrada de manifest pode declarar `reference_syntax`
+(`indexed` para um encoder que lê `<image1>`, `plain` para um que só lê palavras). No profile,
+`image_edit_2` e `image_edit_3` são as edições com 2 e 3 imagens; o filtro escolhe pela
+quantidade de imagens do turno.
+
+Um profile pode declarar vários `variants`; cada variant escolhe um grupo `images`
+próprio e os workflows desse grupo. Os roles resolvidos são
+`variant.<variant-id>.<role>` e não herdam modelos do grupo de outro variant.
+Compartilhar o mesmo `ModelId` é permitido e o download é contado uma vez; omitir
+um role requerido pelo manifest invalida o profile.
+
+Além de `text_to_image` e `image_edit[_2|_3]`, uma variant pode declarar
+`text_to_image_hq`, `restage_edit` e `remove_edit`. Os parâmetros `lora`
+(o adaptador do workflow) e `style` (a força do slider de estilo da geração) são bindings
+do manifest: o filtro escreve os valores no grafo antes
+da chamada porque o Open WebUI não possui campos para eles. Um binding ausente
+é erro de composição; IC6 não adivinha node ids.
+
+
 ## Estados
 
 | Estado | Significado | Consumível por IC6 |

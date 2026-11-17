@@ -27,9 +27,11 @@ Two properties, both verified on Windows 11 before this was written:
   root then keeps the named job alive across Hub sessions. Root exit closes the
   last service-held handle and prevents a proved runner from becoming orphaned.
 
-Everywhere else — any non-Windows host, a kernel call that fails, a job we no
-longer hold — this module answers "cannot tell", and the caller must fall back
-to acting on the single process whose identity it can still verify.
+Linux services that opt into persistent tree cleanup use the authenticated
+subreaper/session supervisor in :mod:`local_ai_stack.posix_runtime`, composed by
+the launcher rather than pretending that POSIX has Windows Job Objects. These
+Windows APIs deliberately retain their original meaning everywhere else:
+without a live job handle they answer "cannot tell".
 """
 
 from __future__ import annotations

@@ -46,15 +46,17 @@ OPEN_WEBUI_SERVE_ARGS = ("serve",)
 COMFYUI_SERVE_ARGS: tuple[str, ...] = ()
 
 # Both web apps take noticeably longer to answer than Ollama does: Open WebUI
-# builds its database on first boot and ComfyUI imports torch before it listens.
-# A readiness wait that gives up sooner would report FAILED on a healthy start.
-OPEN_WEBUI_STARTUP_TIMEOUT = 120.0
-COMFYUI_STARTUP_TIMEOUT = 180.0
-# Ollama listens within a second, but answers no request until it has probed
-# every GPU. On a machine with a second adapter -- an integrated AMD GPU it
-# probes through Vulkan and then drops -- that took 13 s on one start and 27 s
-# on the next on the reference machine. The wait ends as soon as it answers.
-OLLAMA_STARTUP_TIMEOUT = 90.0
+# builds its database and imports its Python stack on first boot, and ComfyUI
+# imports torch before it listens. On the RTX 5090 test machine a first Open
+# WebUI start missed the old 120 s limit and answered healthy afterwards. The
+# wait still ends as soon as the service answers, and a process that exits
+# fails at once, so a generous ceiling only costs time on a real hang.
+OPEN_WEBUI_STARTUP_TIMEOUT = 600.0
+COMFYUI_STARTUP_TIMEOUT = 600.0
+# Ollama may spend minutes probing GPU backends on a cold start. Keep the
+# deadline generous; a process that exits still fails immediately, and retrying
+# a running managed process continues polling until it becomes healthy.
+OLLAMA_STARTUP_TIMEOUT = 600.0
 
 
 def _aligned(spec: ServiceSpec, host: str, port: int) -> ServiceSpec:
@@ -82,6 +84,7 @@ def ollama_launch_spec(
     startup_timeout: float = OLLAMA_STARTUP_TIMEOUT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
     allow_force_kill: bool = True,
+    keep_alive: str | None = None,
 ) -> ProcessLaunchSpec:
     """``ollama serve`` bound to an explicit host and port, with an explicit env.
 
@@ -94,6 +97,8 @@ def ollama_launch_spec(
     child_env: dict[str, str] = {"OLLAMA_HOST": f"{host}:{port}"}
     if models_dir is not None:
         child_env["OLLAMA_MODELS"] = str(models_dir)
+    if keep_alive:
+        child_env["OLLAMA_KEEP_ALIVE"] = keep_alive
     if env:
         child_env.update(env)
     return ProcessLaunchSpec(
@@ -121,6 +126,7 @@ def ollama_control_spec(
     startup_timeout: float = OLLAMA_STARTUP_TIMEOUT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
     allow_force_kill: bool = True,
+    keep_alive: str | None = None,
 ) -> ServiceControlSpec:
     """Ollama, controllable: health spec, process spec and how to launch it."""
     if logs is None and layout is not None:
@@ -134,6 +140,7 @@ def ollama_control_spec(
         port=port,
         models_dir=models_dir,
         env=env,
+        keep_alive=keep_alive,
         logs=logs,
         cwd=cwd,
         startup_timeout=startup_timeout,
@@ -156,7 +163,7 @@ def open_webui_launch_spec(
     cwd: Path | None = None,
     startup_timeout: float = OPEN_WEBUI_STARTUP_TIMEOUT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
-    allow_force_kill: bool = False,
+    allow_force_kill: bool = True,
 ) -> ProcessLaunchSpec:
     """``open-webui serve`` bound to an explicit endpoint and data directory.
 
@@ -195,9 +202,16 @@ def open_webui_control_spec(
     cwd: Path | None = None,
     startup_timeout: float = OPEN_WEBUI_STARTUP_TIMEOUT,
     stop_timeout: float = DEFAULT_STOP_TIMEOUT,
-    allow_force_kill: bool = False,
+    allow_force_kill: bool = True,
 ) -> ServiceControlSpec:
-    """Open WebUI, controllable: health spec, process spec and how to launch it."""
+    """Open WebUI, controllable: health spec, process spec and how to launch it.
+
+    Like ComfyUI, the process that serves the port is not the registered root:
+    the ``open-webui.exe`` console script starts the environment's Python, which
+    on Windows starts the base interpreter. Stopping only the root left that
+    server running ("service-left-running"), so the proved tree is ended
+    through the job, exactly as for ComfyUI and Ollama.
+    """
     if logs is None and layout is not None:
         logs = service_log_files(layout, OPEN_WEBUI_SPEC.id)
     if data_dir is None and layout is not None:

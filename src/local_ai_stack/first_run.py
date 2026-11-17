@@ -28,9 +28,18 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from .acquisition_errors import acquisition_failure
 from .components import ComponentId
 from .download import DownloadProgress
 from .execution import ExecutionReport
+from .installation_control import (
+    CANCELLED_MESSAGE,
+    InstallationCancelled,
+    current_installation_control,
+    installation_checkpoint,
+    installation_cleanup,
+)
+from .model_installer import ModelResult
 from .operation_contracts import (
     OperationActivity,
     OperationActivityCategory,
@@ -130,16 +139,22 @@ class FirstRunCoordinator:
         # -- Ollama, to check and acquire models -- it stops again; nothing is
         # started just because a first installation would end started.
         self.keep_lifecycle = keep_lifecycle
+        self.control = current_installation_control()
+        if self.control is not None:
+            self.control.set_cancel_cleanup(self._cleanup_cancelled)
 
     def run(self) -> OperationResult:
         stream = self.stream
         try:
             stream.begin("Verificando ambiente")
+            installation_checkpoint()
             self._verify_environment()
+            installation_checkpoint()
             stream.advance(
                 OperationState.PREPARING, OperationPhase.PREPARATION, "Planejando instalação"
             )
             phases = self.app.stage(self.app.build_plan(self.profile))
+            installation_checkpoint()
             self._provision(phases.provisioning)
             self._start(OLLAMA, state=OperationState.RUNNING)
             self._acquire_models(phases.after_ollama_ready)
@@ -148,19 +163,32 @@ class FirstRunCoordinator:
                 self._integrate_running()
             else:
                 self._start_the_rest()
-        except FirstRunStopped as stop:
-            self.report.problems.extend(item.message for item in stop.diagnostics)
             left = self._restore_lifecycle()
-            self.report.result = stream.fail(stop.phase, stop.message, [*stop.diagnostics, *left])
-            return self.report.result
-        left = self._restore_lifecycle()
-        if left:
-            self.report.problems.extend(item.message for item in left)
+            if left:
+                self.report.problems.extend(item.message for item in left)
+                self.report.result = stream.fail(
+                    OperationPhase.RESOURCE_RELEASE,
+                    "Não foi possível deixar a stack como estava",
+                    left,
+                )
+                return self.report.result
+            installation_checkpoint()
+        except InstallationCancelled:
+            if self.control is not None:
+                self.control.cleanup_cancelled()
+            else:
+                self._cleanup_cancelled()
             self.report.result = stream.fail(
                 OperationPhase.RESOURCE_RELEASE,
-                "Não foi possível deixar a stack como estava",
-                left,
+                CANCELLED_MESSAGE,
+                [diagnostic("cancelled", CANCELLED_MESSAGE), *self.report.warnings],
             )
+            return self.report.result
+        except FirstRunStopped as stop:
+            self.report.problems.extend(item.message for item in stop.diagnostics)
+            with installation_cleanup():
+                left = self._restore_lifecycle()
+            self.report.result = stream.fail(stop.phase, stop.message, [*stop.diagnostics, *left])
             return self.report.result
         message = "Tudo pronto" if not self.report.did_nothing else "Tudo pronto (nada a fazer)"
         self.report.result = stream.succeed(
@@ -227,6 +255,7 @@ class FirstRunCoordinator:
 
     def _provision(self, plan: InstallPlan) -> None:
         """Layout first, then each component on its own so a UI sees which one."""
+        installation_checkpoint()
         self.app._activity_sink = self._on_provision_event
         try:
             executor = self.app.executor(self.profile)
@@ -239,6 +268,7 @@ class FirstRunCoordinator:
 
             installs = [step for step in plan.steps if step.action is PlanAction.INSTALL]
             for index, step in enumerate(installs, start=1):
+                installation_checkpoint()
                 name = _DISPLAY.get(step.target, step.target)
                 self.stream.advance(
                     OperationState.RUNNING, OperationPhase.EXECUTION, f"Instalando {name}"
@@ -260,6 +290,7 @@ class FirstRunCoordinator:
 
     def _start(self, service_id: str, *, state: OperationState) -> None:
         name = _DISPLAY.get(service_id, service_id)
+        installation_checkpoint()
         controller = self.app._controller(self.profile)
         current = controller.status(service_id)
         if current.health.state is ServiceState.UP:
@@ -287,7 +318,12 @@ class FirstRunCoordinator:
             f"Iniciando {name}",
         )
         self.stream.activity(
-            OperationActivity(OperationActivityCategory.READINESS, "waiting", name),
+            OperationActivity(
+                OperationActivityCategory.READINESS,
+                "waiting",
+                name,
+                detail="a primeira inicialização pode levar alguns minutos",
+            ),
             f"Aguardando {name} responder",
         )
         report = controller.start(service_id, wait=True)
@@ -298,13 +334,18 @@ class FirstRunCoordinator:
                 [diagnostic("service-not-ready", f"{service_id}: {report.detail}")],
             )
         self.stream.detail(
-            OperationActivity(OperationActivityCategory.READINESS, "ready", name), f"{name} pronto"
+            OperationActivity(
+                OperationActivityCategory.READINESS, "ready", name, detail=report.detail
+            ),
+            f"{name} pronto",
         )
         self.report.started.append(service_id)
+        installation_checkpoint()
         self._integrate(service_id)
 
     def _integrate(self, service_id: str) -> None:
         """What a running service still needs from the Hub. Idempotent."""
+        installation_checkpoint()
         if service_id != str(ComponentId.OPEN_WEBUI):
             return
         report = self.app.integrate_open_webui(self.stream, self.profile)
@@ -316,11 +357,13 @@ class FirstRunCoordinator:
             self.report.warnings.append(diagnostic("open-webui-integration", report.detail))
 
     def _acquire_models(self, plan: InstallPlan) -> None:
+        installation_checkpoint()
         steps = [step for step in plan.steps if step.action is PlanAction.ACQUIRE_MODEL]
         if not steps:
             return
         self.stream.advance(OperationState.RUNNING, OperationPhase.EXECUTION, "Baixando modelos")
         for index, step in enumerate(steps, start=1):
+            installation_checkpoint()
             logical = OperationProgress(index - 1, len(steps))
             self.stream.progress(
                 logical.completed,
@@ -427,6 +470,7 @@ class FirstRunCoordinator:
         workflow is what configuration depends on, and that one must succeed.
         """
         executor = self.app.executor(self.profile)
+        installation_checkpoint()
         handlers = self.app.install_actions(self.profile)
         workflows = [step for step in plan.steps if step.action is PlanAction.APPLY_WORKFLOW]
         configure = _only(plan, lambda step: step.action is PlanAction.CONFIGURE)
@@ -436,7 +480,8 @@ class FirstRunCoordinator:
             OperationState.RUNNING, OperationPhase.EXECUTION, "Aplicando configurações"
         )
         for step in workflows:
-            declaration = self.profile.workflows.get(step.target)
+            installation_checkpoint()
+            declaration = self.profile.workflow(step.target)
             spec = handlers.workflow_specs.get(declaration.manifest_id) if declaration else None
             if spec is not None and not spec.complete:
                 self.report.unmapped_workflows.append(step.target)
@@ -492,20 +537,27 @@ class FirstRunCoordinator:
             if controller.status(service_id).health.state is ServiceState.UP:
                 self._integrate(service_id)
 
-    def _restore_lifecycle(self) -> list[OperationDiagnostic]:
+    def _cleanup_cancelled(self) -> None:
+        with installation_cleanup():
+            self.report.warnings.extend(self._restore_lifecycle(cancelled=True))
+
+    def _restore_lifecycle(self, *, cancelled: bool = False) -> list[OperationDiagnostic]:
         """Stop what this run started, when it was asked to leave the stack as it was.
 
         Returns what could not be stopped. Nothing this run did not start is
         touched, and a first installation (``keep_lifecycle`` off) is left
         running, as it always has been.
         """
-        if not self.keep_lifecycle or not self.report.started:
+        if (not self.keep_lifecycle and not cancelled) or not self.report.started:
             return []
-        self.stream.advance(
-            OperationState.FINALIZING,
-            OperationPhase.RESOURCE_RELEASE,
-            "Parando o que o reparo iniciou",
-        )
+        if not self.stream.closed:
+            self.stream.advance(
+                OperationState.FINALIZING,
+                OperationPhase.RESOURCE_RELEASE,
+                "Parando o que a instalação iniciou"
+                if cancelled
+                else "Parando o que o reparo iniciou",
+            )
         controller = self.app._controller(self.profile)
         left: list[OperationDiagnostic] = []
         for service_id in reversed(self.report.started):
@@ -521,11 +573,13 @@ class FirstRunCoordinator:
         return left
 
     def _start_the_rest(self) -> None:
+        installation_checkpoint()
         self.stream.advance(
             OperationState.FINALIZING, OperationPhase.SERVICE_START, "Inicializando serviços"
         )
         endpoints = self.app.options.endpoints_for(self.profile)
         for service_id in (str(ComponentId.OPEN_WEBUI), str(ComponentId.COMFYUI)):
+            installation_checkpoint()
             if not endpoints.enabled(self.profile, service_id):
                 continue
             self._start(service_id, state=OperationState.FINALIZING)
@@ -533,7 +587,9 @@ class FirstRunCoordinator:
     # --- helpers -----------------------------------------------------------
 
     def _execute(self, executor, plan: InstallPlan, message: str) -> ExecutionReport:
+        installation_checkpoint()
         report = executor.execute(plan, dry_run=False)
+        installation_checkpoint()
         # A step the executor does not run (a CHECK, say) is reported, never
         # silently dropped.
         self.report.problems.extend(
@@ -544,10 +600,26 @@ class FirstRunCoordinator:
 
             problems = execution_problems(report)
             self.report.problems.extend(problems)
+            diagnostics: list[OperationDiagnostic] = []
+            model_message: str | None = None
+            for action in report.action_results:
+                if action.ok or action.action is not PlanAction.ACQUIRE_MODEL:
+                    continue
+                payload = action.payload
+                info = (
+                    payload.failure_info
+                    if isinstance(payload, ModelResult) and payload.failure_info is not None
+                    else acquisition_failure()
+                )
+                diagnostics.append(diagnostic(info.code, info.message))
+                if model_message is None:
+                    model_message = info.message
+            if model_message is None:
+                diagnostics = [diagnostic(_code(problem), problem) for problem in problems]
             raise FirstRunStopped(
                 OperationPhase.EXECUTION,
-                message,
-                [diagnostic(_code(problem), problem) for problem in problems],
+                model_message or message,
+                diagnostics,
             )
         return report
 

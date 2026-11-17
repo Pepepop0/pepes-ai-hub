@@ -22,10 +22,10 @@ commit afterwards, so a tag moved upstream is reported rather than followed.
 
 Dependencies
 ------------
-ComfyUI's own requirements.txt leaves torch, torchvision and torchaudio
-unversioned, so installing it verbatim would resolve whatever those packages
-happen to be today — and on an NVIDIA target, which build of torch to install
-is a decision, not a default. Those three are pinned in the manifest instead,
+ComfyUI's own requirements.txt leaves torch and torchvision unversioned, so
+installing it verbatim would resolve whatever those packages happen to be
+today — and on an NVIDIA target, which build of torch to install is a
+decision, not a default. The torch triple is pinned in the manifest instead,
 with the index that serves the CUDA wheels; everything else still comes from
 the repository's own file, which is itself fixed by the pinned commit.
 
@@ -36,18 +36,45 @@ behind claiming to be usable.
 verify() proves both halves independently: the checkout sits on the pinned
 commit, and the environment really holds the pinned distribution at the pinned
 version. Either can be true without the other.
+
+Custom nodes
+------------
+Node packs the manifest pins are checked out into ``custom_nodes/<id>`` inside
+the checkout, which upstream's .gitignore already excludes, and each is
+verified against its own commit. The Hub claims a node folder with its marker
+the moment it clones it, so it only ever moves or removes folders it created:
+a user's own node is never touched, and a same-named one blocks the install
+instead of being replaced. A pack that declares pip dependencies is refused,
+because the Hub installs none for nodes and a node missing its packages would
+only fail later, inside ComfyUI.
 """
 
 from __future__ import annotations
 
 import shutil
+import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .catalog import PinnedCustomNode
 from .components import ComponentId
-from .git_ops import GitClient, GitCloneEvent, GitCloneOutputParser, GitError
-from .markers import ManagedMarker, fingerprint_of, marker_path, read_marker, write_marker
+from .deletion import delete_tree, first_link_inside
+from .git_ops import (
+    GitClient,
+    GitCloneEvent,
+    GitCloneOutputParser,
+    GitError,
+    describe_git_failure,
+)
+from .markers import (
+    MARKER_NAME,
+    ManagedMarker,
+    fingerprint_of,
+    marker_path,
+    read_marker,
+    write_marker,
+)
 from .operation_contracts import OperationActivityCategory, TransferProgress
 from .provisioning import (
     ComponentState,
@@ -65,6 +92,7 @@ from .provisioning import (
     reason_for_pip_failure,
 )
 from .pyenv import (
+    VENV_DIR_NAME,
     PipEvent,
     PipOutputParser,
     PythonEnvironment,
@@ -79,6 +107,20 @@ from .python_runtime import ManagedPythonRuntime, resolve_interpreter
 
 COMPONENT_ID = str(ComponentId.COMFYUI)
 ENTRY_POINT = "main.py"
+# What the Hub itself writes inside the checkout: its ownership marker (and the
+# temporary file it is atomically written through) and the managed virtual
+# environment. Git sees them as untracked files, but they are not local edits,
+# so they must never make a repair refuse to update the checkout. The marker
+# family is matched by prefix, covering `.tmp` and a renamed copy alike.
+# custom_nodes/ needs no entry: upstream's own .gitignore excludes it.
+HUB_OWNED_CHECKOUT_ENTRIES = (f"{MARKER_NAME}*", VENV_DIR_NAME)
+
+CUSTOM_NODES_DIR = "custom_nodes"
+# The marker component that proves a custom_nodes/<id> folder is the Hub's.
+CUSTOM_NODE_COMPONENT = f"{COMPONENT_ID}-custom-node"
+# What may appear untracked in a node checkout without being a local edit:
+# the Hub's marker and the bytecode ComfyUI writes when it imports the node.
+HUB_OWNED_NODE_ENTRIES = (f"{MARKER_NAME}*", "__pycache__")
 
 PYTHON_MINIMUM = (3, 11)
 PYTHON_BELOW = (3, 13)
@@ -145,6 +187,7 @@ class ComfyUIProvisioner(Provisioner):
     commit: str | None = None
     url: str | None = None
     dependencies: DependencyPin = field(default_factory=DependencyPin)
+    custom_nodes: tuple[PinnedCustomNode, ...] = ()
     python_minimum: tuple[int, int] = PYTHON_MINIMUM
     python_below: tuple[int, int] = PYTHON_BELOW
     install_alongside_external: bool = False
@@ -185,6 +228,10 @@ class ComfyUIProvisioner(Provisioner):
                 "extra_index_url": self.dependencies.extra_index_url or "",
                 "use_repository_requirements": self.dependencies.use_repository_requirements,
                 "python": describe_range(self.python_minimum, self.python_below),
+                "custom_nodes": [
+                    [node.id, node.url, node.revision, node.commit]
+                    for node in sorted(self.custom_nodes, key=lambda node: node.id)
+                ],
             }
         )
 
@@ -213,6 +260,28 @@ class ComfyUIProvisioner(Provisioner):
 
     def marker_path(self, context: ProvisionContext) -> Path:
         return marker_path(self.managed_dir(context))
+
+    def custom_node_dir(self, context: ProvisionContext, node: PinnedCustomNode) -> Path:
+        return self.managed_dir(context) / CUSTOM_NODES_DIR / node.id
+
+    def _at_pinned_commit(self, git: GitClient, directory: Path) -> bool:
+        """True when the checkout already sits on the pinned commit: nothing to update."""
+        return self.commit is not None and _head_is(git, directory, self.commit)
+
+    def _stale_custom_nodes(self, context: ProvisionContext) -> list[Path]:
+        """Node folders the Hub installed that the pin no longer lists. Read-only."""
+        root = self.managed_dir(context) / CUSTOM_NODES_DIR
+        if not root.is_dir():
+            return []
+        pinned = {node.id.lower() for node in self.custom_nodes}
+        return sorted(
+            path
+            for path in root.iterdir()
+            if path.is_dir()
+            and not path.is_symlink()
+            and path.name.lower() not in pinned
+            and _owns_custom_node(path)
+        )
 
     # --- deteccao ----------------------------------------------------------
 
@@ -313,9 +382,10 @@ class ComfyUIProvisioner(Provisioner):
         if not detection.is_usable or not detection.is_managed:
             return detection
 
+        git = self._git(context)
         if self.commit is not None:
             try:
-                head = self._git(context).head(self.managed_dir(context))
+                head = git.head(self.managed_dir(context))
             except GitError as exc:
                 return self._invalid(detection, f"Could not read the checkout revision: {exc}")
             if head != self.commit:
@@ -324,6 +394,11 @@ class ComfyUIProvisioner(Provisioner):
                     f"The checkout is at {head[:12]} but the pin is {self.commit[:12]}. "
                     "It was moved outside this hub.",
                 )
+
+        for node in self.custom_nodes:
+            problem = _custom_node_problem(git, self.custom_node_dir(context, node), node)
+            if problem is not None:
+                return self._invalid(detection, problem)
 
         distribution = self.dependencies.verify_distribution
         if distribution is None:
@@ -391,6 +466,28 @@ class ComfyUIProvisioner(Provisioner):
                     action="clone",
                     target=str(directory),
                     summary=f"Clone {self.url} and check out {self.revision}.",
+                ),
+                *(
+                    ProvisionStep(
+                        action="remove-custom-node",
+                        target=str(stale),
+                        summary=(
+                            f"Remove the custom node {stale.name}: "
+                            "this hub installed it and the pin no longer lists it."
+                        ),
+                    )
+                    for stale in self._stale_custom_nodes(context)
+                ),
+                *(
+                    ProvisionStep(
+                        action="install-custom-node",
+                        target=str(self.custom_node_dir(context, node)),
+                        summary=(
+                            f"Check out {node.url} at {node.revision} "
+                            f"into {CUSTOM_NODES_DIR}/{node.id}."
+                        ),
+                    )
+                    for node in self.custom_nodes
                 ),
                 ProvisionStep(
                     action="create-venv",
@@ -544,23 +641,39 @@ class ComfyUIProvisioner(Provisioner):
                 detection, FailureReason.FILESYSTEM, "Could not prepare the layout.", str(exc)
             )
 
-        context.emit(
-            self.component_id,
-            f"Cloning {self.url} at {self.revision}",
-            activity=build_activity(OperationActivityCategory.TRANSFER, "cloning", repo_name),
-        )
-        on_clone_output = GitCloneOutputParser(self._git_progress(context, repo_name)).feed
+        existing = False
         try:
-            if not git.is_repository(directory):
+            existing = git.is_repository(directory)
+            if not existing:
+                context.emit(
+                    self.component_id,
+                    f"Cloning {self.url} at {self.revision}",
+                    activity=build_activity(
+                        OperationActivityCategory.TRANSFER, "cloning", repo_name
+                    ),
+                )
+                on_clone_output = GitCloneOutputParser(self._git_progress(context, repo_name)).feed
                 git.clone(self.url, directory, revision=self.revision, on_output=on_clone_output)
-            else:
+            elif not self._at_pinned_commit(git, directory):
                 # Re-pinning to a newer tag needs it fetched first. fetch()
-                # refuses a dirty tree, so local edits are never discarded.
-                git.fetch(directory)
-                git.checkout(directory, self.revision)
+                # refuses a dirty tree, so local edits are never discarded --
+                # but the Hub's own files in the checkout are not edits.
+                context.emit(
+                    self.component_id,
+                    f"Updating the checkout to {self.revision}",
+                    activity=build_activity(
+                        OperationActivityCategory.TRANSFER, "fetching", repo_name
+                    ),
+                )
+                git.fetch(directory, ignore=HUB_OWNED_CHECKOUT_ENTRIES)
+                git.checkout(directory, self.revision, ignore=HUB_OWNED_CHECKOUT_ENTRIES)
         except GitError as exc:
+            action = "update the ComfyUI checkout" if existing else "clone ComfyUI"
             return self.failed(
-                detection, FailureReason.COMMAND_FAILED, "Could not clone ComfyUI.", str(exc)
+                detection,
+                FailureReason.COMMAND_FAILED,
+                f"Could not {action}: {describe_git_failure(exc)}.",
+                str(exc),
             )
 
         if self.commit is not None:
@@ -580,6 +693,10 @@ class ComfyUIProvisioner(Provisioner):
                     f"{self.revision} resolved to {head[:12]}, not the pinned {self.commit[:12]}.",
                     "The tag moved upstream. No marker was written; re-pin deliberately.",
                 )
+
+        failure = self._install_custom_nodes(context, detection, git)
+        if failure is not None:
+            return failure
 
         if environment_is_reusable(context.runner, environment, interpreter):
             # A retry over a partial install: the environment already works,
@@ -702,6 +819,122 @@ class ComfyUIProvisioner(Provisioner):
         )
         return self.installed(final, plan.steps, f"Installed into {directory}.")
 
+    def _install_custom_nodes(self, context, detection, git) -> ProvisionResult | None:
+        """Bring custom_nodes/ to the pin. None on success, else the failure."""
+        for stale in self._stale_custom_nodes(context):
+            context.emit(
+                self.component_id,
+                f"Removing the custom node {stale.name}, no longer pinned",
+                activity=build_activity(
+                    OperationActivityCategory.PREPARATION, "removing", stale.name
+                ),
+            )
+            problem = _remove_owned(stale)
+            if problem is not None:
+                return self.failed(
+                    detection,
+                    FailureReason.FILESYSTEM,
+                    f"Could not remove the custom node {stale.name}, which is no longer pinned.",
+                    problem,
+                )
+        for node in self.custom_nodes:
+            failure = self._install_custom_node(context, detection, git, node)
+            if failure is not None:
+                return failure
+        return None
+
+    def _install_custom_node(self, context, detection, git, node) -> ProvisionResult | None:
+        target = self.custom_node_dir(context, node)
+        label = f"{CUSTOM_NODES_DIR}/{node.id}"
+        owned = _owns_custom_node(target)
+        if target.exists() and not owned:
+            return self.failed(
+                detection,
+                FailureReason.PRECONDITION,
+                f"{label} already exists and was not installed by this hub.",
+                "It was left untouched. Move it out of custom_nodes so the pinned node "
+                "can be installed there.",
+            )
+        if owned and not (target / ".git").exists():
+            # Ours but no longer a checkout, as an interrupted clone leaves it.
+            problem = _remove_owned(target)
+            if problem is not None:
+                return self.failed(
+                    detection,
+                    FailureReason.FILESYSTEM,
+                    f"Could not replace the incomplete custom node {node.id}.",
+                    problem,
+                )
+
+        fresh = not target.exists()
+        repo_name = _repo_name(node.url)
+        try:
+            if fresh:
+                context.emit(
+                    self.component_id,
+                    f"Cloning {node.url} at {node.revision}",
+                    activity=build_activity(
+                        OperationActivityCategory.TRANSFER, "cloning", repo_name
+                    ),
+                )
+                on_clone_output = GitCloneOutputParser(self._git_progress(context, repo_name)).feed
+                git.clone(node.url, target, on_output=on_clone_output)
+            # Claimed before anything else happens in it, so a failure from here
+            # on leaves a folder a later run knows it may move or replace.
+            write_marker(
+                target,
+                component=CUSTOM_NODE_COMPONENT,
+                source_id=node.url,
+                version=node.revision,
+                checksum=node.commit,
+            )
+            if not _head_is(git, target, node.commit):
+                if not fresh:
+                    context.emit(
+                        self.component_id,
+                        f"Updating {label} to {node.revision}",
+                        activity=build_activity(
+                            OperationActivityCategory.TRANSFER, "fetching", repo_name
+                        ),
+                    )
+                    git.fetch(target, ignore=HUB_OWNED_NODE_ENTRIES)
+                git.checkout(target, node.revision, ignore=HUB_OWNED_NODE_ENTRIES)
+            head = git.head(target)
+        except GitError as exc:
+            return self.failed(
+                detection,
+                FailureReason.COMMAND_FAILED,
+                f"Could not install the custom node {node.id}: {describe_git_failure(exc)}.",
+                str(exc),
+            )
+        if head != node.commit:
+            return self.failed(
+                detection,
+                FailureReason.PRECONDITION,
+                f"{node.id} {node.revision} resolved to {head[:12]}, "
+                f"not the pinned {node.commit[:12]}.",
+                "The tag moved upstream. No ComfyUI marker was written; re-pin deliberately.",
+            )
+
+        declared = _declared_dependencies(target)
+        if declared is not None:
+            # The folder is ours and unusable without packages nobody will
+            # install, so it goes rather than being loaded half-working.
+            problem = _remove_owned(target)
+            detail = (
+                "This hub installs no pip dependencies for custom nodes. "
+                "Pin a revision without them, or remove the node from the manifest."
+            )
+            if problem is not None:
+                detail = f"{detail} The folder could not be removed: {problem}"
+            return self.failed(
+                detection,
+                FailureReason.PRECONDITION,
+                f"The custom node {node.id} declares Python dependencies in {declared}.",
+                detail,
+            )
+        return None
+
     def _git_progress(self, context: ProvisionContext, repo_name: str):
         def on_event(event: GitCloneEvent) -> None:
             context.emit(
@@ -729,11 +962,12 @@ class ComfyUIProvisioner(Provisioner):
                 )
             context.emit(
                 self.component_id,
-                f"{pip_event.action.capitalize()} {pip_event.package}",
+                pip_event.message,
                 activity=build_activity(
                     OperationActivityCategory.DEPENDENCY,
                     pip_event.action,
-                    pip_event.package,
+                    pip_event.item,
+                    detail="pip (Python)",
                     elapsed_seconds=elapsed,
                 ),
                 transfer=transfer,
@@ -756,6 +990,72 @@ def _repo_name(url: str | None) -> str:
     trimmed = url.rstrip("/")
     name = trimmed.rsplit("/", 1)[-1]
     return name[: -len(".git")] if name.endswith(".git") else name or "repositório"
+
+
+def _head_is(git: GitClient, directory: Path, commit: str) -> bool:
+    try:
+        return git.head(directory) == commit
+    except GitError:
+        return False
+
+
+def _owns_custom_node(directory: Path) -> bool:
+    return read_marker(directory, component=CUSTOM_NODE_COMPONENT) is not None
+
+
+def _custom_node_problem(git: GitClient, directory: Path, node: PinnedCustomNode) -> str | None:
+    """Why a pinned node does not verify, or None when it does."""
+    label = f"{CUSTOM_NODES_DIR}/{node.id}"
+    if not _owns_custom_node(directory):
+        if directory.exists():
+            return f"{label} exists but was not installed by this hub."
+        return f"The custom node {node.id} is not installed."
+    if not (directory / ".git").exists():
+        return f"{label} is not a checkout; its install did not complete."
+    try:
+        head = git.head(directory)
+    except GitError as exc:
+        return f"Could not read the revision of {label}: {exc}"
+    if head != node.commit:
+        return f"{label} is at {head[:12]} but the pin is {node.commit[:12]}."
+    return None
+
+
+def _declared_dependencies(directory: Path) -> str | None:
+    """Where a node checkout declares pip dependencies, or None when it declares none.
+
+    An empty or comment-only requirements.txt declares nothing. A file that
+    cannot be read is reported as declaring something: it cannot be shown not to.
+    """
+    requirements = directory / "requirements.txt"
+    if requirements.is_file():
+        try:
+            lines = requirements.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            return "requirements.txt (unreadable)"
+        if any(line.strip() and not line.lstrip().startswith("#") for line in lines):
+            return "requirements.txt"
+    pyproject = directory / "pyproject.toml"
+    if pyproject.is_file():
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            return "pyproject.toml (unreadable)"
+        project = data.get("project")
+        if isinstance(project, dict) and project.get("dependencies"):
+            return "pyproject.toml [project].dependencies"
+    return None
+
+
+def _remove_owned(directory: Path) -> str | None:
+    """Delete a folder the Hub created. None on success, else why it was not."""
+    if directory.is_symlink():
+        return f"{directory} is a link; it was not followed or deleted."
+    link = first_link_inside(directory)
+    if link is not None:
+        return f"{link} is a link; {directory} was left in place rather than delete through it."
+    failures = delete_tree(directory)
+    return "; ".join(failures) if failures else None
 
 
 def provisioner_from_pin(
@@ -789,6 +1089,7 @@ def provisioner_from_pin(
         commit=pin.commit,
         url=pin.url,
         dependencies=resolved,
+        custom_nodes=tuple(pin.custom_nodes),
         python_minimum=pin.python_minimum,
         python_below=pin.python_below,
         install_alongside_external=install_alongside_external,

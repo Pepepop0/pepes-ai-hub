@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import psutil
@@ -108,6 +109,37 @@ def test_child_env_can_start_from_nothing():
 # --- start -----------------------------------------------------------------
 
 
+def test_start_writes_a_timestamped_header_to_both_logs_before_spawning(registry, tmp_path):
+    logs = LogFiles(tmp_path / "stdout.log", tmp_path / "stderr.log")
+
+    def spawn(argv, **kwargs):
+        for path in logs.paths:
+            line = path.read_text(encoding="utf-8").strip()
+            timestamp, message = line.split("] ", 1)
+            assert datetime.fromisoformat(timestamp.removeprefix("[")).tzinfo is not None
+            assert message == "[Pepito Hub] fixture: starting process"
+            assert "secret" not in line
+        return SpawnedProcess(4242)
+
+    launcher = ProcessLauncher(registry, spawn=spawn)
+    result = launcher.start(
+        ProcessLaunchSpec("fixture", (sys.executable, "secret"), logs=logs, env={"KEY": "secret"})
+    )
+    assert result.started
+
+
+def test_lifecycle_log_writes_are_best_effort(tmp_path):
+    from local_ai_stack.logs import append_service_event
+
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    good = tmp_path / "good.log"
+    append_service_event(
+        LogFiles(blocked / "stdout.log", good), "fixture", "ready", before_spawn=True
+    )
+    assert "fixture: ready" in good.read_text(encoding="utf-8")
+
+
 def test_start_registers_only_after_a_successful_spawn(registry, tmp_path):
     calls: list = []
     launcher = ProcessLauncher(registry, spawn=fake_spawn(4242, calls), clock=lambda: 99.0)
@@ -189,9 +221,9 @@ def test_real_child_writes_to_its_log_file(registry, tmp_path, reaper):
     assert result.outcome is LaunchOutcome.STARTED
 
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and not read_log_tail(logs.stdout):
+    while time.monotonic() < deadline and "hello from child" not in read_log_tail(logs.stdout):
         time.sleep(0.05)
-    assert read_log_tail(logs.stdout) == ("hello from child",)
+    assert "hello from child" in read_log_tail(logs.stdout)
     assert registry.load().get("fixture").create_time is not None
 
 
@@ -213,9 +245,11 @@ def test_real_child_gets_the_declared_cwd_and_env(registry, tmp_path, reaper):
     reaper.append(result.pid)
 
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and not read_log_tail(logs.stdout):
+    while time.monotonic() < deadline and not any(
+        line.endswith("|yes") for line in read_log_tail(logs.stdout)
+    ):
         time.sleep(0.05)
-    written = read_log_tail(logs.stdout)[0]
+    written = next(line for line in read_log_tail(logs.stdout) if line.endswith("|yes"))
     assert written.endswith("|yes")
     assert Path(written.split("|")[0]).resolve() == workdir.resolve()
     assert "PEPITO_TEST" not in os.environ
@@ -262,9 +296,11 @@ def test_a_grandchild_shares_the_service_console_instead_of_opening_its_own(
     assert result.outcome is LaunchOutcome.STARTED
 
     deadline = time.monotonic() + 20
-    while time.monotonic() < deadline and not read_log_tail(logs.stdout):
+    while time.monotonic() < deadline and not any(
+        line.startswith("console:") for line in read_log_tail(logs.stdout)
+    ):
         time.sleep(0.05)
-    (line,) = read_log_tail(logs.stdout)
+    line = next(line for line in read_log_tail(logs.stdout) if line.startswith("console:"))
     sharing = {int(pid) for pid in line.removeprefix("console:").split()}
     assert result.pid in sharing
     assert os.getpid() not in sharing
@@ -280,10 +316,11 @@ def test_stderr_can_be_a_separate_file(registry, tmp_path, reaper):
     reaper.append(result.pid)
 
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and not read_log_tail(logs.stderr):
+    while time.monotonic() < deadline and "boom" not in read_log_tail(logs.stderr):
         time.sleep(0.05)
-    assert read_log_tail(logs.stderr) == ("boom",)
-    assert read_log_tail(logs.stdout) == ()
+    assert "boom" in read_log_tail(logs.stderr)
+    assert "boom" not in read_log_tail(logs.stdout)
+    assert any("starting process" in line for line in read_log_tail(logs.stdout))
 
 
 # --- stop ------------------------------------------------------------------

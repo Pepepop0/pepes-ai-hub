@@ -1,15 +1,16 @@
 schema_version: 1
 id: capella
 name: Capella
+version: 5.2.0
 ui:
   default_pet: hello-kitty
   default_theme: capella
 description: >-
-  RTX 5090 32 GB — perfil principal: chat com visão e ferramentas num modelo
-  de 27B, geração e edição de imagem a 1024×1024, tudo residente na mesma GPU.
+  RTX 5090 32 GB — perfil principal: chat multimodal de 27B e imagens com
+  Qwen-Image-2.1 (geração, edição e troca de personagem), alternados na mesma GPU.
 
 hardware:
-  os: windows
+  os: [windows, linux]
   gpu_vendor: nvidia
   min_vram_gb: 32
   recommended_vram_gb: 32
@@ -18,9 +19,10 @@ hardware:
   # profile is for.
   vram_tolerance_mib: 256
   notes: >-
-    Single RTX 5090 (32 GB, 32607 MiB reportados). O modelo de chat (17 GB) e
-    os modelos de imagem (12 GB) cabem juntos na VRAM. RAM: 32 GB é o mínimo
-    operacional, 64 GB o recomendado. Multi-GPU fora do escopo v0.1.
+    Single RTX 5090 (32 GB, 32607 MiB reportados). Chat e imagem não ficam
+    residentes juntos: a troca descarrega Ollama antes da imagem e libera o
+    ComfyUI ao terminar. RAM: 32 GB é o mínimo operacional, 64 GB o recomendado.
+    Multi-GPU fora do escopo v0.1.
 
 services:
   ollama: {enabled: true, port: 11434}
@@ -36,26 +38,74 @@ features:
 
 models:
   chat:
-    primary: ollama/qwen3_5_27b
+    primary: ollama/qwen3_8_27b_q5
     status: candidate
-    alternatives: [ollama/qwen3_5_9b]
-    # Qwen3.5 reasons before it answers unless told not to. Measured on the
-    # reference machine: 5-10x the tokens of the answer on a plain chat turn,
-    # 2,684 tokens to write one image prompt. Open WebUI applies this to every
-    # call for the model, its own background tasks included.
-    params: {think: false}
+    alternatives: [ollama/qwen3_5_27b]
+    params: {think: false, num_ctx: 16384}
+    # Seeded once into Open WebUI's record for the chat model (params.system);
+    # an administrator's own edit in Admin → Models is never overwritten.
+    # Abliteration removes refusals but keeps the base model's habit of
+    # inventing image filters; this states plainly how this installation's
+    # images are made.
+    system_prompt: >-
+      Você é um assistente pessoal rodando localmente para um usuário adulto.
+      Responda de forma direta e sem avisos desnecessários. As imagens
+      deste chat são geradas localmente no ComfyUI pelo sistema, nunca por você.
+      Uma imagem só existe quando o sistema informa que ela foi criada.
+      Nunca afirme que criou, está criando ou vai criar uma imagem; nunca invente
+      resultados nem escreva links de imagem, código ou JSON para simulá-los.
+      O sistema informa em cada mensagem se o botão Imagem está ligado. Só peça
+      para ligá-lo quando o sistema disser que está desligado. Responda em
+      português do Brasil.
   image:
-    diffusion: comfyui/flux2_klein_fp8
-    text_encoder: comfyui/qwen_3_4b_encoder
-    vae: comfyui/flux2_vae
+    diffusion: comfyui/qwen_image_2_1_int8
+    text_encoder: comfyui/qwen3vl_8b_int8_encoder
+    vae: comfyui/qwen_image_2_1_vae
+  # Native ComfyUI analysis models for the character swap.
+  swap:
+    segment: comfyui/sam3_1_multiplex
+    depth: comfyui/depth_anything_3_mono_large
 
 workflows:
-  # The card has the room: FLUX.2 Klein at its native megapixel, not the
-  # 512x512 Open WebUI defaults to. The step count is the profile's, too.
-  text_to_image: {manifest_id: flux2_klein_t2i, size: 1024x1024, steps: 20}
-  image_edit: {manifest_id: flux2_klein_edit}
+  # Qwen-Image-2.1 generates and edits with one model, at the steps of
+  # ComfyUI's official template. Never resident together with Ollama.
+  text_to_image: {manifest_id: qwen_image_2_1_t2i, size: 1024x1024, steps: 25}
+  image_edit: {manifest_id: qwen_image_2_1_edit}
+  # The same edit with two and three input images (up to ten are possible).
+  image_edit_2: {manifest_id: qwen_image_2_1_edit_2}
+  image_edit_3: {manifest_id: qwen_image_2_1_edit_3}
+
+# Shared by the main chat and every variant; every pass declared here must be available.
+# An optional `scene` pass (a Krea 2 identity edit) may be added by a pack.
+character_swap:
+  reference: {manifest_id: qwen_image_2_1_edit}
+  marked: {manifest_id: qwen_image_2_1_edit_2}
+  segment: {manifest_id: sam3_people}
+  depth: {manifest_id: da3_depth}
 
 runtime:
-  aggressive_vram_unload: false
-  prefer_single_heavy_model_resident: false
+  aggressive_vram_unload: true
+  prefer_single_heavy_model_resident: true
+  # The Hub loads the chat model into the GPU once the services are up, and Ollama
+  # keeps it there for an hour of silence (its own default is five minutes), so the
+  # first turn after "Iniciar" and the turns after a pause skip the 20 GB disk load.
+  preload_chat_model: true
+  chat_keep_alive: "60m"
+  # ComfyUI's input and output folders keep what the Hub and its filter wrote for a day;
+  # older files go on start and stop (delivered pictures live on in Open WebUI).
+  comfyui_retention_hours: 24
+  # Chat (27B Q5) and the image model alternate on the card: the image filter
+  # unloads Ollama before each image and frees ComfyUI after it.
+  exclusive_image_vram: true
+  # Each Image turn is routed (chat, new picture, edit) and its English prompt
+  # written by the chat model through one JSON-Schema-constrained Ollama call,
+  # before the unload. The word rules remain the fallback.
+  image_router: true
   open_browser: true
+  # The Hub owns Open WebUI's web search settings (its own settings page: on or off, an
+  # optional SearXNG address, an optional Brave key; DuckDuckGo with none of them).
+  web_search: true
+  # Open WebUI asks the 27B for follow-up suggestions and tags after every answer, two
+  # more calls that can load it beside a running picture; both are switched off (the
+  # chat title is kept).
+  quiet_background_tasks: true

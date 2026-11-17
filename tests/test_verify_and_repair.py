@@ -9,6 +9,7 @@ and the Ollama store's records; "nothing written" is the files themselves.
 
 from __future__ import annotations
 
+from first_run_support import CHAT_REFERENCE
 from test_delivery_wave_a import composition  # noqa: F401 -- the real composition fixture
 
 from local_ai_stack.config import config_path
@@ -60,7 +61,7 @@ def test_verifying_a_stopped_installation_starts_downloads_and_writes_nothing(co
 
 def test_verifying_reports_what_a_repair_would_fix(composition):  # noqa: F811
     world, adapter = installed_and_stopped(composition)
-    chat = next(entry for entry in world.ollama.installed if "qwen" in entry.name)
+    chat = next(entry for entry in world.ollama.installed if entry.name == CHAT_REFERENCE)
     world.ollama.installed.remove(chat)
     before = fingerprint(world, adapter)
 
@@ -105,7 +106,7 @@ def test_repairing_a_stopped_installation_leaves_it_stopped(composition):  # noq
 
 def test_an_explicit_repair_still_repairs(composition):  # noqa: F811
     world, adapter = installed_and_stopped(composition)
-    chat = next(entry for entry in world.ollama.installed if "qwen" in entry.name)
+    chat = next(entry for entry in world.ollama.installed if entry.name == CHAT_REFERENCE)
     world.ollama.installed.remove(chat)
     assert not adapter.verify_installation().ok
 
@@ -136,7 +137,7 @@ def test_repairing_a_running_installation_leaves_it_running(composition):  # noq
 # --- a stopped installation is still an installation --------------------------------------
 
 
-def test_a_stopped_installation_is_shown_as_installed_and_can_be_started(composition):  # noqa: F811
+def test_a_stopped_installation_is_shown_as_installed_and_can_be_started(composition, monkeypatch):  # noqa: F811
     """With Ollama stopped its models cannot be read; that must not read as "nothing
     installed" -- which also disabled Start, the one way to make them readable."""
     import asyncio
@@ -153,10 +154,28 @@ def test_a_stopped_installation_is_shown_as_installed_and_can_be_started(composi
         [row] = [row for row in adapter.installation_summaries() if row.active]
         assert row.status == "ready"
         app, _ = tui(adapter)
+        observations = []
+        projections = adapter.projections
+
+        def observe_projections():
+            result = projections()
+            observations.append(result)
+            return result
+
+        monkeypatch.setattr(adapter, "projections", observe_projections)
 
         async def exercise():
             async with app.run_test(size=(120, 40)) as pilot:
                 await settle(pilot)
+                # The replayed Stop outcome remains visible, but must not
+                # invalidate the startup observation and queue another one.
+                assert app.operation_view.succeeded
+                assert (
+                    app.operation_view.operation_id
+                    == adapter.current_operation().last_event.operation_id
+                )
+                assert len(observations) == 1
+                assert not app._installation_view.checking
                 overview = str(app.query_one("#dashboard-overview", Static).content)
                 assert "Nenhuma stack instalada" not in overview
                 assert not app.query_one("#dashboard-start", Button).disabled

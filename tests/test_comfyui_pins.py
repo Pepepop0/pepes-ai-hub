@@ -33,9 +33,19 @@ from local_ai_stack.pyenv import PythonEnvironment
 from local_ai_stack.runner import CommandResult, CommandRunner
 
 URL = "https://github.com/comfyanonymous/ComfyUI.git"
-REVISION = "v0.34.0"
-COMMIT = "12d5279438bfefc058a269eae805ceab6047777f"
+REVISION = "v0.39.0"
+COMMIT = "b0b743566f65daafc423b4fea8a2fbda94b3384a"
 OTHER_COMMIT = "a" * 40
+
+NODES = {
+    "comfyui-krea2edit": (
+        "https://github.com/lbouaraba/comfyui-krea2edit.git",
+        "v2.0.0",
+        "13ef60f20828949becada815d3cbc371eb5ccaab",
+    ),
+}
+NODE_ID = "comfyui-krea2edit"
+NODE_URL, NODE_REVISION, NODE_COMMIT = NODES[NODE_ID]
 
 TORCH_TRIPLE = (
     "torch==2.11.0+cu130",
@@ -101,7 +111,11 @@ class EnvRunner(CommandRunner):
 
 
 class FakeGit(GitClient):
-    """Materializes a checkout instead of contacting a remote."""
+    """Materializes a checkout instead of contacting a remote.
+
+    A node pack lands as what the pinned tag holds: a checkout whose
+    pyproject declares no dependencies, with no requirements.txt.
+    """
 
     def __init__(self, *, head_commit: str = COMMIT, clone_ok: bool = True):
         super().__init__(EnvRunner())
@@ -121,17 +135,23 @@ class FakeGit(GitClient):
             raise GitError("clone refused")
         target = Path(destination)
         self.clones.append((url, str(target), revision))
-        target.mkdir(parents=True, exist_ok=True)
-        (target / "main.py").write_text("comfy", encoding="utf-8")
-        (target / "requirements.txt").write_text("torch\n", encoding="utf-8")
+        (target / ".git").mkdir(parents=True, exist_ok=True)
+        if url == URL:
+            (target / "main.py").write_text("comfy", encoding="utf-8")
+            (target / "requirements.txt").write_text("torch\n", encoding="utf-8")
+        else:
+            (target / "pyproject.toml").write_text(
+                '[project]\nname = "node"\ndependencies = []\n', encoding="utf-8"
+            )
         self.repositories.add(target)
         return CommandResult(argv=("git", "clone"), returncode=0)
 
-    def checkout(self, path, revision, *, allow_dirty=False, dry_run=None):
+    def checkout(self, path, revision, *, allow_dirty=False, ignore=(), dry_run=None):
         return CommandResult(argv=("git", "checkout"), returncode=0)
 
     def head(self, path: Path) -> str:
-        return self.head_commit
+        node = NODES.get(Path(path).name)
+        return node[2] if node and Path(path).parent.name == "custom_nodes" else self.head_commit
 
 
 def context_for(tmp_path: Path, runner: CommandRunner) -> ProvisionContext:
@@ -188,10 +208,18 @@ def test_the_interpreter_range_is_recorded():
     assert provisioner.python_below == (3, 13)
 
 
+def test_the_manifest_pins_the_node_packs():
+    pinned = {
+        node.id: (node.url, node.revision, node.commit) for node in from_manifest().custom_nodes
+    }
+    assert pinned == NODES
+
+
 def test_the_component_no_longer_blocks(tmp_path):
     plan = from_manifest(git=FakeGit()).plan(context_for(tmp_path, EnvRunner()))
     assert [step.action for step in plan.steps] == [
         "clone",
+        "install-custom-node",
         "create-venv",
         "install-requirements",
         "mark-managed",
@@ -210,7 +238,11 @@ def test_apply_runs_the_whole_way_through(tmp_path):
 
     assert result.outcome is ProvisionOutcome.INSTALLED
     assert result.detection.ownership is Ownership.MANAGED
-    assert git.clones == [(URL, str(context.layout.comfyui_app), REVISION)]
+    custom_nodes = context.layout.comfyui_app / "custom_nodes"
+    assert git.clones == [
+        (URL, str(context.layout.comfyui_app), REVISION),
+        *((url, str(custom_nodes / node_id), None) for node_id, (url, _, _) in NODES.items()),
+    ]
 
     pip_call = next(call for call in runner.calls if "pip" in call)
     for requirement in TORCH_TRIPLE:

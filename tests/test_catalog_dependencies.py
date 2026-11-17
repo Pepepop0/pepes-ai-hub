@@ -18,7 +18,7 @@ schema_version: 1
 repositories:
   comfyui:
     url: https://github.com/comfyanonymous/ComfyUI.git
-    revision: v0.34.0
+    revision: v0.39.0
 {extra}
 """
 

@@ -34,7 +34,7 @@ from local_ai_stack.e2e.seams import InjectionPlan
 from local_ai_stack.installation import detect_repo_root
 from local_ai_stack.integration import IntegrationOptions
 from local_ai_stack.model_catalog import model_catalog
-from local_ai_stack.profiles import load_profiles
+from local_ai_stack.profiles import load_profile, load_profiles
 from local_ai_stack.stack_application import (
     StackApplication,
     StackDependencies,
@@ -62,8 +62,14 @@ ALL_PORTS = tuple(CAPELLA_PORTS.values())
 
 
 def capella_yaml() -> str:
-    """Use the shipped profile verbatim; only providers and bytes are controlled."""
-    return (detect_repo_root() / "profiles" / "capella.yaml").read_text(encoding="utf-8")
+    """Use the loaded profile, including installed overlays, with controlled providers."""
+    import yaml
+
+    return yaml.safe_dump(
+        load_profile(detect_repo_root() / "profiles/capella.yaml").raw,
+        allow_unicode=True,
+        sort_keys=False,
+    )
 
 
 @dataclass
@@ -86,7 +92,12 @@ class ControlledStack:
         return self.launchers[-1] if self.launchers else None
 
     def release(self) -> None:
+        self.app.close()
         for launcher in self.launchers:
+            for service_id in tuple(launcher.members):
+                result = launcher.stop(service_id)
+                if not result.stopped:
+                    raise RuntimeError(f"could not stop {service_id}: {result.detail}")
             launcher.close_all()
         self.root.release()
         self.fixture.release()
@@ -129,15 +140,16 @@ def controlled_stack(
         launchers.append(launcher)
         return launcher
 
-    # The commit each ComfyUI pin resolves to comes from the pin itself; the
-    # toolchain never invents one.
+    # The commit each ComfyUI pin (and each custom node it pins) resolves to
+    # comes from the pin itself; the toolchain never invents one.
     from local_ai_stack.integration import default_provisioners
 
-    heads = {
-        provisioner.url: provisioner.commit
-        for provisioner in default_provisioners(IntegrationOptions()).values()
-        if getattr(provisioner, "url", None) and getattr(provisioner, "commit", None)
-    }
+    heads: dict[str, str] = {}
+    for provisioner in default_provisioners(IntegrationOptions()).values():
+        if getattr(provisioner, "url", None) and getattr(provisioner, "commit", None):
+            heads[provisioner.url] = provisioner.commit
+        for node in getattr(provisioner, "custom_nodes", ()):
+            heads[node.url] = node.commit
     runner = ControlledToolchain(heads=heads, env={})
 
     def provisioners(options):
@@ -180,6 +192,7 @@ def controlled_stack(
             chunk_size=TRANSFER_CHUNK,
         ),
         ollama_client=lambda _endpoint: ollama,
+        ollama_preload=ollama.preload,
         config_writer=ControlledConfigWriter(plan),
         launcher=make_launcher,
         http=endpoints.http,

@@ -71,6 +71,12 @@ def test_open_webui_control_spec_wires_health_process_and_logs(layout):
     assert spec.launch.startup_timeout == OPEN_WEBUI_STARTUP_TIMEOUT
 
 
+def test_web_services_tolerate_the_observed_slow_first_start():
+    """Regression: a first Open WebUI start on the RTX 5090 rig missed 120 s, then came up."""
+    assert OPEN_WEBUI_STARTUP_TIMEOUT > 120
+    assert COMFYUI_STARTUP_TIMEOUT >= OPEN_WEBUI_STARTUP_TIMEOUT
+
+
 def test_open_webui_moves_health_and_discovery_together(layout):
     spec = open_webui_control_spec(EXECUTABLE, layout=layout, port=9090)
     assert spec.service.port == 9090
@@ -204,8 +210,9 @@ def test_comfyui_stops_its_proved_runtime_tree_by_default(layout):
     assert comfyui_control_spec(EXECUTABLE, layout=layout).launch.allow_force_kill is True
 
 
-def test_force_kill_stays_off_for_open_webui(layout):
-    assert open_webui_control_spec(EXECUTABLE, layout=layout).launch.allow_force_kill is False
+def test_open_webui_stops_its_proved_server_tree_by_default(layout):
+    """Regression (RTX 5090 rig): the launcher stopped, its Python server stayed up."""
+    assert open_webui_control_spec(EXECUTABLE, layout=layout).launch.allow_force_kill is True
 
 
 def test_paths_survive_as_strings(tmp_path):
@@ -216,11 +223,10 @@ def test_paths_survive_as_strings(tmp_path):
 
 
 def test_ollama_is_given_time_to_probe_every_gpu_before_it_answers():
-    """Measured: 13 s and then 27 s of GPU discovery on one machine with an
-    integrated AMD GPU next to the NVIDIA one; a 20 s wait failed a healthy start."""
+    """A cold first start can take minutes to finish GPU discovery."""
     from local_ai_stack.adapters import OLLAMA_STARTUP_TIMEOUT, ollama_control_spec
 
     spec = ollama_control_spec("ollama.exe")
     assert spec.launch is not None
     assert spec.launch.startup_timeout == OLLAMA_STARTUP_TIMEOUT
-    assert OLLAMA_STARTUP_TIMEOUT >= 60
+    assert OLLAMA_STARTUP_TIMEOUT >= 600

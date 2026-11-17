@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Avaliação</title>
+<style>
+:root{color-scheme:dark;--bg:#141517;--panel:#1d1f22;--raised:#26292d;--border:#363a40;--fg:#eceef0;--muted:#9aa1a9;--accent:#e8a15a;--S:#4fbf7a;--P:#e6b84a;--N:#e06a6a}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.45 "Segoe UI",system-ui,sans-serif;display:grid;grid-template-rows:auto auto 1fr auto;overflow:hidden}
+button,textarea,select{font:inherit;color:inherit}
+button{background:var(--raised);border:1px solid var(--border);border-radius:8px;padding:6px 12px;cursor:pointer;min-height:34px}
+select{background:var(--raised);border:1px solid var(--border);border-radius:6px;padding:4px;max-width:100%}
+button:hover{border-color:#525861}button:focus-visible,textarea:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+header{display:flex;align-items:center;gap:8px;padding:8px 14px;border-bottom:1px solid var(--border);background:var(--panel);flex-wrap:wrap}
+header h1{font-size:15px;margin:0 12px 0 0;font-weight:600}
+.cases{display:flex;gap:4px;flex-wrap:wrap}
+.cases button[aria-current=true]{background:var(--accent);color:#1a1205;border-color:var(--accent);font-weight:600}
+.cases .done::after{content:" ✓";color:var(--S)}
+.cases .good{border-color:var(--S);color:var(--S)}.cases .good::after{content:" boa";font-size:11px}
+#good[aria-pressed=true]{background:var(--S);color:#062;border-color:var(--S)}
+.hidegood{display:inline-flex;align-items:center;gap:4px;color:var(--muted);font-size:12px}
+.spacer{flex:1}
+.ask{padding:6px 14px;border-bottom:1px solid var(--border);color:var(--muted);max-height:84px;overflow:auto;display:flow-root}
+.ask b{color:var(--fg)}
+.ask .ref{float:left;margin:0 12px 0 0;color:var(--muted);font-size:11px;text-align:center}
+.ask .ref img{display:block;height:56px;border-radius:4px;border:1px solid var(--border)}
+main{display:grid;grid-template-columns:1fr 360px;min-height:0}
+.viewer{display:grid;grid-template-rows:auto 1fr auto;min-height:0;border-right:1px solid var(--border)}
+.vbar{display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;background:transparent}.seg button[aria-pressed=true]{background:var(--raised);color:var(--accent)}
+.panes{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:6px;min-height:0}
+.pane{position:relative;overflow:hidden;background:#0c0d0e;border-radius:8px;cursor:grab;touch-action:none;user-select:none}
+.pane.drag{cursor:grabbing}
+.pane img{position:absolute;left:0;top:0;transform-origin:0 0;image-rendering:auto;pointer-events:none;max-width:none}
+.pane canvas.marks{position:absolute;left:0;top:0;transform-origin:0 0;pointer-events:none;z-index:1}
+.pane.paint{cursor:crosshair}
+.brush{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+.brush input{width:90px}
+.seg button[data-brush=f][aria-pressed=true]{color:var(--N)}.seg button[data-brush=g][aria-pressed=true]{color:var(--S)}
+.tag{position:absolute;left:8px;top:8px;background:#000a;padding:3px 8px;border-radius:6px;font-size:12px;z-index:2;pointer-events:none}
+.zoom{color:var(--muted);font-variant-numeric:tabular-nums;min-width:52px;text-align:right}
+aside{display:flex;flex-direction:column;min-height:0}
+.list{overflow:auto;flex:1;padding:6px}
+.item{border:1px solid var(--border);border-radius:10px;padding:8px;margin-bottom:6px;background:var(--panel)}
+.item[aria-current=true]{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.row{display:flex;align-items:center;gap:6px}
+.name{flex:1;font-weight:600;cursor:pointer;background:none;border:0;text-align:left;padding:0;min-height:0}
+.meta{color:var(--muted);font-size:12px;margin:2px 0 6px}
+.rate button{min-width:34px;padding:4px 8px}
+.rate button[aria-pressed=true][data-v=S]{background:var(--S);color:#062;border-color:var(--S)}
+.rate button[aria-pressed=true][data-v=P]{background:var(--P);color:#431;border-color:var(--P)}
+.rate button[aria-pressed=true][data-v=N]{background:var(--N);color:#300;border-color:var(--N)}
+.rate button[aria-pressed=true][data-v="--"]{background:#b84444;color:#fff;border-color:#b84444}
+.rate button[aria-pressed=true][data-v="-"]{background:var(--N);color:#300;border-color:var(--N)}
+.rate button[aria-pressed=true][data-v="="]{background:var(--muted);color:#111;border-color:var(--muted)}
+.rate button[aria-pressed=true][data-v="+"]{background:#8fd4a5;color:#062;border-color:#8fd4a5}
+.rate button[aria-pressed=true][data-v="++"]{background:var(--S);color:#062;border-color:var(--S)}
+.basenote{color:var(--muted);font-size:12px}
+.prompts{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:0 6px 6px}
+.prompts details{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:3px 8px;min-width:0}
+.prompts summary{cursor:pointer;color:var(--muted);font-size:12px}
+.prompts pre{white-space:pre-wrap;margin:4px 0 2px;max-height:120px;overflow:auto;font:12px/1.4 Consolas,ui-monospace,monospace}
+.seg[hidden]{display:none}
+.fav{font-size:18px;line-height:1;padding:4px 8px}.fav[aria-pressed=true]{color:var(--accent);border-color:var(--accent)}
+textarea{width:100%;min-height:44px;resize:vertical;background:#121315;border:1px solid var(--border);border-radius:8px;padding:6px;margin-top:6px}
+.badge{font-size:11px;border-radius:999px;padding:1px 7px;border:1px solid var(--border);color:var(--muted)}
+footer{display:flex;gap:14px;padding:6px 14px;border-top:1px solid var(--border);color:var(--muted);font-size:12px;flex-wrap:wrap}
+kbd{background:var(--raised);border:1px solid var(--border);border-radius:4px;padding:0 5px;font-size:11px}
+#toast{position:fixed;bottom:44px;left:50%;transform:translateX(-50%);background:var(--raised);border:1px solid var(--border);padding:8px 14px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none}
+#toast.on{opacity:1}
+.missing{position:absolute;inset:0;display:grid;place-items:center;margin:0;padding:24px;text-align:center;color:var(--muted)}
+.missing[hidden]{display:none}
+.item.unavailable{opacity:.62}
+button:disabled{cursor:not-allowed;opacity:.5}
+@media (max-width:1000px){main{grid-template-columns:1fr}aside{max-height:40vh}}
+@media (prefers-reduced-motion:reduce){#toast{transition:none}}
+</style></head><body>
+<header>
+  <h1 id="title">Avaliação</h1>
+  <div class="cases" id="cases" role="tablist" aria-label="Casos"></div>
+  <span class="spacer"></span>
+  <span id="progress" class="badge"></span>
+  <button id="seedcopy" type="button" title="Copia as notas e comentários da outra semente deste pedido para os campos que ainda estão vazios (S)">Copiar da outra semente</button>
+  <button id="good" type="button" aria-pressed="false" title="Este caso já está bom: sai da avaliação e dos próximos labs (B)">Já está boa</button>
+  <label class="hidegood"><input type="checkbox" id="hidegood" checked> ocultar as boas</label>
+  <button id="export" type="button">Exportar avaliação</button>
+  <button id="copy" type="button">Copiar tabela</button>
+  <button id="import" type="button">Importar avaliação</button>
+  <input id="importFile" type="file" accept=".json,.md,.txt,application/json,text/markdown,text/plain" hidden>
+</header>
+<div>
+<div class="ask" id="ask"></div>
+</div>
+<main>
+  <section class="viewer" aria-label="Comparação">
+    <div class="vbar">
+      <div class="seg" role="group" aria-label="Imagem da variante">
+        <button type="button" data-kind="final" aria-pressed="true">Final</button>
+        <button type="button" data-kind="raw" aria-pressed="false" title="Tab alterna entre final e saída bruta, fora dos campos de texto e seleção">Saída bruta (Tab)</button>
+      </div>
+      <div class="seg" role="group" aria-label="Modo">
+        <button type="button" data-mode="side" aria-pressed="true">Lado a lado</button>
+        <button type="button" data-mode="flip" aria-pressed="false">Alternar (segure Espaço)</button>
+      </div>
+      <div class="seg" role="group" aria-label="Imagem da esquerda" id="leftseg" hidden>
+        <button type="button" data-left="scene" aria-pressed="true" title="À esquerda, a imagem antes da edição (O alterna)">Original sem edições</button>
+        <button type="button" data-left="base" aria-pressed="false" title="Comparar diretamente com o resultado de referência (O alterna)">Resultado de referência</button>
+      </div>
+      <div class="seg" role="group" aria-label="Pincel">
+        <button type="button" data-brush="" aria-pressed="true" title="Arrastar move a imagem">Mover</button>
+        <button type="button" data-brush="f" aria-pressed="false" title="Pinte onde está errado (M alterna)">Pintar falha</button>
+        <button type="button" data-brush="g" aria-pressed="false" title="Pinte o que ficou bom (M alterna)">Pintar acerto</button>
+      </div>
+      <label class="brush">Pincel <input type="range" id="bsize" min="3" max="60" value="14" aria-label="Tamanho do pincel"></label>
+      <button type="button" id="bundo" title="Desfaz a última marca desta imagem (Ctrl+Z)">Desfazer marca</button>
+      <button type="button" id="bhide" aria-pressed="false" title="Esconde as marcas para ver por baixo (H)">Ocultar marcas</button>
+      <span class="spacer"></span>
+      <button type="button" id="zout" aria-label="Diminuir zoom">−</button>
+      <span class="zoom" id="zlabel">100%</span>
+      <button type="button" id="zin" aria-label="Aumentar zoom">+</button>
+      <button type="button" id="zfit">Ajustar</button>
+      <button type="button" id="z1">1:1</button>
+    </div>
+    <div class="panes" id="panes">
+      <div class="pane" id="pa"><span class="tag" id="ta">Base (original)</span><img id="ia" alt="Imagem da esquerda"><canvas class="marks" id="ca"></canvas></div>
+      <div class="pane" id="pb"><span class="tag" id="tb"></span><img id="ib" alt="Variante"><canvas class="marks" id="cb"></canvas><p class="missing" id="mb" hidden></p></div>
+    </div>
+    <div class="prompts" id="prompts">
+      <details id="pda"><summary>Prompt da imagem da esquerda</summary><pre id="pta"></pre></details>
+      <details id="pdb"><summary>Prompt desta variante</summary><pre id="ptb"></pre></details>
+    </div>
+  </section>
+  <aside aria-label="Variantes">
+    <div class="list" id="list"></div>
+  </aside>
+</main>
+<footer>
+  <span><kbd>←</kbd><kbd>→</kbd> variante</span><span><kbd>↑</kbd><kbd>↓</kbd> caso</span>
+  <span id="keys"></span><span><kbd>F</kbd> favorita · <kbd>S</kbd> copiar da outra semente</span>
+  <span><kbd>R</kbd> final/bruta</span><span><kbd>Espaço</kbd> mostrar a esquerda</span>
+  <span>roda do mouse = zoom · arrastar = mover · duplo clique = ajustar</span>
+  <span><kbd>M</kbd> pincel falha/acerto/mover · <kbd>H</kbd> ocultar marcas · <kbd>Ctrl</kbd>+<kbd>Z</kbd> desfazer · com o pincel, botão direito move · <kbd>B</kbd> caso já está bom</span>
+  <span>Tudo salva automaticamente neste navegador.</span>
+</footer>
+<div id="toast" role="status" aria-live="polite"></div>
+<script>
+'use strict';
+const DATA = /*__EDIT_LAB_DATA__*/[];
+const KEY = /*__REVIEW_KEY__*/'';
+const PAGE = /*__REVIEW_PAGE__*/{};
+// One storage key per lab and round (scripts/lab_common.py review_page): ratings of another lab
+// or of an earlier round never load here, and the export carries only this page's cases.
+let store = Object.create(null), writable = !!KEY;
+try { const text = KEY ? localStorage.getItem(KEY) : null; if (text) { const parsed = JSON.parse(text); if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) store = parsed; } }
+catch { writable = false; }
+function save(){ if (!writable) return; try { localStorage.setItem(KEY, JSON.stringify(store)); } catch { writable = false; toast('Não foi possível salvar no navegador. Exporte a avaliação.'); } }
+const $ = s => document.querySelector(s);
+const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+const st = {c: 0, v: 0, kind: 'final', mode: 'side', z: 1, x: 0, y: 0, fitted: true, peek: false, brush: '', size: 14, hide: false, left: 'scene', prompt: false};
+// Painted marks: strokes in image coordinates (0..1), kept with the rating and exported in
+// its JSON, so a failure can be located on the picture, not only described.
+const BRUSH = {f: 'rgba(240,64,64,0.5)', g: 'rgba(64,200,110,0.5)'};
+const BRUSH_NAME = {f: 'falha', g: 'acerto'};
+function strokes(r){ if (!Array.isArray(r.m)) r.m = []; return r.m; }
+function cleanStroke(s){
+  if (!s || !['f','g'].includes(s.k) || !Number.isFinite(s.r) || !Array.isArray(s.p)) return null;
+  const p = s.p.filter(q => Array.isArray(q) && q.length === 2 && q.every(n => Number.isFinite(n) && n >= -0.1 && n <= 1.1)).slice(0, 4000);
+  return p.length ? {k: s.k, r: Math.min(0.2, Math.max(0.0005, s.r)), p} : null;
+}
+function markSummary(r){ const m = Array.isArray(r.m) ? r.m : []; const f = m.filter(s => s.k === 'f').length, g = m.length - f; return m.length ? `marcas: ${f} falha${f === 1 ? '' : 's'}, ${g} acerto${g === 1 ? '' : 's'}` : ''; }
+const hashCase = DATA.findIndex(c => '#' + c.id === location.hash); if (hashCase >= 0) st.c = hashCase;
+function rec(c, v){ if (!own(store, c) || !store[c] || typeof store[c] !== 'object') store[c] = {}; const s = store[c]; if (!own(s, v) || !s[v] || typeof s[v] !== 'object') s[v] = {r: '', fav: false, note: ''}; return s[v]; }
+const saved = (c, v) => { const s = own(store, c.id) ? store[c.id] : null; return s && own(s, v.id) && s[v.id] && typeof s[v.id] === 'object' ? s[v.id] : null; };
+const label = v => v.label || v.id;
+const pct = x => x == null ? '–' : Math.round(x * 100) + '%';
+// The original stays on the left by default; every method, including the current one,
+// can be selected on the right. A ``base`` result remains the neutral reference for
+// relative ratings; changing the left picture never changes the meaning of a saved rating.
+const RELATIVE = [['--', '−−', 'Muito pior que a base'], ['-', '−', 'Pior que a base'], ['=', '=', 'Igual à base (neutro)'], ['+', '+', 'Melhor que a base'], ['++', '++', 'Muito melhor que a base']];
+const ABSOLUTE = [['S', 'S', 'Fez o pedido'], ['P', 'P', 'Parcial'], ['N', 'N', 'Não fez']];
+const baseOf = c => c.variants.find(v => v.base && v.ok) || null;
+const scaleOf = c => baseOf(c) ? RELATIVE : ABSOLUTE;
+const RATINGS = [...RELATIVE, ...ABSOLUTE].map(([value]) => value);
+const ratable = v => v.ok && !v.base;
+// Rated: nothing is left to do.
+const settled = (c, v) => { const r = saved(c, v); return !!(r && r.r); };
+function toast(t){const e=$('#toast');e.textContent=t;e.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('on'),2400)}
+// Imports only this page's cases and variants: an export of another lab or round adds nothing.
+function merge(incoming){
+  if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) return 0;
+  let count = 0;
+  for (const c of DATA) {
+    const variants = own(incoming, c.id) ? incoming[c.id] : null;
+    if (!variants || typeof variants !== 'object') continue;
+    for (const variantId of ['_case', ...c.variants.map(v => v.id)]) {
+      const value = own(variants, variantId) ? variants[variantId] : null;
+      if (!value || typeof value !== 'object') continue;
+      const r = rec(c.id, variantId);
+      if (variantId === '_case') { if (value.good === true) r.good = true; count++; continue; }
+      if (!r.r && RATINGS.includes(value.r)) r.r = value.r;
+      if (value.fav === true) r.fav = true;
+      const note = typeof value.note === 'string' ? value.note.trim() : '';
+      const local = String(r.note || '');
+      if (note && local !== note && !local.split('\n').includes('[Importado] ' + note)) r.note = local ? local + '\n[Importado] ' + note : note;
+      if (!r.raw_r && ABSOLUTE.some(([key])=>key===value.raw_r)) r.raw_r = value.raw_r;
+      const rawNote = typeof value.raw_note === 'string' ? value.raw_note.trim() : '';
+      if (rawNote && r.raw_note !== rawNote && !String(r.raw_note||'').split('\n').includes('[Importado] '+rawNote))
+        r.raw_note = r.raw_note ? r.raw_note+'\n[Importado] '+rawNote : rawNote;
+      if (Array.isArray(value.m) && !strokes(r).length) r.m = value.m.map(cleanStroke).filter(Boolean);
+      count++;
+    }
+  }
+  return count;
+}
+function ratedCount(c){ return c.variants.filter(v => ratable(v) && settled(c, v)).length; }
+function caseDone(c){ return c.variants.every(v => !ratable(v) || settled(c, v)); }
+// "Já está boa": the case needs no more rating. It leaves the tabs and the count, its
+// flag goes out in the export (the labs skip it next time) and the page can preset it.
+function isGood(c){ const s = store[c.id]; const r = s && own(s, '_case') ? s._case : null; return r && typeof r.good === 'boolean' ? r.good : !!c.good; }
+function setGood(c, value){ rec(c.id, '_case').good = value; save(); }
+function visible(){ const hide = $('#hidegood').checked; return DATA.map((c, i) => i).filter(i => !hide || !isGood(DATA[i]) || i === st.c); }
+function step(delta){ const pool = DATA.map((c, i) => i).filter(i => !$('#hidegood').checked || !isGood(DATA[i])); if (!pool.length) return;
+  const after = pool.find(i => delta > 0 ? i > st.c : false), before = [...pool].reverse().find(i => i < st.c);
+  st.c = delta > 0 ? (after ?? pool[0]) : (before ?? pool[pool.length - 1]); st.v = firstOpen(DATA[st.c]); render(); }
+function renderCases(){
+  const box=$('#cases');box.replaceChildren();
+  for(const i of visible()){const c=DATA[i];const b=document.createElement('button');b.type='button';b.role='tab';b.textContent=c.id;
+    b.title=c.ask||'';b.setAttribute('aria-current',i===st.c);if(isGood(c))b.classList.add('good');else if(caseDone(c))b.classList.add('done');
+    b.onclick=()=>{st.c=i;st.v=firstOpen(c);st.fitted=true;render()};box.append(b)}
+  const open=DATA.filter(c=>!isGood(c)),good=DATA.length-open.length;
+  const total=open.reduce((n,c)=>n+c.variants.filter(ratable).length,0), done=open.reduce((n,c)=>n+ratedCount(c),0);
+  $('#progress').textContent=`${done}/${total} avaliadas`+(good?` · ${good} já boa${good===1?'':'s'}`:'');
+  $('#good').setAttribute('aria-pressed',String(isGood(DATA[st.c])));
+}
+function button(text, attributes){ const b=document.createElement('button'); b.type='button'; b.textContent=text; for (const [k,v] of Object.entries(attributes||{})) b.setAttribute(k,v); return b; }
+function metaText(v){
+  if(!v.ok)return `Sem saída real: ${v.status}${v.error?' — '+v.error:''}`;
+  if(typeof v.meta==='string')return v.meta;
+  return `mudou ${pct(v.changed)} da área · fora da área ${v.outside==null?'–':v.outside.toFixed(1)} · ${v.seconds==null?'–':Math.round(v.seconds)+' s'}`;
+}
+function renderList(){
+  const c=DATA[st.c], list=$('#list');list.replaceChildren();
+  c.variants.forEach((v,i)=>{const r=rec(c.id,v.id);
+    const el=document.createElement('div');el.className='item'+(v.ok?'':' unavailable');el.setAttribute('aria-current',i===st.v);
+    const row=document.createElement('div');row.className='row';
+    const name=button(label(v),{class:'name',title:v.note||''});
+    const badge=document.createElement('span');badge.className='badge';badge.textContent=v.base?'referência':v.id.split('_')[0];
+    const fav=button('★',{class:'fav','aria-label':'Favorita','aria-pressed':String(!!r.fav)});fav.disabled=!v.ok;
+    row.append(name,badge,fav);
+    const meta=document.createElement('div');meta.className='meta';meta.textContent=metaText(v);
+    if(v.last_attempt)meta.textContent+=` · última tentativa: ${v.last_attempt.status}${v.last_attempt.error?' — '+v.last_attempt.error:''} (saída anterior preservada)`;
+    if(markSummary(r))meta.textContent+=` · ${markSummary(r)}`;
+    const rate=document.createElement('div');rate.className='row rate';rate.setAttribute('role','group');rate.setAttribute('aria-label','Nota');
+    if(v.base)rate.append(Object.assign(document.createElement('span'),{className:'basenote',textContent:'Referência das notas. Selecione acima para ver este resultado à direita; as demais opções são avaliadas contra ele.'}));
+    else{for(const [value,text,title] of scaleOf(c)){const b=button(text,{'data-v':value,'aria-pressed':String(r.r===value),title});b.disabled=!v.ok;b.onclick=()=>{st.v=i;setRate(value)};rate.append(b)}}
+    const ta=document.createElement('textarea');ta.setAttribute('aria-label','Comentário');ta.placeholder='Comentário (ex.: estragou o rosto)';ta.value=r.note||'';
+    ta.oninput=()=>{r.note=ta.value;save()};ta.onfocus=()=>{if(st.v!==i){st.v=i;renderView();markCurrent()}};
+    name.onclick=()=>{st.v=i;renderView();renderList()};fav.onclick=()=>setFav(i);
+    el.append(row,meta,rate,ta);
+    if(v.ok&&v.paths.raw){
+      const rawBox=document.createElement('fieldset');rawBox.style.margin='10px 0 0';rawBox.style.border='1px solid var(--border)';
+      const legend=document.createElement('legend');legend.textContent='Saída bruta — sem máscara';
+      const rawLabel=document.createElement('label');rawLabel.textContent='Atendeu ao pedido? ';
+      const rawSelect=document.createElement('select');rawSelect.setAttribute('aria-label',`Nota da saída bruta — ${label(v)}`);
+      for(const [value,text] of [['','Sem nota'],...ABSOLUTE.map(([value,,text])=>[value,text])]){
+        const option=document.createElement('option');option.value=value;option.textContent=text;rawSelect.append(option)}
+      rawSelect.value=r.raw_r||'';
+      const rawText=document.createElement('textarea');rawText.setAttribute('aria-label',`Comentário da saída bruta — ${label(v)}`);rawText.placeholder='Comentário só sobre a imagem sem máscara';rawText.value=r.raw_note||'';
+      const showRaw=()=>{st.v=i;st.kind='raw';st.peek=false;renderView();markCurrent()};
+      rawSelect.onfocus=showRaw;rawText.onfocus=showRaw;
+      rawSelect.onchange=()=>{r.raw_r=rawSelect.value;save()};
+      rawText.oninput=()=>{r.raw_note=rawText.value;save()};
+      rawLabel.append(rawSelect);rawBox.append(legend,rawLabel,rawText);el.append(rawBox);
+    }
+    list.append(el)});
+}
+function markCurrent(){[...$('#list').children].forEach((e,i)=>e.setAttribute('aria-current',i===st.v))}
+function setRate(value){const c=DATA[st.c],v=c.variants[st.v];if(!ratable(v))return;const r=rec(c.id,v.id);r.r=r.r===value?'':value;save();renderList();renderCases()}
+function setFav(i){const c=DATA[st.c],v=c.variants[i];if(!v.ok)return;const r=rec(c.id,v.id);r.fav=!r.fav;save();renderList()}
+// The prompt that made a picture, under it, folded; one open/closed state for both.
+function showPrompt(box, pre, text){const d=$(box);
+  if(text==null){d.hidden=true;return}
+  d.hidden=false;d.style.visibility=text?'':'hidden';$(pre).textContent=text||'';if(d.open!==st.prompt)d.open=st.prompt}
+for(const id of ['#pda','#pdb'])$(id).addEventListener('toggle',e=>{if(e.target.style.visibility==='hidden')return;st.prompt=e.target.open;for(const other of ['#pda','#pdb'])if($(other).open!==st.prompt)$(other).open=st.prompt});
+function renderView(){
+  const c=DATA[st.c],v=c.variants[st.v];
+  const a=$('#ask');a.replaceChildren(Object.assign(document.createElement('b'),{textContent:`${c.id}${c.ask?' — '+c.ask:''}. `}),document.createTextNode(c.instruction||''));
+  for(const ref of [...(c.references||(c.reference?[{src:c.reference,label:'Referência'}]:[]))].reverse()){
+    const r=Object.assign(document.createElement('a'),{className:'ref',href:ref.src,target:'_blank',title:'Abrir: '+ref.label});
+    r.append(Object.assign(document.createElement('img'),{src:ref.src,alt:ref.label}),ref.label);a.prepend(r)}
+  // The untouched input is the default left picture; the reference result is also an
+  // ordinary selectable option on the right, or an optional direct comparison on the left.
+  const base=baseOf(c),onBase=!!base&&st.left==='base';
+  const left=onBase?base.paths.final:c.source,leftName=onBase?`Referência: ${label(base)}`:'Original — sem edições';
+  if(left&&$('#ia').getAttribute('src')!==left)$('#ia').src=left;
+  $('#ta').textContent=leftName;$('#leftseg').hidden=!base;
+  document.querySelectorAll('[data-left]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.left===(onBase?'base':'scene')));
+  // A variant without a raw output (one picture per job) always shows its final.
+  const kind=v.ok&&st.kind==='raw'&&v.paths.raw?'raw':'final';
+  const path=st.peek?left:(v.ok?v.paths[kind]:null);
+  const ib=$('#ib'),mb=$('#mb');
+  if(path){ib.hidden=false;mb.hidden=true;if(ib.getAttribute('src')!==path)ib.src=path;}
+  else{ib.hidden=true;ib.removeAttribute('src');mb.hidden=false;mb.textContent=`Sem saída real: ${v.status}${v.error?' — '+v.error:''}`;}
+  $('#tb').textContent=st.peek?`${leftName} (segurando Espaço)`:`${label(v)} · ${v.ok?(kind==='final'?'final':'saída bruta'):'sem saída'}`;
+  document.querySelectorAll('[data-kind]').forEach(b=>{b.setAttribute('aria-pressed',b.dataset.kind===kind);b.disabled=b.dataset.kind==='raw'&&!(v.ok&&v.paths.raw)});
+  document.querySelectorAll('[data-mode]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.mode===st.mode));
+  const columns=st.mode==='flip'?'1fr':'1fr 1fr';
+  $('#pa').hidden=st.mode==='flip';$('#panes').style.gridTemplateColumns=columns;$('#prompts').style.gridTemplateColumns=columns;
+  showPrompt('#pda','#pta',st.mode==='flip'?null:(onBase?base.prompt:c.prompt)||'');
+  showPrompt('#pdb','#ptb',(st.peek?(onBase?base.prompt:c.prompt):v.prompt)||'');
+  try{history.replaceState(null,'','#'+c.id)}catch{}
+  // Both pictures live in one frame, the variant's own size: the lab's outputs are not the
+  // size of their source (about 1 MP on a canvas), and one zoom/pan over two natural sizes
+  // put the panes and the painted marks out of step.
+  const go=()=>{if(st.fitted)fit();else apply();drawMarks()};
+  for(const el of [$('#ia'),$('#ib')])el.onload=go;
+  if($('#ia').complete&&$('#ia').naturalWidth)go();
+  document.querySelectorAll('[data-brush]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.brush===st.brush));
+  $('#bhide').setAttribute('aria-pressed',String(st.hide));
+  for(const p of [$('#pa'),$('#pb')])p.classList.toggle('paint',!!st.brush);
+  $('#keys').innerHTML=scaleOf(c).map(([,text],i)=>`<kbd>${i+1}</kbd> ${text}`).join(' ')+(base?' · <kbd>O</kbd> esquerda: base/cena':'');
+}
+function natural(){const b=$('#ib'),a=$('#ia'),i=b&&b.naturalWidth&&!b.hidden?b:a;return [i.naturalWidth||1024,i.naturalHeight||1536]}
+function paneBox(){const p=st.mode==='flip'?$('#pb'):$('#pa');return [p.clientWidth,p.clientHeight]}
+function fit(){const [w,h]=natural(),[pw,ph]=paneBox();st.z=Math.min(pw/w,ph/h);st.x=(pw-w*st.z)/2;st.y=(ph-h*st.z)/2;st.fitted=true;apply()}
+function apply(){const [w,h]=natural();for(const i of [$('#ia'),$('#ib')]){i.style.width=w+'px';i.style.height=h+'px';i.style.objectFit='contain'}
+  for(const i of [$('#ia'),$('#ib'),$('#ca'),$('#cb')])i.style.transform=`translate(${st.x}px,${st.y}px) scale(${st.z})`;$('#zlabel').textContent=Math.round(st.z*100)+'%'}
+function drawStroke(g,s,w,h){g.strokeStyle=g.fillStyle=BRUSH[s.k]||BRUSH.f;g.lineWidth=s.r*w*2;g.lineCap='round';g.lineJoin='round';g.beginPath();
+  if(s.p.length===1){g.arc(s.p[0][0]*w,s.p[0][1]*h,s.r*w,0,Math.PI*2);g.fill();return}
+  s.p.forEach(([x,y],i)=>i?g.lineTo(x*w,y*h):g.moveTo(x*w,y*h));g.stroke()}
+// The variant's marks on its pane, and the same marks fainter on the base, to compare.
+function drawMarks(){const c=DATA[st.c],v=c&&c.variants[st.v];const [w,h]=natural();
+  for(const [id,alpha] of [['cb',1],['ca',0.55]]){const cv=$('#'+id);if(cv.width!==w||cv.height!==h){cv.width=w;cv.height=h}
+    const g=cv.getContext('2d');g.clearRect(0,0,w,h);cv.style.display=st.hide?'none':'';if(!v||!v.ok)continue;
+    g.globalAlpha=alpha;for(const s of strokes(rec(c.id,v.id)))drawStroke(g,s,w,h);g.globalAlpha=1}}
+function setBrush(kind){st.brush=kind;renderView()}
+function undoMark(){const c=DATA[st.c],v=c.variants[st.v];if(!v.ok)return;const m=strokes(rec(c.id,v.id));if(!m.length)return;m.pop();save();drawMarks();renderList()}
+function zoomAt(f,cx,cy){const nz=Math.min(16,Math.max(0.05,st.z*f));st.x=cx-(cx-st.x)*nz/st.z;st.y=cy-(cy-st.y)*nz/st.z;st.z=nz;st.fitted=false;apply()}
+function center(){const [pw,ph]=paneBox();return [pw/2,ph/2]}
+for(const p of [$('#pa'),$('#pb')]){
+  p.addEventListener('wheel',e=>{e.preventDefault();const r=p.getBoundingClientRect();zoomAt(e.deltaY<0?1.2:1/1.2,e.clientX-r.left,e.clientY-r.top)},{passive:false});
+  p.addEventListener('contextmenu',e=>{if(st.brush)e.preventDefault()});
+  p.addEventListener('pointerdown',e=>{p.setPointerCapture(e.pointerId);const c=DATA[st.c],v=c.variants[st.v];
+    if(st.brush&&e.button===0&&v.ok&&!st.peek){
+      // Paint: pointer -> image coordinates (0..1); the brush size is in screen pixels.
+      const [w,h]=natural(),box=p.getBoundingClientRect();
+      const at=ev=>[+(((ev.clientX-box.left-st.x)/st.z)/w).toFixed(4),+(((ev.clientY-box.top-st.y)/st.z)/h).toFixed(4)];
+      const s={k:st.brush,r:+((st.size/2/st.z)/w).toFixed(5),p:[at(e)]};strokes(rec(c.id,v.id)).push(s);drawMarks();
+      const mv=ev=>{const q=at(ev),last=s.p[s.p.length-1];if(Math.hypot((q[0]-last[0])*w,(q[1]-last[1])*h)>=Math.max(1,s.r*w/3)){s.p.push(q);drawMarks()}};
+      const up=()=>{p.removeEventListener('pointermove',mv);p.removeEventListener('pointerup',up);p.removeEventListener('pointercancel',up);save();renderList()};
+      p.addEventListener('pointermove',mv);p.addEventListener('pointerup',up);p.addEventListener('pointercancel',up);return}
+    p.classList.add('drag');const sx=e.clientX-st.x,sy=e.clientY-st.y;
+    const mv=ev=>{st.x=ev.clientX-sx;st.y=ev.clientY-sy;st.fitted=false;apply()};
+    const up=()=>{p.classList.remove('drag');p.removeEventListener('pointermove',mv);p.removeEventListener('pointerup',up);p.removeEventListener('pointercancel',up)};
+    p.addEventListener('pointermove',mv);p.addEventListener('pointerup',up);p.addEventListener('pointercancel',up)});
+  p.addEventListener('dblclick',fit);
+}
+$('#ib').onload=apply;
+$('#zin').onclick=()=>zoomAt(1.25,...center());$('#zout').onclick=()=>zoomAt(1/1.25,...center());$('#zfit').onclick=fit;
+$('#z1').onclick=()=>{const [cx,cy]=center();zoomAt(1/st.z,cx,cy)};
+document.querySelectorAll('[data-kind]').forEach(b=>b.onclick=()=>{st.kind=b.dataset.kind;renderView()});
+document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>{st.mode=b.dataset.mode;renderView();requestAnimationFrame(()=>st.fitted?fit():apply())});
+document.querySelectorAll('[data-brush]').forEach(b=>b.onclick=()=>setBrush(b.dataset.brush));
+document.querySelectorAll('[data-left]').forEach(b=>b.onclick=()=>{st.left=b.dataset.left;renderView()});
+$('#bsize').oninput=e=>{st.size=+e.target.value};
+$('#bundo').onclick=undoMark;$('#bhide').onclick=()=>{st.hide=!st.hide;renderView()};
+addEventListener('resize',()=>{if(st.fitted)fit()});
+addEventListener('keydown',e=>{if(e.target.matches('textarea,input,select'))return;const c=DATA[st.c];if(!c)return;
+  if(e.key==='Tab'&&!e.shiftKey&&!e.ctrlKey&&!e.metaKey&&!e.altKey){e.preventDefault();st.kind=st.kind==='final'?'raw':'final';renderView();return}
+  if((e.ctrlKey||e.metaKey)&&(e.key==='z'||e.key==='Z')){e.preventDefault();undoMark();return}
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
+  const scale=scaleOf(c);
+  if(e.key==='ArrowRight'){st.v=(st.v+1)%c.variants.length;renderView();markCurrent();scrollItem()}
+  else if(e.key==='ArrowLeft'){st.v=(st.v-1+c.variants.length)%c.variants.length;renderView();markCurrent();scrollItem()}
+  else if(e.key==='ArrowDown')step(1)
+  else if(e.key==='ArrowUp')step(-1)
+  else if(/^[1-9]$/.test(e.key)&&scale[+e.key-1])setRate(scale[+e.key-1][0]);
+  else if((e.key==='o'||e.key==='O')&&baseOf(c)){st.left=st.left==='base'?'scene':'base';renderView()}
+  else if(e.key==='f'||e.key==='F')setFav(st.v);
+  else if(e.key==='s'||e.key==='S')copySeedNotes();
+  else if(e.key==='r'||e.key==='R'){st.kind=st.kind==='final'?'raw':'final';renderView()}
+  else if(e.key==='m'||e.key==='M')setBrush({'':'f',f:'g',g:''}[st.brush])
+  else if(e.key==='h'||e.key==='H'){st.hide=!st.hide;renderView()}
+  else if(e.key==='b'||e.key==='B')toggleGood()
+  else if(e.key===' '){e.preventDefault();if(!st.peek){st.peek=true;renderView()}}
+  else return; e.preventDefault()});
+addEventListener('keyup',e=>{if(e.key===' '&&st.peek){st.peek=false;renderView()}});
+addEventListener('blur',()=>{if(st.peek){st.peek=false;renderView()}});
+function scrollItem(){$('#list').children[st.v]?.scrollIntoView({block:'nearest'})}
+function firstOpen(c){
+  const base=c.variants.findIndex(v=>v.base&&v.ok);
+  if(base>=0&&!c.variants.some(v=>ratable(v)&&settled(c,v)))return base;
+  const i=c.variants.findIndex(v=>ratable(v)&&!settled(c,v));
+  return i>=0?i:Math.max(0,c.variants.findIndex(v=>v.ok));
+}
+const oneLine = t => String(t || '').trim().replace(/\s+/g, ' ');
+// What the export carries: this page's cases and variants only.
+function exported(){const out={};
+  for(const c of DATA){const s=own(store,c.id)?store[c.id]:null;if(!s||typeof s!=='object')continue;const keep={};
+    for(const id of ['_case',...c.variants.map(v=>v.id)])if(own(s,id))keep[id]=s[id];
+    if(Object.keys(keep).length)out[c.id]=keep}
+  return out}
+function table(){
+  const ids=[];for(const c of DATA)for(const v of c.variants)if(!ids.includes(v.id))ids.push(v.id);
+  const short=id=>id.split('_')[0],head=id=>ids.filter(o=>short(o)===short(id)).length>1?id:short(id);
+  const cell=t=>String(t||'').replace(/\|/g,'\\|');
+  const lines=[`Avaliação: ${PAGE.title||'laboratório'} · lab ${PAGE.lab||'?'} · rodada ${PAGE.round||'?'}`,'',
+    '| Caso | Pedido | Favorita | '+ids.map(head).join(' | ')+' |','|---|---|---|'+ids.map(()=>'---').join('|')+'|'];
+  const notes=[];
+  for(const c of DATA){const fav=c.variants.filter(v=>saved(c,v)?.fav).map(v=>head(v.id)).join(', ')||'–';
+    lines.push(`| ${c.id} | ${cell(c.ask)} | ${fav} | `+ids.map(id=>{const v=c.variants.find(x=>x.id===id);const r=v&&saved(c,v);
+      return !v||!v.ok?'n/d':v.base?'base':(r?.r||'–')}).join(' | ')+' |');
+    for(const v of c.variants){const r=saved(c,v);if(!r)continue;const n=oneLine(r.note),m=markSummary(r);
+      if(n||m)notes.push(`- ${c.id} ${v.id}: ${[n,m&&`[${m}]`].filter(Boolean).join(' ')}`)}}
+  const count=[];
+  for(const id of ids){const tally=new Map();
+    for(const c of DATA){const v=c.variants.find(x=>x.id===id);const r=v&&ratable(v)?saved(c,v):null;if(!r)continue;
+      if(r.r)tally.set(r.r,(tally.get(r.r)||0)+1)}
+    const parts=RATINGS.filter(k=>tally.has(k)).map(k=>`${k} ${tally.get(k)}`);
+    if(parts.length)count.push(`- ${id}: ${parts.join(' · ')}`)}
+  const used=new Set(DATA.map(scaleOf));
+  const scale=(used.has(RELATIVE)?'\n\nEscala, contra a base: ++ muito melhor · + melhor · = igual · - pior · -- muito pior':'')
+    +(used.has(ABSOLUTE)?'\n\nEscala sem base: S fez o pedido · P parcial · N não fez':'');
+  const good=DATA.filter(isGood).map(c=>c.id);
+  const rawLines=[];
+  for(const c of DATA)for(const v of c.variants){const r=saved(c,v);
+    if(v.paths.raw&&r&&(r.raw_r||r.raw_note))rawLines.push(`| ${c.id} | ${cell(v.id)} | ${r.raw_r||'–'} | ${cell(oneLine(r.raw_note))} |`)}
+  return lines.join('\n')+scale+(good.length?'\n\nJá estão boas (fora das próximas avaliações): '+good.join(', '):'')
+    +(count.length?'\n\nConta por método:\n'+count.join('\n'):'')
+    +(notes.length?'\n\nComentários:\n'+notes.join('\n'):'')
+    +(rawLines.length?'\n\nSaídas brutas — sem máscara (notas independentes: S fez o pedido; P parcial; N não fez):\n\n| Caso | Variante | Nota bruta | Comentário bruto |\n|---|---|---|---|\n'+rawLines.join('\n'):'')+'\n';
+}
+function toggleGood(){const c=DATA[st.c];const now=!isGood(c);setGood(c,now);
+  toast(now?`${c.id} marcado como já bom: sai da lista ao trocar de caso e dos próximos labs.`:`${c.id} volta para a avaliação.`);renderCases()}
+$('#good').onclick=toggleGood;
+// Another seed of the same request: "R1_qwen21_s320101" and "R1_qwen21_s320102". Results of two
+// seeds are usually alike, so one opinion can be carried over: only to fields still empty
+// (rating, comment, raw rating, raw comment), never over what was already written here.
+const seedOf = id => id.replace(/_s\d+$/, '');
+function siblings(c){ return DATA.filter(o => o !== c && seedOf(o.id) === seedOf(c.id) && o.id !== c.id); }
+function copySeedNotes(){
+  const c = DATA[st.c], others = siblings(c);
+  if (!others.length) { toast('Este pedido tem só uma semente: não há de onde copiar.'); return; }
+  let copied = 0, from = '';
+  for (const v of c.variants) {
+    const mine = rec(c.id, v.id);
+    for (const o of others) {
+      const twin = o.variants.find(x => x.id === v.id), source = twin && saved(o, twin);
+      if (!source) continue;
+      let changed = false;
+      if (!mine.r && source.r) { mine.r = source.r; changed = true; }
+      if (!String(mine.note || '').trim() && String(source.note || '').trim()) { mine.note = source.note; changed = true; }
+      if (!mine.raw_r && source.raw_r) { mine.raw_r = source.raw_r; changed = true; }
+      if (!String(mine.raw_note || '').trim() && String(source.raw_note || '').trim()) { mine.raw_note = source.raw_note; changed = true; }
+      if (changed) { copied++; from = o.id; }
+    }
+  }
+  save(); renderList(); renderCases();
+  toast(copied ? `${copied} avaliações copiadas de ${from}. Revise o que for diferente.` : 'Nada para copiar: a outra semente não tem notas novas para os seus campos vazios.');
+}
+$('#seedcopy').onclick = copySeedNotes;
+$('#hidegood').onchange=()=>renderCases();
+$('#copy').onclick=async()=>{try{await navigator.clipboard.writeText(table());toast('Tabela copiada. Cole no chat.')}catch{download();toast('Não deu para copiar; baixei o arquivo.')}};
+const FILE = PAGE.file || 'avaliacao.md';
+function download(){const blob=new Blob([table()+'\n```json\n'+JSON.stringify(exported(),null,1)+'\n```\n'],{type:'text/markdown'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=FILE;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+$('#export').onclick=()=>{download();toast(`Arquivo ${FILE} salvo em Downloads.`)};
+$('#import').onclick=()=>$('#importFile').click();
+$('#importFile').onchange=async()=>{const file=$('#importFile').files[0];$('#importFile').value='';if(!file)return;
+  try{const text=await file.text();const fence=text.match(/```json\s*([\s\S]*?)```/i);const parsed=JSON.parse(fence?fence[1]:text);
+    const count=merge(parsed&&parsed.ratings?parsed.ratings:parsed);if(!count)throw Error('nenhuma avaliação desta página');save();render();toast(count+' avaliações importadas; notas já marcadas aqui foram mantidas.')}
+  catch(error){toast('Importação não aplicada: '+error.message)}};
+function render(){if(!DATA.length)return;renderCases();renderList();renderView();scrollItem()}
+if(PAGE.title){document.title=`Avaliação — ${PAGE.title}`;$('#title').textContent=`${PAGE.title} · avaliação`}
+if(DATA.length){
+  const start=hashCase>=0?hashCase:DATA.findIndex(c=>!isGood(c)&&c.variants.some(v=>ratable(v)&&!settled(c,v)));
+  if(start>=0)st.c=start;st.v=firstOpen(DATA[st.c]);
+}
+render();
+</script></body></html>

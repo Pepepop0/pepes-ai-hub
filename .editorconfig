@@ -9,3 +9,7 @@ indent_size = 4
 
 [*.{yaml,yml,json,md}]
 indent_size = 2
+
+[*.sh]
+end_of_line = lf
+indent_size = 2

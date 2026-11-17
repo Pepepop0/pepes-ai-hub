@@ -25,6 +25,16 @@ from pathlib import Path
 from uuid import uuid4
 
 from .application_contracts import ServicesSnapshot, ServiceView, VramSnapshot
+from .chat_choice import (
+    ChatChoice,
+    ChatChoiceError,
+    ImportedModel,
+    allowed,
+    chat_options,
+    choice_path,
+    parse_reference,
+    write_choice,
+)
 from .compatibility import evaluate_compatibility
 from .config import ConfigError, InstalledConfig, config_path, loads
 from .deletion import delete_tree, deletion_refusal, first_link_inside
@@ -41,6 +51,11 @@ from .installation import (
     ResolvedInstallation,
     resolve_installation,
 )
+from .installation_control import (
+    CANCELLED_MESSAGE,
+    InstallationCancelled,
+    InstallationControl,
+)
 from .installations import (
     FAILURE,
     INSTALL,
@@ -55,6 +70,7 @@ from .installations import (
 )
 from .layout import StackLayout
 from .model_catalog import model_catalog
+from .models import ModelContractError, ModelId
 from .ollama_models import STORE_UNREADABLE
 from .operation_contracts import (
     OperationEvent,
@@ -67,13 +83,14 @@ from .operation_contracts import (
     advance_operation,
 )
 from .operations import OperationStream, diagnostic, safe_text, utc_now
-from .profiles import Profile, load_profiles, offered_profiles
+from .profiles import CHAT_PRIMARY_ROLE, Profile, load_profiles, offered_profiles
 from .stack_application import StackApplication, StackDependencies
 from .storage import enough_space, free_space, model_download_estimate
 from .tui.application import (
     COMPATIBLE,
     INSUFFICIENT,
     RECOMMENDED,
+    UNAVAILABLE,
     ConflictResolutionRequired,
     DeletePlan,
     HubError,
@@ -106,6 +123,15 @@ class _Candidate:
         return self.installation.root
 
 
+@dataclass(frozen=True)
+class _InstallationAttempt:
+    """Session-only retry identity, captured independently of the active binding."""
+
+    operation_id: str
+    candidate: _Candidate
+    kind: str
+
+
 def _succeeded(result: object) -> bool:
     """Whether an operation result says it succeeded, however the backend spells it."""
     state = getattr(result, "state", None)
@@ -125,6 +151,8 @@ UNCHECKED_MODELS = (
 UNSETTLED = "Não foi possível concluir a operação. Nada foi alterado."
 # How often the Hub looks for Open WebUI's first account while an integration waits.
 INTEGRATION_POLL_SECONDS = 3.0
+# The services one can start, stop or restart on their own.
+_SERVICE_IDS = frozenset({"ollama", "open-webui", "comfyui"})
 
 
 def _pending(status) -> tuple[tuple[str, ...], bool]:
@@ -179,6 +207,28 @@ class _Ending:
             return
         self._deliver(event)
 
+    def cancelled(self) -> None:
+        if (
+            self.held is not None
+            and self.held.result is not None
+            and any(item.code == "cancelled" for item in self.held.result.diagnostics)
+        ):
+            return
+        phase = (
+            self.snapshot.last_event.phase
+            if self.snapshot is not None
+            else OperationPhase.PREPARATION
+        )
+        if self.snapshot is None:
+            self._made(None, CANCELLED_MESSAGE)
+        self.held = self._terminal(
+            OperationState.FAILED,
+            phase,
+            CANCELLED_MESSAGE,
+            sequence=self.held.sequence if self.held is not None else None,
+            code="cancelled",
+        )
+
     def close(self, result: object, refusal: str | None) -> None:
         ending = self.held
         if ending is None:
@@ -221,11 +271,12 @@ class _Ending:
         message: str,
         *,
         sequence: int | None = None,
+        code: str = "hub",
     ) -> OperationEvent:
         last = None if self.snapshot is None else self.snapshot.last_event
         number = sequence if sequence is not None else (1 if last is None else last.sequence + 1)
         text = safe_text(message)
-        diagnostics = () if state is OperationState.SUCCEEDED else (diagnostic("hub", text),)
+        diagnostics = () if state is OperationState.SUCCEEDED else (diagnostic(code, text),)
         result = OperationResult(self.operation_id, state, diagnostics=diagnostics)
         return OperationEvent(
             operation_id=self.operation_id,
@@ -305,6 +356,8 @@ class HubApplicationAdapter:
         self.integration_poll_seconds = INTEGRATION_POLL_SECONDS
         self._snapshot: OperationSnapshot | None = None
         self._subscriptions: list[_Subscription] = []
+        self._installation_control: InstallationControl | None = None
+        self._installation_attempt: _InstallationAttempt | None = None
 
     def _profile_id(self) -> str:
         return self.config.profile_id if self.config else self.profiles[0].id
@@ -353,7 +406,13 @@ class HubApplicationAdapter:
     def _profile_name(self, profile_id: str | None) -> str | None:
         return next((p.name for p in self.profiles if p.id == profile_id), profile_id)
 
-    def _observed_status(self, entry: KnownInstallation) -> tuple[str, str, str | None]:
+    def profile_version(self, profile_id: str | None) -> str | None:
+        """The version this Hub ships of a profile; None for one it does not know."""
+        return next((p.version for p in self.profiles if p.id == profile_id), None)
+
+    def _observed_status(
+        self, entry: KnownInstallation, active_status: object | None = None
+    ) -> tuple[str, str, str | None]:
         """What this installation looks like right now: status, detail, profile.
 
         Cheap on purpose -- the folder, its configuration, and (only for the
@@ -379,7 +438,11 @@ class HubApplicationAdapter:
         active_root = self.active_root()
         if active_root is not None and root_key(active_root) == entry.key:
             try:
-                status = self.backend.status(self._profile_id())
+                status = (
+                    active_status
+                    if active_status is not None
+                    else self.backend.status(self._profile_id())
+                )
             except Exception:  # noqa: BLE001 -- a list row never fails the screen
                 return "unknown", "", profile_id
             if status.stack_up:
@@ -387,12 +450,18 @@ class HubApplicationAdapter:
             return ("ready", "", profile_id) if _installed(status) else ("stopped", "", profile_id)
         return "ready", "", profile_id
 
-    def installation_summaries(self) -> tuple[InstallationSummary, ...]:
-        """Every known installation as a row, active one first, then most recent."""
+    def installation_summaries(
+        self, *, active_status: object | None = None
+    ) -> tuple[InstallationSummary, ...]:
+        """Every known installation as a row, active one first, then most recent.
+
+        ``active_status`` is an observation of the active backend already made by
+        the caller (see :meth:`runtime_status`), so one screen probes services once.
+        """
         active_root = self.active_root()
         rows = []
         for entry in self.state.ordered():
-            status, detail, profile_id = self._observed_status(entry)
+            status, detail, profile_id = self._observed_status(entry, active_status)
             rows.append(
                 InstallationSummary(
                     root=entry.root,
@@ -427,7 +496,9 @@ class HubApplicationAdapter:
         if entry is None:
             return refused("Esta pasta não é uma instalação que o Hub conheça.")
         if not root.is_dir():
-            return refused("A pasta desta instalação não existe. Use Esquecer da lista.")
+            return refused(
+                "A pasta desta instalação não existe mais. Você pode removê-la da lista."
+            )
         config = _installed_config(config_path(StackLayout.from_root(root)))
         if config is None:
             return refused("Esta pasta não tem a configuração do Hub e não será apagada por aqui.")
@@ -519,7 +590,7 @@ class HubApplicationAdapter:
             except HubError:
                 return (
                     "A instalação foi apagada, mas a lista não pôde ser atualizada. "
-                    "Use Esquecer da lista."
+                    "Use Remover da lista."
                 )
             return None
 
@@ -606,8 +677,15 @@ class HubApplicationAdapter:
         )
 
     def _target(self, root: Path, config: InstalledConfig) -> _Candidate:
-        """An existing installation as a candidate: its backend and its configuration."""
-        installation = self.resolve(location_of_config(config, root))
+        """An existing installation as a candidate: its backend and its configuration.
+
+        A custom installation's configuration names the folder it was written
+        in. After the folder is moved, the folder it was found in is the truth.
+        """
+        location = location_of_config(config, root)
+        if config.installation.mode is InstallLocationMode.CUSTOM:
+            config = config.with_installation(location)
+        installation = self.resolve(location)
         backend = self._backends.get(installation.root)
         if backend is None:
             backend = self.backend_factory(installation)
@@ -790,37 +868,182 @@ class HubApplicationAdapter:
         return InstallationCheck(problems, (UNCHECKED_MODELS,) if unread else ())
 
     def repair(self) -> str:
-        """Repair what is missing in the installation in use, leaving it as it was.
-
-        Only on request, never as part of a check. The backend's repair runs
-        the same idempotent steps the installer does, with the root, the
-        profile and the mode it already has, and ends with the stack exactly
-        as it found it: stopped stays stopped, running stays running.
-        """
+        """Repair the selected installation without changing its binding or running state."""
         with self._lock:
             if self.config is None:
                 raise HubError("Nenhuma instalação está selecionada.")
             operation_id = self._reserve()
-            backend = self.backend
-            config = self.config
-            root = self.active_root()
+            candidate = _Candidate(
+                InstallSelection(
+                    self.config.profile_id,
+                    self.config.installation.mode,
+                    str(self.active_root())
+                    if self.config.installation.mode is InstallLocationMode.CUSTOM
+                    else None,
+                ),
+                self.backend.installation,
+                self.backend,
+                self.config,
+            )
+            return self._schedule_repair(operation_id, candidate)
 
-            def settle(result: object) -> None:
-                if root is None:
-                    return
-                succeeded = _succeeded(result)
+    def _schedule_repair(self, operation_id: str, candidate: _Candidate) -> str:
+        self._installation_attempt = _InstallationAttempt(operation_id, candidate, "repair")
+        control = InstallationControl(operation_id)
+        self._installation_control = control
+
+        def settle(result: object) -> None:
+            succeeded = _succeeded(result)
+            self._record(
+                candidate.root,
+                REPAIR if succeeded else FAILURE,
+                profile_id=candidate.config.profile_id,
+                result="succeeded" if succeeded else "",
+                summary="" if succeeded else "a verificação não pôde ser concluída",
+            )
+
+        return self._launch(
+            operation_id,
+            lambda emit: candidate.backend.repair(
+                operation_id, candidate.config.profile_id, emit=emit
+            ),
+            settle,
+            candidate=candidate,
+            control=control,
+        )
+
+    # --- the chat model of the installation in use ---------------------------------
+
+    def _chat_context(self) -> tuple[StackApplication, str, Profile, ChatChoice]:
+        if self.config is None:
+            raise HubError("Nenhuma instalação está selecionada.")
+        backend, profile_id = self.backend, self._profile_id()
+        base = next((item for item in self.profiles if item.id == profile_id), None)
+        if base is None:
+            raise HubError(f"O perfil {profile_id} não existe nesta versão do Hub.")
+        return backend, profile_id, base, backend.chat_choice()
+
+    def chat_models(self) -> dict | None:
+        """The chat models the installation in use can run, and which one it runs."""
+        with self._lock:
+            if self.config is None:
+                return None
+            backend, profile_id, base, choice = self._chat_context()
+        catalog = backend.catalog()
+        selected = backend.profile(profile_id).model_for(CHAT_PRIMARY_ROLE)
+        default = base.model_for(CHAT_PRIMARY_ROLE)
+        options = []
+        for model_id in dict.fromkeys([*chat_options(base), *(i.id for i in choice.imported)]):
+            spec = catalog.get(model_id)
+            if spec is None:
+                continue
+            options.append(
+                {
+                    "id": str(model_id),
+                    "reference": spec.source.reference,
+                    "display_name": spec.display_name or spec.source.reference,
+                    "uncensored": spec.uncensored,
+                    "imported": choice.imported_spec(model_id) is not None,
+                    "default": model_id == default,
+                    "selected": model_id == selected,
+                    "size_bytes": getattr(spec.source, "size_bytes", None),
+                }
+            )
+        return {"selected": str(selected), "default": str(default), "options": options}
+
+    def choose_chat_model(self, model_id: str) -> str:
+        """Use another chat model the profile offers or the installation imported.
+
+        The choice is saved and the installation repaired, which acquires the
+        model and points Open WebUI at it. A repair that fails puts the previous
+        choice back, so a model that never arrived is never the one in use.
+        """
+        with self._lock:
+            backend, profile_id, base, choice = self._chat_context()
+            try:
+                target = ModelId(model_id)
+            except ModelContractError as exc:
+                raise HubError("Este modelo não está disponível para esta instalação.") from exc
+            if not allowed(base, choice, target):
+                raise HubError("Este modelo não está disponível para esta instalação.")
+            if target == backend.profile(profile_id).model_for(CHAT_PRIMARY_ROLE):
+                raise HubError("Este já é o modelo de chat desta instalação.")
+            chosen = replace(
+                choice, model=None if target == base.model_for(CHAT_PRIMARY_ROLE) else target
+            )
+            return self._apply_chat_choice(backend, profile_id, choice, chosen)
+
+    def import_chat_model(self, reference: str) -> str:
+        """Add an Ollama or Hugging Face GGUF model to this installation and use it for chat."""
+        with self._lock:
+            backend, profile_id, _, choice = self._chat_context()
+            try:
+                item = ImportedModel(parse_reference(reference))
+            except ChatChoiceError as exc:
+                raise HubError(str(exc)) from exc
+            chosen = replace(choice.with_imported(item), model=item.id)
+            return self._apply_chat_choice(backend, profile_id, choice, chosen)
+
+    def remove_imported_chat_model(self, model_id: str) -> None:
+        """Forget an imported model and free its files. Never the model in use."""
+        with self._lock:
+            backend, profile_id, _, choice = self._chat_context()
+            try:
+                target = ModelId(model_id)
+            except ModelContractError as exc:
+                raise HubError("Este modelo não foi importado nesta instalação.") from exc
+            spec = choice.imported_spec(target)
+            if spec is None:
+                raise HubError("Este modelo não foi importado nesta instalação.")
+            if target == backend.profile(profile_id).model_for(CHAT_PRIMARY_ROLE):
+                raise HubError("Este é o modelo de chat em uso. Escolha outro antes de removê-lo.")
+            try:
+                backend.delete_chat_model(profile_id, spec.source.reference)
+            except Exception as exc:
+                raise HubError(
+                    "Não foi possível apagar os arquivos do modelo. Inicie os serviços e "
+                    "tente de novo."
+                ) from exc
+            self._write_chat_choice(backend, choice.without_imported(target))
+
+    @staticmethod
+    def _write_chat_choice(backend: StackApplication, choice: ChatChoice) -> None:
+        try:
+            write_choice(choice_path(backend.layout.state), choice)
+        except OSError as exc:
+            raise HubError("Não foi possível salvar o modelo de chat. Nada foi alterado.") from exc
+
+    def _apply_chat_choice(
+        self, backend: StackApplication, profile_id: str, previous: ChatChoice, chosen: ChatChoice
+    ) -> str:
+        """Save ``chosen`` and repair; a repair that fails restores ``previous``."""
+        operation_id = self._reserve()
+        try:
+            self._write_chat_choice(backend, chosen)
+        except HubError:
+            self._end_operation(None)
+            raise
+        root = self.active_root()
+
+        def settle(result: object) -> None:
+            succeeded = _succeeded(result)
+            if not succeeded:
+                with contextlib.suppress(HubError):
+                    self._write_chat_choice(backend, previous)
+            if root is not None:
                 self._record(
                     root,
                     REPAIR if succeeded else FAILURE,
+                    profile_id=profile_id,
                     result="succeeded" if succeeded else "",
-                    summary="" if succeeded else "a verificação não pôde ser concluída",
+                    summary="modelo de chat trocado"
+                    if succeeded
+                    else "o modelo de chat não foi trocado",
                 )
 
-            return self._launch(
-                operation_id,
-                lambda emit: backend.repair(operation_id, config.profile_id, emit=emit),
-                settle,
-            )
+        return self._launch(
+            operation_id, lambda emit: backend.repair(operation_id, profile_id, emit=emit), settle
+        )
 
     def installation(self) -> InstallationView:
         if self.config is None:
@@ -838,10 +1061,23 @@ class HubApplicationAdapter:
             self._root_display(),
         )
 
-    def projections(self) -> tuple[InstallationView, ServicesSnapshot, VramSnapshot]:
+    def runtime_status(self) -> tuple[StackApplication, str, object]:
+        """Probe the active backend once: which backend and profile, and what it said.
+
+        The probe is the expensive part of every screen (ports, model store,
+        dry-run). Callers that cache it must discard it when the backend or the
+        profile it was made for is no longer the active one.
+        """
+        backend, profile_id = self.backend, self._profile_id()
+        return backend, profile_id, backend.status(profile_id)
+
+    def projections(
+        self, status: object | None = None
+    ) -> tuple[InstallationView, ServicesSnapshot, VramSnapshot]:
         """One authoritative observation for everything repeated by the Dashboard."""
         try:
-            status = self.backend.status(self._profile_id())
+            if status is None:
+                status = self.backend.status(self._profile_id())
         except Exception as exc:
             raise HubUnavailable(
                 "Não foi possível verificar a instalação. Tente novamente."
@@ -865,36 +1101,44 @@ class HubApplicationAdapter:
     def profile_choices(self) -> tuple[ProfileChoice, ...]:
         """The profiles to offer, and how each stands against this machine.
 
-        The largest one that fits is the recommendation -- no profile is
-        preferred by name -- and the ones that do not fit are presented as
-        asking for more than there is, never as an ordinary choice.
+        The largest compatible profile is recommended. Incompatible profiles
+        preserve their blocker codes so the interface distinguishes low VRAM
+        from a missing prerequisite such as Git.
         """
         facts = self.backend.facts()
         offered = offered_profiles(self.profiles)
-        compatible = {
-            profile.id: evaluate_compatibility(facts, profile).compatible for profile in offered
-        }
-        fitting = [profile for profile in offered if compatible[profile.id]]
+        reports = {profile.id: evaluate_compatibility(facts, profile) for profile in offered}
+        fitting = [profile for profile in offered if reports[profile.id].compatible]
         best = max(
             fitting,
             key=lambda profile: profile.hardware.min_vram_mib,
             default=None,
         )
-        return tuple(
-            ProfileChoice(
-                profile.id,
-                profile.name,
-                profile.description,
-                compatible[profile.id],
-                standing=(
-                    RECOMMENDED
-                    if best is not None and profile.id == best.id
-                    else (COMPATIBLE if compatible[profile.id] else INSUFFICIENT)
-                ),
-                required_vram_gb=profile.hardware.min_vram_gb,
+        choices = []
+        for profile in sorted(offered, key=lambda item: item.hardware.min_vram_mib):
+            report = reports[profile.id]
+            blocker_codes = tuple(issue.code for issue in report.blockers)
+            standing = (
+                RECOMMENDED
+                if best is not None and profile.id == best.id
+                else (
+                    COMPATIBLE
+                    if report.compatible
+                    else (INSUFFICIENT if blocker_codes == ("vram_below_minimum",) else UNAVAILABLE)
+                )
             )
-            for profile in sorted(offered, key=lambda item: item.hardware.min_vram_mib)
-        )
+            choices.append(
+                ProfileChoice(
+                    profile.id,
+                    profile.name,
+                    profile.description,
+                    report.compatible,
+                    standing=standing,
+                    required_vram_gb=profile.hardware.min_vram_gb,
+                    blockers=blocker_codes,
+                )
+            )
+        return tuple(choices)
 
     def storage_estimate(
         self, profile_id: str, mode: InstallLocationMode, custom_root: str | None = None
@@ -956,6 +1200,66 @@ class HubApplicationAdapter:
         with self._lock:
             return self._snapshot
 
+    def installation_control(self) -> dict | None:
+        """Current installation only; a stale operation can never control a later one."""
+        with self._lock:
+            control = self._installation_control
+            return control.snapshot() if control is not None else None
+
+    def control_installation(self, action: str, operation_id: str) -> dict:
+        with self._lock:
+            control = self._installation_control
+            if control is None or not operation_id or control.operation_id != operation_id:
+                raise HubError("Esta instalação não está mais em andamento.")
+            try:
+                return control.request(action)
+            except ValueError as exc:
+                raise HubError(str(exc)) from exc
+
+    def retryable_installation(self) -> dict | None:
+        """Only the latest failed install/repair in this session can be retried."""
+        with self._lock:
+            attempt = self._installation_attempt
+            snapshot = self._snapshot
+            if (
+                self._busy
+                or attempt is None
+                or snapshot is None
+                or snapshot.last_event.operation_id != attempt.operation_id
+                or snapshot.last_event.state is not OperationState.FAILED
+            ):
+                return None
+            return {
+                "operation_id": attempt.operation_id,
+                "profile_id": attempt.candidate.config.profile_id,
+                "root": str(attempt.candidate.root),
+                "kind": attempt.kind,
+            }
+
+    def retry_installation(self, operation_id: str) -> str:
+        """Retry the captured candidate, never the current selection or default folder."""
+        with self._lock:
+            if self._closed:
+                raise HubUnavailable("O Hub está encerrando.")
+            if self._busy:
+                raise OperationBusy("Aguarde a operação atual terminar.")
+            retryable = self.retryable_installation()
+            if retryable is None or not operation_id or retryable["operation_id"] != operation_id:
+                raise HubError("Esta tentativa de instalação não pode mais ser repetida.")
+            attempt = self._installation_attempt
+            candidate = attempt.candidate
+            # No reservation yet: a conflict decision must keep the failed id
+            # valid so resolve_conflicts can be followed by the very same retry.
+            pending = candidate.backend.check_conflicts(candidate.config.profile_id)
+            if pending is not None:
+                self._candidate = candidate
+                raise ConflictResolutionRequired(pending)
+            new_id = self._reserve()
+            self._candidate = candidate
+            if attempt.kind == "repair":
+                return self._schedule_repair(new_id, candidate)
+            return self._schedule_install(new_id, candidate)
+
     def subscribe(self, sink: OperationEventSink):
         with self._lock:
             subscription = _Subscription(self, sink)
@@ -970,6 +1274,7 @@ class HubApplicationAdapter:
             raise HubUnavailable("O Hub está encerrando.")
         if self._busy:
             raise OperationBusy("Aguarde a operação atual terminar.")
+        self._installation_attempt = None
         self._busy = True
         self._idle.clear()
         return uuid4().hex
@@ -983,6 +1288,9 @@ class HubApplicationAdapter:
         """
         if candidate is not None and self._candidate is candidate:
             self._candidate = None
+        if self._installation_control is not None:
+            self._installation_control.close()
+            self._installation_control = None
         self._busy = False
         self._idle.set()
         self._watch_integration()
@@ -1047,6 +1355,7 @@ class HubApplicationAdapter:
         settle: Callable[[object], str | None] | None = None,
         *,
         candidate: _Candidate | None = None,
+        control: InstallationControl | None = None,
     ) -> str:
         """Run one reserved operation on its own thread, with exactly one ending.
 
@@ -1065,7 +1374,30 @@ class HubApplicationAdapter:
             result = None
             refusal = None
             try:
-                result = run(ending.emit)
+                with control.scope() if control is not None else contextlib.nullcontext():
+                    try:
+                        result = run(ending.emit)
+                    except InstallationCancelled:
+                        raise
+                    except Exception:  # noqa: BLE001 -- failure still closes its control gate
+                        result = None
+                    if control is not None:
+                        while True:
+                            if _succeeded(result):
+                                control.checkpoint()
+                            with self._lock:
+                                if control.finish(failed=not _succeeded(result)):
+                                    break
+            except InstallationCancelled:
+                if control is not None:
+                    with contextlib.suppress(Exception):
+                        control.cleanup_cancelled()
+                result = OperationResult(
+                    operation_id,
+                    OperationState.FAILED,
+                    diagnostics=(diagnostic("cancelled", CANCELLED_MESSAGE),),
+                )
+                ending.cancelled()
             except Exception:  # noqa: BLE001 -- the ending says it failed
                 result = None
             finally:
@@ -1078,7 +1410,7 @@ class HubApplicationAdapter:
                         refusal = UNSETTLED
                     finally:
                         self._end_operation(candidate)
-                ending.close(result, refusal)
+                        ending.close(result, refusal)
 
         worker = threading.Thread(target=execute, name="hub-operation")
         try:
@@ -1089,25 +1421,37 @@ class HubApplicationAdapter:
         self._worker = worker
         return operation_id
 
-    def _record(self, root: Path, kind: str, *, result: str = "", summary: str = "") -> None:
+    def _record(
+        self,
+        root: Path,
+        kind: str,
+        *,
+        profile_id: str | None = None,
+        result: str = "",
+        summary: str = "",
+    ) -> None:
         """Write one line of an installation's history, if the disk will have it.
 
         History is kept on a best-effort basis: an installation that installed
-        or repaired did so whether or not the line describing it was saved.
+        or repaired did so whether or not the line describing it was saved. A
+        success also records the version of ``profile_id`` it applied.
         """
+        version = self.profile_version(profile_id) if kind != FAILURE else None
         try:
-            self._persist(self.state.recording(root, kind, result=result, summary=summary))
+            self._persist(
+                self.state.recording(
+                    root, kind, result=result, summary=summary, profile_version=version
+                )
+            )
         except HubError:
             pass
 
     def _prepare(self, selection: InstallSelection) -> _Candidate:
         """Everything the selection implies, bound to nothing. Never touches the active one."""
-        if selection.profile_id not in {p.id for p in self.profiles}:
+        profile = next((p for p in self.profiles if p.id == selection.profile_id), None)
+        if profile is None:
             raise HubError("Perfil não encontrado. Selecione um perfil disponível.")
-        location = InstallLocation(
-            selection.mode,
-            Path(selection.custom_root) if selection.custom_root else None,
-        )
+        location = selection.location(profile.name)
         installation = self.resolve(location)
         backend = self._backends.get(installation.root)
         if backend is None:
@@ -1137,7 +1481,7 @@ class HubApplicationAdapter:
         )
         if candidate.config.installation.mode is InstallLocationMode.CUSTOM:
             state = state.with_general(
-                state.general.remembering_custom_root(candidate.config.installation.root)
+                state.general.remembering_custom_root(candidate.selection.custom_root)
             )
         self._persist(state)
 
@@ -1190,20 +1534,6 @@ class HubApplicationAdapter:
                     # resolver -- but the active installation is untouched.
                     self._candidate = candidate
                     raise _BackendConflictRequired(pending)
-                self._candidate = candidate
-                self._remember_attempt(candidate)
-                # The installation's own configuration belongs to its folder; the
-                # Hub's pointer to it is only written once the run succeeds. The
-                # interface preferences it carries are the Hub's, so whatever the
-                # folder already holds is kept: a second run rewrites nothing.
-                path = config_path(candidate.installation.layout)
-                existing = _installed_config(path)
-                write_installed_config(
-                    path,
-                    candidate.config
-                    if existing is None
-                    else candidate.config.with_general(existing.general),
-                )
                 return self._schedule_install(operation_id, candidate)
             except _BackendConflictRequired as exc:
                 # The candidate stays: the decision owed is about it.
@@ -1219,6 +1549,26 @@ class HubApplicationAdapter:
                 ) from exc
 
     def _schedule_install(self, operation_id: str, candidate: _Candidate) -> str:
+        self._installation_attempt = _InstallationAttempt(operation_id, candidate, "install")
+        control = InstallationControl(operation_id)
+        self._installation_control = control
+
+        def run(emit) -> object:
+            # Capture the retry context before any writes or installer work can
+            # fail. Reuse the resolved candidate on retry, including its mode
+            # and the original parent/create_subfolder choice.
+            with self._lock:
+                self._remember_attempt(candidate)
+                path = config_path(candidate.installation.layout)
+                existing = _installed_config(path)
+                write_installed_config(
+                    path,
+                    candidate.config
+                    if existing is None
+                    else candidate.config.with_general(existing.general),
+                )
+            return candidate.backend.first_run(operation_id, candidate.config.profile_id, emit=emit)
+
         def settle(result: object) -> None:
             if not _succeeded(result):
                 self._record(candidate.root, FAILURE, summary="a instalação não foi concluída")
@@ -1229,15 +1579,19 @@ class HubApplicationAdapter:
             # installed" keeps saying when work was last done.
             report = getattr(candidate.backend, "last_first_run", None)
             if not getattr(report, "did_nothing", False):
-                self._record(candidate.root, INSTALL, result="succeeded")
+                self._record(
+                    candidate.root,
+                    INSTALL,
+                    profile_id=candidate.config.profile_id,
+                    result="succeeded",
+                )
 
         return self._launch(
             operation_id,
-            lambda emit: candidate.backend.first_run(
-                operation_id, candidate.config.profile_id, emit=emit
-            ),
+            run,
             settle,
             candidate=candidate,
+            control=control,
         )
 
     def cancel_pending_installation(self) -> None:
@@ -1317,6 +1671,26 @@ class HubApplicationAdapter:
     def restart_stack(self) -> str:
         return self._command("restart_stack")
 
+    def _service_command(self, name: str, service_id: str) -> str:
+        if service_id not in _SERVICE_IDS:
+            raise HubError("Serviço desconhecido.")
+        with self._lock:
+            operation_id = self._reserve()
+            backend, profile_id = self.backend, self._profile_id()
+            command = getattr(backend, name)
+            return self._launch(
+                operation_id, lambda emit: command(operation_id, profile_id, service_id, emit=emit)
+            )
+
+    def start_service(self, service_id: str) -> str:
+        return self._service_command("start_service", service_id)
+
+    def stop_service(self, service_id: str) -> str:
+        return self._service_command("stop_service", service_id)
+
+    def restart_service(self, service_id: str) -> str:
+        return self._service_command("restart_service", service_id)
+
     def open_webui_target(self) -> LaunchTarget | LaunchRefusal:
         with self._lock:
             operation_id = self._reserve()
@@ -1349,9 +1723,17 @@ class HubApplicationAdapter:
         with self._lock:
             self._closed = True
             self._closing.set()
+            watch = self._integration_watch
+            if self._installation_control is not None:
+                with contextlib.suppress(ValueError):
+                    self._installation_control.request("cancel")
             for subscription in tuple(self._subscriptions):
                 subscription.close()
         self.wait()
+        if watch is not None:
+            watch.join()
+        for backend in self._backends.values():
+            backend.close()
 
 
 class _Subscription:

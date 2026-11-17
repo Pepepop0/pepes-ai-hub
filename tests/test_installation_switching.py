@@ -113,6 +113,9 @@ class RecordingBackend:
     def current_operation(self):
         return None
 
+    def close(self, timeout: float = 0.0) -> None:
+        """The real backend waits for its background preloads; this one has none."""
+
     def check_conflicts(self, profile_id):
         if self.root in self.world.conflicting:
             self._conflict = ConflictPreflightReport(
@@ -194,6 +197,20 @@ class RecordingBackend:
 
     def restart_stack(self, operation_id, profile_id, *, emit=None):
         return self._command("restart_stack", operation_id, profile_id, emit=emit)
+
+    def _service(self, name, operation_id, profile_id, service_id, *, emit=None):
+        self.commands.append(f"{name}:{service_id}")
+        self.world.calls.append((self.root, f"{name}:{service_id}", profile_id))
+        return succeeded(operation_id)
+
+    def start_service(self, operation_id, profile_id, service_id, *, emit=None):
+        return self._service("start_service", operation_id, profile_id, service_id, emit=emit)
+
+    def stop_service(self, operation_id, profile_id, service_id, *, emit=None):
+        return self._service("stop_service", operation_id, profile_id, service_id, emit=emit)
+
+    def restart_service(self, operation_id, profile_id, service_id, *, emit=None):
+        return self._service("restart_service", operation_id, profile_id, service_id, emit=emit)
 
 
 class World:

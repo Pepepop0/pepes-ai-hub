@@ -870,9 +870,10 @@ def test_real_model_download_reaches_the_real_wizard_and_second_run_is_quiet(com
             assert current.transfer.total_bytes == MODEL_BYTES
             assert current.transfer.bytes_per_second == pytest.approx(1.5625 * 1024**2)
             assert current.transfer.eta_seconds is not None
-            assert current.progress is not None and current.progress.total == 4
+            assert current.progress is not None
+            logical_total = current.progress.total
             rendered = assert_transfer_bar_fits(app, 120)
-            assert f"{current.progress.completed}/4" in rendered
+            assert f"{current.progress.completed}/{logical_total}" in rendered
             assert "%" in rendered and "KiB / 1 MiB" in rendered
             assert "1.56 MiB/s" in rendered and "restantes" in rendered
             assert unsafe_characters(rendered) == ()
@@ -1000,7 +1001,10 @@ def test_real_model_failure_preserves_last_transfer_in_the_real_wizard(compositi
                 assert "100%" in done
             else:
                 assert "100%" not in done
-            assert not list(adapter.backend.layout.root.rglob("*.part"))
+            # An interrupted file keeps its bytes for the next attempt to resume; a file
+            # that failed its checksum is discarded. Neither is ever promoted.
+            partials = list(adapter.backend.layout.root.rglob("*.part"))
+            assert bool(partials) is (failure == "interrupted")
             assert not list(adapter.backend.layout.root.rglob("*.safetensors"))
             assert not adapter.backend.last_first_run.acquired
 
@@ -1158,14 +1162,12 @@ def test_custom_location_flows_from_the_real_wizard_to_backend(composition):
 
 
 def test_missing_model_is_pending_and_retry_acquires_only_that_model(composition):
-    from local_ai_stack.models import ModelId
-
     world, adapter, _ = composition()
     adapter.install(InstallSelection("capella"))
     adapter.wait(10)
     backend = adapter.backend
     profile = backend.profile("capella")
-    spec = backend.catalog().require(ModelId("comfyui/flux2_vae"))
+    spec = backend.catalog().require(profile.model_for("image.vae"))
     missing = backend.model_installer(profile).detect(spec).path
     assert missing.is_file()
     missing.unlink()  # only this test-owned fixture model

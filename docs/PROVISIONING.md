@@ -92,12 +92,44 @@ string.
 
 | componente | distribuição | pin |
 |---|---|---|
-| ollama | zip portable | `v0.33.2` + SHA-256 (`artifacts.yaml`) |
-| open-webui | pacote PyPI | `open-webui==0.11.3` (`packages.yaml`) |
-| comfyui | checkout Git | tag `v0.34.0` + commit `12d5279…` (`repositories.yaml`) |
+| ollama | ZIP portable Windows / tar.zst Linux | `v0.33.2` + SHA-256 por plataforma (`artifacts.yaml`) |
+| open-webui | pacote PyPI | `open-webui==0.12.0` (`packages.yaml`) |
+| comfyui | checkout Git | tag `v0.39.0` + commit `b0b7435…` (`repositories.yaml`), mais custom nodes pinados (`custom_nodes`) |
 
 Nada resolve `latest`. Subir versão é editar manifest, revisado como qualquer
 mudança. `catalog.py` lê os manifests e não toca a rede.
+
+Na bancada Capella 1.16, `hardware.os` declara explicitamente Windows e Linux;
+desde o 1.19.39 o Pepe e o Pepinho (`pepe`, `pepe-8gb`) também. Os artefatos do
+catálogo (Ollama por plataforma, modelos e workflows sem plataforma) são os mesmos
+para os três perfis. A bancada escolhe o perfil com `PEPITOS_BENCH_PROFILE` (padrão
+`capella`) e cada perfil usa a sua pasta de dados (`<BASE>/<perfil>-data`). O catálogo seleciona
+OS/arquitetura, sem substituir um binário Windows por Linux ou resolver `latest`.
+No Linux o executável Ollama é `apps/ollama/bin/ollama`, com suas bibliotecas;
+o tar.zst oficial é conferido e extraído com filtro de dados para uma staging.
+O bootstrap exige Python 3.11/3.12 e driver compatível com o torch cu130 fixado.
+O motor original continua responsável por baixar todos os modelos, aplicar os
+workflows e integrar os filtros. Instalar um template genérico não substitui isso.
+
+Uma instalação gerenciada do Open WebUI com versão diferente do pin é
+atualizada no lugar: o plano vira `upgrade-package` + `mark-managed` no mesmo
+venv, sem recriar o ambiente e sem tocar em `DATA_DIR`. A partir da 0.12 o
+Open WebUI amarra todo bearer ao `auth.session_stamp` da conta e aceita só
+tipos declarados; o token local que o Hub assina para o primeiro admin leva
+`typ: automation` e o `session_stamp` atual, e um admin sem stamp não recebe
+token.
+
+## Downloads gated do Hugging Face
+
+`Downloader(request_headers=...)` pede cabeçalhos por URL; a aplicação usa
+`huggingface_auth.request_headers`, que só devolve `Authorization: Bearer`
+para `https://huggingface.co` (nunca para outro host, http, ou o CDN de LFS
+para onde o Hub redireciona). A credencial vem de `HF_TOKEN` /
+`HUGGING_FACE_HUB_TOKEN` ou de `%APPDATA%\PepitosAIHub\hf-token.dpapi`,
+cifrada com DPAPI do usuário. `--hf-login` usa OAuth device flow quando
+`PEPITOS_HF_CLIENT_ID` aponta um app OAuth público (escopo `gated-repos`);
+sem ele, pede um token read sem eco. Nenhum caminho imprime ou registra o
+token.
 
 ## Ollama — estratégia e limitação
 
@@ -146,9 +178,10 @@ Distribuído como fonte: clone Git pinado por tag **e** commit, mais um
 virtualenv ao lado. Depois do checkout o commit é conferido contra o pin, então
 tag movida upstream é reportada em vez de seguida silenciosamente.
 
-O `requirements.txt` do ComfyUI no revision pinado deixa `torch`,
-`torchvision` e `torchaudio` **sem versão**. Esses três são pinados no manifest;
-o resto continua vindo daquele arquivo, que já está congelado pelo commit.
+O `requirements.txt` do ComfyUI no revision pinado deixa `torch` e
+`torchvision` **sem versão**; `torchaudio` saiu do arquivo antes da v0.39.0
+(upstream #16457), mas continua pinado no manifest para manter o trio. O resto
+continua vindo daquele arquivo, que já está congelado pelo commit.
 
 | pin | valor | por quê |
 |---|---|---|
@@ -160,7 +193,7 @@ o resto continua vindo daquele arquivo, que já está congelado pelo commit.
 
 Por que não o torch 2.13.0, que existe no mesmo índice: torchaudio parou no
 2.11.0, então 2.12/2.13 não têm par. Fixar torch mais novo obrigaria a
-descartar o torchaudio que o ComfyUI lista.
+tirar o torchaudio do pin.
 
 Driver do host reporta CUDA 13.3, que satisfaz um build CUDA 13.0.
 
@@ -171,6 +204,26 @@ verdadeira sem a outra.
 
 Componente sem pin de dependência continua recusando com `PRECONDITION`
 **antes de clonar** — nada é criado.
+
+### Custom nodes
+
+`repositories.comfyui.custom_nodes.<id>` pina um pacote de nodes com `url`
+(https), `revision` e `commit` (40 hex, obrigatório). O provisioner clona cada
+um em `custom_nodes/<id>` depois que o ComfyUI está no commit, faz checkout do
+revision e confere `HEAD == commit`; o `.gitignore` do ComfyUI já ignora
+`custom_nodes/`, então o checkout principal não fica sujo. A pasta recebe o
+marcador do Hub (`comfyui-custom-node`) assim que é clonada:
+
+- só pastas com esse marcador são atualizadas ou removidas; um node que o pin
+  deixou de listar e que o Hub instalou é apagado; nodes do usuário nunca;
+- uma pasta do usuário com o mesmo `<id>` bloqueia a instalação (`PRECONDITION`)
+  e fica intacta;
+- um node com dependências pip (`requirements.txt` com alguma linha, ou
+  `[project].dependencies` não vazio no `pyproject.toml`) é recusado e a pasta
+  é removida — o Hub não instala dependências de nodes.
+
+Os pins dos nodes entram no fingerprint do marcador, então mudar um node
+reinstala; `verify()` confere marcador e `HEAD` de cada node.
 
 ## O que ainda não existe
 

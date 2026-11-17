@@ -50,6 +50,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .acquisition_errors import AcquisitionFailure, acquisition_failure
 from .download import (
     ChecksumMismatchError,
     Downloader,
@@ -58,6 +59,7 @@ from .download import (
     ProgressCallback,
     sha256_of,
 )
+from .installation_control import installation_checkpoint
 from .models import (
     FileModelSource,
     ManagedModelPaths,
@@ -264,6 +266,7 @@ class ModelResult:
     steps: tuple[ModelStep, ...] = ()
     detail: str = ""
     failure: ModelFailure | None = None
+    failure_info: AcquisitionFailure | None = None
 
     @property
     def ok(self) -> bool:
@@ -480,6 +483,7 @@ class ModelInstaller:
             self.log.debug("could not record verification for %s: %s", spec.id, exc)
 
     def _detect_ollama(self, spec: ModelSpec, source: OllamaModelSource) -> ModelStatus:
+        shown = spec.display_name or source.reference
         if self.ollama is None:
             return ModelStatus(
                 id=spec.id,
@@ -504,7 +508,7 @@ class ModelInstaller:
                 id=spec.id,
                 kind=spec.kind,
                 state=ModelState.NOT_INSTALLED,
-                detail=f"{source.reference} is not in the Ollama model store.",
+                detail=f"{shown} is not in the Ollama model store.",
                 reference=source.reference,
             )
         if not entry.matches_digest(source.digest):
@@ -513,7 +517,7 @@ class ModelInstaller:
                 kind=spec.kind,
                 state=ModelState.INVALID,
                 detail=(
-                    f"{source.reference} is present but its digest does not match the "
+                    f"{shown} is present but its digest does not match the "
                     f"pinned {source.digest}; the tag was republished upstream."
                 ),
                 reference=source.reference,
@@ -551,7 +555,8 @@ class ModelInstaller:
                 ModelStep(
                     action="pull",
                     target=spec.source.reference,
-                    summary=f"Pull {spec.source.reference} into the Ollama model store.",
+                    summary=f"Pull {spec.display_name or spec.source.reference} "
+                    "into the Ollama model store.",
                 ),
             )
         return ModelPlan(spec.id, steps, status)
@@ -568,6 +573,7 @@ class ModelInstaller:
         report, and an already-satisfied file is a SKIP, never a transfer.
         """
         if not dry_run:
+            installation_checkpoint()
             self._invalidate_snapshot()
         plan = self.plan(spec)
         if plan.is_noop:
@@ -606,12 +612,15 @@ class ModelInstaller:
         )
         try:
             self.downloader.fetch(download, progress=progress)
-        except ChecksumMismatchError as exc:
-            return self._failed(spec, plan, ModelFailure.CHECKSUM, str(exc))
-        except DownloadError as exc:
-            return self._failed(spec, plan, ModelFailure.NETWORK, str(exc))
-        except OSError as exc:
-            return self._failed(spec, plan, ModelFailure.FILESYSTEM, str(exc))
+        except (DownloadError, OSError) as exc:
+            info = acquisition_failure(exc, url=source.artifact.url)
+            if isinstance(exc, ChecksumMismatchError):
+                failure = ModelFailure.CHECKSUM
+            elif info.os_errno is not None or info.os_winerror is not None:
+                failure = ModelFailure.FILESYSTEM
+            else:
+                failure = ModelFailure.NETWORK
+            return self._failed(spec, plan, failure, info.message, failure_info=info)
         return self._confirm(spec, plan)
 
     def _acquire_ollama(
@@ -629,13 +638,19 @@ class ModelInstaller:
             )
         try:
             self.ollama.pull(source.reference)
+            installation_checkpoint()
         except OllamaClientError as exc:
-            return self._failed(spec, plan, ModelFailure.PROVIDER, str(exc))
+            shown = spec.display_name or source.reference
+            return self._failed(
+                spec, plan, ModelFailure.PROVIDER, str(exc).replace(source.reference, shown)
+            )
         return self._confirm(spec, plan)
 
     def _confirm(self, spec: ModelSpec, plan: ModelPlan) -> ModelResult:
         """Acquisition only counts once verification agrees."""
+        installation_checkpoint()
         status = self.verify(spec)
+        installation_checkpoint()
         if not status.available:
             return ModelResult(
                 spec.id,
@@ -648,7 +663,13 @@ class ModelInstaller:
         return ModelResult(spec.id, ModelOutcome.ACQUIRED, status, steps=plan.steps)
 
     def _failed(
-        self, spec: ModelSpec, plan: ModelPlan, failure: ModelFailure, detail: str
+        self,
+        spec: ModelSpec,
+        plan: ModelPlan,
+        failure: ModelFailure,
+        detail: str,
+        *,
+        failure_info: AcquisitionFailure | None = None,
     ) -> ModelResult:
         return ModelResult(
             spec.id,
@@ -657,6 +678,7 @@ class ModelInstaller:
             steps=plan.steps,
             detail=detail,
             failure=failure,
+            failure_info=failure_info,
         )
 
     # --- verificacao -------------------------------------------------------

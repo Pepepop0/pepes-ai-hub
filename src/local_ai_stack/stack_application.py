@@ -43,6 +43,9 @@ from .application_contracts import (
     ServiceView,
     VramSnapshot,
 )
+from .chat_choice import ChatChoice, choice_path, effective_profile, read_choice, with_imports
+from .civitai_auth import request_headers as civitai_request_headers
+from .comfyui_retention import clean_comfyui_folders, comfyui_queue_busy
 from .components import ComponentId
 from .controller import ServiceController
 from .download import Downloader, DownloadProgress
@@ -60,6 +63,7 @@ from .external_conflicts import (
     merged_options,
     terminate_by_pid,
 )
+from .huggingface_auth import request_headers as huggingface_request_headers
 from .install_actions import InstallActionHandlers
 from .installation import ResolvedInstallation
 from .integration import (
@@ -88,20 +92,32 @@ from .inventory import (
 )
 from .inventory import lookup_process as default_lookup_process
 from .launcher import ProcessLauncher
+from .logs import append_service_event, service_log_files
 from .managed_config import ManagedConfigWriter
 from .model_catalog import ModelCatalog, model_catalog
 from .model_installer import ModelInstaller
 from .model_resolver import StackModelResolver, unresolved_roles
 from .models import ManagedModelPaths, OllamaModelSource
-from .ollama_models import HttpOllamaClient
+from .ollama_models import (
+    PRELOAD_TIMEOUT,
+    HttpOllamaClient,
+    delete_ollama_model,
+    preload_ollama_model,
+)
+from .open_webui_background_tasks import sync_background_tasks
 from .open_webui_filters import (
+    ART_FILTER_ID,
+    PHOTO_FILTER_ID,
+    QUALITY_FILTER_ID,
+    REFS_FILTER_ID,
     FilterSync,
     FilterSyncReport,
     first_admin_id,
     sync_image_chat_filter,
 )
 from .open_webui_image_edit import sync_image_edit
-from .open_webui_models import sync_chat_model
+from .open_webui_models import sync_chat_model, versioned_label
+from .open_webui_web_search import sync_web_search
 from .operation_contracts import (
     OperationActivity,
     OperationActivityCategory,
@@ -122,7 +138,14 @@ from .profiles import (
     FEATURE_IMAGE_GENERATION,
     FEATURE_TOOLS,
     IMAGE_EDIT_WORKFLOW,
+    IMAGE_ROUTER_RUNTIME_KEY,
+    PRELOAD_CHAT_MODEL_RUNTIME_KEY,
+    QUIET_BACKGROUND_TASKS_RUNTIME_KEY,
+    TEXT_TO_IMAGE_HQ_WORKFLOW,
+    TEXT_TO_IMAGE_WORKFLOW,
+    WEB_SEARCH_RUNTIME_KEY,
     Profile,
+    declared_workflows,
     load_profiles,
 )
 from .provisioning import ProvisionContext, ProvisionEvent, ProvisionOutcome
@@ -130,6 +153,7 @@ from .registry import IdentityVerdict, ManagedProcessRegistry
 from .resources import resource_root
 from .runner import CommandRunner
 from .service_config import (
+    EXCLUSIVE_VRAM_RUNTIME_KEY,
     ImageEditSettings,
     StackConfiguration,
     declared_capability_problems,
@@ -137,8 +161,11 @@ from .service_config import (
 )
 from .services import ServiceState
 from .system import SystemFacts, detect_system
+from .web_search_settings import WebSearchSettings
+from .web_search_settings import load_settings as load_web_search_settings
 from .workflows import (
     WorkflowError,
+    WorkflowParameter,
     load_workflow_graph,
     resolve_workflow,
     verify_workflow_references,
@@ -155,6 +182,11 @@ START_ORDER: tuple[str, ...] = (
 # Hosts a launch target may point at. The endpoint domain derives the URL; this
 # is the last check before handing it to something that will open it.
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def model_request_headers(url: str) -> dict[str, str]:
+    """The credential a model download needs: each helper answers only for its own host."""
+    return {**huggingface_request_headers(url), **civitai_request_headers(url)}
 
 
 def _external_endpoint_occupants(
@@ -212,9 +244,19 @@ class StackDependencies:
     model_sync: Callable[..., FilterSyncReport] = sync_chat_model
     # Keeps that Open WebUI's image editing pointed at the profile's edit workflow.
     image_edit_sync: Callable[[Path, str, ImageEditSettings], FilterSyncReport] = sync_image_edit
+    # Keeps that Open WebUI's web search set as the Hub's own settings say; the settings
+    # are read when the sync runs, so a change made in the Hub is the one applied.
+    web_search_sync: Callable[..., FilterSyncReport] = sync_web_search
+    web_search_settings: Callable[[], WebSearchSettings] = load_web_search_settings
+    # Switches Open WebUI's follow-up and tag generation off on a profile that asks for it.
+    background_task_sync: Callable[..., FilterSyncReport] = sync_background_tasks
     # Whether that Open WebUI has its first account yet, read from its own database.
     first_admin: Callable[[Path], str | None] = first_admin_id
     monotonic: Callable[[], float] = time.monotonic
+    # Loads the chat model into a running Ollama (endpoint, model, num_ctx, keep_alive).
+    ollama_preload: Callable[..., None] = preload_ollama_model
+    # Whether ComfyUI (at this endpoint) has a job running or waiting.
+    comfyui_queue_busy: Callable[[str], bool] = comfyui_queue_busy
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], datetime] = utc_now
 
@@ -322,6 +364,8 @@ class StackApplication:
         self.deps = dependencies or StackDependencies()
 
         self._lock = threading.Lock()
+        self._preload_threads: list[threading.Thread] = []
+        self._closed = False
         self._busy = False
         self._operation: OperationSnapshot | None = None
         self._subscribers: list[_Subscription] = []
@@ -331,6 +375,7 @@ class StackApplication:
         self._awaiting_admin: str | None = None
         self._facts: SystemFacts | None = None
         self._installers: dict[str, ModelInstaller] = {}
+        self._chat_choice_cache: tuple[int | None, ChatChoice] | None = None
         self._registry: ManagedProcessRegistry | None = None
         self._launcher: ProcessLauncher | None = None
         self.last_first_run = None
@@ -364,11 +409,26 @@ class StackApplication:
         return self.installation.layout
 
     def profile(self, profile_id: str) -> Profile:
+        """The profile as this installation runs it: with its chosen chat model, if any."""
         try:
-            return self.profiles[profile_id]
+            base = self.profiles[profile_id]
         except KeyError:
             known = ", ".join(sorted(self.profiles)) or "none"
             raise UnknownProfile(f"unknown profile {profile_id!r}; known: {known}") from None
+        return effective_profile(base, self.chat_choice(), self.catalog())
+
+    def chat_choice(self) -> ChatChoice:
+        """This installation's saved chat model choice. Re-read only when the file changes."""
+        path = choice_path(self.layout.state)
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            stamp = None
+        cached = self._chat_choice_cache
+        if cached is None or cached[0] != stamp:
+            cached = (stamp, read_choice(path) if stamp is not None else ChatChoice())
+            self._chat_choice_cache = cached
+        return cached[1]
 
     @property
     def active_profile(self) -> str | None:
@@ -497,7 +557,9 @@ class StackApplication:
         return self.deps.provisioners(self.options)
 
     def catalog(self) -> ModelCatalog:
-        return self.deps.catalog if self.deps.catalog is not None else model_catalog()
+        """The shipped catalog, plus the models this installation imported."""
+        base = self.deps.catalog if self.deps.catalog is not None else model_catalog()
+        return with_imports(base, self.chat_choice())
 
     def model_installer(self, profile: Profile) -> ModelInstaller:
         """One installer per profile, shared by the executor and the resolver."""
@@ -510,13 +572,25 @@ class StackApplication:
                 else HttpOllamaClient(endpoint)
             )
             downloader = (
-                self.deps.downloader() if self.deps.downloader is not None else Downloader()
+                self.deps.downloader()
+                if self.deps.downloader is not None
+                else Downloader(request_headers=model_request_headers)
             )
             installer = ModelInstaller(
                 ManagedModelPaths.from_layout(self.layout), downloader=downloader, ollama=ollama
             )
             self._installers[profile.id] = installer
         return installer
+
+    def delete_chat_model(self, profile_id: str, reference: str) -> None:
+        """Remove one model from this installation's running Ollama store.
+
+        Raises when Ollama is not reachable: the files cannot be freed without it,
+        and saying the model was removed while its gigabytes stay would mislead.
+        """
+        endpoint = self.options.endpoints_for(self.profile(profile_id)).ollama
+        delete_ollama_model(reference, endpoint)
+        self.model_installer(self.profile(profile_id)).forget_detections()
 
     def resolver(self, profile: Profile) -> StackModelResolver:
         return StackModelResolver(installer=self.model_installer(profile), catalog=self.catalog())
@@ -537,6 +611,8 @@ class StackApplication:
         return default_install_actions(
             self.provision_context(),
             repo_root=self.repo_root,
+            # As this installation runs them, so configuration names the chosen chat model.
+            profiles=tuple(self.profile(profile_id) for profile_id in self.profiles),
             installer_factory=lambda _profile: self.model_installer(profile),
             catalog=self.catalog(),
             config_writer=self.deps.config_writer,
@@ -750,7 +826,7 @@ class StackApplication:
         specs = self.install_actions(profile).workflow_specs
         return frozenset(
             target
-            for target, declaration in profile.workflows.items()
+            for target, _field, declaration in declared_workflows(profile)
             if (spec := specs.get(declaration.manifest_id)) is not None and not spec.complete
         )
 
@@ -790,11 +866,19 @@ class StackApplication:
         """A controller for what provisioning owns right now."""
         integration = snapshot if snapshot is not None else self._integration()
         configuration = self.stack_configuration(profile) if self.layout.root.exists() else None
+        service_options: dict[str, dict[str, object]] = {}
+        if profile.runtime.get(WEB_SEARCH_RUNTIME_KEY):
+            image_search_env = self.deps.web_search_settings().image_search_env()
+            if image_search_env:
+                service_options[str(ComponentId.OPEN_WEBUI)] = {"env": image_search_env}
+        if profile.chat_keep_alive:
+            service_options[str(ComponentId.OLLAMA)] = {"keep_alive": profile.chat_keep_alive}
         return build_service_controller(
             integration,
             self.registry(),
             layout=self.layout,
             launcher=self.launcher(),
+            service_options=service_options or None,
             configuration=configuration,
             config_writer=self.deps.config_writer,
             endpoints=self.options.endpoints_for(profile),
@@ -917,6 +1001,77 @@ class StackApplication:
                 self._start_services(stream, profile, START_ORDER)
         return _result_of(stream)
 
+    def start_service(
+        self,
+        operation_id: str,
+        profile_id: str,
+        service_id: str,
+        *,
+        emit: OperationEventSink | None = None,
+    ) -> OperationResult:
+        """Start one service, and the ones it depends on that are still down."""
+        profile = self.profile(profile_id)
+        order = _start_order_up_to(service_id)
+        with (
+            self._operation_stream(operation_id, emit) as stream,
+            self._detection_snapshot(profile),
+        ):
+            self._active_profile = profile.id
+            stream.begin(f"Verificando {_display(service_id)}")
+            self._start_services(
+                stream, profile, order, ready_message=f"{_display(service_id)} pronto"
+            )
+        return _result_of(stream)
+
+    def stop_service(
+        self,
+        operation_id: str,
+        profile_id: str,
+        service_id: str,
+        *,
+        emit: OperationEventSink | None = None,
+    ) -> OperationResult:
+        """Stop one managed service. Services that depend on it keep running."""
+        profile = self.profile(profile_id)
+        _start_order_up_to(service_id)
+        with (
+            self._operation_stream(operation_id, emit) as stream,
+            self._detection_snapshot(profile),
+        ):
+            self._active_profile = profile.id
+            stream.begin(f"Verificando {_display(service_id)}")
+            self._stop_services(stream, profile, only=service_id)
+        return _result_of(stream)
+
+    def restart_service(
+        self,
+        operation_id: str,
+        profile_id: str,
+        service_id: str,
+        *,
+        emit: OperationEventSink | None = None,
+    ) -> OperationResult:
+        profile = self.profile(profile_id)
+        order = _start_order_up_to(service_id)
+        with (
+            self._operation_stream(operation_id, emit) as stream,
+            self._detection_snapshot(profile),
+        ):
+            self._active_profile = profile.id
+            stream.begin(f"Verificando {_display(service_id)}")
+            stopped = self._stop_services(stream, profile, finish=False, only=service_id)
+            if stopped:
+                stream.fail(
+                    OperationPhase.RESOURCE_RELEASE,
+                    f"Não foi possível reiniciar o {_display(service_id)}",
+                    stopped,
+                )
+            else:
+                self._start_services(
+                    stream, profile, order, ready_message=f"{_display(service_id)} pronto"
+                )
+        return _result_of(stream)
+
     def open_webui(
         self, operation_id: str, profile_id: str, *, emit: OperationEventSink | None = None
     ) -> OpenWebUILaunch:
@@ -1011,7 +1166,9 @@ class StackApplication:
         ``models.chat.params``), and the image
         edit settings that point Open WebUI's own edit path at the profile's
         ComfyUI edit workflow (``open_webui_image_edit``, when the profile
-        enables image editing and that workflow is ready). Each is installed
+        enables image editing and that workflow is ready). The web search settings
+        and the quieted background tasks (follow-ups and tags off,
+        ``open_webui_background_tasks``) follow their runtime flags. Each is installed
         once, updated when it drifted, and otherwise left alone. The report is
         the most significant of them; None when the profile has no use for any.
         """
@@ -1029,12 +1186,37 @@ class StackApplication:
                 )
             )
         chat_model = self._chat_model_reference(profile)
-        # Two independent reasons to own the record: keeping Open WebUI's builtin
-        # tools out of the prompt (the tools capability), and what the profile
-        # asks of the model at every request (models.chat.params). Either one on
-        # its own is enough; a profile with neither never touches the record.
-        if chat_model is not None and (profile.enables(FEATURE_TOOLS) or profile.chat_params):
-            extra = {"params": profile.chat_params} if profile.chat_params else {}
+        # Three independent reasons to own the record: keeping Open WebUI's
+        # builtin tools out of the prompt (the tools capability), what the
+        # profile asks of the model at every request (models.chat.params), and
+        # the system prompt it seeds (models.chat.system_prompt). Any one is
+        # enough; a profile with none never touches the record.
+        system_prompt = profile.chat_system_prompt
+        default_feature_ids = (
+            [FEATURE_IMAGE_GENERATION] if profile.runtime.get(IMAGE_ROUTER_RUNTIME_KEY) else None
+        )
+        if chat_model is not None and (
+            profile.enables(FEATURE_TOOLS)
+            or profile.chat_params
+            or system_prompt
+            or default_feature_ids
+        ):
+            # The label the model selector shows, with the profile's version, and the
+            # presets the profile declares (any other the Hub made is switched off).
+            extra: dict[str, object] = {
+                "name": versioned_label(profile.name, profile.version),
+                "presets": [variant.id for variant in profile.variants],
+            }
+            if profile.chat_params:
+                extra["params"] = profile.chat_params
+            if system_prompt:
+                extra["system_prompt"] = system_prompt
+            if default_feature_ids is not None:
+                extra["default_feature_ids"] = default_feature_ids
+            # The main record offers the switches its own workflows allow, as presets do.
+            main_switches = self._image_switches(profile, profile.workflows)
+            if main_switches:
+                extra["filter_ids"] = main_switches
             syncs.append(
                 (
                     "modelo de chat",
@@ -1043,10 +1225,58 @@ class StackApplication:
                     ),
                 )
             )
+        if chat_model is not None:
+            for variant in profile.variants:
+                variant_extra: dict[str, object] = {
+                    "record_id": variant.id,
+                    "name": versioned_label(variant.name, profile.version),
+                }
+                if profile.chat_params:
+                    variant_extra["params"] = profile.chat_params
+                if system_prompt:
+                    variant_extra["system_prompt"] = system_prompt
+                if default_feature_ids is not None:
+                    variant_extra["default_feature_ids"] = default_feature_ids
+                switches = self._image_switches(profile, variant.workflows)
+                if switches:
+                    # The "Alta qualidade", "Arte digital" and "Fotorrealista" switches this
+                    # preset offers.
+                    variant_extra["filter_ids"] = switches
+                syncs.append(
+                    (
+                        f"modelo {variant.name}",
+                        lambda extra=variant_extra: self.deps.model_sync(
+                            self.layout.open_webui_data,
+                            endpoints.open_webui,
+                            chat_model,
+                            **extra,
+                        ),
+                    )
+                )
         if profile.enables(FEATURE_IMAGE_EDITING):
             edit = self._image_edit_sync(profile, endpoints)
             if edit is not None:
                 syncs.append(("edição de imagem", edit))
+        if profile.runtime.get(WEB_SEARCH_RUNTIME_KEY):
+            syncs.append(
+                (
+                    "pesquisa web",
+                    lambda: self.deps.web_search_sync(
+                        self.layout.open_webui_data,
+                        endpoints.open_webui,
+                        self.deps.web_search_settings,
+                    ),
+                )
+            )
+        if profile.runtime.get(QUIET_BACKGROUND_TASKS_RUNTIME_KEY):
+            syncs.append(
+                (
+                    "tarefas em segundo plano",
+                    lambda: self.deps.background_task_sync(
+                        self.layout.open_webui_data, endpoints.open_webui
+                    ),
+                )
+            )
         if not syncs:
             return None
         stream.activity(
@@ -1115,6 +1345,28 @@ class StackApplication:
                 self._busy = False
         return self._awaiting_admin is not None
 
+    def _image_switches(self, profile: Profile, workflows: Mapping[str, Any]) -> list[str]:
+        """The composer switches a preset offers: "Alta qualidade" when it declares a high
+        quality generation, "Arte digital" and "Fotorrealista" when its generation graph maps
+        a style strength (the image filter turns that slider toward illustration or photographs;
+        with neither on, the request decides), and "Buscar referências" when the image router
+        can build a new picture on a web photo: it edits pictures and may search the web."""
+        switches = []
+        if TEXT_TO_IMAGE_HQ_WORKFLOW in workflows:
+            switches.append(QUALITY_FILTER_ID)
+        declared = workflows.get(TEXT_TO_IMAGE_WORKFLOW)
+        specs = self.install_actions(profile).workflow_specs
+        spec = specs.get(declared.manifest_id) if declared is not None else None
+        if spec is not None and WorkflowParameter.STYLE in spec.bindings:
+            switches.extend((ART_FILTER_ID, PHOTO_FILTER_ID))
+        if (
+            IMAGE_EDIT_WORKFLOW in workflows
+            and profile.runtime.get(IMAGE_ROUTER_RUNTIME_KEY)
+            and profile.runtime.get(WEB_SEARCH_RUNTIME_KEY)
+        ):
+            switches.append(REFS_FILTER_ID)
+        return switches
+
     def _image_edit_sync(
         self, profile: Profile, endpoints: StackEndpoints
     ) -> Callable[[], FilterSyncReport] | None:
@@ -1144,7 +1396,12 @@ class StackApplication:
                     "; ".join(problems)
                 )
                 return lambda: FilterSyncReport(FilterSync.UNAVAILABLE, detail)
-        settings, problems = open_webui_image_edit_settings(endpoints, resolution, graph)
+        settings, problems = open_webui_image_edit_settings(
+            endpoints,
+            resolution,
+            graph,
+            exclusive_vram=bool(profile.runtime.get(EXCLUSIVE_VRAM_RUNTIME_KEY)),
+        )
         if settings is None:
             detail = "; ".join(problems)
             return lambda: FilterSyncReport(FilterSync.UNAVAILABLE, detail)
@@ -1160,6 +1417,90 @@ class StackApplication:
             return None
         return spec.source.reference
 
+    def close(self, timeout: float = PRELOAD_TIMEOUT) -> None:
+        """Finish every background preload before releasing this installation.
+
+        Services deliberately survive closing the Hub. Its background writers
+        must not: each preload can append a service event after its HTTP request.
+        A timeout is reported, so callers cannot delete a still-active root.
+        """
+        with self._lock:
+            if self._busy:
+                raise OperationBusy("an operation is still running")
+            self._closed = True
+            threads = tuple(self._preload_threads)
+        deadline = time.monotonic() + timeout
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                raise TimeoutError("chat preload has not finished")
+        with self._lock:
+            self._preload_threads.clear()
+
+    def _preload_chat_model(self, profile: Profile) -> None:
+        """Load the chat model into Ollama in the background; never blocks or fails a start.
+
+        The first turn after "Iniciar" would otherwise wait for the disk to feed the whole
+        model to the GPU. The outcome and its time go to ``hub-events.log``. The thread is
+        not a daemon: a one-shot ``hub run start`` keeps its process until the load ends.
+        """
+        if not profile.runtime.get(PRELOAD_CHAT_MODEL_RUNTIME_KEY):
+            return
+        logs = service_log_files(self.layout, str(ComponentId.OLLAMA))
+        model = self._chat_model_reference(profile)
+        if model is None:
+            append_service_event(
+                logs, str(ComponentId.OLLAMA), "chat preload skipped: no chat model is pinned"
+            )
+            return
+        endpoint = self.options.endpoints_for(profile).ollama
+        num_ctx = profile.chat_params.get("num_ctx")
+        if not isinstance(num_ctx, int) or isinstance(num_ctx, bool):
+            num_ctx = None
+        keep_alive = profile.chat_keep_alive
+        preload = self.deps.ollama_preload
+        monotonic = self.deps.monotonic
+
+        def run() -> None:
+            started = monotonic()
+            try:
+                preload(endpoint, model, num_ctx=num_ctx, keep_alive=keep_alive)
+            except Exception as exc:  # noqa: BLE001 -- a failed preload never fails the start
+                detail = f"chat preload failed after {monotonic() - started:.1f}s: {exc}"
+            else:
+                detail = f"chat preload elapsed={monotonic() - started:.1f}s model={model}"
+            append_service_event(logs, str(ComponentId.OLLAMA), detail)
+
+        thread = threading.Thread(target=run, name="chat-preload")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("stack application is closed")
+            thread.start()
+            self._preload_threads.append(thread)
+
+    def _clean_comfyui_folders(self, profile: Profile) -> None:
+        """SPEC-208: drop the old files the Hub and its filter left in ComfyUI's folders.
+
+        Never fails a start or a stop; the outcome goes to ``hub-events.log``.
+        """
+        hours = profile.comfyui_retention_hours
+        if hours is None:
+            return
+        logs = service_log_files(self.layout, str(ComponentId.COMFYUI))
+        endpoint = self.options.endpoints_for(profile).comfyui
+        try:
+            report = clean_comfyui_folders(
+                self.layout.comfyui_app,
+                hours,
+                now=self.deps.clock(),
+                busy=lambda: self.deps.comfyui_queue_busy(endpoint),
+                repo_root=self.repo_root,
+            )
+            detail = report.describe(hours)
+        except Exception as exc:  # noqa: BLE001 -- a cleanup never fails a start or a stop
+            detail = f"comfyui cleanup failed: {exc}"
+        append_service_event(logs, str(ComponentId.COMFYUI), detail)
+
     # --- ciclo de vida -------------------------------------------------------
 
     def _start_services(
@@ -1170,6 +1511,7 @@ class StackApplication:
         *,
         finish: bool = True,
         controller: ServiceController | None = None,
+        ready_message: str = "Stack pronta",
     ):
         """Start each enabled managed service in order. External is observed only.
 
@@ -1220,6 +1562,15 @@ class StackApplication:
             if not report.ready:
                 problems.append(diagnostic("service-not-ready", f"{service_id}: {report.detail}"))
                 break
+            stream.detail(
+                OperationActivity(
+                    OperationActivityCategory.READINESS,
+                    "ready",
+                    _display(service_id),
+                    detail=report.detail,
+                ),
+                f"{_display(service_id)} pronto",
+            )
             started.append(service_id)
             warnings.extend(self._integrate(stream, profile, service_id))
             if service_id == str(ComponentId.OLLAMA):
@@ -1229,13 +1580,17 @@ class StackApplication:
                 # to start are built again on what Ollama answers now.
                 self.model_installer(profile).forget_detections()
                 controller = self._controller(profile, snapshot=snapshot)
+        if str(ComponentId.COMFYUI) in started:
+            self._clean_comfyui_folders(profile)
+        if not problems and str(ComponentId.OLLAMA) in started:
+            self._preload_chat_model(profile)
         if not finish:
             return problems
         if problems:
             return stream.fail(OperationPhase.SERVICE_START, "Falha ao iniciar a stack", problems)
         return stream.succeed(
             OperationPhase.FINALIZATION,
-            "Stack pronta" if started else "Nada para iniciar",
+            ready_message if started else "Nada para iniciar",
             output_references=tuple(started),
             diagnostics=warnings,
         )
@@ -1249,16 +1604,34 @@ class StackApplication:
             return []
         return [diagnostic("open-webui-integration", report.detail)]
 
-    def _stop_services(self, stream: OperationStream, profile: Profile, *, finish: bool = True):
+    def _stop_services(
+        self,
+        stream: OperationStream,
+        profile: Profile,
+        *,
+        finish: bool = True,
+        only: str | None = None,
+    ):
+        """Stop managed services, dependents first; ``only`` narrows it to one service."""
         controller = self._controller(profile)
         problems = []
         stopped = []
         for service_id in reversed(START_ORDER):
+            if only is not None and service_id != only:
+                continue
             current = controller.status(service_id)
             if current.runtime.state is not RuntimeProcessState.RUNNING:
                 continue
             if not current.stoppable:
                 # External or unowned: reported, never killed.
+                if only is not None:
+                    problems.append(
+                        diagnostic(
+                            "service-not-owned",
+                            f"{service_id} was not started by this installation; "
+                            "the Hub never stops a process it does not own",
+                        )
+                    )
                 continue
             stream.advance(
                 OperationState.RUNNING,
@@ -1283,13 +1656,19 @@ class StackApplication:
         if str(ComponentId.OPEN_WEBUI) in stopped:
             # Nothing left to sync into; the next start integrates again.
             self._awaiting_admin = None
+        if only is None or only == str(ComponentId.COMFYUI):
+            self._clean_comfyui_folders(profile)
         if not finish:
             return problems
         if problems:
-            return stream.fail(OperationPhase.RESOURCE_RELEASE, "Falha ao parar a stack", problems)
+            failure = (
+                "Falha ao parar a stack" if only is None else f"Falha ao parar {_display(only)}"
+            )
+            return stream.fail(OperationPhase.RESOURCE_RELEASE, failure, problems)
+        done = "Stack parada" if only is None else f"{_display(only)} parado"
         return stream.succeed(
             OperationPhase.FINALIZATION,
-            "Stack parada" if stopped else "Nada para parar",
+            done if stopped else "Nada para parar",
             output_references=tuple(stopped),
         )
 
@@ -1341,6 +1720,8 @@ class _OperationScope:
 
     def __enter__(self) -> OperationStream:
         with self.app._lock:
+            if self.app._closed:
+                raise RuntimeError("stack application is closed")
             if self.app._busy:
                 raise OperationBusy("another operation is already running")
             self.app._busy = True
@@ -1453,6 +1834,22 @@ _DISPLAY = {
 
 def _display(service_id: str) -> str:
     return _DISPLAY.get(service_id, service_id)
+
+
+# What each service needs running before it starts: Open WebUI's chat backend
+# is Ollama. ComfyUI stands alone, so starting it never starts the chat stack.
+_SERVICE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    str(ComponentId.OLLAMA): (),
+    str(ComponentId.OPEN_WEBUI): (str(ComponentId.OLLAMA),),
+    str(ComponentId.COMFYUI): (),
+}
+
+
+def _start_order_up_to(service_id: str) -> tuple[str, ...]:
+    """The service and its dependencies, in start order. Unknown ids are refused."""
+    if service_id not in _SERVICE_DEPENDENCIES:
+        raise ValueError(f"unknown service {service_id!r}")
+    return (*_SERVICE_DEPENDENCIES[service_id], service_id)
 
 
 def _provision_problem(item) -> str:

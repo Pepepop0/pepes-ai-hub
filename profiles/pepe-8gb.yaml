@@ -1,6 +1,7 @@
 schema_version: 1
 id: pepe-8gb
 name: Pepinho
+version: 1.2.0
 ui:
   default_pet: claw
   default_theme: pepe
@@ -10,7 +11,7 @@ description: >-
   sem prometer desempenho alto).
 
 hardware:
-  os: windows
+  os: [windows, linux]
   gpu_vendor: nvidia
   min_vram_gb: 8
   recommended_vram_gb: 8
@@ -44,7 +45,10 @@ models:
     vae: comfyui/flux2_vae
 
 workflows:
-  text_to_image: {manifest_id: flux2_klein_t2i}
+  # 1024x1024 is FLUX.2 klein's native size; without it Open WebUI generates at 512x512 and the
+  # edit (which scales its input to 1 MP) jumps to 1024x1024 on the first edit. Not measured on
+  # 8 GB of VRAM.
+  text_to_image: {manifest_id: flux2_klein_t2i, size: 1024x1024}
   image_edit: {manifest_id: flux2_klein_edit}
 
 runtime:

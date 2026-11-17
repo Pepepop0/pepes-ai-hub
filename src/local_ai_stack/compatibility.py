@@ -38,11 +38,12 @@ def evaluate_compatibility(facts: SystemFacts, profile: Profile) -> Compatibilit
     warnings: list[CompatibilityIssue] = []
     blockers: list[CompatibilityIssue] = []
 
-    if facts.os_name.casefold() != profile.hardware.os.casefold():
+    supported = profile.hardware.os
+    if facts.os_name.casefold() not in supported:
         blockers.append(
             CompatibilityIssue(
                 "os_mismatch",
-                f"Profile requires {profile.hardware.os}; detected {facts.os_name}.",
+                f"Profile requires {' or '.join(supported)}; detected {facts.os_name}.",
             )
         )
 

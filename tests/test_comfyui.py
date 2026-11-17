@@ -34,8 +34,8 @@ from local_ai_stack.pyenv import PythonEnvironment
 from local_ai_stack.runner import CommandResult, CommandRunner
 
 URL = "https://github.com/comfyanonymous/ComfyUI.git"
-REVISION = "v0.34.0"
-COMMIT = "12d5279438bfefc058a269eae805ceab6047777f"
+REVISION = "v0.39.0"
+COMMIT = "b0b743566f65daafc423b4fea8a2fbda94b3384a"
 OTHER_COMMIT = "a" * 40
 
 DEPS = DependencyPin(
@@ -131,7 +131,7 @@ class FakeGit(GitClient):
         self.repositories.add(target)
         return CommandResult(argv=("git", "clone"), returncode=0)
 
-    def checkout(self, path, revision, *, allow_dirty=False, dry_run=None):
+    def checkout(self, path, revision, *, allow_dirty=False, ignore=(), dry_run=None):
         return CommandResult(argv=("git", "checkout"), returncode=0)
 
     def head(self, path: Path) -> str:
@@ -176,6 +176,89 @@ def install_managed(context: ProvisionContext, *, marker: bool = True, venv: boo
         write_marker(
             directory, component=COMPONENT_ID, source_id=URL, version=REVISION, checksum=COMMIT
         )
+
+
+class StatusRunner(FakeRunner):
+    """Answers `git status --porcelain` the way a real checkout with Hub files does."""
+
+    def __init__(self, status: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.status = status
+
+    def run(self, argv: Sequence[str], **kwargs: object) -> CommandResult:
+        items = tuple(str(a) for a in argv)
+        if len(items) > 1 and Path(items[0]).stem == "git" and items[1] == "status":
+            self.calls.append(items)
+            return CommandResult(argv=items, returncode=0, stdout=self.status)
+        return super().run(argv, **kwargs)
+
+
+class RealCleanlinessGit(FakeGit):
+    """FakeGit whose fetch and checkout run GitClient's real cleanliness check."""
+
+    def __init__(self, status: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.runner = StatusRunner(status)
+
+    def checkout(self, path, revision, *, allow_dirty=False, ignore=(), dry_run=None):
+        return GitClient.checkout(
+            self, path, revision, allow_dirty=allow_dirty, ignore=ignore, dry_run=dry_run
+        )
+
+    def git_calls(self, subcommand: str) -> list[tuple[str, ...]]:
+        return [call for call in self.runner.calls if len(call) > 1 and call[1] == subcommand]
+
+
+def checkout_needing_repair(context: ProvisionContext, git: FakeGit) -> None:
+    """An installed checkout with the Hub's marker in it, whose environment went missing."""
+    install_managed(context, marker=True, venv=False)
+    (context.layout.comfyui_app / "requirements.txt").write_text("torch\n", encoding="utf-8")
+    git.repositories.add(context.layout.comfyui_app)
+
+
+def test_repairing_an_installed_checkout_ignores_the_hubs_own_marker(tmp_path):
+    """Regression (RTX 5090 rig): `?? .pepito-managed.json` made every repair fail."""
+    git = RealCleanlinessGit(f"?? {MARKER_NAME}\n?? {MARKER_NAME}.bak\n?? .venv/\n")
+    context = context_for(tmp_path)
+    checkout_needing_repair(context, git)
+
+    def moved_to_pin(_path):
+        return COMMIT if git.git_calls("checkout") else OTHER_COMMIT
+
+    git.head = moved_to_pin
+
+    result = pinned(git=git).apply(context)
+
+    assert result.outcome is ProvisionOutcome.INSTALLED, result.failure
+    assert git.git_calls("fetch") and git.git_calls("checkout")
+
+
+def test_a_checkout_already_at_the_pin_is_neither_fetched_nor_checked_out(tmp_path):
+    git = RealCleanlinessGit(f"?? {MARKER_NAME}\n")
+    context = context_for(tmp_path)
+    checkout_needing_repair(context, git)
+
+    result = pinned(git=git).apply(context)
+
+    assert result.outcome is ProvisionOutcome.INSTALLED, result.failure
+    assert git.git_calls("fetch") == [] and git.git_calls("checkout") == []
+    assert git.clones == []
+
+
+def test_a_real_local_edit_still_blocks_updating_the_checkout(tmp_path):
+    git = RealCleanlinessGit(f"?? {MARKER_NAME}\n M comfy/model_management.py\n")
+    git.head_commit = OTHER_COMMIT
+    context = context_for(tmp_path)
+    checkout_needing_repair(context, git)
+
+    result = pinned(git=git).apply(context)
+
+    assert result.outcome is ProvisionOutcome.FAILED
+    assert result.failure.message == (
+        "Could not update the ComfyUI checkout: "
+        "the existing checkout has local changes and was left untouched."
+    )
+    assert git.git_calls("fetch") == []
 
 
 # --- identidade e pin ------------------------------------------------------
@@ -348,6 +431,7 @@ def test_the_default_registry_ships_comfyui_fully_pinned():
     # The dependency decision now comes from the manifest, so apply() no longer
     # refuses: this is the component's blocker being closed.
     assert not provisioner.dependencies.is_empty
+    assert [node.id for node in provisioner.custom_nodes] == ["comfyui-krea2edit"]
 
 
 def test_missing_git_refuses(tmp_path):
@@ -489,6 +573,9 @@ def test_failed_clone_is_reported_structurally(tmp_path):
     assert result.outcome is ProvisionOutcome.FAILED
     assert result.failure is not None
     assert result.failure.reason is FailureReason.COMMAND_FAILED
+    assert result.failure.message == (
+        "Could not clone ComfyUI: Git failed without a cause it stated plainly."
+    )
 
 
 def test_install_stays_inside_the_install_root(tmp_path):
@@ -557,8 +644,15 @@ def test_pip_output_is_parsed_into_dependency_activity_and_transfer(tmp_path):
     assert downloading[0].activity.item == "torch"
     assert downloading[-1].transfer.completed_bytes == 10_000_000
     assert downloading[-1].transfer.total_bytes == 10_000_000
-    installed = [e for e in events if e.milestone and e.activity.action == "installed"]
-    assert any(e.activity.item == "torch" for e in installed)
+    installed = [
+        e
+        for e in events
+        if e.milestone
+        and e.activity.action == "installed"
+        and e.activity.category is OperationActivityCategory.DEPENDENCY
+    ]
+    assert [e.activity.item for e in installed] == ["1 pacote Python"]
+    assert installed[0].activity.detail == "pip (Python)"
 
 
 def test_git_clone_progress_is_parsed_into_transfer_activity(tmp_path):

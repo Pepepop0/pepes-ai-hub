@@ -39,6 +39,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from .installation import ResolvedInstallation
+from .installation_control import installation_checkpoint
 from .layout import StackLayout
 from .operation_contracts import OperationActivity, OperationActivityCategory, TransferProgress
 from .operations import safe_text
@@ -356,6 +357,7 @@ class ProvisionContext:
         milestone: bool = False,
     ) -> None:
         """Publish a progress note. Sanitized before it leaves the backend."""
+        installation_checkpoint()
         event = ProvisionEvent(
             component_id,
             level,

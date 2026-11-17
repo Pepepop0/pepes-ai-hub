@@ -1,0 +1,46 @@
+{
+ "nodes": [
+  {
+   "key": "value",
+   "node_ids": [
+    "75:69"
+   ],
+   "type": "height"
+  },
+  {
+   "key": "unet_name",
+   "node_ids": [
+    "75:70"
+   ],
+   "type": "model"
+  },
+  {
+   "key": "value",
+   "node_ids": [
+    "76"
+   ],
+   "type": "prompt"
+  },
+  {
+   "key": "noise_seed",
+   "node_ids": [
+    "75:73"
+   ],
+   "type": "seed"
+  },
+  {
+   "key": "steps",
+   "node_ids": [
+    "75:62"
+   ],
+   "type": "steps"
+  },
+  {
+   "key": "value",
+   "node_ids": [
+    "75:68"
+   ],
+   "type": "width"
+  }
+ ]
+}

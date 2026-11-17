@@ -82,7 +82,13 @@ def test_the_catalog_loads_without_touching_the_network(monkeypatch):
     monkeypatch.setattr(httpx.Client, "stream", explode)
     catalog = model_catalog()
     assert catalog.unpinned == {}
-    assert len(catalog.for_provider(ModelProvider.COMFYUI)) == 3
+    for profile_id in ("pepe-8gb", "pepe", "capella"):
+        profile = load_profile(REPO / "profiles" / f"{profile_id}.yaml")
+        assert dict(unresolved_roles(profile, catalog)) == {}, profile_id
+        specs = profile_model_specs(profile, catalog)
+        comfyui = [spec for spec in specs if spec.provider is ModelProvider.COMFYUI]
+        assert comfyui, profile_id
+        assert all(spec.source.artifact.has_checksum for spec in comfyui)
 
 
 def test_no_role_is_unresolvable_any_more(pepe):

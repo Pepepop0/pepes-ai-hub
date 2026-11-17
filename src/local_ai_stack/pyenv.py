@@ -135,6 +135,48 @@ class PythonEnvironment:
     def exists(self) -> bool:
         return self.python.is_file()
 
+    def script_is_current(self, name: str) -> bool:
+        """False when a console script still runs an interpreter from another folder.
+
+        pip writes the absolute path of the environment's interpreter into
+        every console script it installs. A folder moved in Explorer keeps the
+        old path in each launcher, which then fails before Python even starts
+        ("Fatal error in launcher"); reinstalling over a satisfied requirement
+        does not rewrite it. A script whose interpreter cannot be read counts
+        as current: only a proven mismatch is reported.
+        """
+        interpreter = launcher_interpreter(self.script(name))
+        return interpreter is None or _same_path(interpreter, self.python)
+
+
+# Where a pip console script records its interpreter: a `#!` line, at the top
+# of a text script or just before the zip appended to a Windows launcher exe.
+_SHEBANG_RE = re.compile(rb'#!\s*"?([^"\r\n]+?)"?\s*\r?\n')
+
+
+def launcher_interpreter(script: Path) -> Path | None:
+    """The interpreter a pip console script was written for, when it says."""
+    try:
+        data = script.read_bytes()
+    except OSError:
+        return None
+    archive = data.rfind(b"PK\x03\x04")
+    head = data[:archive] if archive > 0 else data[:4096]
+    marker = head.rfind(b"#!") if archive > 0 else head.find(b"#!")
+    if marker < 0:
+        return None
+    match = _SHEBANG_RE.match(head, marker)
+    if match is None:
+        return None
+    try:
+        return Path(match.group(1).decode("utf-8").strip())
+    except UnicodeDecodeError:
+        return None
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
 
 def _probe_version(
     runner: CommandRunner, prefix: Sequence[str], *, code: str = _VERSION_PROBE
@@ -310,6 +352,24 @@ class PipEvent:
     completed_bytes: int | None = None
     total_bytes: int | None = None
     bytes_per_second: float | None = None
+    package_count: int | None = None
+
+    @property
+    def item(self) -> str:
+        if self.package_count is None:
+            return self.package
+        suffix = "pacote Python" if self.package_count == 1 else "pacotes Python"
+        return f"{self.package_count} {suffix}"
+
+    @property
+    def message(self) -> str:
+        verb = {
+            "resolving": "Resolvendo",
+            "downloading": "Baixando",
+            "installing": "Instalando",
+            "installed": "Instalado" if self.package_count == 1 else "Instalados",
+        }[self.action]
+        return f"{verb} {self.item}"
 
 
 PipObserver = Callable[[PipEvent], None]
@@ -376,13 +436,19 @@ class PipOutputParser:
             return
         match = _INSTALLING_RE.match(text)
         if match:
-            for name in _split_names(match.group(1)):
-                self._on_event(PipEvent("installing", name))
+            names = _split_names(match.group(1))
+            if names:
+                # pip announces the complete set once, then installs it without
+                # per-package progress. Reporting every name in a tight loop
+                # falsely made the last name look like the package holding up
+                # the operation for the whole silent install phase.
+                self._on_event(PipEvent("installing", "pacotes Python", package_count=len(names)))
             return
         match = _SUCCESS_RE.match(text)
         if match:
-            for token in match.group(1).split():
-                self._on_event(PipEvent("installed", token.rsplit("-", 1)[0]))
+            tokens = match.group(1).split()
+            if tokens:
+                self._on_event(PipEvent("installed", "pacotes Python", package_count=len(tokens)))
 
 
 def _package_of(artifact: str) -> str | None:
@@ -406,6 +472,10 @@ def _split_names(joined: str) -> list[str]:
     return [name.strip() for name in joined.split(",") if name.strip()]
 
 
+# Read once per pip invocation by pip itself; see pip_install.
+PIP_ISOLATED_ENV = {"PIP_CONFIG_FILE": os.devnull}
+
+
 def pip_install(
     runner: CommandRunner,
     environment: PythonEnvironment,
@@ -419,13 +489,17 @@ def pip_install(
     """Install pinned requirements into the environment.
 
     Requirements are passed verbatim and are expected to be pinned by the
-    caller; nothing here resolves a floating version.
+    caller; nothing here resolves a floating version. Machine-wide pip config
+    files are ignored (pip's documented ``PIP_CONFIG_FILE=os.devnull``): a host
+    ``constraint =`` or index set in /etc/pip.conf or pip.ini would otherwise
+    silently override the manifest's pins. Explicit PIP_* variables still apply.
     """
     if not requirements:
         raise PythonEnvironmentError("no requirements given")
     result = runner.run(
         pip_install_argv(environment, requirements, extra_args=extra_args),
         timeout=timeout,
+        env=PIP_ISOLATED_ENV,
         dry_run=dry_run,
         on_output=on_output,
     )

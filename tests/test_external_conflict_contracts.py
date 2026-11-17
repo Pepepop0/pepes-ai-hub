@@ -77,7 +77,7 @@ def test_filesystem_install_location_is_independent_from_conflict_policy(mode, p
 def test_custom_root_and_external_installation_are_not_a_runtime_conflict_by_themselves(tmp_path):
     custom = InstallLocation.custom(tmp_path / "loira-40k")
     assessment = report()
-    assert custom.root != Path("C:/Users/Pedro/AppData/Local/Programs/Ollama")
+    assert custom.root != Path("C:/Users/User/AppData/Local/Programs/Ollama")
     assert assessment.disposition is ConflictPreflightDisposition.READY
     assert assessment.conflicts == ()
     assert assessment.available_policies == ()

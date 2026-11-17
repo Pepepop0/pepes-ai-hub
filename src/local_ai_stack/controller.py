@@ -37,6 +37,7 @@ from .launcher import (
     StopOutcome,
     StopResult,
 )
+from .logs import append_service_event
 from .probes import http_probe, tcp_probe
 from .processes import (
     ProcessOrigin,
@@ -232,7 +233,8 @@ class ServiceController:
             descendants: frozenset[int] = frozenset()
             if entry_status.process is not None and process_report.usable:
                 descendants = proven_descendants(entry_status.process, process_report)
-            managed_pids = frozenset({root, *members, *descendants})
+            roots = (root,) if entry_status.process is not None else ()
+            managed_pids = frozenset({*roots, *members, *descendants})
         runtime = discover_process(
             spec.process,
             processes=process_report,
@@ -276,19 +278,21 @@ class ServiceController:
             )
 
         current = self.status(service_id)
+
         if current.runtime.state is RuntimeProcessState.RUNNING:
             if current.origin is ProcessOrigin.MANAGED:
-                return StartReport(
-                    LaunchResult(
-                        LaunchOutcome.ALREADY_MANAGED,
-                        service_id,
-                        current.runtime.pid,
-                        f"already managed as pid {current.runtime.pid}",
-                        current.managed,
-                    ),
-                    RuntimeProcessState.RUNNING,
-                    current.health,
+                launch = LaunchResult(
+                    LaunchOutcome.ALREADY_MANAGED,
+                    service_id,
+                    current.runtime.pid,
+                    f"already managed as pid {current.runtime.pid}",
+                    current.managed,
                 )
+                if wait and (current.health is None or current.health.state is not ServiceState.UP):
+                    limit = spec.launch.startup_timeout if timeout is None else timeout
+                    state, health, detail = self._await_ready(spec, current.runtime.pid, limit)
+                    return StartReport(launch, state, health, detail)
+                return StartReport(launch, RuntimeProcessState.RUNNING, current.health)
             return StartReport(
                 LaunchResult(
                     LaunchOutcome.ALREADY_RUNNING_EXTERNAL,
@@ -303,6 +307,7 @@ class ServiceController:
                 current.health,
             )
 
+        started_at = self._monotonic()
         launch = self.launcher.start(spec.launch, dry_run=dry_run)
         if not launch.started:
             state = (
@@ -316,29 +321,49 @@ class ServiceController:
                 launch, RuntimeProcessState.STARTING, detail="spawned; readiness not checked"
             )
         limit = spec.launch.startup_timeout if timeout is None else timeout
-        state, health, detail = self._await_ready(spec, launch.pid, limit)
+        state, health, detail = self._await_ready(spec, launch.pid, limit, started_at=started_at)
         return StartReport(launch, state, health, detail)
 
     def _check(self, spec: ServiceControlSpec, listeners: ListenerReport) -> ServiceStatus:
         return check_service(spec.service, http=self._http, tcp=self._tcp, listeners=listeners)
 
     def _await_ready(
-        self, spec: ServiceControlSpec, pid: int | None, timeout: float
+        self,
+        spec: ServiceControlSpec,
+        pid: int | None,
+        timeout: float,
+        *,
+        started_at: float | None = None,
     ) -> tuple[RuntimeProcessState, ServiceStatus, str]:
         """Poll health until the service answers, the process dies, or time runs out."""
-        deadline = self._monotonic() + timeout
+        wait_started = self._monotonic()
+        started_at = wait_started if started_at is None else started_at
+        deadline = wait_started + timeout
+
+        def finish(state: RuntimeProcessState, health: ServiceStatus, detail: str):
+            elapsed = max(0.0, self._monotonic() - started_at)
+            detail = f"{detail}; readiness elapsed={elapsed:.3f}s"
+            append_service_event(
+                spec.launch.logs if spec.launch is not None else None, spec.service_id, detail
+            )
+            return state, health, detail
+
         while True:
             # Rescan every round: a service that is starting up has not opened
             # its port yet, and a stale scan would hide the moment it does.
             listeners = self._list_listeners()
             if pid is not None and self._lookup_process(pid).outcome is LookupOutcome.NOT_FOUND:
                 health = self._check(spec, listeners)
-                return RuntimeProcessState.FAILED, health, f"process {pid} exited during startup"
+                return finish(
+                    RuntimeProcessState.FAILED, health, f"process {pid} exited during startup"
+                )
             health = self._check(spec, listeners)
             if health.state is ServiceState.UP:
-                return RuntimeProcessState.RUNNING, health, "process running and service healthy"
+                return finish(
+                    RuntimeProcessState.RUNNING, health, "process running and service healthy"
+                )
             if self._monotonic() >= deadline:
-                return (
+                return finish(
                     RuntimeProcessState.FAILED,
                     health,
                     f"process is running but did not become healthy within {timeout:.1f}s",

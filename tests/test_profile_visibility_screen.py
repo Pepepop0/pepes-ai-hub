@@ -11,6 +11,7 @@ import asyncio
 from dataclasses import replace
 
 from hub_fakes import ready_application
+from internal_profile_support import INTERNAL_PROFILE_ID, internal_profile
 from test_app import all_profiles, integration_snapshot, reference_facts, stopped_runtime
 from textual.widgets import Button
 
@@ -19,14 +20,18 @@ from local_ai_stack.config import InstalledConfig
 from local_ai_stack.profiles import offered_profiles
 from local_ai_stack.tui.navigation import Section
 
-INTERNAL = "test"
+INTERNAL = INTERNAL_PROFILE_ID
+
+
+def profiles_with_internal():
+    return [*all_profiles(), internal_profile()]
 
 
 def hub(*, profile_id: str = "pepe") -> LocalAIStackApp:
     """The shell over an installation that runs ``profile_id``."""
     return LocalAIStackApp(
         facts=reference_facts(),
-        profiles=all_profiles(),
+        profiles=profiles_with_internal(),
         runtime_snapshot=stopped_runtime(),
         integration=integration_snapshot(),
         installed_config=InstalledConfig(profile_id=profile_id),
@@ -52,9 +57,9 @@ def profile_buttons(app) -> set[str]:
     }
 
 
-def test_the_shipped_profiles_include_an_internal_one():
-    """Otherwise the tests below would prove nothing."""
-    profiles = all_profiles()
+def test_the_fixture_includes_an_internal_profile():
+    """The hidden-profile scenarios exercise real data, not an absent id."""
+    profiles = profiles_with_internal()
     assert any(profile.id == INTERNAL and profile.internal for profile in profiles)
     assert INTERNAL not in {profile.id for profile in offered_profiles(profiles, env={})}
 
@@ -93,7 +98,7 @@ def test_an_installation_that_runs_an_internal_profile_still_says_so():
     """Hidden from the offer is not hidden from the truth."""
 
     async def exercise() -> None:
-        internal = next(profile for profile in all_profiles() if profile.id == INTERNAL)
+        internal = next(profile for profile in profiles_with_internal() if profile.id == INTERNAL)
         app = hub(profile_id=INTERNAL)
         async with app.run_test(size=(120, 40)) as pilot:
             await settle(pilot)

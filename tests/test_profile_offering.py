@@ -17,7 +17,6 @@ from test_installation_switching import World, hub
 from local_ai_stack.model_catalog import model_catalog
 from local_ai_stack.profiles import (
     ENV_SHOW_INTERNAL_PROFILES,
-    VISIBILITY_INTERNAL,
     VISIBILITY_PUBLIC,
     ProfileError,
     load_profile,
@@ -32,10 +31,10 @@ from local_ai_stack.storage import (
     model_download_estimate,
 )
 from local_ai_stack.system import GPUInfo, SystemFacts
-from local_ai_stack.tui.application import COMPATIBLE, INSUFFICIENT, RECOMMENDED
+from local_ai_stack.tui.application import COMPATIBLE, INSUFFICIENT, RECOMMENDED, UNAVAILABLE
 
 ROOT = Path(__file__).resolve().parents[1]
-SHIPPED = load_profiles(ROOT / "profiles")
+SHIPPED = list(offered_profiles(load_profiles(ROOT / "profiles"), env={}))
 
 
 # --- visibility -------------------------------------------------------------------
@@ -47,19 +46,25 @@ def test_the_shipped_profiles_say_who_they_are_for():
         "capella": VISIBILITY_PUBLIC,
         "pepe": VISIBILITY_PUBLIC,
         "pepe-8gb": VISIBILITY_PUBLIC,
-        "test": VISIBILITY_INTERNAL,
     }
 
 
 def test_an_internal_profile_is_not_offered_and_is_not_gone():
-    offered = offered_profiles(SHIPPED, env={})
+    from test_service_config import disabled_profile
+
+    profiles = [*SHIPPED, disabled_profile()]
+    offered = offered_profiles(profiles, env={})
     assert [profile.id for profile in offered] == ["capella", "pepe", "pepe-8gb"]
-    assert {profile.id for profile in SHIPPED} - {profile.id for profile in offered} == {"test"}
+    assert {profile.id for profile in profiles} - {profile.id for profile in offered} == {"test"}
 
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
 def test_a_machine_can_ask_for_the_internal_ones(value):
-    offered = offered_profiles(SHIPPED, env={ENV_SHOW_INTERNAL_PROFILES: value})
+    from test_service_config import disabled_profile
+
+    offered = offered_profiles(
+        [*SHIPPED, disabled_profile()], env={ENV_SHOW_INTERNAL_PROFILES: value}
+    )
     assert "test" in {profile.id for profile in offered}
 
 
@@ -117,6 +122,26 @@ def test_the_largest_profile_that_fits_is_the_recommended_one(tmp_path, vram_mib
         adapter.close()
 
 
+def test_missing_git_is_not_mislabeled_as_insufficient_vram(tmp_path):
+    world = World()
+    adapter = hub(tmp_path, world)
+    try:
+        adapter.backend.facts = lambda: SystemFacts(
+            "Windows",
+            "11",
+            "3.11.9",
+            False,
+            True,
+            (GPUInfo("NVIDIA GeForce RTX 5090", 32607),),
+        )
+        choices = adapter.profile_choices()
+        assert {choice.standing for choice in choices} == {UNAVAILABLE}
+        assert {choice.blockers for choice in choices} == {("git_missing",)}
+        assert all(choice.compatible is False for choice in choices)
+    finally:
+        adapter.close()
+
+
 def test_the_offered_profiles_are_ordered_from_smallest_to_largest(tmp_path):
     world = World()
     adapter = hub(tmp_path, world)
@@ -165,7 +190,10 @@ def test_every_shipped_profile_can_say_what_it_downloads():
     assert estimates["capella"].known_bytes > estimates["pepe"].known_bytes
     assert estimates["pepe"].known_bytes > estimates["pepe-8gb"].known_bytes
     assert 13 < estimates["pepe-8gb"].known_gib < 15
-    assert 27 < estimates["capella"].known_gib < 29
+    # The public chat, Qwen image set and shared analysis models total about 38 GiB.
+    assert estimates["capella"].known_gib > 38
+    if not next(profile for profile in SHIPPED if profile.id == "capella").variants:
+        assert estimates["capella"].known_gib < 39
 
 
 def test_a_model_without_a_recorded_size_is_named_not_guessed():

@@ -399,6 +399,7 @@ class ControlledOllama:
         self.pulls: list[str] = []
         self.list_calls = 0
         self.chats: list[tuple[str, str, str]] = []
+        self.preloads: list[tuple[str, str, int | None, str | None]] = []
 
     def list_models(self) -> tuple[OllamaModelEntry, ...]:
         self.list_calls += 1
@@ -416,6 +417,20 @@ class ControlledOllama:
         self.pulls.append(reference)
         digest = self.pinned.get(reference) or hashlib.sha256(reference.encode("utf-8")).hexdigest()
         self.installed.append(OllamaModelEntry(name=reference, digest=digest, size_bytes=1))
+
+    def preload(
+        self,
+        endpoint: str,
+        reference: str,
+        *,
+        num_ctx: int | None = None,
+        keep_alive: str | None = None,
+    ) -> None:
+        """Warm only an installed model, without contacting a real Ollama."""
+        known = {entry.name for entry in self.list_models()}
+        if reference not in known:
+            raise OllamaClientError(f"{reference} is not in the controlled store")
+        self.preloads.append((endpoint, reference, num_ctx, keep_alive))
 
     # --- rota de chat ------------------------------------------------------
 

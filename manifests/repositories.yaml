@@ -9,12 +9,13 @@
 schema_version: 1
 
 repositories:
-  # ComfyUI v0.34.0, published 2026-08-26, stable (not a prerelease).
-  # The tag was a lightweight tag pointing directly at this commit.
+  # ComfyUI v0.39.0, published 2026-10-05, stable (not a prerelease).
+  # The tag was a lightweight tag pointing directly at this commit. The
+  # repository now lives at Comfy-Org/ComfyUI; this URL redirects there.
   comfyui:
     url: https://github.com/comfyanonymous/ComfyUI.git
-    revision: v0.34.0
-    commit: 12d5279438bfefc058a269eae805ceab6047777f
+    revision: v0.39.0
+    commit: b0b743566f65daafc423b4fea8a2fbda94b3384a
     destination: apps/comfyui
 
     # cp311 wheels exist for the whole torch triple below, and 3.11 is what the
@@ -24,9 +25,9 @@ repositories:
       minimum: "3.11"
       below: "3.13"
 
-    # ComfyUI's own requirements.txt leaves torch, torchvision and torchaudio
-    # unversioned, so they are pinned here instead. Everything else comes from
-    # that file, which is itself fixed by the commit above.
+    # ComfyUI's own requirements.txt leaves torch and torchvision unversioned,
+    # so they are pinned here instead. Everything else comes from that file,
+    # which is itself fixed by the commit above.
     #
     # cu130 because the README at this very commit states cu130 or above is
     # required for Nvidia 20 series and newer, and the target is an RTX 5070.
@@ -34,9 +35,15 @@ repositories:
     #
     # 2.11.0 rather than the newer 2.13.0 in the same index: torchaudio is in
     # maintenance mode and its last cu130 build is 2.11.0, so 2.12 and 2.13
-    # have no matching torchaudio. This triple is internally consistent —
-    # torchvision 0.26.0 declares torch==2.11.0 — and ComfyUI needs torch 2.7
-    # at minimum, so 2.11.0 is comfortably above the floor.
+    # have no matching torchaudio. Upstream dropped torchaudio from
+    # requirements.txt before v0.39.0 (#16457); it stays pinned here so the
+    # triple is unchanged, and leaving it out is what would unlock a newer
+    # torch. This triple is internally consistent — torchvision 0.26.0
+    # declares torch==2.11.0 — and ComfyUI needs torch 2.7 at minimum, so
+    # 2.11.0 is comfortably above the floor. At v0.39.0 nothing in
+    # requirements.txt pins torch: its torch dependents (kornia, spandrel,
+    # torchsde, torchvision) resolve against this triple on cp311/win_amd64,
+    # and comfy-kitchen 0.2.37 and comfy-aimdo 0.5.5 declare no torch at all.
     dependencies:
       extra_index_url: https://download.pytorch.org/whl/cu130
       requirements:
@@ -46,3 +53,16 @@ repositories:
       use_repository_requirements: true
       verify_distribution: torch
       verify_version: "2.11.0"
+
+    # Node packs checked out into custom_nodes/<id>, each verified against its
+    # commit. The Hub installs no pip dependencies for them: a pack that
+    # declares any is refused at install time rather than half-working.
+    custom_nodes:
+      # Krea 2 Identity Edit nodes v2.0.0 (annotated tag, 2026-10-16), which peels to
+      # this commit. Provides Krea2EditModelPatch (with `ref_position`, the placement
+      # the V2 LoRAs restage with) and Krea2EditGroundedEncode; pyproject declares
+      # `dependencies = []` and there is no requirements.txt. Licence: Apache-2.0.
+      comfyui-krea2edit:
+        url: https://github.com/lbouaraba/comfyui-krea2edit.git
+        revision: v2.0.0
+        commit: 13ef60f20828949becada815d3cbc371eb5ccaab

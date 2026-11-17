@@ -1,80 +1,138 @@
-# PRD — Local AI Stack Manager
+# PRD: gerenciar IA local pelo desktop
 
-## 1. Visão
+Este documento define o redesenho do Pepito’s AI Hub para Windows. O objetivo é instalar e operar uma stack local sem exigir terminal, mantendo as proteções do motor Python existente. O [PRD de instalações](PRD_INSTALLATIONS.md) detalha os fluxos de arquivos; o [roadmap](ROADMAP.md) separa esta entrega de propostas futuras.
 
-Provisionador local de IA para Windows com TUI. O usuário escolhe um profile e o sistema instala, configura, valida e inicia uma stack local com LLM, visão, tool calling, geração e edição de imagem.
+## Público e problema
 
-## 2. Problema
+Você escolhe um perfil e uma pasta; o Hub provisiona Ollama, Open WebUI, ComfyUI, modelos e workflows. Hoje, a navegação divide decisões relacionadas entre telas e torna ações de manutenção difíceis de encontrar. A nova interface reúne essas ações na instalação correspondente e mostra o efeito antes de executá-las.
 
-A montagem manual exige múltiplas instalações, paths, downloads grandes, workflows ComfyUI, node mappings, URLs/portas, configuração de modelos, controle de processos e cuidados de VRAM. O produto converte esse conhecimento implícito em um processo reproduzível e auditável.
+O público inicial usa Windows 10/11 x64 com NVIDIA. O produto continua local, sem conta do Hub, servidor remoto ou telemetria adicionados por este redesenho.
 
-## 3. Profiles
+## Decisões de produto
 
-### Pepe
-- Windows 10
-- RTX 5070
-- 12 GB VRAM
-- chat local, visão e tools;
-- FLUX.2 Klein para geração/edição;
-- política agressiva de unload/reload.
+- Janela desktop nativa com WebView2, React, TypeScript e componentes shadcn/ui
+- Backend Python existente como única autoridade sobre instalações, processos e arquivos
+- Interface em português, com tema escuro, claro e do sistema
+- Mascote Claw existente preservado; nenhum novo personagem substitui a identidade
+- Open WebUI continua responsável por chat e imagens; o Hub não duplica esse cliente
+- Perfis e manifests continuam declarativos, com versões e revisões fixadas
+- Estado desconhecido aparece como desconhecido, nunca como sucesso ou capacidade zero
+- Ações destrutivas exigem confirmação contextual e nova validação no backend
 
-### Capella
-- Windows 10
-- RTX 5090
-- 32 GB VRAM
-- single GPU na v0.1;
-- modelos maiores e menos pressão de VRAM.
+## Navegação
 
-### Test
-- deve caber nas restrições de Pepe ou abaixo quando possível;
-- prioriza instalação rápida e smoke tests;
-- deve validar chat, visão, tools, geração e edição;
-- escolha de modelos de baixa restrição/alinhamento deve ser declarativa no manifest, não acoplada ao core.
+| Área | Pergunta respondida | Conteúdo e ações |
+| --- | --- | --- |
+| Visão geral | O que está selecionado e funcionando? | Instalação ativa, saúde dos serviços, VRAM observada, iniciar/parar/reiniciar, abrir chat, operação atual |
+| Instalações | Onde estão meus arquivos e como mantê-los? | Nova instalação, cadastrar existente, alternar, abrir pastas, localizar movida, verificar, reparar, esquecer, excluir |
+| Modelos e perfis | O que cada perfil utiliza? | Catálogo pesquisável, filtros, identificadores, provedores, requisitos, licenças e composição dos perfis |
+| Atividade | O que está acontecendo ou falhou? | Eventos reais da sessão, progresso disponível, resultado e diagnóstico do ambiente |
+| Configurações | Como personalizar e autorizar downloads? | Tema, Hugging Face, informações da aplicação e comportamento de encerramento |
 
-## 4. Jornada
+**Nova instalação** abre um fluxo guiado, não outra árvore de menus. Perfil, local e revisão são etapas da mesma decisão.
 
-1. Clonar repo.
-2. Executar bootstrap.
-3. TUI abre.
-4. Detectar OS/GPU/VRAM/Python/Git.
-5. Escolher profile.
-6. Mostrar compatibilidade e plano.
-7. Confirmar.
-8. Instalar/verificar componentes.
-9. Baixar/validar modelos.
-10. Aplicar workflows/configs.
-11. Executar health checks.
-12. Criar atalho.
-13. Abrir stack por um launcher.
+## PRD da instalação inicial
 
-## 5. Requisitos v0.1
+O fluxo deve manter os dados preenchidos enquanto você revisa as etapas:
 
-- TUI Python;
-- profiles YAML;
-- detector Windows/NVIDIA;
-- provisioning idempotente;
-- Ollama, ComfyUI e Open WebUI;
-- downloads resumíveis quando possível;
-- checksums em artefatos declarados;
-- workflows API versionados;
-- mappings versionados;
-- health checks 11434/8080/8188;
-- Doctor;
-- launcher e atalho;
-- logs legíveis.
+1. Escolher um perfil com resumo e compatibilidade observada
+2. Escolher local padrão, portátil ou personalizado
+3. Usar seletor nativo ou digitar o caminho personalizado
+4. Revisar perfil, destino e estimativa de espaço antes de instalar
+5. Resolver conflitos externos com uma política explícita, quando existirem
+6. Acompanhar eventos e o resultado real da operação
+7. Abrir o Open WebUI quando o backend declarar o destino disponível
 
-## 6. Não funcionais
+Requisitos de aceitação:
 
-Idempotência, reprodutibilidade, operações explícitas, versões pinadas, erros recuperáveis, logs, zero mutação destrutiva sem confirmação e profiles independentes da lógica de hardware.
+- Não iniciar instalação ao selecionar um perfil ou pasta
+- Explicar incompatibilidade de hardware e falta de espaço
+- Indicar estimativas incompletas, sem inventar tamanhos
+- Impedir comandos concorrentes incompatíveis
+- Não oferecer cancelamento de download se o motor não consegue cancelar com segurança
+- Preservar uma instalação incompleta para verificação ou reparo posterior
+- Não encerrar silenciosamente o aplicativo durante uma operação ativa
 
-## 7. Fora de escopo v0.1
+## PRD da operação diária
 
-Linux, macOS, AMD, Intel Arc, multi-GPU, cluster, update irrestrito, rollback total e edição não documentada do DB interno do Open WebUI.
+A Visão geral deve priorizar a instalação ativa, não métricas decorativas. Os estados de serviço vêm do backend; a tela não deduz prontidão apenas de uma porta aberta.
 
-## 8. Sucesso da v0.1
+Requisitos de aceitação:
 
-Na Pepe, a partir de clone limpo: TUI inicia, GPU é detectada, profile é compatível, componentes são provisionados, modelos são localizados/baixados, serviços sobem, Doctor passa, Open WebUI abre, text-to-image funciona e o caminho de image-edit está pronto.
+- Iniciar, parar e reiniciar utilizam o controlador existente
+- Abrir chat consulta o destino autorizado pelo domínio
+- Ações sem instalação selecionada ficam indisponíveis com orientação para instalar ou cadastrar
+- Progresso numérico aparece somente quando a operação informa uma medida
+- Falhas continuam visíveis com orientação, mesmo depois da próxima atualização de status
+- Atualizações não sobrepõem requisições nem roubam o foco dos formulários
+- Verificação não altera arquivos; reparo exige uma ação separada
 
-## 9. MVP da primeira noite
+## PRD do catálogo
 
-Arquitetura congelada, profiles validados, TUI funcional, detector/Doctor funcional, provisioning básico implementado ou mockado, launcher/status base, testes e documentação suficiente para continuar sem reconstruir contexto.
+O catálogo informa o que está disponível nos manifests embarcados. Ele não afirma que todo modelo listado já foi baixado.
+
+Requisitos de aceitação:
+
+- Pesquisar nome e identificador de modelos
+- Mostrar provedor, arquivo ou referência, licença e tamanho quando conhecidos
+- Mostrar composição dos perfis e requisito de VRAM
+- Diferenciar catálogo de inventário instalado
+- Não mostrar botões de download, edição de perfil ou importação sem implementação correspondente
+
+## PRD do modelo de chat da instalação
+
+Cada instalação usa o modelo de chat principal do perfil, um dos alternativos que o perfil declara, ou um modelo importado. A escolha fica em `<raiz>/state/chat-model.yaml` e muda só o chat; os modelos de imagem continuam os do perfil.
+
+Requisitos de aceitação:
+
+- Opções extras de chat só aparecem quando declaradas pelo perfil; a seleção troca para a opção declarada e pode voltar ao padrão do perfil
+- Importar aceita `usuario/modelo:tag` do Ollama ou `hf.co/usuario/repositorio:quant` do Hugging Face, exige uma tag explícita e recusa `:latest`
+- Trocar ou importar salva a escolha e executa o reparo, que baixa o modelo e configura o Open WebUI; se o reparo falhar, a escolha anterior volta
+- Modelos importados não são verificados por digest; o diálogo diz isso e lembra o limite de VRAM
+- Remover um importado apaga os arquivos do Ollama e exige que ele não esteja em uso
+- Confirmar antes de baixar, mostrando o tamanho conhecido e um aviso sobre conteúdo sem censura
+
+Carregar perfis por uma pasta `addons` e importar modelos de imagem (checkpoints, LoRAs) continuam propostas separadas: exigem workflows, validação de schema e política de confiança próprios.
+
+## PRD das configurações e credenciais
+
+O login do Hugging Face deve acontecer sem colar credenciais no terminal ou no chat. O campo de token fica mascarado e é limpo após uso. A aplicação valida a conta antes de salvar pelo mecanismo DPAPI do Windows.
+
+Requisitos de aceitação:
+
+- Consultar identidade e acesso ao modelo gated
+- Explicar que aceitar a licença acontece no Hugging Face
+- Remover a credencial local por ação explícita
+- Informar a precedência de `HF_TOKEN` sobre a credencial salva
+- Não registrar token em atividade, URLs, mensagens de erro ou preferências do navegador
+- Não prometer OAuth sem um client ID registrado
+- Aplicar tema sem reiniciar o motor ou os serviços
+
+## Acessibilidade e estados de interface
+
+Todos os fluxos precisam funcionar por teclado. Diálogos devem conter o foco, fechar com Escape quando seguro e devolver o foco à origem.
+
+Critérios visuais e de interação:
+
+- Controles com rótulos, foco visível e descrição nas ações somente com ícone
+- Confirmação destrutiva com caminho legível, sem truncar o destino essencial
+- Conteúdo utilizável em janela estreita e com zoom
+- Tema claro e escuro com contraste legível
+- Respeito à preferência de movimento reduzido
+- Estados distintos de carregamento, vazio, indisponível e erro
+- Datas e números formatados para português
+- Nenhuma métrica, instalação ou mensagem de sucesso fictícia
+
+## Segurança e limites
+
+A interface conversa com um servidor restrito ao loopback e autenticado por sessão. O renderer não pode executar comandos arbitrários, escolher métodos Python ou abrir qualquer arquivo do sistema por uma API genérica.
+
+A exclusão permanece limitada a instalações reconhecidas, com proteção contra caminhos perigosos e links para outros locais. Serviços externos não são encerrados sem passar pela política de conflitos existente.
+
+Esta entrega não adiciona suporte Linux/macOS, multi-GPU, atualizações automáticas, assinatura de código, backup integral, rollback ou um novo motor de geração. O hardware físico da Capella continua dependendo da validação na RTX 5090.
+
+## Evidência exigida para entrega
+
+A entrega precisa demonstrar o renderer real e a janela nativa, além de testes do backend. Os fluxos de cadastro, mudança de pasta e exclusão devem usar dados temporários controlados, nunca apagar instalações pessoais para validar uma tela.
+
+Registre os comandos executados e limites em [validação desktop](testing/desktop-ui-checklist.md). Diferencie prova do gerenciamento de instalações de prova de inferência com GPU.

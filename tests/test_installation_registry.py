@@ -28,8 +28,8 @@ from local_ai_stack.installations import (
     write_state,
 )
 
-PEPEH = r"C:\Users\Pedro\Desktop\PEPEH"
-OTHER = r"C:\Users\Pedro\Desktop\PEPITO_8GB_TEST"
+PEPEH = r"C:\Users\User\Desktop\PEPEH"
+OTHER = r"C:\Users\User\Desktop\PEPITO_8GB_TEST"
 
 VERSION_ONE = f"""schema_version: 1
 profile:
@@ -150,6 +150,38 @@ def test_history_is_kept_when_a_known_installation_is_seen_again():
 
     entry = later.entry_for(PEPEH)
     assert entry.last_install is not None and entry.last_used_at == used_at
+
+
+def test_a_successful_install_or_repair_records_the_profile_version_and_a_failure_does_not():
+    state = HubState().activating(config_for(PEPEH))
+    state = state.recording(PEPEH, INSTALL, result="succeeded", profile_version="1.2.0")
+    assert state.entry_for(PEPEH).profile_version == "1.2.0"
+
+    state = state.recording(PEPEH, FAILURE, summary="falhou", profile_version="1.3.0")
+    assert state.entry_for(PEPEH).profile_version == "1.2.0"
+
+    state = state.recording(PEPEH, REPAIR, result="succeeded", profile_version="1.3.0")
+    assert state.entry_for(PEPEH).profile_version == "1.3.0"
+    assert loads_state(dumps_state(state)).entry_for(PEPEH).profile_version == "1.3.0"
+
+
+def test_a_state_written_before_versions_were_recorded_reads_the_version_as_unknown():
+    state = HubState().activating(config_for(PEPEH)).recording(PEPEH, INSTALL, result="succeeded")
+    document = dumps_state(state)
+    assert "profile_version" not in document
+
+    assert loads_state(document).entry_for(PEPEH).profile_version is None
+    assert loads_state(VERSION_ONE).entry_for(PEPEH).profile_version is None
+
+
+def test_another_profile_in_the_same_folder_forgets_the_recorded_version():
+    state = HubState().activating(config_for(PEPEH))
+    state = state.recording(PEPEH, INSTALL, result="succeeded", profile_version="1.2.0")
+
+    same = state.remembering(PEPEH, InstallLocationMode.CUSTOM, profile_id="pepe")
+    assert same.entry_for(PEPEH).profile_version == "1.2.0"
+    other = state.activating(config_for(PEPEH, "capella"))
+    assert other.entry_for(PEPEH).profile_version is None
 
 
 # --- what is derived is never stored ----------------------------------------------

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -103,7 +104,8 @@ class OllamaProvisioner(Provisioner):
         return context.layout.ollama_app
 
     def managed_executable(self, context: ProvisionContext) -> Path:
-        return self.managed_dir(context) / EXECUTABLE
+        directory = self.managed_dir(context)
+        return directory / EXECUTABLE if os.name == "nt" else directory / "bin" / EXECUTABLE
 
     def marker_path(self, context: ProvisionContext) -> Path:
         return marker_path(self.managed_dir(context))
@@ -403,10 +405,10 @@ class OllamaProvisioner(Provisioner):
         )
         try:
             _reset_directory(staging)
-            _extract_zip(download.path, staging)
+            _extract_archive(download.path, staging)
             _merge_directory(staging, target)
             shutil.rmtree(staging, ignore_errors=True)
-        except (OSError, zipfile.BadZipFile, ValueError) as exc:
+        except (OSError, zipfile.BadZipFile, tarfile.TarError, ValueError) as exc:
             shutil.rmtree(staging, ignore_errors=True)
             return self.failed(
                 detection,
@@ -482,13 +484,43 @@ def _extract_zip(archive: Path, destination: Path) -> None:
         bundle.extractall(destination)
 
 
+def _extract_archive(archive: Path, destination: Path) -> None:
+    """Extract only pinned formats; data_filter confines links and paths to staging."""
+    if archive.name.endswith(".zip"):
+        _extract_zip(archive, destination)
+        return
+    if not archive.name.endswith(".tar.zst"):
+        raise ValueError("Unsupported Ollama archive format.")
+    import zstandard
+
+    with (
+        archive.open("rb") as source,
+        zstandard.ZstdDecompressor().stream_reader(source) as decompressed,
+        tarfile.open(fileobj=decompressed, mode="r|") as bundle,
+    ):
+        for member in bundle:
+            path = Path(member.name)
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("Archive member leaves the managed staging directory.")
+            bundle.extract(member, destination, filter="data")
+
+
 def _merge_directory(source: Path, destination: Path) -> None:
     """Copy a staged tree into place, creating parents as needed."""
+    if destination.is_symlink():
+        raise ValueError("The managed application directory must not be a symlink.")
     destination.mkdir(parents=True, exist_ok=True)
+    boundary = destination.resolve()
+    for existing in destination.rglob("*"):
+        if existing.is_symlink() and not existing.resolve().is_relative_to(boundary):
+            raise ValueError("An existing managed application link leaves its directory.")
     for entry in source.iterdir():
         target = destination / entry.name
-        if entry.is_dir():
-            shutil.copytree(entry, target, dirs_exist_ok=True)
+        if entry.is_symlink():
+            target.unlink(missing_ok=True)
+            shutil.copy2(entry, target, follow_symlinks=False)
+        elif entry.is_dir():
+            shutil.copytree(entry, target, dirs_exist_ok=True, symlinks=True)
         else:
             shutil.copy2(entry, target)
 

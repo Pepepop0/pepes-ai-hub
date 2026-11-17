@@ -136,9 +136,12 @@ Dois limites medidos nesta máquina antes de escrever o código:
 
 1. **A prova normalmente morre com a sessão.** O job é destruído quando o último
    *handle* fecha, mesmo com membros vivos. Serviços comuns preservam esse limite.
-   Ollama e ComfyUI são exceções explícitas porque ambos mantêm trabalho real em
-   descendentes: runners `llama-server` no primeiro; o interpretador Python que
-   atende `8188` no segundo. O root recebe uma cópia do handle e o job usa
+   Ollama, Open WebUI e ComfyUI são exceções explícitas porque os três mantêm
+   trabalho real em descendentes: runners `llama-server` no primeiro; o
+   interpretador Python que atende `8080` (iniciado por `open-webui.exe`) no
+   segundo; o que atende `8188` no terceiro. Sem isso, parar o Open WebUI
+   encerrava só o lançador e deixava o servidor de pé (`service-left-running`).
+   O root recebe uma cópia do handle e o job usa
    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. O root mantém o job vivo quando o Hub
    fecha; outro Hub reabre o mesmo nome e recupera a prova. Quando o root termina,
    o handle dele fecha e descendentes ainda pertencentes ao job não podem virar

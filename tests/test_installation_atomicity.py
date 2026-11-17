@@ -8,6 +8,7 @@ is not an installation the Hub knows.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -370,6 +371,26 @@ def test_finding_a_moved_installation_replaces_the_old_entry(tmp_path, world):
         assert gone not in roots and moved in roots
         assert adapter.active_root() == moved
         assert read_state(adapter.selection_path).entry_for(gone) is None
+    finally:
+        adapter.close()
+
+
+def test_a_custom_folder_moved_on_disk_is_selected_at_its_new_root(tmp_path, world):
+    first, original, moved = tmp_path / "first", tmp_path / "original", tmp_path / "moved"
+    adapter = hub(tmp_path, world)
+    try:
+        install(adapter, custom(first))
+        install(adapter, custom(original, "pepe-8gb"))
+        adapter.switch_installation(first)
+        shutil.move(original, moved)
+
+        adapter.relocate_installation(original, moved)
+
+        persisted = read_state(adapter.selection_path)
+        assert adapter.active_root() == moved
+        assert root_key(persisted.active_root) == root_key(moved)
+        assert persisted.entry_for(original) is None
+        assert persisted.entry_for(moved) is not None
     finally:
         adapter.close()
 

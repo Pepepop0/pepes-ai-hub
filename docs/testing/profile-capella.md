@@ -1,8 +1,14 @@
+> **Superseded (2026-10).** Capella 5.1.0 runs
+> `Qwen3.8 27B Q5_K_M` and Qwen-Image-2.1 INT8 ConvRot,
+> on the Qwen-Image-2.1 family only. See `capella-5090-checklist.md` for
+> the current contract. The record below describes the earlier `qwen3.5:27b` +
+> Klein 4B profile (Capella 1.0) and is kept as history.
+
 # Capella: the 32 GB profile, finalised
 
 What the Capella profile was, what it is now, how its chat model and image
 settings were chosen, and what was exercised on a fresh root
-(`C:\Users\Pedro\Desktop\CAPELLA_TEST`) on the reference machine. The reference
+(`$HOME\Desktop\CAPELLA_TEST`) on the reference machine. The reference
 machine is an RTX 5070 with 12 GB; everything the card's size decides is
 **pending on a real RTX 5090** -- `capella-5090-checklist.md` is the list.
 

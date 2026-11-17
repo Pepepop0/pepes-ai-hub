@@ -34,12 +34,12 @@ from local_ai_stack.runner import CommandResult, CommandRunner
 URL = "https://github.com/comfyanonymous/ComfyUI.git"
 
 PIN_A = {
-    "revision": "v0.34.0",
+    "revision": "v0.39.0",
     "commit": "1" * 40,
     "requirements": ("torch==2.11.0+cu130",),
 }
 PIN_B = {
-    "revision": "v0.35.0",
+    "revision": "v0.40.0",
     "commit": "2" * 40,
     "requirements": ("torch==2.12.0+cu130",),
 }
@@ -91,9 +91,11 @@ class Runner(CommandRunner):
 
 
 class Git(GitClient):
-    def __init__(self, *, head_commit: str = PIN_A["commit"]):
+    def __init__(self, *, head_commit: str = PIN_A["commit"], before_checkout: str | None = None):
+        """``before_checkout`` is HEAD until a checkout moves it to ``head_commit``."""
         super().__init__(Runner())
         self.head_commit = head_commit
+        self.before_checkout = before_checkout
         self.clones: list[str] = []
         self.checkouts: list[str] = []
         self.fetches: list[str] = []
@@ -114,16 +116,25 @@ class Git(GitClient):
         self.repositories.add(target)
         return CommandResult(argv=("git", "clone"), returncode=0)
 
-    def fetch(self, path, *, remote="origin", allow_dirty=False, dry_run=None):
+    def fetch(self, path, *, remote="origin", allow_dirty=False, ignore=(), dry_run=None):
         self.fetches.append(str(path))
         return CommandResult(argv=("git", "fetch"), returncode=0)
 
-    def checkout(self, path, revision, *, allow_dirty=False, dry_run=None):
+    def checkout(self, path, revision, *, allow_dirty=False, ignore=(), dry_run=None):
         self.checkouts.append(revision)
         return CommandResult(argv=("git", "checkout"), returncode=0)
 
     def head(self, path: Path) -> str:
+        if self.before_checkout is not None and not self.checkouts:
+            return self.before_checkout
         return self.head_commit
+
+
+def repinning_git(directory: Path) -> Git:
+    """The checkout of an install under pin A, about to be moved to pin B."""
+    git = Git(head_commit=PIN_B["commit"], before_checkout=PIN_A["commit"])
+    git.repositories.add(directory)
+    return git
 
 
 def provisioner(pin: dict, *, git: Git | None = None) -> ComfyUIProvisioner:
@@ -237,8 +248,7 @@ def test_a_repin_is_never_reported_as_skipped(tmp_path):
     context, _ = install(tmp_path, PIN_A)
 
     runner = Runner(head_commit=PIN_B["commit"], torch_version="2.12.0+cu130")
-    git = Git(head_commit=PIN_B["commit"])
-    git.repositories.add(context.layout.comfyui_app)
+    git = repinning_git(context.layout.comfyui_app)
     result = provisioner(PIN_B, git=git).apply(
         ProvisionContext(installation=context.installation, runner=runner)
     )
@@ -251,8 +261,7 @@ def test_a_repin_is_never_reported_as_skipped(tmp_path):
 
 def test_a_repin_checks_out_the_new_revision_after_fetching(tmp_path):
     context, _ = install(tmp_path, PIN_A)
-    git = Git(head_commit=PIN_B["commit"])
-    git.repositories.add(context.layout.comfyui_app)
+    git = repinning_git(context.layout.comfyui_app)
     runner = Runner(head_commit=PIN_B["commit"], torch_version="2.12.0+cu130")
 
     provisioner(PIN_B, git=git).apply(
@@ -268,8 +277,7 @@ def test_a_repin_rewrites_the_marker(tmp_path):
     directory = context.layout.comfyui_app
     before = read_marker(directory, component="comfyui")
 
-    git = Git(head_commit=PIN_B["commit"])
-    git.repositories.add(directory)
+    git = repinning_git(directory)
     runner = Runner(head_commit=PIN_B["commit"], torch_version="2.12.0+cu130")
     new = provisioner(PIN_B, git=git)
     new.apply(ProvisionContext(installation=context.installation, runner=runner))

@@ -3,8 +3,10 @@
 Both spellings run :func:`main`. With no flag it opens the Hub. ``--doctor``
 prints the environment report and ``--smoke`` proves a build can stand up -
 application importable, resources present, state path resolvable - and exits
-without ever drawing the TUI. Neither is a second application flow; they are
-the same program answering a question instead of opening a window.
+without opening a window. ``hub`` operates the same Hub without the window,
+in JSON, for coding agents (docs/AGENT_WORKFLOW.md). None of them is a second
+application flow; they are the same program answering a question instead of
+opening a window.
 """
 
 from __future__ import annotations
@@ -24,8 +26,55 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="check that this build finds its application, resources and state path",
     )
+    auth = parser.add_mutually_exclusive_group()
+    auth.add_argument(
+        "--hf-login",
+        action="store_true",
+        help="authorize gated Hugging Face model downloads",
+    )
+    auth.add_argument(
+        "--hf-status",
+        action="store_true",
+        help="verify the saved Hugging Face credential",
+    )
+    auth.add_argument(
+        "--hf-logout",
+        action="store_true",
+        help="remove the locally stored Hugging Face credential",
+    )
     parser.add_argument("--version", action="version", version=f"{PRODUCT_NAME} {__version__}")
+    areas = parser.add_subparsers(dest="area", metavar="hub")
+    hub = areas.add_parser("hub", help="operate the Hub without the window, in JSON (for agents)")
+    hub_commands = hub.add_subparsers(dest="hub_command", required=True)
+    state = hub_commands.add_parser("state", help="print the Hub state as JSON")
+    state.add_argument("--json", action="store_true", help="JSON output (the default)")
+    hub_commands.add_parser("commands", help="list the commands `hub run` accepts")
+    run = hub_commands.add_parser("run", help="run one allowlisted command")
+    run.add_argument("name", metavar="command")
+    run.add_argument("--args", dest="command_args", metavar="JSON", help="JSON object of args")
+    run.add_argument(
+        "--wait", action="store_true", help="stream the operation's events until it ends"
+    )
+    run.add_argument("--timeout", type=_seconds, metavar="S", help="with --wait: stop after S")
+    serve = hub_commands.add_parser("serve", help="serve the UI on loopback and print its URL")
+    serve.add_argument("--no-open", action="store_true", help="do not launch a browser")
+    export = hub_commands.add_parser(
+        "export-session", help="export owned session evidence without credentials"
+    )
+    export.add_argument("--root", required=True, help="absolute installation root")
+    export.add_argument("--output", required=True, help="destination ZIP file")
+    fetch = hub_commands.add_parser(
+        "fetch-session", help="collect through SSH and verify a local copy"
+    )
+    fetch.add_argument("--host", required=True, help="verified OpenSSH host or alias")
+    fetch.add_argument("--port", type=int, default=22)
+    fetch.add_argument("--identity-file")
+    fetch.add_argument("--bundle", required=True, help="absolute remote source bundle directory")
+    fetch.add_argument("--root", required=True, help="absolute remote installation root")
+    fetch.add_argument("--output", required=True, help="new local ZIP file")
     args = parser.parse_args(argv)
+    if args.area == "hub" and args.hub_command == "run" and args.timeout and not args.wait:
+        run.error("--timeout requires --wait")
     if args.doctor:
         from .doctor import doctor_text
 
@@ -35,10 +84,90 @@ def main(argv: list[str] | None = None) -> int:
         report = smoke_report()
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0 if report["ok"] else 1
-    from .app import run_tui
+    if args.hf_login or args.hf_status or args.hf_logout:
+        from .huggingface_auth import (
+            HuggingFaceAuthError,
+            check_status,
+            clear_token,
+            interactive_login,
+        )
 
-    run_tui()
-    return 0
+        try:
+            if args.hf_logout:
+                clear_token()
+                print("Hugging Face credential removed.")
+                return 0
+            status = interactive_login() if args.hf_login else check_status()
+        except HuggingFaceAuthError as exc:
+            print(f"Hugging Face: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(status.as_dict(), indent=2, ensure_ascii=False))
+        return 0 if status.authenticated else 1
+    if args.area == "hub":
+        if args.hub_command == "export-session":
+            import hashlib
+            from pathlib import Path
+
+            from .layout import StackLayout
+            from .session_export import SessionExportError, export_session
+
+            try:
+                output = Path(args.output).expanduser().absolute()
+                output.parent.mkdir(parents=True, exist_ok=True)
+                archive = export_session(StackLayout.from_root(args.root), output)
+                with archive.open("rb") as stream:
+                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                print(
+                    json.dumps(
+                        {"archive": str(archive), "sha256": digest, "bytes": archive.stat().st_size}
+                    )
+                )
+                return 0
+            except (SessionExportError, OSError, ValueError) as exc:
+                from .runner import sanitize
+
+                print(json.dumps({"ok": False, "error": sanitize(str(exc))}))
+                return 1
+        if args.hub_command == "fetch-session":
+            from pathlib import Path
+
+            from .session_transfer import fetch_session
+
+            try:
+                archive = fetch_session(
+                    host=args.host,
+                    port=args.port,
+                    identity_file=args.identity_file,
+                    bundle=args.bundle,
+                    root=args.root,
+                    destination=Path(args.output),
+                )
+                print(json.dumps({"ok": True, "archive": str(archive)}))
+                return 0
+            except (OSError, ValueError, RuntimeError) as exc:
+                from .runner import sanitize
+
+                print(json.dumps({"ok": False, "error": sanitize(str(exc))}))
+                return 1
+        from .desktop import agent
+
+        if args.hub_command == "state":
+            return agent.hub_state()
+        if args.hub_command == "commands":
+            return agent.hub_commands()
+        if args.hub_command == "run":
+            return agent.hub_run(args.name, args.command_args, wait=args.wait, timeout=args.timeout)
+        return agent.hub_serve(open_browser=not args.no_open)
+    from .desktop import run_desktop
+
+    return run_desktop()
+
+
+def _seconds(value: str) -> float:
+    seconds = float(value)
+    if not seconds > 0:
+        raise argparse.ArgumentTypeError("must be a positive number of seconds")
+    return seconds
 
 
 def smoke_report() -> dict:
@@ -157,10 +286,10 @@ def smoke_report() -> dict:
         return type(default_folder_picker()).__name__
 
     def application() -> str:
-        from .app import LocalAIStackApp
+        from .desktop.server import DesktopServer
         from .hub_application import HubApplicationAdapter
 
-        return f"{LocalAIStackApp.__name__}, {HubApplicationAdapter.__name__}"
+        return f"{DesktopServer.__name__}, {HubApplicationAdapter.__name__}"
 
     def composition() -> dict:
         """Build what the Hub builds to open, against the default root.
@@ -204,6 +333,15 @@ def smoke_report() -> dict:
             "plans": plans,
             "portable_root": str(portable),
         }
+
+    def desktop_assets() -> dict:
+        directory = resource_root() / "desktop-ui" / "dist"
+        index = directory / "index.html"
+        if not index.is_file():
+            raise RuntimeError("desktop assets missing; run npm ci && npm run build in desktop-ui")
+        return {"index": str(index)}
+
+    check("desktop", desktop_assets)
 
     check("profiles", profiles)
     check("manifests", manifests)

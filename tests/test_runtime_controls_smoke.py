@@ -73,6 +73,11 @@ def wait_until_gone(pid: int, timeout: float = 10.0) -> bool:
     return False
 
 
+def service_output(log) -> tuple[str, ...]:
+    """The service's own lines: the Hub's start header is the only other content."""
+    return tuple(line for line in read_log_tail(log) if line and "[Pepito Hub]" not in line)
+
+
 def build_controller(tmp_path, *, http):
     layout = StackLayout.from_root(tmp_path / "stack")
     layout.ensure()
@@ -127,9 +132,13 @@ def test_managed_lifecycle_start_detect_stop_cleanup(tmp_path, reaper):
 
     deadline = time.monotonic() + 10
     log = layout.log_file("smoke")
-    while time.monotonic() < deadline and not read_log_tail(log):
+    while time.monotonic() < deadline and f"{MARKER} up" not in read_log_tail(log):
         time.sleep(0.05)
-    assert read_log_tail(log) == (f"{MARKER} up",)
+    # The child's output, and the Hub's start header intact before it: the readiness
+    # event goes to hub-events.log, never over the running child's own lines.
+    assert service_output(log) == (f"{MARKER} up",)
+    assert read_log_tail(log)[1].endswith("[Pepito Hub] smoke: starting process")
+    assert "readiness elapsed=" in (log.parent / "hub-events.log").read_text(encoding="utf-8")
 
     stopped = controller.stop("smoke")
     assert stopped.outcome is StopOutcome.STOPPED
@@ -242,9 +251,9 @@ def test_open_webui_adapter_drives_a_real_child_through_its_lifecycle(tmp_path, 
 
     deadline = time.monotonic() + 10
     log = layout.log_file("open-webui")
-    while time.monotonic() < deadline and not read_log_tail(log):
+    while time.monotonic() < deadline and f"{MARKER} open-webui" not in read_log_tail(log):
         time.sleep(0.05)
-    assert read_log_tail(log) == (f"{MARKER} open-webui",)
+    assert service_output(log) == (f"{MARKER} open-webui",)
 
     assert controller.stop("open-webui").outcome is StopOutcome.STOPPED
     assert wait_until_gone(started.pid)

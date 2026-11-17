@@ -19,3 +19,6 @@ Thumbs.db
 
 # Editor/agent tooling: local permission and session state, never the product.
 .claude/
+
+# Desktop renderer dependencies and generated output.
+node_modules/

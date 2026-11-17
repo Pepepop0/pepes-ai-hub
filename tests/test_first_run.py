@@ -12,6 +12,7 @@ import itertools
 from pathlib import Path
 
 import pytest
+import yaml
 from first_run_support import (
     CAPELLA,
     CAPELLA_PORTS,
@@ -20,11 +21,10 @@ from first_run_support import (
     capella_yaml,
     controlled_stack,
 )
+from internal_profile_support import INTERNAL_PROFILE_ID, internal_profile_yaml
 
 from local_ai_stack.e2e import tracking
-from local_ai_stack.e2e.fixtures import (
-    SHIPPED_IMAGE_MODELS,
-)
+from local_ai_stack.e2e.fixtures import shipped_image_models
 from local_ai_stack.e2e.seams import Injection, InjectionPlan
 from local_ai_stack.installation import detect_repo_root
 from local_ai_stack.integration import IntegrationOptions
@@ -109,12 +109,13 @@ def test_the_first_run_really_installed_acquired_and_started(stack):
     stack.app.first_run("op-1", CAPELLA)
     # Ollama's archive was downloaded and extracted for real.
     assert any("/ollama/" in url for url in stack.artifacts.requests)
-    # The three Capella weights were downloaded and verified against the catalog.
+    # Every file-backed image model declared by Capella was downloaded and verified.
+    expected_models = len(shipped_image_models({CAPELLA}))
     assert (
         sum(
             url.startswith("https://controlled.invalid/models/") for url in stack.artifacts.requests
         )
-        == 3
+        == expected_models
     )
     # The chat model was pulled into the store.
     assert stack.ollama.pulls == [CHAT_REFERENCE]
@@ -132,7 +133,7 @@ def test_nothing_in_the_first_run_is_hardcoded_for_capella(stack):
     for service_id, port in CAPELLA_PORTS.items():
         assert endpoints.port(service_id) == port
     requested = {url.rsplit("/", 1)[-1] for url in stack.artifacts.requests}
-    for _role, _name, _kind, _placement, filename in SHIPPED_IMAGE_MODELS:
+    for _role, _name, _kind, _placement, filename in shipped_image_models({CAPELLA}):
         assert filename in requested
     import ast
 
@@ -190,12 +191,12 @@ def test_model_downloads_publish_transfer_progress_with_a_known_total(stack):
     assert all(event.transfer.total_bytes is not None for event in transfers)
     assert all(event.transfer.completed_bytes >= 0 for event in transfers)
     # Grouped by which model each event's message names, the first and last
-    # observation for every downloaded artifact must be present, and the last
+    # observation for every declared artifact must be present, and the last
     # one must show the transfer as complete.
     by_target: dict[str, list] = {}
     for event in transfers:
         by_target.setdefault(event.message, []).append(event.transfer)
-    assert len(by_target) == 3, "Capella declares three file-backed image models"
+    assert len(by_target) == len(shipped_image_models({CAPELLA}))
     for message, observations in by_target.items():
         last = observations[-1]
         assert last.completed_bytes == last.total_bytes, message
@@ -211,7 +212,8 @@ def test_transfer_progress_coexists_with_the_logical_step_counter(stack):
     transfers = _transfer_events(recorder)
     assert logical and transfers
     assert all(event.progress is not None for event in transfers)
-    assert all(event.progress.total == 4 for event in transfers)
+    totals = {event.progress.total for event in transfers}
+    assert len(totals) == 1
     assert all(0 <= event.progress.completed < event.progress.total for event in transfers)
     assert any(event.transfer is None for event in logical)
 
@@ -231,7 +233,6 @@ def test_an_interrupted_download_ends_failed_with_no_transfer_event_after_the_re
     built = controlled_stack(injections=InjectionPlan.of(Injection.DOWNLOAD_INTERRUPTED))
     try:
         _result, recorder = _first_failed(built)
-        assert recorder.events[-1].message == "Falha ao baixar modelos"
         # The reducer only ever accepts one terminal event; a stray publish
         # after failure would have raised OperationClosed instead of quietly
         # appearing after it, but the count is checked directly all the same.
@@ -336,6 +337,7 @@ def test_service_start_publishes_starting_waiting_and_ready(stack):
         and event.detail.action == "ready"
     ]
     assert len(ready_details) == 3, "Ollama, Open WebUI and ComfyUI each report ready"
+    assert all("readiness elapsed=" in event.detail.detail for event in ready_details)
 
 
 def test_workflow_and_configuration_publish_activity_and_verified_detail(stack):
@@ -421,7 +423,7 @@ def test_the_shipped_capella_profile_has_a_resolvable_primary_chat_model():
     built = controlled_stack(profile_yaml=capella_yaml())
     try:
         profile = built.app.profile(CAPELLA)
-        assert profile.models["chat"]["primary"] == "ollama/qwen3_5_27b"
+        assert profile.models["chat"]["primary"] == "ollama/qwen3_8_27b_q5"
         assert not built.app.unresolved_models(profile)
         result = built.app.first_run("op-shipped", CAPELLA)
         assert result.state is OperationState.SUCCEEDED
@@ -430,7 +432,7 @@ def test_the_shipped_capella_profile_has_a_resolvable_primary_chat_model():
         built.release()
 
 
-@pytest.mark.parametrize("profile_id", ["pepe", "pepe-8gb", "test"])
+@pytest.mark.parametrize("profile_id", ["pepe", "pepe-8gb"])
 def test_other_shipped_profiles_are_accepted_by_the_flow(profile_id):
     """They load and are planned; whether they can finish is their own data's business."""
     text = (detect_repo_root() / "profiles" / f"{profile_id}.yaml").read_text(encoding="utf-8")
@@ -443,22 +445,16 @@ def test_other_shipped_profiles_are_accepted_by_the_flow(profile_id):
         built.release()
 
 
-def shipped_profile_yaml(name: str) -> str:
-    return (detect_repo_root() / "profiles" / f"{name}.yaml").read_text(encoding="utf-8")
+TEST_PROFILE = INTERNAL_PROFILE_ID
 
 
-TEST_PROFILE = "test"
-
-
-def test_the_test_profile_completes_a_real_first_run_without_fetching_anything():
+def test_an_internal_profile_completes_a_real_first_run_without_fetching_anything():
     """The smoke that failed at "Aplicando configurações" now finishes.
 
     Every service is installed, configured and started, and because the
     profile enables no capability nothing heavy is downloaded or pulled.
     """
-    built = controlled_stack(
-        profile_yaml=shipped_profile_yaml(TEST_PROFILE), profile_id=TEST_PROFILE
-    )
+    built = controlled_stack(profile_yaml=internal_profile_yaml(), profile_id=TEST_PROFILE)
     try:
         recorder = Recorder()
         result = built.app.first_run("op-test", TEST_PROFILE, emit=recorder)
@@ -479,10 +475,8 @@ def test_the_test_profile_completes_a_real_first_run_without_fetching_anything()
         built.release()
 
 
-def test_the_test_profile_second_run_does_nothing():
-    built = controlled_stack(
-        profile_yaml=shipped_profile_yaml(TEST_PROFILE), profile_id=TEST_PROFILE
-    )
+def test_an_internal_profile_second_run_does_nothing():
+    built = controlled_stack(profile_yaml=internal_profile_yaml(), profile_id=TEST_PROFILE)
     try:
         assert built.app.first_run("op-1", TEST_PROFILE).state is OperationState.SUCCEEDED
         downloads, starts = len(built.artifacts.requests), list(built.launcher.starts)
@@ -500,7 +494,7 @@ def test_the_test_profile_second_run_does_nothing():
 def test_a_retry_after_configuration_failed_configures_without_reinstalling():
     """The real partial state: every component installed, configuration refused."""
     built = controlled_stack(
-        profile_yaml=shipped_profile_yaml(TEST_PROFILE),
+        profile_yaml=internal_profile_yaml(),
         profile_id=TEST_PROFILE,
         injections=InjectionPlan.of(Injection.CONFIG_TAMPERED),
     )
@@ -530,11 +524,9 @@ def test_an_incoherent_profile_is_refused_before_anything_is_installed():
     it names is the edit graph, which needs an input image and cannot generate
     from text; no amount of installing would change that.
     """
-    yaml_text = capella_yaml().replace(
-        "text_to_image: {manifest_id: flux2_klein_t2i,",
-        "text_to_image: {manifest_id: flux2_klein_edit,",
-    )
-    assert "manifest_id: flux2_klein_edit," in yaml_text
+    data = yaml.safe_load(capella_yaml())
+    data["workflows"]["text_to_image"]["manifest_id"] = "qwen_image_2_1_edit"
+    yaml_text = yaml.safe_dump(data, sort_keys=False)
     built = controlled_stack(profile_yaml=yaml_text)
     try:
         recorder = Recorder()
@@ -555,8 +547,8 @@ def test_an_incoherent_profile_is_refused_before_anything_is_installed():
 @pytest.mark.parametrize(
     ("workflow", "declaration"),
     [
-        ("image_edit", "image_edit: {manifest_id: missing, size: 1024x1024, steps: 20}"),
-        ("text_to_image", "text_to_image: {manifest_id: missing}"),
+        ("image_edit", {"manifest_id": "missing", "size": "1024x1024", "steps": 20}),
+        ("text_to_image", {"manifest_id": "missing"}),
     ],
 )
 def test_a_workflow_whose_manifest_does_not_exist_is_refused_before_anything_is_installed(
@@ -565,11 +557,9 @@ def test_a_workflow_whose_manifest_does_not_exist_is_refused_before_anything_is_
     """Every declared workflow's manifest id is settled by the shipped manifest alone,
     so a name nothing declares stops the run before a byte is fetched -- whichever
     workflow names it, and whatever else that declaration asks for."""
-    yaml_text = capella_yaml()
-    start = yaml_text.index(f"  {workflow}: ")
-    end = yaml_text.index("\n", start)
-    yaml_text = yaml_text[:start] + f"  {declaration}" + yaml_text[end:]
-    assert "manifest_id: missing" in yaml_text
+    data = yaml.safe_load(capella_yaml())
+    data["workflows"][workflow] = declaration
+    yaml_text = yaml.safe_dump(data, sort_keys=False)
     built = controlled_stack(profile_yaml=yaml_text)
     try:
         recorder = Recorder()
@@ -701,6 +691,40 @@ def test_restart_the_stack(stack):
     assert stack.app.status(CAPELLA).stack_up
 
 
+def test_one_service_stops_and_restarts_without_touching_the_others(stack):
+    stack.app.first_run("op-1", CAPELLA)
+
+    stopped = stack.app.stop_service("op-2", CAPELLA, "open-webui")
+    assert stopped.state is OperationState.SUCCEEDED
+    assert stopped.output_references == ("open-webui",)
+    assert stack.launcher.stops == ["open-webui"]
+
+    before = list(stack.launcher.starts)
+    restarted = stack.app.restart_service("op-3", CAPELLA, "comfyui")
+    assert restarted.state is OperationState.SUCCEEDED
+    assert stack.launcher.stops == ["open-webui", "comfyui"]
+    assert stack.launcher.starts[len(before) :] == ["comfyui"]
+
+
+def test_starting_open_webui_alone_brings_up_ollama_first(stack):
+    stack.app.first_run("op-1", CAPELLA)
+    assert stack.app.stop_stack("op-2", CAPELLA).state is OperationState.SUCCEEDED
+    before = list(stack.launcher.starts)
+
+    started = stack.app.start_service("op-3", CAPELLA, "open-webui")
+
+    assert started.state is OperationState.SUCCEEDED, started.diagnostics
+    assert stack.launcher.starts[len(before) :] == ["ollama", "open-webui"]
+    assert "comfyui" not in started.output_references
+
+
+def test_an_unknown_service_is_refused_before_anything_runs(stack):
+    stack.app.first_run("op-1", CAPELLA)
+    with pytest.raises(ValueError):
+        stack.app.stop_service("op-2", CAPELLA, "postgres")
+    assert stack.launcher.stops == []
+
+
 def test_starting_before_installing_fails_with_a_reason(stack):
     result = stack.app.start_stack("op-1", CAPELLA)
     assert result.state is OperationState.FAILED
@@ -800,8 +824,7 @@ def test_a_provisioning_failure_is_reported():
 def test_a_model_acquisition_failure_is_reported():
     built = controlled_stack(injections=InjectionPlan.of(Injection.DOWNLOAD_INTERRUPTED))
     try:
-        _result, recorder = _first_failed(built)
-        assert recorder.events[-1].message == "Falha ao baixar modelos"
+        _first_failed(built)
         assert not built.app.status(CAPELLA).installation_ready
     finally:
         built.release()

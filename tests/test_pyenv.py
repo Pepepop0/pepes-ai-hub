@@ -101,16 +101,17 @@ def test_a_second_package_resets_the_current_package():
     assert ticks[-1].package == "numpy"
 
 
-def test_installing_collected_packages_reports_one_event_per_package():
+def test_installing_collected_packages_reports_one_truthful_aggregate_event():
     events = events_for("Installing collected packages: torch, numpy, filelock")
-    assert [e.action for e in events] == ["installing"] * 3
-    assert [e.package for e in events] == ["torch", "numpy", "filelock"]
+    assert events == [PipEvent("installing", "pacotes Python", package_count=3)]
+    assert events[0].item == "3 pacotes Python"
+    assert events[0].message == "Instalando 3 pacotes Python"
 
 
-def test_successfully_installed_reports_bare_package_names():
+def test_successfully_installed_reports_one_aggregate_milestone():
     events = events_for("Successfully installed torch-2.4.0 numpy-2.0.0 scikit-learn-1.2.0")
-    assert [e.action for e in events] == ["installed"] * 3
-    assert [e.package for e in events] == ["torch", "numpy", "scikit-learn"]
+    assert events == [PipEvent("installed", "pacotes Python", package_count=3)]
+    assert events[0].message == "Instalados 3 pacotes Python"
 
 
 def test_a_full_pip_transcript_produces_the_expected_event_sequence():
@@ -134,8 +135,6 @@ def test_a_full_pip_transcript_produces_the_expected_event_sequence():
         "downloading",
         "downloading",
         "installing",
-        "installing",
-        "installed",
         "installed",
     ]
 

@@ -23,6 +23,7 @@ provisioner then refuses to install rather than guessing a URL.
 
 from __future__ import annotations
 
+import platform
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -41,6 +42,9 @@ PACKAGE_MANIFEST = "packages.yaml"
 MANIFEST_DIR = "manifests"
 
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+# A custom node id is the folder it is checked out into, so it must be a plain
+# directory name: no separators, no `..`, nothing that leaves custom_nodes/.
+_NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class CatalogError(ValueError):
@@ -74,12 +78,28 @@ class PinnedDependencies:
 
 
 @dataclass(frozen=True)
+class PinnedCustomNode:
+    """A ComfyUI custom node pack checked out into ``custom_nodes/<id>``.
+
+    Pinned exactly like a repository, except that the commit is mandatory:
+    the node is verified against it, and a node pack has no release process
+    that would make a tag alone trustworthy.
+    """
+
+    id: str
+    url: str
+    revision: str
+    commit: str
+
+
+@dataclass(frozen=True)
 class PinnedRepository:
     """A source checkout pinned to an exact revision.
 
     `revision` is what gets checked out. `commit`, when recorded, is what that
     revision resolved to at pinning time, which lets a provisioner notice a tag
-    that moved under it.
+    that moved under it. `custom_nodes` are further checkouts that live inside
+    this one (ComfyUI's ``custom_nodes/``), each pinned the same way.
     """
 
     component: str
@@ -90,6 +110,7 @@ class PinnedRepository:
     dependencies: PinnedDependencies | None = None
     python_minimum: tuple[int, int] = (3, 11)
     python_below: tuple[int, int] = (3, 13)
+    custom_nodes: tuple[PinnedCustomNode, ...] = ()
 
     @property
     def is_pinned(self) -> bool:
@@ -129,9 +150,18 @@ def artifact_catalog() -> dict[str, Artifact]:
 
 
 def artifact_for(component_id: str) -> Artifact | None:
-    """The pinned artifact for a component, or None when nothing is pinned."""
+    """The artifact pinned for this component and the executing OS/architecture."""
     wanted = normalize_component_id(component_id)
-    matches = [a for a in artifact_catalog().values() if a.component == wanted]
+    host_os = platform.system().casefold()
+    machine = platform.machine().casefold()
+    architecture = {"x86_64": "amd64", "aarch64": "arm64"}.get(machine, machine)
+    matches = [
+        artifact
+        for artifact in artifact_catalog().values()
+        if artifact.component == wanted
+        and artifact.platform in {None, host_os}
+        and artifact.architecture in {None, architecture}
+    ]
     if not matches:
         return None
     if len(matches) > 1:
@@ -146,7 +176,16 @@ def _repository_from(data: Any, component: str, source: Path | str) -> PinnedRep
     unknown = sorted(
         str(key)
         for key in data
-        if key not in {"url", "revision", "commit", "destination", "dependencies", "python"}
+        if key
+        not in {
+            "url",
+            "revision",
+            "commit",
+            "destination",
+            "dependencies",
+            "python",
+            "custom_nodes",
+        }
     )
     if unknown:
         raise CatalogError(
@@ -194,7 +233,52 @@ def _repository_from(data: Any, component: str, source: Path | str) -> PinnedRep
         dependencies=_dependencies_from(data.get("dependencies"), component, source),
         python_minimum=minimum,
         python_below=below,
+        custom_nodes=_custom_nodes_from(data.get("custom_nodes"), component, source),
     )
+
+
+def _custom_nodes_from(
+    data: Any, component: str, source: Path | str
+) -> tuple[PinnedCustomNode, ...]:
+    """Parse the pinned custom nodes. Same rules as a repository, commit required."""
+    if data is None:
+        return ()
+    field = f"repositories.{component}.custom_nodes"
+    if not isinstance(data, dict):
+        raise CatalogError(f"{source}: {field} must be a mapping")
+    nodes: list[PinnedCustomNode] = []
+    for raw_id, entry in data.items():
+        node_id = str(raw_id)
+        if not _NODE_ID_RE.match(node_id):
+            raise CatalogError(f"{source}: {field}: {node_id!r} is not a plain folder name")
+        # Windows folders are case-insensitive: two ids differing only in case
+        # would be checked out into the same directory.
+        if any(node.id.lower() == node_id.lower() for node in nodes):
+            raise CatalogError(f"{source}: {field}: duplicate custom node {node_id!r}")
+        where = f"{field}.{node_id}"
+        if not isinstance(entry, dict):
+            raise CatalogError(f"{source}: {where} must be a mapping")
+        unknown = sorted(str(key) for key in entry if key not in {"url", "revision", "commit"})
+        if unknown:
+            raise CatalogError(f"{source}: {where}: unknown fields: {', '.join(unknown)}")
+        url = entry.get("url")
+        if not isinstance(url, str) or not url.strip().lower().startswith("https://"):
+            raise CatalogError(f"{source}: {where}.url must be an https URL")
+        revision = entry.get("revision")
+        if not isinstance(revision, str) or not revision.strip():
+            raise CatalogError(f"{source}: {where}.revision must be a non-empty string")
+        commit = entry.get("commit")
+        if not isinstance(commit, str) or not _SHA1_RE.match(commit.strip().lower()):
+            raise CatalogError(f"{source}: {where}.commit must be a full 40-character sha")
+        nodes.append(
+            PinnedCustomNode(
+                id=node_id,
+                url=url.strip(),
+                revision=revision.strip(),
+                commit=commit.strip().lower(),
+            )
+        )
+    return tuple(nodes)
 
 
 def _dependencies_from(data: Any, component: str, source: Path | str) -> PinnedDependencies | None:

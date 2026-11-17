@@ -7,6 +7,7 @@ runs but no socket is ever opened. Nothing is written outside tmp_path.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import logging
 from pathlib import Path
 
@@ -279,7 +280,168 @@ def test_partial_file_is_removed_after_a_mid_transfer_cancel(tmp_path):
     with pytest.raises(DownloadCancelledError):
         downloader.fetch(spec, cancel=cancel)
     assert not spec.destination.exists()
-    assert not list(spec.destination.parent.glob(f"*{PART_SUFFIX}"))
+    assert not list(spec.destination.parent.glob(f"*{PART_SUFFIX}*"))
+
+
+# --- retomada e várias conexões ----------------------------------------------
+
+BIG = bytes(range(256)) * 40  # 10240 bytes
+BIG_SHA = hashlib.sha256(BIG).hexdigest()
+
+
+class RangeServer:
+    """A source that answers byte ranges (or ignores them), and can drop a range once
+    after some of its bytes, the way a CDN connection dies mid-body."""
+
+    def __init__(self, body: bytes, *, ranges: bool = True, drop: dict | None = None):
+        self.body = body
+        self.ranges = ranges
+        self.drop = dict(drop or {})  # range start -> bytes sent before the connection dies
+        self.asked: list[str | None] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        header = request.headers.get("range")
+        self.asked.append(header)
+        size = len(self.body)
+        if header is None or not self.ranges:
+            return httpx.Response(200, content=self.body, headers={"content-length": str(size)})
+        first, _, last = header.removeprefix("bytes=").partition("-")
+        start, end = int(first), int(last) if last else size - 1
+        if start >= size:
+            return httpx.Response(416)
+        piece = self.body[start : end + 1]
+        sent = self.drop.pop(start, None)
+        return httpx.Response(
+            206,
+            content=piece if sent is None else self._dying(piece, sent),
+            headers={
+                "content-range": f"bytes {start}-{end}/{size}",
+                "content-length": str(len(piece)),
+            },
+        )
+
+    @staticmethod
+    def _dying(piece: bytes, sent: int):
+        yield piece[:sent]
+        raise httpx.ReadError("connection lost mid-transfer")
+
+
+def ranged(server: RangeServer, *, slow: bool = True, **kwargs) -> Downloader:
+    """Small ranges and chunks. ``slow``: every clock reading is a second later, so each
+    512-byte chunk takes a second and the stream is split after its first 10 s window;
+    otherwise the clock stands still and the stream is never judged slow."""
+    ticks = itertools.count()
+    return downloader_with(
+        httpx.MockTransport(server),
+        connections=4,
+        segment_min_bytes=1024,
+        chunk_size=512,
+        monotonic=(lambda: float(next(ticks))) if slow else (lambda: 0.0),
+        **kwargs,
+    )
+
+
+def big_spec(tmp_path: Path) -> DownloadSpec:
+    return DownloadSpec(
+        url=URL, destination=tmp_path / "out" / "model.bin", sha256=BIG_SHA, size_bytes=len(BIG)
+    )
+
+
+def test_a_stream_cut_mid_body_resumes_from_its_partial_on_the_next_fetch(tmp_path):
+    spec = DownloadSpec(url=URL, destination=tmp_path / "out" / "o.zip", sha256=BIG_SHA)
+    server = RangeServer(BIG)
+    first = httpx.Response(
+        200,
+        content=RangeServer._dying(BIG, 4000),
+        headers={"content-length": str(len(BIG))},
+    )
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return first if calls["n"] == 1 else server(request)
+
+    downloader = downloader_with(httpx.MockTransport(handler), max_attempts=1, chunk_size=1000)
+    with pytest.raises(DownloadError, match="resumes"):
+        downloader.fetch(spec)
+    assert downloader.part_path(spec.destination).stat().st_size == 4000
+
+    result = downloader.fetch(spec)
+    assert server.asked == ["bytes=4000-"]  # only the rest was asked for
+    assert result.verified and spec.destination.read_bytes() == BIG
+    assert sorted(path.name for path in spec.destination.parent.iterdir()) == ["o.zip"]
+
+
+def test_a_partial_an_older_version_left_without_state_is_resumed_as_a_prefix(tmp_path):
+    spec = big_spec(tmp_path)
+    server = RangeServer(BIG)
+    downloader = ranged(server, slow=False)
+    part = downloader.part_path(spec.destination)
+    part.parent.mkdir(parents=True)
+    part.write_bytes(BIG[:6000])
+
+    result = downloader.fetch(spec)
+    assert result.verified and spec.destination.read_bytes() == BIG
+    assert server.asked == ["bytes=6000-"]
+
+
+def test_a_full_link_keeps_one_stream(tmp_path):
+    spec = big_spec(tmp_path)
+    server = RangeServer(BIG)
+    result = ranged(server, slow=False).fetch(spec)
+    assert result.verified and spec.destination.read_bytes() == BIG
+    assert server.asked == [None]
+
+
+def test_a_slow_stream_fetches_the_rest_as_ranges_over_several_connections(tmp_path):
+    spec = big_spec(tmp_path)
+    server = RangeServer(BIG)
+    seen: list[int] = []
+    result = ranged(server).fetch(spec, progress=lambda item: seen.append(item.downloaded_bytes))
+
+    assert result.status is DownloadStatus.DOWNLOADED and result.verified
+    assert spec.destination.read_bytes() == BIG
+    # Ten one-second chunks (5120 bytes) on one stream, the probe, then the other half as
+    # four ranges, each byte once.
+    assert server.asked[:2] == [None, "bytes=0-0"]
+    assert sorted(server.asked[2:]) == [
+        "bytes=5120-6399",
+        "bytes=6400-7679",
+        "bytes=7680-8959",
+        "bytes=8960-10239",
+    ]
+    assert seen[-1] == len(BIG)
+    assert sorted(path.name for path in spec.destination.parent.iterdir()) == ["model.bin"]
+
+
+def test_an_interrupted_ranged_download_later_asks_only_for_what_is_missing(tmp_path):
+    spec = big_spec(tmp_path)
+    # The range starting at byte 6400 dies after one 512-byte chunk of its 1280.
+    server = RangeServer(BIG, drop={6400: 512})
+    downloader = ranged(server, max_attempts=1)
+    with pytest.raises(DownloadError):
+        downloader.fetch(spec)
+    assert not spec.destination.exists()
+
+    server.asked.clear()
+    result = downloader.fetch(spec)
+    assert result.verified and spec.destination.read_bytes() == BIG
+    assert server.asked == ["bytes=6912-7679"]  # the rest of that range, nothing else
+
+
+def test_a_source_that_ignores_ranges_gets_one_plain_stream(tmp_path):
+    spec = big_spec(tmp_path)
+    server = RangeServer(BIG, ranges=False)
+    result = ranged(server).fetch(spec)
+    assert result.verified and spec.destination.read_bytes() == BIG
+    assert server.asked == [None, "bytes=0-0"]  # asked once, then the stream went on
+
+
+def test_a_cancelled_ranged_download_leaves_nothing_behind(tmp_path):
+    spec = big_spec(tmp_path)
+    with pytest.raises(DownloadCancelledError):
+        ranged(RangeServer(BIG)).fetch(spec, cancel=lambda: True)
+    assert list(spec.destination.parent.iterdir()) == []
 
 
 # --- dry-run ---------------------------------------------------------------

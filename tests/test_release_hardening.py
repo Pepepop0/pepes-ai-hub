@@ -17,6 +17,7 @@ retry gets the user back to a working stack without deleting the root.
 from __future__ import annotations
 
 import pytest
+import yaml
 from first_run_support import (
     CAPELLA,
     CAPELLA_PORTS,
@@ -25,13 +26,18 @@ from first_run_support import (
     controlled_stack,
     restarted_hub,
 )
+from internal_profile_support import (
+    INTERNAL_PROFILE_ID,
+    internal_profile_data,
+    internal_profile_yaml,
+)
 
 from local_ai_stack.installation import detect_repo_root
 from local_ai_stack.operation_contracts import OperationState
 from local_ai_stack.processes import ProcessOrigin
 from local_ai_stack.services import ServiceState
 
-TEST = "test"
+TEST = INTERNAL_PROFILE_ID
 PEPE = "pepe"
 RTX_5070_MIB = 12227
 SERVICES = ("ollama", "open-webui", "comfyui")
@@ -44,7 +50,7 @@ def shipped(profile_id: str) -> str:
 def stack_for(profile_id: str, **kwargs):
     vram = RTX_5070_MIB if profile_id == PEPE else RTX_5090_MIB
     return controlled_stack(
-        profile_yaml=shipped(profile_id),
+        profile_yaml=internal_profile_yaml() if profile_id == TEST else shipped(profile_id),
         profile_id=profile_id,
         vram_mib=vram,
         listener_depth=2,
@@ -77,7 +83,7 @@ def kill_tree(built, service_id: str) -> None:
 # --- 1. first run, every shipped profile -------------------------------------
 
 
-@pytest.mark.parametrize("profile_id", [TEST, CAPELLA, PEPE])
+@pytest.mark.parametrize("profile_id", ["pepe-8gb", CAPELLA, PEPE])
 def test_every_shipped_profile_completes_a_first_run(profile_id):
     built = stack_for(profile_id)
     try:
@@ -104,8 +110,9 @@ def test_every_shipped_profile_completes_a_first_run(profile_id):
 
 
 def test_an_invalid_profile_never_reaches_installation():
-    yaml_text = capella_yaml().replace("primary: ollama/qwen3_5_27b", "primary: TBD")
-    assert "primary: TBD" in yaml_text
+    data = yaml.safe_load(capella_yaml())
+    data["models"]["chat"]["primary"] = "TBD"
+    yaml_text = yaml.safe_dump(data, sort_keys=False)
     with pytest.raises(Exception, match="chat"):
         controlled_stack(profile_yaml=yaml_text)
 
@@ -113,7 +120,7 @@ def test_an_invalid_profile_never_reaches_installation():
 # --- 2. second run ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("profile_id", [TEST, CAPELLA, PEPE])
+@pytest.mark.parametrize("profile_id", ["pepe-8gb", CAPELLA, PEPE])
 def test_a_second_run_does_nothing_in_the_same_session(profile_id):
     built = stack_for(profile_id)
     try:
@@ -135,7 +142,7 @@ def test_a_second_run_does_nothing_in_the_same_session(profile_id):
         built.release()
 
 
-@pytest.mark.parametrize("profile_id", [TEST, CAPELLA, PEPE])
+@pytest.mark.parametrize("profile_id", ["pepe-8gb", CAPELLA, PEPE])
 def test_a_second_run_does_nothing_after_the_hub_is_reopened(profile_id):
     built = stack_for(profile_id)
     try:
@@ -329,10 +336,9 @@ def test_opening_open_webui_after_a_hub_restart_reuses_the_running_service(runni
 
 
 def test_opening_open_webui_is_refused_when_the_profile_disables_it():
-    yaml_text = shipped(TEST).replace(
-        "open-webui: {enabled: true, port: 8080}", "open-webui: {enabled: false, port: 8080}"
-    )
-    assert "enabled: false" in yaml_text
+    data = internal_profile_data()
+    data["services"]["open-webui"]["enabled"] = False
+    yaml_text = yaml.safe_dump(data, sort_keys=False)
     built = controlled_stack(profile_yaml=yaml_text, profile_id=TEST, listener_depth=2)
     try:
         launch = built.app.open_webui("op-1", TEST)

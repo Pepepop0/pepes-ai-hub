@@ -1,4 +1,6 @@
-# Estado atual — setup manual de referência (Pepe)
+# Referência histórica: setup manual Pepe
+
+Este registro descreve o ambiente manual que originou o provisionamento. Ele não é o estado de implementação da branch desktop. Consulte o [PRD atual](PRD.md), a [arquitetura](ARCHITECTURE.md) e os [critérios de validação desktop](testing/desktop-ui-checklist.md). Capella continua dependendo de validação física na RTX 5090.
 
 ## Hardware
 
@@ -35,7 +37,7 @@ UI: `http://localhost:8080`
 ComfyUI Desktop funcionando. Base path observado no setup manual:
 
 ```text
-C:\Users\Pedro\AppData\Local\Comfy-Desktop\ComfyUI-Shared\models
+%USERPROFILE%\AppData\Local\Comfy-Desktop\ComfyUI-Shared\models
 ```
 
 Esse path não deve ser hardcodado no produto.

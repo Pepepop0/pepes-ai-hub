@@ -1,5 +1,12 @@
 # HANDOFF — LEIA PRIMEIRO
 
+## Escopo atual — Hub 1.17
+
+O desktop continua Windows/NVIDIA. A pedido do usuário, Capella também tem uma
+bancada Linux x86-64 headless: o CLI original instala/opera a stack, e o acesso
+ao Open WebUI ocorre por túnel SSH. Veja `docs/testing/runbook-linux-1.17.md`.
+O restante deste documento registra o objetivo histórico da v0.1.
+
 ## Objetivo imediato
 
 Transformar o setup manual validado na máquina **Pepe (RTX 5070 12 GB / Windows 10)** em um gerenciador de stack local reproduzível.
@@ -30,9 +37,11 @@ Uma TUI que:
 
 Prompts prontos em `prompts/`.
 
-## Não fazer agora
+## Fora do escopo
 
-Linux, macOS, AMD, multi-GPU, Docker, auto-update complexo, uninstall perfeito, hacks no SQLite do Open WebUI ou otimizações prematuras.
+Desktop Linux/macOS, AMD, multi-GPU, auto-update complexo, uninstall perfeito,
+hacks no SQLite do Open WebUI e otimizações prematuras. Docker Linux sem GPU é
+usado apenas para validar a preparação; não prova inferência na RTX 5090.
 
 ## Primeira ação
 

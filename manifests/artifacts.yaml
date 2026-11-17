@@ -7,8 +7,8 @@
 # asset, which is what the release publisher recorded. The downloader treats a
 # present checksum as mandatory and discards bytes that do not match.
 #
-# Windows/amd64 only, matching the v0.1 target. Other platforms get their own
-# entries when they are supported, not a substitution at runtime.
+# Platform-specific binaries are selected explicitly. No Windows executable is
+# substituted for a Linux program; the component version remains the same.
 
 schema_version: 1
 
@@ -23,6 +23,19 @@ artifacts:
     filename: ollama-windows-amd64.zip
     sha256: 2439cbea65310b1aadf7d8fc41d7faf5d033f920d42e00a476c58bf9bff6950e
     size_bytes: 1460134793
+    platform: windows
+    architecture: amd64
+
+  # Official v0.33.2 Linux/NVIDIA archive; digest from GitHub release API.
+  - id: ollama-linux-amd64
+    component: ollama
+    version: "0.33.2"
+    platform: linux
+    architecture: amd64
+    url: https://github.com/ollama/ollama/releases/download/v0.33.2/ollama-linux-amd64.tar.zst
+    filename: ollama-linux-amd64.tar.zst
+    sha256: 9785247dea264d9072f09f6c9c0eb4b8e666892826a3d8388eba3e8fb9ed1db9
+    size_bytes: 1422262024
 
   # The Python the packaged Hub installs Open WebUI and ComfyUI with.
   #
@@ -43,3 +56,5 @@ artifacts:
     filename: cpython-3.11.16+20260901-x86_64-pc-windows-msvc-install_only.tar.gz
     sha256: 6be524fa6752af802146a4adc7d098565425b0b1c166e19a5a7a4c8cccb86bf6
     size_bytes: 47940627
+    platform: windows
+    architecture: amd64

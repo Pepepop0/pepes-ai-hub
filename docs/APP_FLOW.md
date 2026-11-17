@@ -1,7 +1,45 @@
-# App flow — Wave A (first-run / lifecycle / Open WebUI)
+# Fluxo da aplicação desktop
 
-Camada de aplicação atrás do botão **Instalar**. Compõe os domínios existentes;
-não decide nada que já tenha dono.
+O entrypoint padrão abre React em uma janela WebView2. O transporte local em `local_ai_stack.desktop` entrega comandos ao mesmo `HubApplicationAdapter` descrito abaixo. A navegação e os critérios atuais estão no [PRD](PRD.md); os fluxos de arquivos estão no [PRD de instalações](PRD_INSTALLATIONS.md).
+
+## Navegação atual
+
+1. **Visão geral** mostra a instalação ativa, saúde, VRAM e ações de runtime.
+2. **Instalações** reúne criar, cadastrar, localizar pasta movida, alternar, abrir pastas, verificar, reparar, esquecer e excluir.
+3. **Modelos e perfis** permite consultar o catálogo embarcado, sem afirmar que os modelos estão baixados.
+4. **Atividade** apresenta eventos da sessão e diagnóstico.
+5. **Configurações** reúne tema, Hugging Face e informações do aplicativo.
+
+Criar instalação segue perfil → local → revisão → execução. A escolha de pasta não inicia provisionamento. Cadastrar e localizar usam arquivos existentes; excluir consulta um plano e pede uma confirmação. Estados de erro e operação em andamento vêm do backend, não de temporizadores no renderer.
+
+### Escolher o destino personalizado
+
+O assistente trata a pasta escolhida como pasta principal. **Criar pasta com o nome da instalação** começa ligado: selecionar `Desktop` para Capella instala em `Desktop\Capella`. Desligue o switch para usar exatamente a pasta escolhida. A estimativa, a revisão e a execução usam o mesmo destino final, sem criar diretórios durante a revisão.
+
+O histórico de destinos guarda a pasta principal, enquanto a configuração e o registro da instalação guardam a raiz final. Selecionar um destino recente não acrescenta a subpasta novamente. Instalações anteriores não são movidas.
+
+### Pausar, retomar e cancelar
+
+O cartão da operação oferece **Pausar**, **Retomar** e **Cancelar instalação** durante instalação, conclusão e reparo. A confirmação de pausa só ocorre quando o coordenador e todos os workers de download atingem pontos seguros. Git, pip e outros comandos externos terminam a etapa atual antes de aplicar uma solicitação; a interface mostra **Pausando** ou **Cancelando** enquanto aguarda.
+
+Cancelar acorda uma instalação pausada e mantém arquivos concluídos e parciais retomáveis para a próxima tentativa. O Hub não marca uma instalação nova como concluída, não troca a instalação ativa e libera os controles depois do resultado. A limpeza para somente serviços iniciados por aquela execução. Fechar a janela continua recusado enquanto a operação está ativa, inclusive pausada.
+
+### Repetir uma tentativa e configurar tokens
+
+**Tentar novamente** usa o perfil e a raiz da tentativa que falhou, não a instalação ativa. O contexto é capturado antes da preparação, também na primeira instalação. A tentativa recebe outro ID, reusa arquivos verificados e preserva a escolha de subpasta sem acrescentá-la outra vez. IDs antigos não controlam tentativas novas; um preflight que pede decisão mantém a intenção original até a resolução.
+
+O retry pertence à sessão atual. Ao reabrir o Hub, selecione a raiz incompleta registrada e use **Concluir instalação** ou **Reparar**.
+
+Na revisão e no retry, **Configurar tokens** abre o mesmo formulário protegido usado em Configurações. O Civitai avisa sobre downloads autenticados; os arquivos atuais do Hugging Face permanecem públicos. A ausência de token não impede reutilizar arquivos locais: **Continuar sem token** exige uma escolha explícita. Os campos são apagados ao enviar e ao fechar o modal; validar a conta não garante acesso a todo repositório ou licença.
+
+Falhas de aquisição mostram uma causa observada e uma ação. O diagnóstico distingue HTTP 401/403, limite 429, timeout ou interrupção, checksum, disco cheio e acesso negado. Falhas não classificadas mantêm uma orientação segura, sem inventar causa nem exibir URLs, caminhos privados ou credenciais.
+
+
+## Motor de aplicação preservado
+
+O conteúdo a seguir documenta a composição original e sua evidência histórica. Referências à TUI descrevem o consumidor anterior, não a interface padrão desta branch. As provas antigas não substituem a [validação desktop](testing/desktop-ui-checklist.md).
+
+O motor compõe os domínios existentes e mantém suas responsabilidades.
 
 | Módulo | Papel |
 |---|---|
@@ -27,8 +65,7 @@ são recusados antes de executar trabalho.
 O bridge guarda o snapshot produzido pelo backend antes de entregar cada evento.
 Replay da última observação, entrega e fechamento da subscription são
 serializados pelo mesmo lock. Exceções de um consumer não interrompem os outros.
-Fechar o adapter impede novas operações e aguarda a operação aceita terminar;
-não foi acrescentado cancelamento de instalação.
+Fechar o adapter impede novas operações e aguarda a operação aceita terminar. O cancelamento explícito da instalação usa o controle cooperativo descrito acima.
 
 `services_snapshot`, `vram_snapshot` e prontidão vêm do backend. Iniciar, parar e
 reiniciar delegam a `StackApplication`. O botão Open WebUI solicita um target ao
@@ -40,8 +77,7 @@ de status preservam o bloqueio do botão durante o lançamento e seu cooldown.
 
 - DEFAULT continua usando a raiz de dados resolvida pelo domínio.
 - PORTABLE continua resolvendo `repo/stack` e persistindo `root: null`.
-- CUSTOM passa o caminho absoluto escolhido a `InstallLocation.custom`/resolver;
-  nenhum caminho específico de máquina foi codificado na aplicação.
+- CUSTOM persiste a raiz final, resolvida a partir da pasta principal e do switch do assistente. Chamadores programáticos continuam usando o caminho exato, salvo quando solicitam `create_subfolder=True`; nenhum caminho específico de máquina fica codificado na aplicação.
 
 A seleção usa o schema existente `InstalledConfig`, em `state/config.yaml` da
 instalação. `state/hub-selection.yaml` na raiz de dados padrão permite localizar
@@ -98,9 +134,7 @@ pela vida toda. Um launcher por controller perderia a prova do que iniciou
 
 ## Limitações honestas
 
-- Capella agora declara `chat.primary: ollama/qwen3_5_9b`, ID canônico já presente
-  no catálogo. O perfil enviado é usado sem substituição nos testes; só os
-  providers e bytes dos modelos são controlados. Pepe/Test continuam inalterados.
+- A definição atual da Capella está em `profiles/capella.yaml`: chat Qwen3.8 27B, imagens Qwen-Image-2.1 INT8 ConvRot, sem variante de chat extra. O perfil é preservado nesta branch desktop. A evidência histórica abaixo antecede essa combinação.
 - Capella mantém o requisito de 32 GiB de VRAM. Em uma RTX 5070 de 12 GiB, o
   resultado esperado ao selecioná-la é uma recusa útil no preflight. Para smoke
   de instalação bem-sucedida nessa placa, usar um perfil compatível, como Pepe.

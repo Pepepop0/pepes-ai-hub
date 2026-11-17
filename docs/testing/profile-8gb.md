@@ -1,7 +1,7 @@
 # Pepe 8 GB: the full stack on an 8 GB NVIDIA card
 
 What the `pepe-8gb` profile is, how its chat model was chosen, and what was
-measured on a fresh root (`C:\Users\Pedro\Desktop\PEPITO_8GB_TEST`) with the
+measured on a fresh root (`$HOME\Desktop\PEPITO_8GB_TEST`) with the
 GPU held down to 8 GB.
 
 ## What the profile is

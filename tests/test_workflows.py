@@ -4,9 +4,11 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from comfy_sam_fake import EMPTY_BATCH, saved_masks
 
 import local_ai_stack
 from local_ai_stack.models import (
@@ -26,6 +28,7 @@ from local_ai_stack.workflows import (
     WorkflowParameter,
     WorkflowParameters,
     WorkflowState,
+    load_workflow_graph,
     load_workflow_manifest,
     parse_workflow_manifest,
     render_workflow,
@@ -657,3 +660,201 @@ def image_resolver_repo() -> FakeResolver:
             model_id, kind, ModelState.AVAILABLE, FileModelLocation(path, filename, placement)
         )
     return FakeResolver(models)
+
+
+# --- an input image on several nodes: the edit workflows that take references -------------------
+
+
+def test_a_parameter_may_name_several_nodes_in_order_and_never_the_same_one_twice():
+    def manifest(mapping: dict) -> dict:
+        return {
+            "schema_version": 1,
+            "workflows": {
+                "w": {
+                    "file": "w.json",
+                    "models": {"required": ["image.diffusion"], "parameter": "image.diffusion"},
+                    "mapping": mapping,
+                }
+            },
+        }
+
+    spec = parse_workflow_manifest(
+        manifest({"image": {"node_ids": ["1", 2, "3"], "key": "image"}})
+    )["w"]
+    binding = spec.binding(WorkflowParameter.IMAGE)
+    assert binding.node_ids == ("1", "2", "3") and binding.node_id == "1"
+
+    single = parse_workflow_manifest(manifest({"image": {"node_id": "1", "key": "image"}}))["w"]
+    assert single.binding(WorkflowParameter.IMAGE).node_ids == ("1",)
+
+    for mapping, message in [
+        ({"image": {"node_ids": ["1", "1"], "key": "image"}}, "same node twice"),
+        ({"image": {"node_ids": [], "key": "image"}}, "non-empty list"),
+        ({"image": {"node_id": "1", "node_ids": ["1"], "key": "image"}}, "not both"),
+        ({"image": {"node_ids": ["1"]}}, "missing key"),
+    ]:
+        with pytest.raises(WorkflowError, match=message):
+            parse_workflow_manifest(manifest(mapping))
+
+
+@pytest.mark.parametrize(
+    ("workflow_id", "single_id", "images", "syntax"),
+    [
+        ("qwen_image_2_1_edit_2", "qwen_image_2_1_edit", 2, "indexed"),
+        ("qwen_image_2_1_edit_3", "qwen_image_2_1_edit", 3, "indexed"),
+    ],
+)
+def test_a_reference_edit_graph_loads_one_image_per_mapped_node_and_the_models_of_its_single_edit(
+    specs, workflow_id, single_id, images, syntax
+):
+    def graph_of(workflow_id: str) -> dict:
+        return json.loads((REPO / specs[workflow_id].file).read_text(encoding="utf-8"))
+
+    spec, graph, single = specs[workflow_id], graph_of(workflow_id), graph_of(single_id)
+    assert spec.complete and spec.reference_syntax == syntax
+    nodes = spec.binding(WorkflowParameter.IMAGE).node_ids
+    assert len(nodes) == images
+    assert [graph[node]["class_type"] for node in nodes] == ["LoadImage"] * images
+    assert [n["class_type"] for n in graph.values()].count("LoadImage") == images
+    for node in graph.values():
+        for value in node["inputs"].values():
+            if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
+                assert value[0] in graph, value
+
+    def loaded(source: dict) -> set:
+        return {
+            (key, value)
+            for node in source.values()
+            for key, value in node["inputs"].items()
+            if key in {"unet_name", "clip_name", "vae_name", "lora_name"}
+        }
+
+    assert loaded(graph) == loaded(single), "no model the single edit does not already load"
+    assert set(spec.required_roles) == set(specs[single_id].required_roles)
+    for parameter in spec.parameters:
+        for node_id in spec.binding(parameter).node_ids:
+            assert node_id in graph, (parameter, node_id)
+
+
+@pytest.mark.parametrize(
+    ("workflow_id", "family", "policy", "count"),
+    [
+        ("qwen_image_2_1_edit", "qwen21", "generic", 1),
+        ("qwen_image_2_1_edit_2", "qwen21", "generic", 2),
+        ("qwen_image_2_1_edit_3", "qwen21", "generic", 3),
+    ],
+)
+def test_edit_capabilities_match_actual_image_slots(specs, workflow_id, family, policy, count):
+    spec = specs[workflow_id]
+    graph = json.loads((REPO / spec.file).read_text(encoding="utf-8"))
+    assert (spec.family, spec.reference_policy, spec.reference_count) == (family, policy, count)
+    assert sum(node["class_type"] == "LoadImage" for node in graph.values()) == count
+
+
+def test_reference_policies_refuse_incompatible_image_counts(specs):
+    with pytest.raises(WorkflowError, match="needs two images"):
+        replace(specs["qwen_image_2_1_edit"], reference_policy="scene_character")
+    with pytest.raises(WorkflowError, match="needs one image"):
+        replace(specs["qwen_image_2_1_edit_2"], reference_policy="single")
+
+
+@pytest.mark.parametrize("workflow_id", ["sam3_people", "da3_depth"])
+def test_swap_analysis_graphs_are_embedded_bound_and_fully_connected(specs, tmp_path, workflow_id):
+    from test_service_config import resolver_for
+
+    from local_ai_stack.model_catalog import model_catalog
+
+    profile = load_profile(REPO / "profiles" / "capella.yaml")
+    spec = specs[workflow_id]
+    resolution = resolve_workflow(spec, profile, resolver_for(profile, tmp_path), repo_root=REPO)
+    assert resolution.ready, resolution.problems
+    assert spec.status == "mapped_and_embedded"
+    graph = load_workflow_graph(resolution)
+    assert "nodes" not in graph
+    assert verify_workflow_references(resolution, graph) == ()
+    assert spec.reference_count == 1 and spec.reference_policy == "single"
+    catalog = model_catalog()
+    source = catalog.require(profile.model_for(spec.parameter_role)).source
+    model = spec.binding(WorkflowParameter.MODEL)
+    assert graph[model.node_id]["inputs"][model.key] == source.artifact.filename
+    reached = set()
+
+    def visit(node_id):
+        if node_id in reached:
+            return
+        reached.add(node_id)
+        assert "class_type" in graph[node_id]
+        for value in graph[node_id]["inputs"].values():
+            if isinstance(value, list):
+                assert len(value) == 2 and isinstance(value[1], int)
+                assert value[0] in graph
+                visit(value[0])
+
+    outputs = [node_id for node_id, node in graph.items() if node["class_type"] == "SaveImage"]
+    assert len(outputs) == (3 if workflow_id == "sam3_people" else 1)
+    for output in outputs:
+        visit(output)
+    assert reached == set(graph)
+
+
+def test_sam3_uses_native_multi_detection_conditioning_and_separate_masks(specs):
+    graph = json.loads((REPO / specs["sam3_people"].file).read_text(encoding="utf-8"))
+    assert graph["3"]["class_type"] == "CLIPTextEncode"
+    # The SAM3 tokenizer interprets :N as max_detections metadata; plain person caps at 1.
+    assert graph["3"]["inputs"] == {"clip": ["2", 1], "text": "person:1000"}
+    assert graph["4"]["inputs"] == {
+        "model": ["2", 0],
+        "image": ["1", 0],
+        "conditioning": ["3", 0],
+        "threshold": 0.5,
+        "refine_iterations": 2,
+        "individual_masks": True,
+    }
+    assert graph["5"]["inputs"]["mask"] == ["4", 0]
+    assert graph["6"]["inputs"]["images"] == ["5", 0]
+
+
+def test_sam3_also_detects_speech_bubbles_and_text_for_the_swap_compositor(specs):
+    graph = json.loads((REPO / specs["sam3_people"].file).read_text(encoding="utf-8"))
+    for prompt, detect, save, prefix in (
+        ("7", "8", "10", "PepitoSwap/overlay_bubble"),
+        ("11", "12", "14", "PepitoSwap/overlay_text"),
+    ):
+        text = graph[prompt]["inputs"]["text"]
+        assert text.endswith(":1000") and text.split(":")[0] in ("speech bubble", "text")
+        assert graph[detect]["inputs"]["conditioning"] == [prompt, 0]
+        # One union mask, blank when nothing is found: an empty batch fails SaveImage.
+        assert graph[detect]["inputs"]["individual_masks"] is False
+        assert graph[save]["inputs"]["filename_prefix"] == prefix
+    assert graph["6"]["inputs"]["filename_prefix"] == "PepitoSwap/people"
+
+
+def test_a_scene_without_bubbles_or_text_saves_blank_masks_instead_of_failing(specs):
+    graph = json.loads((REPO / specs["sam3_people"].file).read_text(encoding="utf-8"))
+    saved = saved_masks(graph, {"person": 2})
+    assert saved == {"6": [True, True], "10": [False], "14": [False]}
+    assert saved_masks(graph, {"person": 1, "speech bubble": 3, "text": 2})["10"] == [True]
+    # The lab's T2/T4/T5/T6 failure: per-detection masks with nothing detected.
+    graph["8"]["inputs"]["individual_masks"] = True
+    with pytest.raises(IndexError, match=EMPTY_BATCH):
+        saved_masks(graph, {"person": 2})
+
+
+def test_da3_dynamic_combo_inputs_use_flat_prefixed_api_keys(specs):
+    graph = json.loads((REPO / specs["da3_depth"].file).read_text(encoding="utf-8"))
+    assert WorkflowParameter.PROMPT not in specs["da3_depth"].bindings
+    assert graph["2"]["inputs"]["weight_dtype"] == "default"
+    assert graph["3"]["inputs"] == {
+        "da3_model": ["2", 0],
+        "image": ["1", 0],
+        "resolution": 504,
+        "resize_method": "upper_bound_resize",
+        "mode": "mono",
+    }
+    assert graph["4"]["inputs"] == {
+        "da3_geometry": ["3", 0],
+        "output": "depth",
+        "output.normalization": "v2_style",
+        "output.apply_sky_clip": False,
+    }
+    assert graph["5"]["inputs"]["images"] == ["4", 0]

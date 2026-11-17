@@ -15,7 +15,7 @@ from local_ai_stack.components import (
 )
 from local_ai_stack.layout import StackLayout
 from local_ai_stack.processes import DEFAULT_PROCESS_SPECS
-from local_ai_stack.profiles import load_profile, validate_profile_data
+from local_ai_stack.profiles import load_profile, load_profiles, validate_profile_data
 from local_ai_stack.services import DEFAULT_SERVICE_SPECS
 from local_ai_stack.stacks import STANDARD_STACK
 
@@ -91,10 +91,9 @@ def test_runtime_process_ids_match_the_stack():
 
 
 def test_shipped_profiles_use_canonical_service_ids():
-    for path in sorted(PROFILES.glob("*.yaml")):
-        profile = load_profile(path)
-        assert set(profile.services) <= set(CANONICAL_IDS), path.name
-        assert "open_webui" not in profile.services, path.name
+    for profile in load_profiles(PROFILES):
+        assert set(profile.services) <= set(CANONICAL_IDS), profile.id
+        assert "open_webui" not in profile.services, profile.id
 
 
 def test_profile_services_join_with_stack_components():
@@ -142,7 +141,9 @@ def test_no_module_uses_the_legacy_id_as_a_value():
     back is the old spelling written as a string, because that is what would
     split the two layers again.
     """
-    allowed = {"components.py", "processes.py"}  # the alias table and a cmdline marker
+    # The alias table, a cmdline marker, and the native extension, which names the Python
+    # *package directory* of the managed Open WebUI (a path it must find), not a service id.
+    allowed = {"components.py", "processes.py", "open_webui_native.py"}
     offenders = []
     for path in sorted((REPO / "src" / "local_ai_stack").rglob("*.py")):
         if path.name in allowed:

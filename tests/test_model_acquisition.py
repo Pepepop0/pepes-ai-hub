@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -176,15 +177,24 @@ def test_a_repinned_checksum_makes_the_existing_file_invalid(tmp_path):
 # --- ComfyUI: aquisicao ----------------------------------------------------
 
 
-def test_apply_downloads_into_the_managed_tree(tmp_path):
+@pytest.mark.parametrize(
+    "placement",
+    [
+        ModelPlacement.DIFFUSION_MODELS,
+        ModelPlacement.CHECKPOINTS,
+        ModelPlacement.GEOMETRY_ESTIMATION,
+    ],
+)
+def test_apply_downloads_into_the_managed_tree(tmp_path, placement):
     installer = installer_for(tmp_path)
-    spec = file_spec()
+    original = file_spec()
+    spec = replace(original, source=replace(original.source, placement=placement))
     result = installer.apply(spec)
 
     assert result.outcome is ModelOutcome.ACQUIRED
     destination = installer.paths.destination_for(spec)
     assert destination.read_bytes() == WEIGHTS
-    assert destination.parent.name == ModelPlacement.DIFFUSION_MODELS.value
+    assert destination.parent.name == placement.value
     assert destination.parent.parent.name == "comfyui"
 
 
@@ -398,6 +408,28 @@ def test_a_failed_pull_is_reported_structurally(tmp_path):
     assert result.failure is ModelFailure.PROVIDER
 
 
+def test_a_named_ollama_model_is_shown_by_its_name_while_the_pull_uses_the_reference(tmp_path):
+    spec = replace(ollama_spec(), display_name="Demo 8B")
+    store = FakeOllama(fail="pull")
+    installer = installer_for(tmp_path, ollama=store)
+
+    step = installer.plan(spec).steps[0]
+    assert step.target == "demo:8b"
+    assert "Demo 8B" in step.summary and "demo:8b" not in step.summary
+    assert "demo:8b" not in installer.detect(spec).detail
+
+    result = installer.apply(spec)
+    assert store.pulls == []
+    pulled = FakeOllama()
+    installer_for(tmp_path, ollama=pulled).apply(spec)
+    assert pulled.pulls == ["demo:8b"]
+    assert "Demo 8B" in result.detail and "demo:8b" not in result.detail
+
+    republished = FakeOllama(installed=(OllamaModelEntry(name="demo:8b", digest="sha256:dead"),))
+    invalid = installer_for(tmp_path, ollama=republished).detect(spec)
+    assert "demo:8b" not in invalid.detail and invalid.reference == "demo:8b"
+
+
 def test_acquisition_never_removes_a_model_someone_else_pulled(tmp_path):
     theirs = OllamaModelEntry(name="someone-elses:13b", digest="sha256:aaaa")
     store = FakeOllama(installed=(theirs,))
@@ -558,6 +590,7 @@ def test_a_tbd_role_produces_no_requirement():
     data = deepcopy(profile.raw)
     data["models"]["chat"]["primary"] = "TBD"
     data["features"].update(chat=False, vision=False, tools=False)
+    data.pop("variants", None)
     profile = validate_profile_data(data)
     roles = {requirement.role for requirement in profile.model_requirements}
     assert "chat.primary" not in roles

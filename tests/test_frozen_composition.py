@@ -29,11 +29,13 @@ from local_ai_stack.installation import InstallLocation, resolve_installation
 from local_ai_stack.integration import default_install_actions, provision_context
 from local_ai_stack.layout import ENV_ROOT
 from local_ai_stack.planning import build_install_plan
+from local_ai_stack.profiles import load_profiles
 from local_ai_stack.resources import ENV_RESOURCE_ROOT, RESOURCE_DIRECTORIES, resource_root
 from local_ai_stack.stack_application import StackApplication
+from local_ai_stack.workflows import load_workflow_manifest
 
 CHECKOUT = Path(__file__).resolve().parents[1]
-PROFILES = {"capella", "pepe", "pepe-8gb", "test"}
+PROFILES = {profile.id for profile in load_profiles(CHECKOUT / "profiles")}
 
 
 @pytest.fixture
@@ -47,6 +49,10 @@ def frozen_build(monkeypatch, tmp_path):
     bundle = app / "_internal"
     for name in RESOURCE_DIRECTORIES:
         shutil.copytree(CHECKOUT / name, bundle / name)
+    # The spec bundles the built renderer here; its contents are not under test.
+    renderer = bundle / "desktop-ui" / "dist"
+    renderer.mkdir(parents=True)
+    (renderer / "index.html").write_text("<html></html>", encoding="utf-8")
     exe = app / "PepitosAIHub.exe"
     exe.write_bytes(b"")
     monkeypatch.setattr(sys, "frozen", True, raising=False)
@@ -98,7 +104,7 @@ def test_the_stack_application_composes_without_a_checkout(frozen_build):
 
     assert application.repo_root == bundle
     assert set(application.profiles) == PROFILES
-    handlers = application.install_actions(application.profile("test"))
+    handlers = application.install_actions(application.profile("pepe"))
     assert handlers.repo_root == bundle
 
 
@@ -183,4 +189,6 @@ def test_the_image_edit_graph_is_read_from_the_bundle(frozen_build):
     assert load_workflow_graph(resolution)["76"]["class_type"] == "LoadImage"
     report = smoke_report()
     assert report["ok"], report["problems"]
-    assert report["workflows"]["embedded"] == ["flux2_klein_edit", "flux2_klein_t2i"]
+    assert report["workflows"]["embedded"] == sorted(
+        load_workflow_manifest(Path(__file__).resolve().parents[1] / "manifests/workflows.yaml")
+    )

@@ -120,6 +120,9 @@ class KnownInstallation:
     Enough to render a row and to recover from a folder that moved: where it
     was, how it was installed, when it was last used and what it last did.
     Whether it exists right now is not here; that is observed.
+    ``profile_version`` is the profile's version the last successful install
+    or repair applied; None when unknown -- a state written before versions
+    were recorded, or a profile that changed since.
     """
 
     root: Path
@@ -130,6 +133,7 @@ class KnownInstallation:
     last_install: OperationRecord | None = None
     last_repair: OperationRecord | None = None
     last_failure: OperationRecord | None = None
+    profile_version: str | None = None
 
     @property
     def key(self) -> str:
@@ -143,6 +147,8 @@ class KnownInstallation:
             record["profile"] = self.last_known_profile
         if self.last_known_stack:
             record["stack"] = self.last_known_stack
+        if self.profile_version:
+            record["profile_version"] = self.profile_version
         for name, value in (
             ("last_install", self.last_install),
             ("last_repair", self.last_repair),
@@ -173,6 +179,7 @@ class KnownInstallation:
             last_install=OperationRecord.from_dict(data.get("last_install")),
             last_repair=OperationRecord.from_dict(data.get("last_repair")),
             last_failure=OperationRecord.from_dict(data.get("last_failure")),
+            profile_version=_text(data.get("profile_version")),
         )
 
 
@@ -225,6 +232,11 @@ class HubState:
     ) -> HubState:
         """This folder is an installation the Hub knows. Does not make it active."""
         existing = self.entry_for(root)
+        # A version describes what one profile installed: another profile in
+        # the same folder has not been installed at that version.
+        same_profile = existing is not None and (
+            profile_id is None or profile_id == existing.last_known_profile
+        )
         entry = KnownInstallation(
             root=Path(os.path.normpath(os.fspath(root))),
             mode=mode,
@@ -234,6 +246,7 @@ class HubState:
             last_install=existing.last_install if existing else None,
             last_repair=existing.last_repair if existing else None,
             last_failure=existing.last_failure if existing else None,
+            profile_version=existing.profile_version if same_profile and existing else None,
         )
         return replace(self, known=self._replacing(entry))
 
@@ -244,14 +257,22 @@ class HubState:
         *,
         result: str = "",
         summary: str = "",
+        profile_version: str | None = None,
     ) -> HubState:
-        """What this installation last did: an install, a repair, or a failure."""
+        """What this installation last did: an install, a repair, or a failure.
+
+        A successful install or repair also records the profile version it
+        applied; a failure leaves the recorded version as it was.
+        """
         entry = self.entry_for(root)
         if entry is None:
             return self
         record = OperationRecord(now(), result, summary)
         field_name = {INSTALL: "last_install", REPAIR: "last_repair", FAILURE: "last_failure"}[kind]
-        return replace(self, known=self._replacing(replace(entry, **{field_name: record})))
+        changes: dict[str, Any] = {field_name: record}
+        if kind != FAILURE and profile_version:
+            changes["profile_version"] = profile_version
+        return replace(self, known=self._replacing(replace(entry, **changes)))
 
     def activating(self, config: InstalledConfig) -> HubState:
         """This installation is the active one.

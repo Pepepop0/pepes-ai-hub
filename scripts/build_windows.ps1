@@ -32,8 +32,8 @@ $DistDir = Join-Path $Root 'dist'
 $BuildDir = Join-Path $Root 'build'
 $OutDir = Join-Path $DistDir $AppName
 $Exe = Join-Path $OutDir "$AppName.exe"
+$CliExe = Join-Path $OutDir "$AppName-CLI.exe"
 $Internal = Join-Path $OutDir '_internal'
-$PyInstallerPin = 'pyinstaller==6.22.3'
 
 function Step([string]$Message) { Write-Host "==> $Message" -ForegroundColor Cyan }
 function Fail([string]$Message) { Write-Host "BUILD FAILED: $Message" -ForegroundColor Red; exit 1 }
@@ -66,10 +66,22 @@ if ($Version) { Write-Host "Pepito's AI Hub $BuildVersion"; exit 0 }
 
 Step "Building Pepito's AI Hub $BuildVersion from $Root"
 
-# --- 1. Build dependency, pinned -------------------------------------------
-Step "Ensuring $PyInstallerPin in the venv"
-$code = Invoke-Native $Python @('-m', 'pip', 'install', '--disable-pip-version-check', '--quiet', $PyInstallerPin)
-if ($code -ne 0) { Fail "Could not install $PyInstallerPin." }
+# --- 1. Build dependencies and renderer ------------------------------------
+Step "Ensuring build and desktop dependencies in the venv"
+$code = Invoke-Native $Python @('-m', 'pip', 'install', '--disable-pip-version-check', '--quiet', '-e', "$Root[build]")
+if ($code -ne 0) { Fail "Could not install build dependencies." }
+if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) { Fail 'Node.js 22+ and npm are required to build the desktop UI.' }
+Push-Location (Join-Path $Root 'desktop-ui')
+try {
+    Step 'Installing locked desktop dependencies'
+    $code = Invoke-Native 'npm.cmd' @('ci')
+    if ($code -ne 0) { Fail 'npm ci failed.' }
+    Step 'Building the desktop renderer'
+    $code = Invoke-Native 'npm.cmd' @('run', 'build')
+    if ($code -ne 0) { Fail 'Desktop renderer build failed.' }
+} finally {
+    Pop-Location
+}
 
 # --- 2. Clean only what this script produced --------------------------------
 # Never `Remove-Item dist` wholesale: only the app folder and PyInstaller's
@@ -89,13 +101,14 @@ if ($code -ne 0) { Fail 'PyInstaller reported an error.' }
 # --- 4. Verify the output ---------------------------------------------------
 Step 'Verifying the entrypoint and bundled resources'
 if (-not (Test-Path $Exe)) { Fail "Entrypoint missing: $Exe" }
+if (-not (Test-Path $CliExe)) { Fail "CLI entrypoint missing: $CliExe" }
 $missing = @()
 foreach ($name in @('profiles', 'manifests', 'workflows', 'assets')) {
     $dir = Join-Path $Internal $name
     if (-not (Test-Path $dir)) { $missing += $name }
 }
 if ($missing.Count -gt 0) { Fail "Resource directories missing from the bundle: $($missing -join ', ')" }
-foreach ($sentinel in @('profiles\capella.yaml', 'manifests\artifacts.yaml', 'workflows\flux2-klein-t2i-api.json', 'assets\themes')) {
+foreach ($sentinel in @('profiles\capella.yaml', 'manifests\artifacts.yaml', 'workflows\flux2-klein-t2i-api.json', 'assets\themes', 'assets\app.ico', 'desktop-ui\dist\index.html')) {
     if (-not (Test-Path (Join-Path $Internal $sentinel))) { Fail "Bundled resource incomplete: $sentinel" }
 }
 
@@ -104,11 +117,11 @@ Write-Host ("Output: {0}  ({1:N1} MB)" -f $OutDir, ($size / 1MB))
 
 # --- 5. Smoke the built executable -------------------------------------------
 if (-not $SkipSmoke) {
-    Step 'Running the packaged smoke check (PepitosAIHub.exe --smoke)'
-    $code = Invoke-Native $Exe @('--smoke')
+    Step 'Running the packaged smoke check (PepitosAIHub-CLI.exe --smoke)'
+    $code = Invoke-Native $CliExe @('--smoke')
     if ($code -ne 0) { Fail "Packaged smoke check failed (exit $code)." }
     Step 'Checking --version on the built executable'
-    $code = Invoke-Native $Exe @('--version')
+    $code = Invoke-Native $CliExe @('--version')
     if ($code -ne 0) { Fail '--version failed on the built executable.' }
 }
 

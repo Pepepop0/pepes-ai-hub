@@ -46,10 +46,18 @@ from .profiles import (
     FEATURE_CHAT,
     FEATURE_IMAGE_EDITING,
     FEATURE_IMAGE_GENERATION,
+    FILTER_STACK_WORKFLOWS,
+    IMAGE_EDIT_REFERENCE_WORKFLOWS,
     IMAGE_EDIT_WORKFLOW,
+    IMAGE_ROUTER_RUNTIME_KEY,
+    POSE_ROLE_PREFIX,
+    QUIET_BACKGROUND_TASKS_RUNTIME_KEY,
+    TEXT_TO_IMAGE_HQ_WORKFLOW,
     TEXT_TO_IMAGE_WORKFLOW,
     Profile,
+    WorkflowConfig,
     capability_problems,
+    declared_workflows,
 )
 from .workflows import (
     WorkflowParameter,
@@ -76,6 +84,31 @@ ENV_IMAGE_GENERATION_MODEL = "IMAGE_GENERATION_MODEL"
 ENV_IMAGE_SIZE = "IMAGE_SIZE"
 ENV_IMAGE_STEPS = "IMAGE_STEPS"
 ENV_DEFAULT_MODELS = "DEFAULT_MODELS"
+# Read by the Hub's image chat filter inside Open WebUI: when set, every Image
+# turn unloads Ollama before ComfyUI runs and frees ComfyUI before the chat
+# model answers, so a 20 GB chat model and an 18 GB image set alternate on one
+# 32 GB card instead of fighting over it.
+ENV_EXCLUSIVE_VRAM = "PEPITO_EXCLUSIVE_VRAM"
+ENV_PEPITO_OLLAMA_URL = "PEPITO_OLLAMA_URL"
+ENV_PEPITO_COMFYUI_URL = "PEPITO_COMFYUI_URL"
+# Opt-in, not inferred: the older ``prefer_single_heavy_model_resident`` flag
+# is set on profiles validated without the swap, so it must not turn it on.
+EXCLUSIVE_VRAM_RUNTIME_KEY = "exclusive_image_vram"
+ENV_IMAGE_PROMPT_GENERATION = "ENABLE_IMAGE_PROMPT_GENERATION"
+# Read by the same filter: an Image turn is decided (chat, new picture, edit)
+# and its prompt written by one constrained call to the chat model in Ollama.
+ENV_IMAGE_ROUTER = "PEPITO_IMAGE_ROUTER"
+# Read by the same filter: the workflow each Open WebUI model id makes and
+# edits pictures with (``IMAGE_STACKS_FILE``), so a chat variant's pictures
+# come from its own models instead of the one workflow Open WebUI keeps.
+ENV_IMAGE_STACKS = "PEPITO_IMAGE_STACKS"
+IMAGE_STACKS_FILE = "pepito-image-stacks.json"
+# Seed Open WebUI's follow-up and tag generation switches off on a new database
+# (``runtime.quiet_background_tasks``). They only seed missing config rows; an
+# existing installation is switched through the admin API
+# (``open_webui_background_tasks``). Title generation is left alone.
+ENV_ENABLE_FOLLOW_UP_GENERATION = "ENABLE_FOLLOW_UP_GENERATION"
+ENV_ENABLE_TAGS_GENERATION = "ENABLE_TAGS_GENERATION"
 
 CHAT_ROLE = CHAT_PRIMARY_ROLE
 
@@ -91,17 +124,41 @@ OPEN_WEBUI_NODE_TYPES: Mapping[WorkflowParameter, str] = {
     WorkflowParameter.IMAGE: "image",
 }
 
-# What Open WebUI 0.11.3's edit path fills in (routers/images.py image_edits ->
-# ComfyUIEditImageForm): the uploaded image(s), the instruction, the configured
-# model and a seed. Width and height only when an edit size is configured, and
-# steps never, so a graph that maps those would receive None for them.
-OPEN_WEBUI_EDIT_PARAMETERS: frozenset[WorkflowParameter] = frozenset(
+# Per-job fields the filter patches using the same manifest bindings as Open WebUI.
+FILTER_STACK_BINDINGS: Mapping[WorkflowParameter, str] = {
+    WorkflowParameter.LORA: "lora",
+    WorkflowParameter.STYLE: "style",
+    WorkflowParameter.STRENGTH: "strength",
+    WorkflowParameter.WIDTH: "width",
+    WorkflowParameter.HEIGHT: "height",
+    WorkflowParameter.GROUNDING: "grounding",
+    WorkflowParameter.SEED: "seed",
+}
+
+# Edit canvas and grounding are filter-owned: Open WebUI's edit path has no per-job
+# values for them and would overwrite mapped width/height with None.
+FILTER_EDIT_PARAMETERS: frozenset[WorkflowParameter] = frozenset(
     {
-        WorkflowParameter.IMAGE,
-        WorkflowParameter.PROMPT,
-        WorkflowParameter.MODEL,
-        WorkflowParameter.SEED,
+        WorkflowParameter.LORA,
+        WorkflowParameter.STRENGTH,
+        WorkflowParameter.WIDTH,
+        WorkflowParameter.HEIGHT,
+        WorkflowParameter.GROUNDING,
     }
+)
+# Open WebUI fills image, instruction, model and a randomized seed. An explicit
+# filter seed patch must remove that seed node mapping so it is not randomized.
+# Steps remain unsupported on the edit path.
+OPEN_WEBUI_EDIT_PARAMETERS: frozenset[WorkflowParameter] = (
+    frozenset(
+        {
+            WorkflowParameter.IMAGE,
+            WorkflowParameter.PROMPT,
+            WorkflowParameter.MODEL,
+            WorkflowParameter.SEED,
+        }
+    )
+    | FILTER_EDIT_PARAMETERS
 )
 
 
@@ -279,7 +336,7 @@ def open_webui_workflow_nodes(resolution: WorkflowResolution) -> list[dict[str, 
         if node_type is None:
             continue
         binding = resolution.spec.binding(parameter)
-        nodes.append({"type": node_type, "key": binding.key, "node_ids": [binding.node_id]})
+        nodes.append({"type": node_type, "key": binding.key, "node_ids": list(binding.node_ids)})
     return nodes
 
 
@@ -381,12 +438,19 @@ class ImageEditSettings:
     model: str
     workflow: Mapping[str, object]
     nodes: tuple[Mapping[str, object], ...]
+    # Chat and image models never share the card: Open WebUI must not call the
+    # task model to rewrite an image prompt, which would reload Ollama between
+    # its unload and the ComfyUI run.
+    exclusive_vram: bool = False
 
 
 def open_webui_image_edit_settings(
     endpoints: StackEndpoints,
     resolution: WorkflowResolution,
     graph: Mapping[str, object] | None,
+    *,
+    exclusive_vram: bool = False,
+    require_prompt: bool = True,
 ) -> tuple[ImageEditSettings | None, tuple[str, ...]]:
     """The edit settings for a ready workflow, or the reasons there are none.
 
@@ -411,10 +475,12 @@ def open_webui_image_edit_settings(
         )
     parameters = set(resolution.spec.parameters)
     problems = []
-    if WorkflowParameter.IMAGE not in parameters or WorkflowParameter.PROMPT not in parameters:
+    if WorkflowParameter.IMAGE not in parameters or (
+        require_prompt and WorkflowParameter.PROMPT not in parameters
+    ):
+        needs = "both an image and a prompt" if require_prompt else "an image"
         problems.append(
-            f"image editing is not configurable: workflow {resolution.spec.id!r} must map "
-            "both an image and a prompt"
+            f"image editing is not configurable: workflow {resolution.spec.id!r} must map {needs}"
         )
     unsupported = sorted(p.value for p in parameters - OPEN_WEBUI_EDIT_PARAMETERS)
     if unsupported:
@@ -428,7 +494,12 @@ def open_webui_image_edit_settings(
         base_url=endpoints.comfyui,
         model=resolution.runtime_name,
         workflow=dict(graph),
-        nodes=tuple(open_webui_workflow_nodes(resolution)),
+        nodes=tuple(
+            node
+            for node in open_webui_workflow_nodes(resolution)
+            if node["type"] not in {parameter.value for parameter in FILTER_EDIT_PARAMETERS}
+        ),
+        exclusive_vram=exclusive_vram,
     )
     return settings, ()
 
@@ -449,8 +520,8 @@ def workflow_manifest_problems(
     """
     unknown = "which the workflow manifest does not declare"
     return {
-        workflow_id: (f"workflows.{workflow_id} names {declared.manifest_id!r}, {unknown}",)
-        for workflow_id, declared in sorted(profile.workflows.items())
+        key: (f"{field_name} names {declared.manifest_id!r}, {unknown}",)
+        for key, field_name, declared in sorted(declared_workflows(profile))
         if declared.manifest_id not in workflow_specs
     }
 
@@ -472,7 +543,7 @@ def workflow_drive_problems(
     """
     problems: dict[str, tuple[str, ...]] = {}
     size_parameters = {WorkflowParameter.WIDTH, WorkflowParameter.HEIGHT}
-    for workflow_id, declared in sorted(profile.workflows.items()):
+    for key, field_name, declared in sorted(declared_workflows(profile)):
         if declared.size is None and declared.steps is None:
             continue
         spec = workflow_specs.get(declared.manifest_id)
@@ -485,9 +556,7 @@ def workflow_drive_problems(
         if declared.steps is not None and WorkflowParameter.STEPS not in mapped:
             unmapped.append(f"{declared.steps} steps, but it maps no step count")
         if unmapped:
-            problems[workflow_id] = tuple(
-                f"workflows.{workflow_id} asks {spec.id!r} for {item}" for item in unmapped
-            )
+            problems[key] = tuple(f"{field_name} asks {spec.id!r} for {item}" for item in unmapped)
     return problems
 
 
@@ -517,20 +586,37 @@ def declared_capability_problems(
         problems.extend(messages)
     if not profile.enables(FEATURE_IMAGE_GENERATION):
         return tuple(problems)
-    declared = profile.workflows.get(TEXT_TO_IMAGE_WORKFLOW)
+    stacks = [("workflows", profile.workflows)]
+    stacks.extend(
+        (f"variants[{variant.id}].workflows", variant.workflows) for variant in profile.variants
+    )
+    for prefix, workflows in stacks:
+        problems.extend(_stack_problems(profile, workflow_specs, prefix, workflows))
+    return tuple(problems)
+
+
+def _stack_problems(
+    profile: Profile,
+    workflow_specs: Mapping[str, WorkflowSpec],
+    prefix: str,
+    workflows: Mapping[str, WorkflowConfig],
+) -> list[str]:
+    """One image stack's generation and edit graphs, as declared_capability_problems checks them."""
+    problems: list[str] = []
+    declared = workflows.get(TEXT_TO_IMAGE_WORKFLOW)
     if declared is None:
-        return tuple(problems)
+        return problems
     spec = workflow_specs.get(declared.manifest_id)
     if spec is None:
         pass  # said once already, by the check every workflow goes through
     elif not spec.complete:
         problems.append(
-            f"workflows.text_to_image names {spec.id!r}, which is not mapped yet "
+            f"{prefix}.text_to_image names {spec.id!r}, which is not mapped yet "
             f"({', '.join(spec.unresolved)})"
         )
     elif WorkflowParameter.IMAGE in spec.bindings:
         problems.append(
-            f"workflows.text_to_image names {spec.id!r}, which edits an input image "
+            f"{prefix}.text_to_image names {spec.id!r}, which edits an input image "
             "and cannot generate from text"
         )
     else:
@@ -539,7 +625,7 @@ def declared_capability_problems(
             problems.append(
                 f"workflow {spec.id!r} loads {', '.join(missing)}, which the profile does not name"
             )
-    edit = profile.workflows.get(IMAGE_EDIT_WORKFLOW)
+    edit = workflows.get(IMAGE_EDIT_WORKFLOW)
     edit_spec = workflow_specs.get(edit.manifest_id) if edit is not None else None
     if (
         profile.enables(FEATURE_IMAGE_EDITING)
@@ -547,8 +633,242 @@ def declared_capability_problems(
         and edit_spec.complete
         and WorkflowParameter.IMAGE not in edit_spec.bindings
     ):
-        problems.append(f"workflows.image_edit names {edit_spec.id!r}, which takes no input image")
-    return tuple(problems)
+        problems.append(f"{prefix}.image_edit names {edit_spec.id!r}, which takes no input image")
+    return problems
+
+
+def _filter_bindings(resolution: WorkflowResolution) -> dict[str, object]:
+    """What the image filter sets in the graph text itself (Open WebUI has no input for it)."""
+    bindings: dict[str, object] = {}
+    for parameter, name in FILTER_STACK_BINDINGS.items():
+        if parameter in resolution.spec.bindings:
+            binding = resolution.spec.binding(parameter)
+            bindings[name] = {"node_ids": list(binding.node_ids), "key": binding.key}
+    return bindings
+
+
+def _workflow_capabilities(resolution: WorkflowResolution) -> dict[str, object]:
+    spec = resolution.spec
+    capabilities: dict[str, object] = {"reference_count": spec.reference_count}
+    if spec.family:
+        capabilities["family"] = spec.family
+    if spec.reference_count:
+        capabilities["reference_policy"] = spec.reference_policy or (
+            "single" if spec.reference_count == 1 else "generic"
+        )
+    return capabilities
+
+
+def _stack_workflow(resolution: WorkflowResolution, graph: Mapping[str, object]) -> dict:
+    """One workflow as Open WebUI's ComfyUI path takes it: graph text, node map, model, and
+    the bindings the image filter writes into the graph itself."""
+    return {
+        "workflow": json.dumps(dict(graph), sort_keys=True),
+        "nodes": open_webui_workflow_nodes(resolution),
+        "model": resolution.runtime_name,
+        **_workflow_capabilities(resolution),
+        **_filter_bindings(resolution),
+    }
+
+
+def _stack_edit(
+    endpoints: StackEndpoints,
+    resolutions: Mapping[str, WorkflowResolution],
+    graphs: Mapping[str, Mapping[str, object]],
+    declared: WorkflowConfig,
+    field: str,
+    *,
+    require_prompt: bool = True,
+) -> tuple[dict[str, object] | None, tuple[str, ...]]:
+    """One edit workflow as the image filter hands it to Open WebUI: graph text, node
+    map, model, and how its instruction names the input images."""
+    resolution = resolutions.get(declared.manifest_id)
+    if resolution is None:
+        return None, (f"{field} has no workflow",)
+    settings, problems = open_webui_image_edit_settings(
+        endpoints, resolution, graphs.get(resolution.spec.id), require_prompt=require_prompt
+    )
+    if settings is None:
+        return None, problems
+    part: dict[str, object] = {
+        "workflow": json.dumps(dict(settings.workflow), sort_keys=True),
+        "nodes": [dict(node) for node in settings.nodes],
+        "model": settings.model,
+        **_workflow_capabilities(resolution),
+    }
+    if resolution.spec.reference_syntax:
+        part["syntax"] = resolution.spec.reference_syntax
+    part.update(_filter_bindings(resolution))
+    adapters = {
+        role.partition(".")[2].removeprefix(POSE_ROLE_PREFIX): model.require_location().runtime_name
+        for role, model in resolution.models.items()
+        if role.partition(".")[2].startswith(POSE_ROLE_PREFIX)
+    }
+    if adapters:
+        part["adapters"] = adapters
+    return part, ()
+
+
+def open_webui_image_stacks(
+    profile: Profile,
+    chat_reference: str,
+    resolutions: Mapping[str, WorkflowResolution],
+    graphs: Mapping[str, Mapping[str, object]],
+    endpoints: StackEndpoints,
+) -> tuple[dict[str, dict], list[str]]:
+    """The pictures of each Open WebUI model the profile makes, by record id.
+
+    The chat model's own record (its Ollama tag) gets the profile's workflows
+    and the variant's preset gets the variant's, each a ``generate`` and, when
+    editing is on, an ``edit``: what the image filter hands Open WebUI's
+    ComfyUI path for a turn on that model. The profile's own are only reached
+    after its generation was configured, so its failures are said there; the
+    variant fails closed here, since without its entry its turns would quietly
+    use the profile's models.
+    """
+    owners = [(chat_reference, "workflows", profile.workflows, profile.behavior, "image")]
+    owners.extend(
+        (
+            variant.id,
+            f"variants[{variant.id}].workflows",
+            variant.workflows,
+            variant.behavior,
+            variant.images,
+        )
+        for variant in profile.variants
+    )
+    stacks: dict[str, dict] = {}
+    # Optional and shared: do not expose a half-available swap pipeline on any model.
+    swap: dict[str, object] = {}
+    for name, declared_swap in profile.character_swap.items():
+        part, _ = _stack_edit(
+            endpoints,
+            resolutions,
+            graphs,
+            declared_swap,
+            f"character_swap.{name}",
+            require_prompt=name != "depth",
+        )
+        if part is None:
+            swap.clear()
+            break
+        swap[name] = part
+    problems: list[str] = []
+    for model_id, prefix, workflows, behavior, images in owners:
+        declared = workflows.get(TEXT_TO_IMAGE_WORKFLOW)
+        resolution = resolutions.get(declared.manifest_id) if declared is not None else None
+        graph = graphs.get(resolution.spec.id) if resolution is not None else None
+        if resolution is None or not resolution.ready or graph is None:
+            reasons = () if resolution is None else resolution.problems
+            problems.append(
+                f"image generation for {model_id!r} is not configurable: "
+                f"{prefix}.text_to_image has no ready workflow with a graph"
+            )
+            problems.extend(reasons)
+            continue
+        generate = _stack_workflow(resolution, graph)
+        if declared.size is not None:
+            generate["size"] = declared.size
+        if declared.steps is not None:
+            generate["steps"] = declared.steps
+        stack: dict[str, object] = {"generate": generate}
+        if swap:
+            stack["swap"] = swap
+        if generate.get("family"):
+            stack["family"] = generate["family"]
+        # The router's own Ollama call must ask for the chat's context size, or Ollama
+        # reloads the resident chat model at its default size on every routed turn.
+        num_ctx = profile.chat_params.get("num_ctx")
+        if isinstance(num_ctx, int) and not isinstance(num_ctx, bool):
+            stack["num_ctx"] = num_ctx
+        edit = workflows.get(IMAGE_EDIT_WORKFLOW)
+        if profile.enables(FEATURE_IMAGE_EDITING) and edit is not None:
+            part, edit_problems = _stack_edit(
+                endpoints, resolutions, graphs, edit, f"{prefix}.image_edit"
+            )
+            if part is not None:
+                stack["edit"] = part
+                for key in ("family", "reference_policy"):
+                    if key in part:
+                        stack[key] = part[key]
+            elif model_id != chat_reference:
+                problems.extend(edit_problems)
+            # The same edit with more input images, chosen by how many the turn has.
+            references: dict[str, dict] = {}
+            for count, key in IMAGE_EDIT_REFERENCE_WORKFLOWS.items():
+                declared_edit = workflows.get(key)
+                if declared_edit is None:
+                    continue
+                ref_part, ref_problems = _stack_edit(
+                    endpoints, resolutions, graphs, declared_edit, f"{prefix}.{key}"
+                )
+                if ref_part is not None:
+                    references[str(count)] = ref_part
+                elif model_id != chat_reference:
+                    problems.extend(ref_problems)
+            if references:
+                stack["edit_refs"] = references
+            # The passes only the image filter drives: restaging, removal, the pose edit.
+            for key, name in FILTER_STACK_WORKFLOWS.items():
+                declared_pass = workflows.get(key)
+                if declared_pass is None:
+                    continue
+                pass_part, pass_problems = _stack_edit(
+                    endpoints, resolutions, graphs, declared_pass, f"{prefix}.{key}"
+                )
+                if pass_part is not None:
+                    stack[name] = pass_part
+                elif model_id != chat_reference:
+                    problems.extend(pass_problems)
+        # The "high quality" generation, chosen by the quality switch.
+        declared_hq = workflows.get(TEXT_TO_IMAGE_HQ_WORKFLOW)
+        if declared_hq is not None:
+            hq_resolution = resolutions.get(declared_hq.manifest_id)
+            hq_graph = graphs.get(hq_resolution.spec.id) if hq_resolution is not None else None
+            if hq_resolution is None or not hq_resolution.ready or hq_graph is None:
+                problems.append(
+                    f"high quality generation for {model_id!r} is not configurable: "
+                    f"{prefix}.{TEXT_TO_IMAGE_HQ_WORKFLOW} has no ready workflow with a graph"
+                )
+                if hq_resolution is not None:
+                    problems.extend(hq_resolution.problems)
+            else:
+                generate_hq = _stack_workflow(hq_resolution, hq_graph)
+                if declared_hq.size is not None:
+                    generate_hq["size"] = declared_hq.size
+                if declared_hq.steps is not None:
+                    generate_hq["steps"] = declared_hq.steps
+                stack["generate_hq"] = generate_hq
+        if behavior.router_rules:
+            stack["router_rules"] = list(behavior.router_rules)
+        pose = stack.get("pose")
+        if isinstance(pose, dict) and behavior.poses:
+            declared_pose = workflows.get("pose_edit")
+            resolution = (
+                resolutions.get(declared_pose.manifest_id) if declared_pose is not None else None
+            )
+            available = (
+                {
+                    role.partition(".")[2]: model
+                    for role, model in resolution.models.items()
+                    if role.partition(".")[0] == images
+                }
+                if resolution is not None
+                else {}
+            )
+            adapters = {
+                name: available[item.adapter].require_location().runtime_name
+                for name, item in behavior.poses.items()
+                if item.adapter in available
+            }
+            pose["adapters"] = adapters
+            prompts = {
+                name: item.prompt for name, item in behavior.poses.items() if name in adapters
+            }
+            if prompts:
+                pose["prompts"] = prompts
+        stacks[model_id] = stack
+    return stacks, problems
 
 
 def build_stack_configuration(
@@ -591,6 +911,9 @@ def build_stack_configuration(
         problems.extend(chat.problems)
     else:
         problems.append("this profile enables chat but not Ollama, so chat cannot be configured")
+    if profile.runtime.get(QUIET_BACKGROUND_TASKS_RUNTIME_KEY):
+        env[ENV_ENABLE_FOLLOW_UP_GENERATION] = "false"
+        env[ENV_ENABLE_TAGS_GENERATION] = "false"
 
     workflows: dict[str, WorkflowResolution] = {}
     # Every workflow the profile declares: the manifest id it names, and then
@@ -603,7 +926,7 @@ def build_stack_configuration(
             problems.extend(messages)
     refused = {**refused, **drive_problems}
     if workflow_specs:
-        wanted = {config.manifest_id for config in profile.workflows.values()}
+        wanted = {declared.manifest_id for _key, _field, declared in declared_workflows(profile)}
         workflows = resolve_workflows(
             workflow_specs, profile, resolver, repo_root=repo_root, only=wanted
         )
@@ -634,6 +957,38 @@ def build_stack_configuration(
                 steps=declared.steps,
             )
             env.update(image.env)
+            if image.env and profile.runtime.get(EXCLUSIVE_VRAM_RUNTIME_KEY):
+                env[ENV_EXCLUSIVE_VRAM] = "true"
+                env[ENV_PEPITO_OLLAMA_URL] = endpoints.ollama
+                env[ENV_PEPITO_COMFYUI_URL] = endpoints.comfyui
+                env[ENV_IMAGE_PROMPT_GENERATION] = "false"
+            if (
+                image.env
+                and profile.runtime.get(IMAGE_ROUTER_RUNTIME_KEY)
+                and endpoints.enabled(profile, ComponentId.OLLAMA)
+            ):
+                env[ENV_IMAGE_ROUTER] = "true"
+                env[ENV_PEPITO_OLLAMA_URL] = endpoints.ollama
+                chat_model = resolved_models.get(CHAT_ROLE)
+                location = (
+                    chat_model.require_location()
+                    if chat_model is not None and chat_model.available
+                    else None
+                )
+                if isinstance(location, OllamaModelLocation):
+                    stacks, stack_problems = open_webui_image_stacks(
+                        profile, location.reference, workflows, graphs or {}, endpoints
+                    )
+                    problems.extend(stack_problems)
+                    stacks_path = layout.open_webui_data / IMAGE_STACKS_FILE
+                    env[ENV_IMAGE_STACKS] = str(stacks_path)
+                    open_webui_documents.append(
+                        json_document(
+                            stacks_path,
+                            stacks,
+                            "the workflow each Open WebUI model makes pictures with",
+                        )
+                    )
             open_webui_documents.extend(image.documents)
             problems.extend(image.problems)
             manual.extend(image.manual_steps)
@@ -691,6 +1046,11 @@ __all__: Sequence[str] = (
     "COMFYUI_SEARCH_PATHS_FILE",
     "COMFYUI_WORKFLOW_FILE",
     "COMFYUI_WORKFLOW_NODES_FILE",
+    "ENV_ENABLE_FOLLOW_UP_GENERATION",
+    "ENV_ENABLE_TAGS_GENERATION",
+    "ENV_IMAGE_STACKS",
+    "EXCLUSIVE_VRAM_RUNTIME_KEY",
+    "IMAGE_STACKS_FILE",
     "OPEN_WEBUI_EDIT_PARAMETERS",
     "OPEN_WEBUI_ENV_FILE",
     "ImageEditSettings",
@@ -703,6 +1063,7 @@ __all__: Sequence[str] = (
     "open_webui_chat_configuration",
     "open_webui_image_configuration",
     "open_webui_image_edit_settings",
+    "open_webui_image_stacks",
     "open_webui_ollama_env",
     "open_webui_workflow_nodes",
     "workflow_drive_problems",

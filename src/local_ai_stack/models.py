@@ -39,6 +39,7 @@ class ModelKind(StrEnum):
     DIFFUSION = "diffusion"
     TEXT_ENCODER = "text-encoder"
     VAE = "vae"
+    LORA = "lora"
     AUXILIARY = "auxiliary"
 
 
@@ -49,6 +50,8 @@ class ModelPlacement(StrEnum):
     DIFFUSION_MODELS = "diffusion_models"
     TEXT_ENCODERS = "text_encoders"
     VAE = "vae"
+    LORAS = "loras"
+    GEOMETRY_ESTIMATION = "geometry_estimation"
     AUXILIARY = "auxiliary"
 
 
@@ -137,13 +140,27 @@ class FileModelSource:
 ModelSource: TypeAlias = OllamaModelSource | FileModelSource
 
 
+ChatParam: TypeAlias = tuple[str, bool | int | float | str]
+
+
 @dataclass(frozen=True)
 class ModelSpec:
-    """Declarative catalog record. Loading it performs no I/O or mutation."""
+    """Declarative catalog record. Loading it performs no I/O or mutation.
+
+    ``uncensored`` marks a chat model published without refusal training, so a
+    screen can offer it as such. ``params`` are what the model itself needs at
+    every request (``think: false`` for a reasoning model shown as plain chat);
+    a tuple of pairs, because a spec is a dictionary key in detection caches.
+    ``display_name`` is the name a screen shows instead of the provider reference,
+    which stays what downloads and verification use.
+    """
 
     id: ModelId
     kind: ModelKind
     source: ModelSource
+    uncensored: bool = False
+    params: tuple[ChatParam, ...] = ()
+    display_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.id.provider is not self.source.provider:

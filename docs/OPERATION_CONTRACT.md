@@ -29,8 +29,7 @@ with embedded paths, node bindings, endpoints or process information.
 
 ## Lifecycle, events and results
 
-`OperationState`: `PREPARING`, `QUEUED`, `RUNNING`, `FINALIZING`, `SUCCEEDED`,
-`FAILED`. Only the last two are terminal. No cancellation contract is introduced.
+`OperationState`: `PREPARING`, `QUEUED`, `RUNNING`, `FINALIZING`, `SUCCEEDED`, `FAILED`. Only the last two are terminal. Explicit installation cancellation ends with `FAILED` and diagnostic code `cancelled`; consumers distinguish it from a failure instead of inventing a successful completion.
 Idle means `current_operation() is None`; it is not an operation lifecycle state.
 The last completed snapshot remains available until the application selects a
 new operation. Operation IDs are fresh, application/caller-allocated opaque IDs;
@@ -125,6 +124,20 @@ not implement that UI:
   percentage or ETA for this case.
 - No transfer observation: an indeterminate activity indicator such as
   `[>] Instalando dependências...`. Never infer a percentage from elapsed time.
+
+## Installation pause and cancellation
+
+The desktop projects `installation_control` separately from immutable operation events. It is `null` without an active installation or repair. Otherwise it contains `operation_id`, `state` (`running`, `pausing`, `paused`, `cancelling`), `can_pause`, and `can_cancel`.
+
+`pause_installation`, `resume_installation`, and `cancel_installation` require the current operation ID. These commands remain available while the Hub is busy; missing, stale, or completed IDs cannot control another operation. Their replies nest the control projection instead of declaring a new operation ID.
+
+Pause is cooperative: all participating workers must reach checkpoints before the projection says `paused`. A running external command finishes before acknowledging a request; no arbitrary process is suspended. Cancellation wakes paused workers, preserves completed files and resumable partial downloads, and prevents a new candidate from being committed. Cleanup stops only services started by that execution. Both success and failure release the control.
+
+Closing an active operation still waits for its terminal result. The UI must offer explicit resume or cancel rather than representing a paused installation as idle.
+
+`retryable_installation` is a separate session projection: `operation_id`, `profile_id`, `root`, and `kind` (`install` or `repair`). It exists only for the latest failed attempt with captured context. `retry_installation` requires that failed ID and starts a fresh operation. It does not derive a profile or root from the active installation, which may not exist yet. New work invalidates stale retry contexts; a conflict decision preserves the pending attempt until resolution.
+
+Model-download diagnostics preserve observed failure facts without backend exception text: `model-download-http-{status}`, `model-download-timeout`, `model-download-transport`, `model-download-checksum`, `model-download-disk-full`, `model-download-access-denied`, `model-download-filesystem`, or `model-download-failed`. The canonical model ID stays in the activity, not in the diagnostic's opaque identifier field.
 
 ## Install activity and detail timeline
 
@@ -232,7 +245,7 @@ arbitrary manifest or graph. Only that existing selection is accepted in this
 wave. The application resolves
 `profile.workflows[request.workflow].manifest_id`; models come from the profile's
 existing `image.diffusion`, `image.text_encoder` and `image.vae` requirements and
-the manifest's required roles. For Capella this selects `flux2_klein_t2i`.
+the manifest's required roles. For Capella this selects `qwen_image_2_1_t2i`.
 The request's shape validation does not load or validate a profile's existence.
 The coordinator must resolve the profile, model availability and structural
 workflow validity with existing domain code before submission. No node IDs,
@@ -341,8 +354,8 @@ explicitly without replacing the Test API schema.
 These paths follow the repository's existing flat backend layout. Planned files
 below are reserved names, not implementations created in this foundation.
 Use separate worktrees based on the foundation commit; no two agents share a
-working tree. For Wave A this table supersedes the earlier MVP ownership table
-in `AGENT_WORKFLOW.md`.
+working tree. For Wave A this table superseded the earlier MVP ownership table
+(since replaced: `AGENT_WORKFLOW.md` is now the agent CLI guide).
 
 | Owner | Exclusive scope |
 | --- | --- |

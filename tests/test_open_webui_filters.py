@@ -19,13 +19,25 @@ import httpx
 import pytest
 
 from local_ai_stack.open_webui_filters import (
+    ART_FILTER_ID,
     FILTER_ID,
     OWNER,
+    PHOTO_FILTER_ID,
+    QUALITY_FILTER_ID,
+    REFS_FILTER_ID,
     FilterSync,
+    art_filter_source,
     filter_source,
     first_admin_id,
+    install_art_filter,
     install_image_chat_filter,
+    install_photo_filter,
+    install_quality_filter,
+    install_refs_filter,
     local_admin_token,
+    photo_filter_source,
+    quality_filter_source,
+    refs_filter_source,
     sync_image_chat_filter,
 )
 
@@ -170,10 +182,14 @@ def data_dir(tmp_path: Path, *, admin: bool = True, secret: str | None = "s3cret
         (directory / ".webui_secret_key").write_text(secret, encoding="utf-8")
     connection = sqlite3.connect(directory / "webui.db")
     connection.execute("create table user (id text, role text, created_at integer)")
+    connection.execute("create table auth (id text, active integer, session_stamp text)")
     if admin:
         connection.execute("insert into user values ('user-2', 'user', 1)")
         connection.execute("insert into user values ('admin-1', 'admin', 2)")
         connection.execute("insert into user values ('admin-9', 'admin', 3)")
+        connection.execute("insert into auth values ('user-2', 1, 'stamp-user')")
+        connection.execute("insert into auth values ('admin-1', 1, 'stamp-admin')")
+        connection.execute("insert into auth values ('admin-9', 1, 'stamp-other')")
     connection.commit()
     connection.close()
     return directory
@@ -196,6 +212,9 @@ def test_the_token_is_signed_with_the_instance_secret_for_the_first_admin(tmp_pa
     assert json.loads(unpad(header)) == {"alg": "HS256", "typ": "JWT"}
     claims = json.loads(unpad(payload))
     assert claims["id"] == "admin-1" and claims["exp"] - claims["iat"] == 60 and claims["jti"]
+    # Open WebUI 0.12 rejects a bearer whose stamp differs from the account's,
+    # and accepts only declared token types.
+    assert claims["session_stamp"] == "stamp-admin" and claims["typ"] == "automation"
     expected = hmac.new(b"s3cret", f"{header}.{payload}".encode(), hashlib.sha256).digest()
     assert unpad(signature) == expected
 
@@ -204,6 +223,15 @@ def test_no_secret_or_no_admin_means_no_token(tmp_path):
     assert local_admin_token(data_dir(tmp_path, secret=None)) is None
     assert local_admin_token(data_dir(tmp_path / "b", admin=False)) is None
     assert local_admin_token(data_dir(tmp_path / "c", secret="  ")) is None
+
+
+def test_a_revoked_or_unstamped_admin_gets_no_token(tmp_path):
+    directory = data_dir(tmp_path)
+    connection = sqlite3.connect(directory / "webui.db")
+    connection.execute("update auth set session_stamp = null where id = 'admin-1'")
+    connection.commit()
+    connection.close()
+    assert local_admin_token(directory) is None
 
 
 # --- sync: the product-facing outcome --------------------------------------------
@@ -238,22 +266,95 @@ def test_sync_installs_then_reports_unchanged(tmp_path):
 
 
 def test_sync_updates_a_stale_filter(tmp_path):
-    api = FakeFunctionsApi(
-        {
-            FILTER_ID: {
-                "id": FILTER_ID,
-                "name": "Pepito Image Chat",
-                "type": "filter",
-                "content": "# 727482a\nclass Filter: pass\n",
-                "meta": {"description": "Pepito's AI Hub: native image chat compatibility"},
-                "is_active": True,
-                "is_global": True,
-            }
-        }
-    )
+    api = FakeFunctionsApi()
+    with api.client() as client:
+        install_image_chat_filter(client)
+        install_quality_filter(client)
+        install_art_filter(client)
+        install_photo_filter(client)
+        install_refs_filter(client)
+    installed(api)["content"] = "# 727482a\nclass Filter: pass\n"
+    installed(api)["meta"]["description"] = "Pepito's AI Hub: native image chat compatibility"
     report = sync_image_chat_filter(data_dir(tmp_path), "http://x", client_factory=factory_for(api))
     assert report.outcome is FilterSync.UPDATED and report.changed
     assert installed(api)["content"] == filter_source()
+
+
+def test_the_quality_switch_is_installed_active_and_never_global(tmp_path):
+    """A toggle filter is offered only by the models that name it: global would put it on
+    every model, including the ones with nothing to switch."""
+    api = FakeFunctionsApi({USER_FUNCTION["id"]: dict(USER_FUNCTION)})
+    with api.client() as client:
+        assert install_quality_filter(client) is FilterSync.INSTALLED
+    record = api.records[QUALITY_FILTER_ID]
+    assert record["content"] == quality_filter_source()
+    assert record["is_active"] and not record["is_global"]
+    assert api.writes == [
+        "/api/v1/functions/create",
+        f"/api/v1/functions/id/{QUALITY_FILTER_ID}/toggle",
+    ]
+    with api.client() as client:
+        api.writes.clear()
+        assert install_quality_filter(client) is FilterSync.UNCHANGED
+        # Somebody made it global by hand: the Hub takes that back.
+        record["is_global"] = True
+        assert install_quality_filter(client) is FilterSync.UPDATED
+    assert not record["is_global"]
+    assert api.records[USER_FUNCTION["id"]] == USER_FUNCTION
+
+
+@pytest.mark.parametrize(
+    ("install", "function_id", "source"),
+    [
+        (install_art_filter, ART_FILTER_ID, art_filter_source),
+        (install_photo_filter, PHOTO_FILTER_ID, photo_filter_source),
+        (install_refs_filter, REFS_FILTER_ID, refs_filter_source),
+    ],
+)
+def test_the_style_switches_are_installed_active_and_never_global(install, function_id, source):
+    api = FakeFunctionsApi({USER_FUNCTION["id"]: dict(USER_FUNCTION)})
+    with api.client() as client:
+        assert install(client) is FilterSync.INSTALLED
+    record = api.records[function_id]
+    assert record["content"] == source()
+    assert record["is_active"] and not record["is_global"]
+    assert api.writes == [
+        "/api/v1/functions/create",
+        f"/api/v1/functions/id/{function_id}/toggle",
+    ]
+    with api.client() as client:
+        api.writes.clear()
+        assert install(client) is FilterSync.UNCHANGED
+        record["is_global"] = True
+        assert install(client) is FilterSync.UPDATED
+    assert not record["is_global"]
+    assert api.records[USER_FUNCTION["id"]] == USER_FUNCTION
+
+
+@pytest.mark.parametrize(
+    "source", [quality_filter_source, art_filter_source, photo_filter_source, refs_filter_source]
+)
+def test_the_switches_are_toggle_filters_that_change_nothing(source):
+    """Open WebUI lists one in the composer only if the module says ``toggle``; the filter
+    itself must leave the request exactly as it is."""
+    import asyncio
+
+    namespace: dict = {}
+    exec(compile(source(), "switch", "exec"), namespace)  # noqa: S102
+    switch = namespace["Filter"]()
+    assert switch.toggle is True
+    assert base64.b64decode(switch.icon.split(",", 1)[1]).startswith(b"<svg ")
+    body = {"messages": [{"role": "user", "content": "oi"}]}
+    assert asyncio.run(switch.inlet(body)) is body and body == {
+        "messages": [{"role": "user", "content": "oi"}]
+    }
+
+
+def test_a_foreign_function_under_the_quality_id_is_refused():
+    api = FakeFunctionsApi({QUALITY_FILTER_ID: {**USER_FUNCTION, "id": QUALITY_FILTER_ID}})
+    with api.client() as client, pytest.raises(PermissionError):
+        install_quality_filter(client)
+    assert api.writes == []
 
 
 def test_sync_without_an_administrator_waits_instead_of_guessing(tmp_path):

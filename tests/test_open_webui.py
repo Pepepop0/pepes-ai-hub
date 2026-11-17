@@ -30,7 +30,7 @@ from local_ai_stack.provisioning import (
 from local_ai_stack.pyenv import PythonEnvironment, pip_install_argv
 from local_ai_stack.runner import CommandResult, CommandRunner
 
-VERSION = "0.11.3"
+VERSION = "0.12.0"
 
 
 class FakeRunner(CommandRunner):
@@ -129,7 +129,7 @@ def test_component_id_is_canonical():
 
 
 def test_requirement_is_pinned_exactly():
-    assert pinned().requirement == "open-webui==0.11.3"
+    assert pinned().requirement == "open-webui==0.12.0"
     assert OpenWebUIProvisioner().requirement is None
 
 
@@ -282,9 +282,10 @@ def test_plan_describes_venv_install_and_marker(tmp_path):
     assert [step.action for step in plan.steps] == [
         "create-venv",
         "install-package",
+        "sync-native-extension",
         "mark-managed",
     ]
-    assert plan.steps[1].target == "open-webui==0.11.3"
+    assert plan.steps[1].target == "open-webui==0.12.0"
 
 
 def test_plan_without_a_pin_is_blocked(tmp_path):
@@ -319,6 +320,30 @@ def test_plan_is_a_noop_once_managed(tmp_path):
     assert pinned().plan(context).is_noop
 
 
+def test_a_managed_install_behind_the_pin_is_upgraded_in_place(tmp_path):
+    runner = FakeRunner(installed_version="0.11.3")
+    context = context_for(tmp_path, runner)
+    install_managed(context)
+    data = context.layout.open_webui_data
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "webui.db").write_bytes(b"user data")
+
+    plan = pinned().plan(context)
+    assert [step.action for step in plan.steps] == [
+        "upgrade-package",
+        "sync-native-extension",
+        "mark-managed",
+    ]
+
+    result = pinned().apply(context)
+
+    assert result.outcome is ProvisionOutcome.INSTALLED
+    assert runner.ran("open-webui==0.12.0")
+    marker = json.loads((context.layout.open_webui_app / MARKER_NAME).read_text(encoding="utf-8"))
+    assert marker["version"] == VERSION
+    assert (data / "webui.db").read_bytes() == b"user data"
+
+
 # --- instalacao ------------------------------------------------------------
 
 
@@ -331,7 +356,7 @@ def test_apply_creates_the_environment_and_installs_the_pin(tmp_path):
     assert result.outcome is ProvisionOutcome.INSTALLED
     assert result.detection.ownership is Ownership.MANAGED
     assert runner.ran("-m venv")
-    assert runner.ran("open-webui==0.11.3")
+    assert runner.ran("open-webui==0.12.0")
     marker = json.loads((context.layout.open_webui_app / MARKER_NAME).read_text(encoding="utf-8"))
     assert marker["component"] == "open-webui"
     assert marker["version"] == VERSION
@@ -439,6 +464,54 @@ def test_install_emits_progress_events(tmp_path):
     assert "installing" in actions
     assert "verifying" in actions
     assert "ready" in [event.activity.action for event in seen if event.milestone]
+
+
+def windows_launcher(interpreter: Path) -> bytes:
+    """What pip writes on Windows: launcher stub, a shebang, then a zip."""
+    return b"MZ launcher stub" + f'#!"{interpreter}"\r\n'.encode() + b"PK\x03\x04payload"
+
+
+class SatisfiedRunner(FakeRunner):
+    """pip that finds the requirement satisfied and only rewrites scripts when forced."""
+
+    def run(self, argv: Sequence[str], **kwargs: object) -> CommandResult:
+        items = tuple(str(a) for a in argv)
+        if "pip" in items:
+            self.calls.append(items)
+            if "--force-reinstall" in items:
+                environment = PythonEnvironment(root=Path(items[0]).parent.parent)
+                environment.script("open-webui").write_bytes(windows_launcher(environment.python))
+            return CommandResult(argv=items, returncode=0)
+        return super().run(argv, **kwargs)
+
+
+def test_a_moved_installation_is_invalid_until_its_command_is_rebuilt(tmp_path):
+    """Regression (RTX 5090 rig): folders moved into a new root kept launchers for the old one."""
+    context = context_for(tmp_path, SatisfiedRunner())
+    install_managed(context)
+    environment = PythonEnvironment.inside(context.layout.open_webui_app)
+    old = tmp_path / "old-root" / "apps" / "open-webui" / ".venv" / "Scripts" / "python.exe"
+    environment.script("open-webui").write_bytes(windows_launcher(old))
+
+    detection = pinned().detect(context)
+    assert detection.state is ComponentState.INVALID
+    assert "moved" in detection.detail
+
+    result = pinned().apply(context)
+
+    assert result.outcome is ProvisionOutcome.INSTALLED, result.failure
+    forced = [call for call in context.runner.calls if "--force-reinstall" in call]
+    assert len(forced) == 1 and "--no-deps" in forced[0]
+    assert pinned().detect(context).state is ComponentState.INSTALLED
+
+
+def test_a_launcher_for_this_folder_is_current(tmp_path):
+    context = context_for(tmp_path)
+    install_managed(context)
+    environment = PythonEnvironment.inside(context.layout.open_webui_app)
+    environment.script("open-webui").write_bytes(windows_launcher(environment.python))
+
+    assert pinned().detect(context).state is ComponentState.INSTALLED
 
 
 # --- smoke real, somente leitura -------------------------------------------

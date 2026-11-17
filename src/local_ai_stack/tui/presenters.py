@@ -110,7 +110,7 @@ def render_profile_details(profile: Profile, facts: SystemFacts) -> str:
         escape(terminal_text(profile.description)),
         "",
         "[b]Requisitos[/b]",
-        f"Sistema: {escape(requirement.os)}",
+        f"Sistema: {escape(', '.join(requirement.os))}",
         f"Placa de vídeo: {escape(requirement.gpu_vendor)}",
         f"VRAM mínima: {requirement.min_vram_mib} MiB",
         f"VRAM recomendada: {requirement.recommended_vram_mib} MiB",

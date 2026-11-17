@@ -23,26 +23,36 @@ from local_ai_stack.endpoints import (
 )
 from local_ai_stack.layout import StackLayout
 from local_ai_stack.managed_config import ManagedConfigWriter
+from local_ai_stack.model_catalog import model_catalog
 from local_ai_stack.models import (
     FileModelLocation,
     ModelId,
     ModelKind,
-    ModelPlacement,
     ModelState,
     OllamaModelLocation,
     ResolvedModel,
 )
-from local_ai_stack.profiles import load_profile, validate_profile_data
+from local_ai_stack.profiles import declared_workflows, load_profile, validate_profile_data
 from local_ai_stack.service_config import (
+    COMFYUI_SEARCH_PATHS_FILE,
     ENV_COMFYUI_BASE_URL,
     ENV_COMFYUI_WORKFLOW_NODES,
     ENV_DEFAULT_MODELS,
+    ENV_ENABLE_FOLLOW_UP_GENERATION,
     ENV_ENABLE_IMAGE_GENERATION,
     ENV_ENABLE_OLLAMA_API,
+    ENV_ENABLE_TAGS_GENERATION,
+    ENV_EXCLUSIVE_VRAM,
     ENV_IMAGE_GENERATION_MODEL,
+    ENV_IMAGE_PROMPT_GENERATION,
+    ENV_IMAGE_ROUTER,
     ENV_IMAGE_SIZE,
+    ENV_IMAGE_STACKS,
     ENV_IMAGE_STEPS,
     ENV_OLLAMA_BASE_URL,
+    ENV_PEPITO_COMFYUI_URL,
+    ENV_PEPITO_OLLAMA_URL,
+    IMAGE_STACKS_FILE,
     build_stack_configuration,
     comfyui_search_paths,
     comfyui_search_paths_document,
@@ -103,11 +113,7 @@ def resolver_for(profile, tmp_path) -> FakeResolver:
                 OllamaModelLocation(model_id.name.replace("_", "-")),
             )
             continue
-        placement = {
-            "image.diffusion": ModelPlacement.DIFFUSION_MODELS,
-            "image.text_encoder": ModelPlacement.TEXT_ENCODERS,
-            "image.vae": ModelPlacement.VAE,
-        }[requirement.role]
+        placement = model_catalog().require(model_id).source.placement
         path = tmp_path / "models" / "comfyui" / placement.value / f"{model_id.name}.safetensors"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x")
@@ -432,6 +438,25 @@ def stage_graph(tmp_path) -> None:
     template.write_text(SHIPPED_GRAPH.read_text(encoding="utf-8"), encoding="utf-8")
 
 
+def stage_profile_graphs(specs, profile, tmp_path) -> dict[str, dict]:
+    """Stage every graph the profile's workflows name, its variant's included, as a
+    checkout holds them.
+
+    Returns the graphs by manifest id, the shape ``build_stack_configuration``
+    takes them in, so a profile is composed from its own workflows."""
+    graphs = {}
+    for _key, _field, declared in declared_workflows(profile):
+        spec = specs.get(declared.manifest_id)
+        if spec is None:
+            continue
+        text = (REPO / spec.file).read_text(encoding="utf-8")
+        template = tmp_path / spec.file
+        template.parent.mkdir(parents=True, exist_ok=True)
+        template.write_text(text, encoding="utf-8")
+        graphs[spec.id] = json.loads(text)
+    return graphs
+
+
 def test_a_profile_produces_a_complete_configuration(specs, layout, tmp_path):
     profile = profile_named("pepe")
     stage_graph(tmp_path)
@@ -460,10 +485,10 @@ def test_a_size_asked_of_a_workflow_that_cannot_take_it_fails_the_whole_composit
     """The edit graph maps neither width nor steps. A profile that asks it for them
     is refused by the composition itself -- not only by the text-to-image helper --
     and nothing is configured from it."""
-    stage_graph(tmp_path)
     data = deepcopy(profile_named("capella").raw)
     data["workflows"]["image_edit"].update(size="1024x1024", steps=20)
     profile = validate_profile_data(data)
+    graphs = stage_profile_graphs(specs, profile, tmp_path)
 
     configuration = build_stack_configuration(
         profile,
@@ -471,12 +496,13 @@ def test_a_size_asked_of_a_workflow_that_cannot_take_it_fails_the_whole_composit
         layout,
         workflow_specs=specs,
         repo_root=tmp_path,
-        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
+        graphs=graphs,
     )
 
     assert not configuration.ok
     problems = "\n".join(configuration.problems)
-    assert "workflows.image_edit" in problems and "flux2_klein_edit" in problems
+    edit = profile.workflows["image_edit"].manifest_id
+    assert "workflows.image_edit" in problems and edit in problems
     assert "maps no width and height" in problems and "maps no step count" in problems
 
 
@@ -515,9 +541,8 @@ def test_a_workflow_manifest_that_does_not_exist_invalidates_the_configuration(
 
 
 def test_the_shipped_capella_asks_only_what_its_workflows_map(specs, layout, tmp_path):
-    """The valid half of the contraproof: 1024x1024 and 20 steps on the text-to-image
-    workflow, nothing asked of the edit workflow."""
-    stage_graph(tmp_path)
+    """The valid half of the contraproof: Qwen-Image's 1024x1024 at its template's 25
+    steps on the text-to-image workflow, nothing asked of the edit workflow."""
     profile = profile_named("capella")
     assert profile.workflows["image_edit"].size is None
     assert profile.workflows["image_edit"].steps is None
@@ -528,12 +553,20 @@ def test_the_shipped_capella_asks_only_what_its_workflows_map(specs, layout, tmp
         layout,
         workflow_specs=specs,
         repo_root=tmp_path,
-        graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
+        graphs=stage_profile_graphs(specs, profile, tmp_path),
     )
 
     assert configuration.ok, configuration.problems
     open_webui = configuration.service(ComponentId.OPEN_WEBUI)
-    assert (open_webui.env[ENV_IMAGE_SIZE], open_webui.env[ENV_IMAGE_STEPS]) == ("1024x1024", "20")
+    assert (open_webui.env[ENV_IMAGE_SIZE], open_webui.env[ENV_IMAGE_STEPS]) == ("1024x1024", "25")
+
+
+def disabled_profile():
+    """An internal smoke fixture, independent of optional installed profiles."""
+    data = deepcopy(profile_named("pepe").raw)
+    data.update(id="test", name="Test", visibility="internal", models={}, workflows={}, runtime={})
+    data["features"] = {key: False for key in data["features"]}
+    return validate_profile_data(data)
 
 
 def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_path):
@@ -542,17 +575,16 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
     Pepe and Capella select different chat models; Test selects none.
     Each configuration uses the reference returned by this fixture's resolver.
     """
-    stage_graph(tmp_path)
     built = {}
-    for name in ("pepe", "capella", "test"):
-        profile = profile_named(name)
+    for profile in (profile_named("pepe"), profile_named("capella"), disabled_profile()):
+        name = profile.id
         built[name] = build_stack_configuration(
             profile,
             resolver_for(profile, tmp_path),
             layout,
             workflow_specs=specs,
             repo_root=tmp_path,
-            graphs={"flux2_klein_t2i": json.loads(SHIPPED_GRAPH.read_text(encoding="utf-8"))},
+            graphs=stage_profile_graphs(specs, profile, tmp_path),
         )
 
     pepe = built["pepe"].service(ComponentId.OPEN_WEBUI)
@@ -561,12 +593,14 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
     assert pepe.env[ENV_ENABLE_IMAGE_GENERATION] == "true"
 
     capella = built["capella"].service(ComponentId.OPEN_WEBUI)
-    assert capella.env[ENV_DEFAULT_MODELS] == "qwen3-5-27b"
+    assert capella.env[ENV_DEFAULT_MODELS] == "qwen3-8-27b-q5"
     assert capella.problems == ()
     assert capella.env[ENV_ENABLE_IMAGE_GENERATION] == "true", "images still work"
-    # Capella asks its workflow for the card's room; Pepe leaves the defaults alone.
-    assert (capella.env[ENV_IMAGE_SIZE], capella.env[ENV_IMAGE_STEPS]) == ("1024x1024", "20")
-    assert ENV_IMAGE_SIZE not in pepe.env and ENV_IMAGE_STEPS not in pepe.env
+    # Capella asks its workflow for the card's room and its template's steps; Pepe asks for
+    # FLUX.2 klein's native size and leaves the steps alone.
+    assert (capella.env[ENV_IMAGE_SIZE], capella.env[ENV_IMAGE_STEPS]) == ("1024x1024", "25")
+    assert pepe.env[ENV_IMAGE_SIZE] == "1024x1024"
+    assert ENV_IMAGE_STEPS not in pepe.env
 
     test = built["test"].service(ComponentId.OPEN_WEBUI)
     # Chat is disabled, so no backend address and no model -- but not an empty
@@ -577,6 +611,120 @@ def test_a_different_profile_produces_its_own_configuration(specs, layout, tmp_p
     assert test.problems == ()
     assert built["test"].ok, built["test"].problems
     assert built["test"].service(ComponentId.COMFYUI).documents == ()
+
+
+def test_quiet_background_tasks_seed_follow_ups_and_tags_off_but_not_titles(
+    specs, layout, tmp_path
+):
+    """``runtime.quiet_background_tasks`` seeds both switches off on a new database
+    (an existing one is switched through the admin API); titles keep their default,
+    and a profile without the flag (Pepe) seeds nothing."""
+    env = {}
+    for name in ("capella", "pepe"):
+        profile = profile_named(name)
+        env[name] = (
+            build_stack_configuration(
+                profile,
+                resolver_for(profile, tmp_path),
+                layout,
+                workflow_specs=specs,
+                repo_root=tmp_path,
+                graphs=stage_profile_graphs(specs, profile, tmp_path),
+            )
+            .service(ComponentId.OPEN_WEBUI)
+            .env
+        )
+    assert env["capella"][ENV_ENABLE_FOLLOW_UP_GENERATION] == "false"
+    assert env["capella"][ENV_ENABLE_TAGS_GENERATION] == "false"
+    assert "ENABLE_TITLE_GENERATION" not in env["capella"]
+    assert not {ENV_ENABLE_FOLLOW_UP_GENERATION, ENV_ENABLE_TAGS_GENERATION} & set(env["pepe"])
+
+
+EXCLUSIVE_VRAM_ENV = (
+    ENV_EXCLUSIVE_VRAM,
+    ENV_PEPITO_OLLAMA_URL,
+    ENV_PEPITO_COMFYUI_URL,
+    ENV_IMAGE_PROMPT_GENERATION,
+)
+
+
+def test_exclusive_vram_reaches_open_webui_only_from_a_profile_that_asks_for_it(
+    specs, layout, tmp_path
+):
+    """``runtime.exclusive_image_vram`` hands the image filter the two services
+    it unloads between, and turns off Open WebUI's own prompt generation, which
+    would load the chat model back beside the image model. The same profile
+    without the flag gets none of it, and still generates images. Profiles
+    validated without the swap (Pepe, Pepe 8 GB) do not opt in."""
+    capella = profile_named("capella")
+    assert not profile_named("pepe").runtime.get("exclusive_image_vram")
+    assert not profile_named("pepe-8gb").runtime.get("exclusive_image_vram")
+    shared = replace(
+        capella,
+        runtime={**capella.runtime, "exclusive_image_vram": False, "image_router": False},
+    )
+    graphs = stage_profile_graphs(specs, capella, tmp_path)
+    env = {
+        key: build_stack_configuration(
+            profile,
+            resolver_for(profile, tmp_path),
+            layout,
+            workflow_specs=specs,
+            repo_root=tmp_path,
+            graphs=graphs,
+        )
+        .service(ComponentId.OPEN_WEBUI)
+        .env
+        for key, profile in (("exclusive", capella), ("shared", shared))
+    }
+
+    endpoints = StackEndpoints.from_profile(capella)
+    assert {name: env["exclusive"][name] for name in EXCLUSIVE_VRAM_ENV} == {
+        ENV_EXCLUSIVE_VRAM: "true",
+        ENV_PEPITO_OLLAMA_URL: endpoints.ollama,
+        ENV_PEPITO_COMFYUI_URL: endpoints.comfyui,
+        ENV_IMAGE_PROMPT_GENERATION: "false",
+    }
+    assert not set(EXCLUSIVE_VRAM_ENV) & set(env["shared"])
+    assert env["shared"][ENV_ENABLE_IMAGE_GENERATION] == "true"
+
+
+def test_the_image_router_reaches_open_webui_only_from_a_profile_that_asks_for_it(
+    specs, layout, tmp_path
+):
+    """``runtime.image_router`` hands the filter the switch and the Ollama it asks;
+    without it the word rules decide, as on Pepe and Pepe 8 GB."""
+    capella = profile_named("capella")
+    assert profile_named("pepe").runtime.get("image_router") is None
+    assert profile_named("pepe-8gb").runtime.get("image_router") is None
+    graphs = stage_profile_graphs(specs, capella, tmp_path)
+    variants = {
+        "router": replace(capella, runtime={**capella.runtime, "exclusive_image_vram": False}),
+        "rules": replace(
+            capella,
+            runtime={**capella.runtime, "exclusive_image_vram": False, "image_router": False},
+        ),
+    }
+    env = {
+        key: build_stack_configuration(
+            profile,
+            resolver_for(profile, tmp_path),
+            layout,
+            workflow_specs=specs,
+            repo_root=tmp_path,
+            graphs=graphs,
+        )
+        .service(ComponentId.OPEN_WEBUI)
+        .env
+        for key, profile in variants.items()
+    }
+    endpoints = StackEndpoints.from_profile(capella)
+    assert env["router"][ENV_IMAGE_ROUTER] == "true"
+    assert env["router"][ENV_PEPITO_OLLAMA_URL] == endpoints.ollama
+    assert ENV_IMAGE_ROUTER not in env["rules"]
+    assert ENV_PEPITO_OLLAMA_URL not in env["rules"]
+    # Without the router no image stacks are written, so the character swap is never offered.
+    assert ENV_IMAGE_STACKS in env["router"] and ENV_IMAGE_STACKS not in env["rules"]
 
 
 def test_a_port_moved_in_a_profile_moves_the_generated_configuration(specs, layout, tmp_path):
@@ -694,3 +842,133 @@ def test_a_hand_written_config_is_never_overwritten(specs, layout, tmp_path):
     assert not report.ok
     assert target in report.refused
     assert "somewhere-else" in target.read_text(encoding="utf-8")
+
+
+def swap_stacks(profile, specs, layout, tmp_path, *, missing_model=None, missing_graph=None):
+    graphs = stage_profile_graphs(specs, profile, tmp_path)
+    resolver = resolver_for(profile, tmp_path)
+    if missing_model:
+        model_id = profile.model_for(missing_model)
+        resolver.models[model_id] = replace(
+            resolver.models[model_id], state=ModelState.NOT_INSTALLED, location=None
+        )
+    if missing_graph:
+        graphs.pop(missing_graph)
+    configuration = build_stack_configuration(
+        profile, resolver, layout, workflow_specs=specs, repo_root=tmp_path, graphs=graphs
+    )
+    document = next(
+        (doc for doc in configuration.documents if doc.path.name == IMAGE_STACKS_FILE), None
+    )
+    return (None if document is None else json.loads(document.body)), configuration
+
+
+def test_character_swap_is_shared_by_both_stacks_with_existing_part_shape(specs, layout, tmp_path):
+    profile = profile_named("capella")
+    stacks, configuration = swap_stacks(profile, specs, layout, tmp_path)
+    assert configuration.ok, configuration.problems
+    swaps = [stack["swap"] for stack in stacks.values()]
+    assert len(swaps) == 1 + len(profile.variants)
+    swap = swaps[0]
+    assert set(swap) == set(profile.character_swap)
+    for name, part in swap.items():
+        assert {
+            "workflow",
+            "nodes",
+            "model",
+            "reference_count",
+            "reference_policy",
+            "family",
+        } <= part.keys()
+        graph = json.loads(part["workflow"])
+        for binding in part["nodes"]:
+            assert set(binding) == {"type", "key", "node_ids"}
+            for node_id in binding["node_ids"]:
+                assert binding["key"] in graph[node_id]["inputs"]
+        images = next(binding for binding in part["nodes"] if binding["type"] == "image")
+        assert part["reference_count"] == len(images["node_ids"])
+        assert part["reference_count"] == (2 if name in ("marked", "scene") else 1)
+    assert {node["type"] for node in swap["segment"]["nodes"]} == {"image", "prompt", "model"}
+    assert {node["type"] for node in swap["depth"]["nodes"]} == {"image", "model"}
+    assert swap["marked"]["syntax"] == "indexed"
+    search = next(
+        doc for doc in configuration.documents if doc.path.name == COMFYUI_SEARCH_PATHS_FILE
+    )
+    assert "checkpoints:" in search.body and "geometry_estimation:" in search.body
+
+
+@pytest.mark.parametrize(
+    "role",
+    ["swap.segment", "swap.depth"],
+)
+def test_missing_swap_weight_disables_entire_pipeline(specs, layout, tmp_path, role):
+    stacks, _ = swap_stacks(profile_named("capella"), specs, layout, tmp_path, missing_model=role)
+    assert stacks
+    assert all("swap" not in stack for stack in stacks.values())
+
+
+def test_missing_main_image_weight_writes_no_stacks_so_no_swap(specs, layout, tmp_path):
+    """Every main-stack image role is also one of text-to-image's, so without it image
+    generation is not configured, no image stacks are written, and no model offers the swap."""
+    stacks, configuration = swap_stacks(
+        profile_named("capella"), specs, layout, tmp_path, missing_model="image.text_encoder"
+    )
+    assert stacks is None
+    assert ENV_IMAGE_STACKS not in configuration.service(ComponentId.OPEN_WEBUI).env
+
+
+@pytest.mark.parametrize(
+    "manifest_id",
+    [
+        "qwen_image_2_1_edit",
+        "qwen_image_2_1_edit_2",
+        "sam3_people",
+        "da3_depth",
+    ],
+)
+def test_missing_swap_graph_disables_entire_pipeline(specs, layout, tmp_path, manifest_id):
+    stacks, _ = swap_stacks(
+        profile_named("capella"), specs, layout, tmp_path, missing_graph=manifest_id
+    )
+    assert stacks
+    assert all("swap" not in stack for stack in stacks.values())
+
+
+def test_profile_without_character_swap_emits_no_swap(specs, layout, tmp_path):
+    data = deepcopy(profile_named("capella").raw)
+    data.pop("character_swap")
+    profile = validate_profile_data(data)
+    stacks, configuration = swap_stacks(profile, specs, layout, tmp_path)
+    assert configuration.ok, configuration.problems
+    assert all("swap" not in stack for stack in stacks.values())
+    assert not any(
+        requirement.role.startswith("swap.") for requirement in profile.model_requirements
+    )
+
+
+def test_swap_declarations_enter_install_plan_resolution_and_size_estimate(specs):
+    from local_ai_stack.planning import PlanAction, build_install_plan
+    from local_ai_stack.storage import model_download_estimate
+
+    profile = profile_named("capella")
+    requirements = {item.role: item.model_id for item in profile.model_requirements}
+    plan = build_install_plan(profile)
+    acquired = {step.target for step in plan.steps if step.action == PlanAction.ACQUIRE_MODEL}
+    for name, declared in profile.character_swap.items():
+        key = f"character_swap.{name}"
+        assert profile.workflow(key) == declared
+        assert any(
+            step.action == PlanAction.APPLY_WORKFLOW and step.target == key for step in plan.steps
+        )
+        for role in specs[declared.manifest_id].required_roles:
+            assert str(requirements[role]) in acquired
+    models = {str(key): value for key, value in model_catalog().specs.items()}
+    estimate = model_download_estimate(profile, models)
+    without = replace(
+        profile,
+        model_requirements=tuple(
+            item for item in profile.model_requirements if not item.role.startswith("swap.")
+        ),
+    )
+    assert estimate.complete
+    assert estimate.known_bytes - model_download_estimate(without, models).known_bytes == 3082294904

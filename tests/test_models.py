@@ -1,10 +1,10 @@
 from pathlib import Path
 
 import pytest
-import yaml
 
 from local_ai_stack.artifacts import Artifact
 from local_ai_stack.layout import StackLayout
+from local_ai_stack.model_catalog import load_model_catalog
 from local_ai_stack.models import (
     FileModelLocation,
     FileModelSource,
@@ -169,12 +169,8 @@ def test_model_resolver_protocol_is_the_only_ic5_surface_ic6_needs():
 
 
 def test_profile_and_manifest_layers_use_the_same_canonical_ids():
-    data = yaml.safe_load((ROOT / "manifests" / "models.yaml").read_text(encoding="utf-8"))
-    declared = {
-        ModelId(f"{provider}/{name}")
-        for provider in ("ollama", "comfyui")
-        for name in data[provider]
-    }
+    catalog = load_model_catalog(ROOT / "manifests" / "models.yaml")
+    declared = catalog.declared_ids
     required = {
         requirement.model_id
         for profile in load_profiles(ROOT / "profiles")

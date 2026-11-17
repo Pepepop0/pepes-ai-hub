@@ -10,10 +10,8 @@
 # temp directory nobody can inspect. A folder starts fast, keeps the data
 # readable next to the program, and is what "put the app on a disk" means.
 #
-# Console: on. The Hub is a terminal application; the console window that
-# opens when the executable is double-clicked is the Hub's own window, not a
-# helper. Child services are started with CREATE_NO_WINDOW by the launcher and
-# never open windows of their own.
+# The desktop executable has no console. A separate CLI executable shares the
+# same bundle for diagnostics and scripted commands.
 
 import sys
 from pathlib import Path
@@ -33,6 +31,10 @@ APP_NAME = "PepitosAIHub"
 # The product's own read-only data, bundled under the same names the checkout
 # uses so resources.resource_root() finds them beside the code.
 datas = [(str(ROOT / name), name) for name in RESOURCE_DIRECTORIES]
+desktop_dist = ROOT / "desktop-ui" / "dist"
+if not (desktop_dist / "index.html").is_file():
+    raise SystemExit("Desktop assets missing. Run npm ci && npm run build in desktop-ui.")
+datas.append((str(desktop_dist), "desktop-ui/dist"))
 # Textual ships its default CSS and other data files inside the package.
 datas += collect_data_files("textual")
 datas += collect_data_files("rich")
@@ -102,12 +104,28 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,
+    console=False,
+    icon=str(ROOT / "assets" / "app.ico"),
     disable_windowed_traceback=False,
+    version=version_resource(),
+)
+cli = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name=APP_NAME + "-CLI",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,
+    icon=str(ROOT / "assets" / "app.ico"),
     version=version_resource(),
 )
 coll = COLLECT(
     exe,
+    cli,
     a.binaries,
     a.datas,
     strip=False,

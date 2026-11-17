@@ -21,7 +21,7 @@ from .model_catalog import ModelCatalog, ModelCatalogError
 from .model_installer import ModelInstaller
 from .model_resolver import StackModelResolver
 from .planning import InstallPlan, PlanAction, PlanStep
-from .profiles import Profile
+from .profiles import Profile, declared_workflows
 from .service_config import build_stack_configuration
 from .workflows import (
     WorkflowError,
@@ -114,7 +114,7 @@ class InstallActionHandlers:
     def _resolve_workflow(
         self, profile: Profile, target: str, resolver: StackModelResolver
     ) -> WorkflowResolution | None:
-        declaration = profile.workflows.get(target)
+        declaration = profile.workflow(target)
         if declaration is None:
             return None
         spec = self.workflow_specs.get(declaration.manifest_id)
@@ -155,7 +155,7 @@ class InstallActionHandlers:
         self, profile: Profile, resolver: StackModelResolver
     ) -> dict[str, Mapping[str, object]]:
         graphs: dict[str, Mapping[str, object]] = {}
-        for declaration in profile.workflows.values():
+        for _key, _field, declaration in declared_workflows(profile):
             spec = self.workflow_specs.get(declaration.manifest_id)
             if spec is None:
                 continue

@@ -22,7 +22,7 @@ from typing import Protocol, runtime_checkable
 
 from ..application_contracts import ApplicationReadModel
 from ..external_conflict_contracts import ConflictPreflightReport
-from ..installation import InstallLocationMode
+from ..installation import InstallLocation, InstallLocationMode
 
 
 class HubError(RuntimeError):
@@ -61,16 +61,16 @@ class SwitchRequiresStop(HubError):
 RECOMMENDED = "recommended"
 COMPATIBLE = "compatible"
 INSUFFICIENT = "insufficient"
+UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True)
 class ProfileChoice:
-    """One profile as the wizard presents it: a name and a one-line reason to pick it.
+    """One profile and its compatibility with the detected machine.
 
-    ``standing`` is what the detected hardware says: the largest profile this
-    machine can run is recommended, the smaller ones that also fit are
-    compatible, and the ones that ask for more VRAM than there is say so
-    instead of being offered as if they were a choice.
+    ``standing`` distinguishes insufficient VRAM from another missing
+    prerequisite. ``blockers`` carries stable compatibility issue codes so
+    each interface can explain the actual requirement instead of guessing.
     """
 
     id: str
@@ -79,6 +79,7 @@ class ProfileChoice:
     compatible: bool | None = None
     standing: str | None = None
     required_vram_gb: int | float | None = None
+    blockers: tuple[str, ...] = ()
 
     @property
     def recommended(self) -> bool:
@@ -92,6 +93,7 @@ class InstallSelection:
     profile_id: str
     mode: InstallLocationMode = InstallLocationMode.DEFAULT
     custom_root: str | None = None
+    create_subfolder: bool = False
 
     def __post_init__(self) -> None:
         if not self.profile_id.strip():
@@ -100,6 +102,24 @@ class InstallSelection:
             raise ValueError("a custom installation needs a root")
         if self.mode is not InstallLocationMode.CUSTOM and self.custom_root:
             raise ValueError("only a custom installation names a root")
+        if type(self.create_subfolder) is not bool:
+            raise ValueError("create_subfolder must be a boolean")
+
+    def location(self, profile_name: str) -> InstallLocation:
+        """The final destination, without creating it; explicit roots stay exact by default."""
+        location = InstallLocation(self.mode, Path(self.custom_root) if self.custom_root else None)
+        root = location.root
+        if root is None or not self.create_subfolder:
+            return location
+        if (
+            not profile_name.strip()
+            or profile_name != profile_name.strip()
+            or profile_name.endswith(".")
+            or any(char in profile_name for char in '/\\<>:"|?*')
+            or any(ord(char) < 32 for char in profile_name)
+        ):
+            raise ValueError("the profile name must be a single folder name")
+        return InstallLocation.custom(root / profile_name)
 
 
 @dataclass(frozen=True)

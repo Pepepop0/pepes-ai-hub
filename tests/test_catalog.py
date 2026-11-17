@@ -24,6 +24,15 @@ REPO = Path(__file__).resolve().parents[1]
 OLLAMA_SHA = "2439cbea65310b1aadf7d8fc41d7faf5d033f920d42e00a476c58bf9bff6950e"
 
 
+@pytest.fixture
+def windows_host(monkeypatch):
+    """The Windows pin, independent of the platform running the suite."""
+    from local_ai_stack import catalog
+
+    monkeypatch.setattr(catalog.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(catalog.platform, "machine", lambda: "AMD64")
+
+
 # --- manifest existe e valida ----------------------------------------------
 
 
@@ -50,7 +59,7 @@ def test_ollama_is_pinned_to_an_exact_version():
     assert artifact.component == "ollama"
 
 
-def test_ollama_pin_carries_a_verifiable_checksum():
+def test_ollama_pin_carries_a_verifiable_checksum(windows_host):
     artifact = artifact_for(ComponentId.OLLAMA)
     assert artifact is not None
     assert artifact.has_checksum
@@ -58,7 +67,7 @@ def test_ollama_pin_carries_a_verifiable_checksum():
     assert len(artifact.sha256) == 64
 
 
-def test_ollama_url_is_the_official_release_asset():
+def test_ollama_url_is_the_official_release_asset(windows_host):
     artifact = artifact_for(ComponentId.OLLAMA)
     assert artifact is not None
     assert artifact.url == (
@@ -80,7 +89,7 @@ def test_nothing_resolves_latest():
         assert artifact.version is not None
 
 
-def test_portable_archive_not_the_installer():
+def test_portable_archive_not_the_installer(windows_host):
     """The installer writes PATH and the registry, so it is never pinned."""
     artifact = artifact_for(ComponentId.OLLAMA)
     assert artifact is not None

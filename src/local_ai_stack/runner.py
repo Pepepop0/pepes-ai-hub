@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
 
+from .installation_control import installation_checkpoint
+
 logger = logging.getLogger(__name__)
 
 # (stream, line) for each line a streamed command writes, as it writes it.
@@ -250,6 +252,7 @@ class CommandRunner:
         if on_output is not None and input_text is not None:
             raise ValueError("on_output nao e suportado junto de input_text")
 
+        installation_checkpoint()
         self.log.debug(
             "run: %s (cwd=%s, timeout=%.1fs)", " ".join(safe), cwd_str, effective_timeout
         )
@@ -401,6 +404,7 @@ class CommandRunner:
             safe_argv=safe,
         )
         self.log.warning("timeout apos %.1fs: %s", effective_timeout, " ".join(safe))
+        installation_checkpoint()
         if check:
             raise CommandTimeoutError(
                 f"timeout apos {effective_timeout:.1f}s: {result.display}", result
@@ -426,6 +430,7 @@ class CommandRunner:
             safe_argv=safe,
         )
         self.log.warning("executavel nao encontrado: %s", safe[0])
+        installation_checkpoint()
         if check:
             raise CommandNotFoundError(f"executavel nao encontrado: {safe[0]}", result) from exc
         return result
@@ -450,6 +455,7 @@ class CommandRunner:
             safe_argv=safe,
         )
         self.log.warning("falha ao iniciar %s: %s", safe[0], detail)
+        installation_checkpoint()
         if check:
             raise CommandNotFoundError(f"falha ao iniciar {safe[0]}: {detail}", result) from exc
         return result
@@ -475,6 +481,7 @@ class CommandRunner:
             safe_argv=safe,
         )
         self.log.debug("exit=%s em %.2fs: %s", result.returncode, result.duration_s, result.display)
+        installation_checkpoint()
         if check and not result.ok:
             raise CommandFailedError(
                 f"exit {result.returncode}: {result.display}\n{sanitize(result.stderr).strip()}",

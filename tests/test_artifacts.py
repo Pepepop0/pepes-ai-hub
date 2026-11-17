@@ -26,6 +26,7 @@ artifacts:
   - id: helper-tool
     url: https://example.invalid/helper.zip
     filename: helper.zip
+    sha256: {SHA}
 """
 
 
@@ -34,6 +35,7 @@ def artifact(**overrides):
         "id": "ollama-windows",
         "url": "https://example.invalid/o.zip",
         "filename": "o.zip",
+        "sha256": SHA,
     }
     data.update(overrides)
     return Artifact.from_dict(data)
@@ -42,12 +44,12 @@ def artifact(**overrides):
 # --- forma minima ----------------------------------------------------------
 
 
-def test_minimal_artifact_needs_only_id_url_and_filename():
+def test_minimal_artifact_needs_only_id_url_filename_and_sha256():
     a = artifact()
     assert a.id == "ollama-windows"
     assert a.filename == "o.zip"
-    assert a.sha256 is None
-    assert a.has_checksum is False
+    assert a.sha256 == SHA
+    assert a.has_checksum is True
     assert a.size_bytes is None
     assert a.version is None
 
@@ -70,9 +72,9 @@ def test_artifact_is_immutable():
 # --- validacao -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("missing", ["id", "url", "filename"])
+@pytest.mark.parametrize("missing", ["id", "url", "filename", "sha256"])
 def test_required_fields(missing):
-    data = {"id": "x", "url": "https://e.invalid/a.zip", "filename": "a.zip"}
+    data = {"id": "x", "url": "https://e.invalid/a.zip", "filename": "a.zip", "sha256": SHA}
     del data[missing]
     with pytest.raises(ArtifactError) as exc:
         Artifact.from_dict(data)
@@ -137,7 +139,7 @@ def test_manifest_loads_into_artifacts_by_id(tmp_path):
     artifacts = load_artifact_manifest(path)
     assert set(artifacts) == {"ollama-windows", "helper-tool"}
     assert artifacts["ollama-windows"].sha256 == SHA
-    assert artifacts["helper-tool"].sha256 is None
+    assert artifacts["helper-tool"].sha256 == SHA
 
 
 def test_manifest_rejects_a_wrong_schema_version():
@@ -147,7 +149,7 @@ def test_manifest_rejects_a_wrong_schema_version():
 
 
 def test_manifest_rejects_duplicate_ids():
-    entry = {"id": "dup", "url": "https://e.invalid/a.zip", "filename": "a.zip"}
+    entry = {"id": "dup", "url": "https://e.invalid/a.zip", "filename": "a.zip", "sha256": SHA}
     with pytest.raises(ArtifactError) as exc:
         validate_artifact_manifest({"schema_version": 1, "artifacts": [entry, dict(entry)]})
     assert "duplicate" in str(exc.value)
@@ -160,8 +162,8 @@ def test_manifest_rejects_an_empty_artifact_list():
 
 def test_manifest_reports_the_offending_index():
     entries = [
-        {"id": "good", "url": "https://e.invalid/a.zip", "filename": "a.zip"},
-        {"id": "bad", "url": "nope", "filename": "b.zip"},
+        {"id": "good", "url": "https://e.invalid/a.zip", "filename": "a.zip", "sha256": SHA},
+        {"id": "bad", "url": "nope", "filename": "b.zip", "sha256": SHA},
     ]
     with pytest.raises(ArtifactError) as exc:
         validate_artifact_manifest({"schema_version": 1, "artifacts": entries}, "m.yaml")

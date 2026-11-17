@@ -18,6 +18,7 @@ Two limits are deliberate:
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from typing import Protocol, runtime_checkable
 
 import httpx
 
+from .installation_control import InstallationControl, current_installation_control
 from .runner import sanitize
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,10 @@ DEFAULT_BASE_URL = "http://127.0.0.1:11434"
 LIST_TIMEOUT = 10.0
 # A pull downloads gigabytes over a slow link; the ceiling is generous but real.
 PULL_TIMEOUT = 3 * 60 * 60.0
+# Loading a 20 GB model from a cold disk; generous, but a stuck Ollama must not hold forever.
+PRELOAD_TIMEOUT = 300.0
+# The preload's prompt: as short as a prompt gets; only the one token answered matters.
+PRELOAD_PROMPT = "Oi"
 
 
 # What a model check says when Ollama is not answering: the store could not be
@@ -131,13 +137,15 @@ class HttpOllamaClient:
     def pull(self, reference: str) -> None:
         """Add a model to the store. Never removes or replaces anything else.
 
-        Requests ``"stream": False`` and blocks until Ollama answers once, so
-        there is no byte-level observation to bridge to a transfer contract.
-        Ollama's streaming NDJSON pull does report ``completed``/``total``
-        per layer, but adopting it is a client redesign, not an instrumentation
-        seam; until then a pull's progress stays logical ("pulling
-        <reference>"), never invented bytes.
+        Standalone calls retain the single-response API. An installation uses
+        streaming responses so pause/cancel can disconnect this pull request
+        before acknowledging its checkpoint. Resume asks for the same model;
+        Ollama reuses its completed layers and resumable blobs.
         """
+        control = current_installation_control()
+        if control is not None:
+            self._pull_controlled(reference, control)
+            return
         try:
             with self._client(self.pull_timeout) as client:
                 response = client.post(
@@ -159,6 +167,78 @@ class HttpOllamaClient:
             if isinstance(status, str) and status.lower() not in {"success", "ok"}:
                 raise OllamaClientError(f"pull of {reference} ended as {status!r}")
 
+    def _pull_controlled(self, reference: str, control: InstallationControl) -> None:
+        while True:
+            control.checkpoint()
+            interrupted = False
+            complete = False
+            try:
+                with (
+                    self._client(self.pull_timeout) as client,
+                    client.stream(
+                        "POST",
+                        f"{self.base_url}/api/pull",
+                        json={"model": reference, "stream": True},
+                        timeout=self.pull_timeout,
+                    ) as response,
+                ):
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if control.interruption_requested:
+                            interrupted = True
+                            break
+                        if not line.strip():
+                            continue
+                        payload = json.loads(line)
+                        if not isinstance(payload, dict):
+                            raise TypeError("unexpected Ollama pull payload")
+                        if payload.get("error"):
+                            raise OllamaClientError(
+                                f"could not pull {reference}: {sanitize(str(payload['error']))}"
+                            )
+                        if str(payload.get("status", "")).lower() in {"success", "ok"}:
+                            complete = True
+                            break
+            except (httpx.HTTPError, ValueError, TypeError) as exc:
+                # A pending request still wins over a provider error; cancellation
+                # is never mistaken for a successful or failed model acquisition.
+                control.checkpoint()
+                raise OllamaClientError(
+                    f"could not pull {reference}: {sanitize(str(exc))}"
+                ) from exc
+            # Both response and client are closed: the server must not keep this
+            # request pulling in the background while the installation is paused.
+            control.checkpoint()
+            if interrupted:
+                continue
+            if not complete:
+                raise OllamaClientError(f"pull of {reference} ended before success")
+            return
+
+
+def delete_ollama_model(
+    reference: str,
+    base_url: str = DEFAULT_BASE_URL,
+    *,
+    client_factory: Callable[[], httpx.Client] | None = None,
+) -> None:
+    """Remove one model from an Ollama store. A model already absent is not an error.
+
+    Deliberately not a method of :class:`HttpOllamaClient`: acquisition holds that
+    client, and it must have no way to delete. Only a person's explicit "remove
+    this imported model" reaches this function.
+    """
+    try:
+        with client_factory() if client_factory else httpx.Client(timeout=LIST_TIMEOUT) as client:
+            response = client.request(
+                "DELETE", f"{base_url.rstrip('/')}/api/delete", json={"model": reference}
+            )
+            if response.status_code == 404:
+                return
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise OllamaClientError(f"could not delete {reference}: {sanitize(str(exc))}") from exc
+
 
 __all__ = [
     "DEFAULT_BASE_URL",
@@ -166,4 +246,39 @@ __all__ = [
     "OllamaClientError",
     "OllamaModelClient",
     "OllamaModelEntry",
+    "delete_ollama_model",
 ]
+
+
+def preload_ollama_model(
+    base_url: str,
+    model: str,
+    *,
+    num_ctx: int | None = None,
+    keep_alive: str | None = None,
+    timeout: float = PRELOAD_TIMEOUT,
+    client_factory: Callable[[], httpx.Client] | None = None,
+) -> None:
+    """Load ``model`` into Ollama's memory and warm it with a one-token answer.
+
+    A bare load left the first chat turn slow even with the model resident (12/11:
+    32.4 s, then 5-7 s), so a minimal prompt is answered with ``num_predict: 1``
+    (SPEC-312). ``num_ctx`` is sent so the resident copy has the context the chat
+    will ask for (a different one would reload it). Raises :class:`OllamaClientError`
+    when it does not load.
+    """
+    body: dict[str, object] = {"model": model, "prompt": PRELOAD_PROMPT, "stream": False}
+    if keep_alive:
+        body["keep_alive"] = keep_alive
+    options: dict[str, object] = {"num_predict": 1}
+    if num_ctx is not None:
+        options["num_ctx"] = num_ctx
+    body["options"] = options
+    try:
+        with client_factory() if client_factory is not None else httpx.Client() as client:
+            response = client.post(
+                f"{base_url.rstrip('/')}/api/generate", json=body, timeout=timeout
+            )
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise OllamaClientError(f"could not load {model}: {sanitize(str(exc))}") from exc

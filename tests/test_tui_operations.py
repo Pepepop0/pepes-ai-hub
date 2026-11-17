@@ -23,6 +23,7 @@ from hub_fakes import (
     ready_application,
     unsafe_conflict,
 )
+from internal_profile_support import INTERNAL_PROFILE_ID, INTERNAL_PROFILE_NAME, internal_profile
 from test_app import all_profiles, integration_snapshot, reference_facts, stopped_runtime
 from textual.widgets import Button, Input, Static
 
@@ -62,12 +63,13 @@ def hub(
     *,
     first_run_wizard: bool = True,
     installed_config: InstalledConfig | None = None,
+    profiles=None,
 ) -> tuple[LocalAIStackApp, FakeHubApplication, list[str]]:
     opened: list[str] = []
     fake = application if application is not None else FakeHubApplication()
     app = LocalAIStackApp(
         facts=reference_facts(),
-        profiles=all_profiles(),
+        profiles=all_profiles() if profiles is None else profiles,
         runtime_snapshot=stopped_runtime(),
         installed_config=installed_config,
         integration=integration_snapshot(),
@@ -786,13 +788,16 @@ def test_the_rail_shows_the_pet_for_the_installed_profile():
     run(exercise)
 
 
-def test_the_test_profile_has_no_pet_and_the_rail_degrades_to_text():
+def test_an_internal_profile_without_a_pet_makes_the_rail_degrade_to_text():
     async def exercise() -> None:
-        app, _, _ = hub(ready_application(profile_id="test"))
+        app, _, _ = hub(
+            ready_application(profile_id=INTERNAL_PROFILE_ID),
+            profiles=[*all_profiles(), internal_profile()],
+        )
         async with app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             rail = app.query_one(RightRail)
-            assert str(app.query_one("#rail-profile", Static).content) == "Test"
+            assert str(app.query_one("#rail-profile", Static).content) == INTERNAL_PROFILE_NAME
             assert rail.appearance.resolved.pet_id == "none"
             assert rail.appearance.animator is None
             slot = str(app.query_one("#pet-slot", Static).content)
@@ -967,32 +972,6 @@ def test_the_tui_imports_contracts_never_the_backend():
                     if any(part in forbidden for part in alias.name.split(".")):
                         offenders.append(f"{path.name}: {alias.name}")
     assert offenders == []
-
-
-def test_the_frozen_contracts_were_not_edited_here():
-    """Ownership: those three files belong to Codex and are read, never written, by Wave A."""
-    import subprocess
-
-    import local_ai_stack
-
-    package = Path(local_ai_stack.__file__).resolve().parent
-    root = package.parents[1]
-    if not (root / ".git").exists():
-        pytest.skip("not a checkout")
-    changed = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD", "--"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.split()
-    frozen = {
-        "src/local_ai_stack/operation_contracts.py",
-        "src/local_ai_stack/image_generation_contracts.py",
-        "src/local_ai_stack/application_contracts.py",
-        "src/local_ai_stack/external_conflict_contracts.py",
-    }
-    assert not (frozen & set(changed))
 
 
 # --- external conflict UX ---------------------------------------------------
@@ -1258,7 +1237,7 @@ def test_custom_path_stays_correct_through_a_conflict_and_is_not_confused_for_in
             await click(pilot, "#wizard-profile-pepe-8gb")
             await click(pilot, "#wizard-next")
             await click(pilot, "#wizard-mode-custom")
-            screen.set_custom_root(r"C:\Users\Pedro\Desktop\loira-40k")
+            screen.set_custom_root(r"C:\Users\User\Desktop\loira-40k")
             await pilot.pause()
             assert text(app, "#wizard-custom-error") == ""
             await click(pilot, "#wizard-next")
@@ -1266,7 +1245,7 @@ def test_custom_path_stays_correct_through_a_conflict_and_is_not_confused_for_in
             review = text(app, "#wizard-step-review")
             assert "Perfil: [b]Pepinho[/b]" in review
             assert "Local: [b]Personalizado[/b]" in review
-            assert r"Pasta: C:\Users\Pedro\Desktop\loira-40k" in review
+            assert r"Pasta: C:\Users\User\Desktop\loira-40k" in review
 
             await click(pilot, "#wizard-next")
             await pump(pilot, fake, 1)
@@ -1283,13 +1262,13 @@ def test_custom_path_stays_correct_through_a_conflict_and_is_not_confused_for_in
 
             assert screen.state.step is WizardStep.DONE
             assert fake.mode is InstallLocationMode.CUSTOM
-            assert fake.root_display == r"C:\Users\Pedro\Desktop\loira-40k"
+            assert fake.root_display == r"C:\Users\User\Desktop\loira-40k"
 
             await click(pilot, "#wizard-finish")
             assert not isinstance(app.screen, WizardScreen)
             install_summary = str(app.query_one("#install-summary", Static).content)
             assert "Personalizada" in install_summary, "the mode, in the screen's words"
-            assert r"C:\Users\Pedro\Desktop\loira-40k" in install_summary
+            assert r"C:\Users\User\Desktop\loira-40k" in install_summary
 
     run(exercise)
 

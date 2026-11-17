@@ -1,132 +1,100 @@
-# Building the Windows release
+# Compilar o aplicativo desktop para Windows
 
-This is for whoever cuts a release. A person using the Hub never needs it:
-they get `PepitosAIHub.exe`, double-click it, and the first-run wizard takes
-over.
+Este guia gera uma pasta distribuível com a janela desktop e um executável separado para diagnóstico. O computador de destino não precisa de Node.js ou Python instalado para abrir o Hub; precisa do runtime Microsoft Edge WebView2. Para criar uma instalação, também precisa do Git for Windows: se estiver ausente, o assistente oferece instalação pelo `winget` após confirmação explícita ou abre o instalador oficial; reabra o Hub depois.
 
-## Prerequisites
+## Preparar o ambiente de desenvolvimento
 
-- Windows 10/11, x64.
-- This checkout bootstrapped: `bootstrap-dev.bat` (creates `.venv` on
-  Python 3.11).
-- Network access once, for the build dependency: the script installs
-  `pyinstaller==6.22.3` (pinned in `pyproject.toml` under `[build]`) into
-  `.venv`.
+Use Windows 10/11 x64, Python 3.11 e Node.js 22.12 ou mais recente. O bootstrap instala as dependências Python, as dependências do renderer pelo lockfile e compila React.
 
-Nothing else. No Python needs to be on the target machine: the product
-provisions its own (see *Managed Python*).
+Na raiz do checkout, execute:
 
-## Command
+```powershell
+.\bootstrap-dev.bat
+.\run.bat
+```
+
+O frontend fica em `desktop-ui/`. O comando de produção é `npm run build`; ele verifica TypeScript e gera `desktop-ui/dist`. Node.js não acompanha o aplicativo distribuído.
+
+## Gerar o bundle
+
+O script usa a `.venv` do checkout e o PyInstaller fixado em `pyproject.toml`:
 
 ```powershell
 .\scripts\build_windows.ps1
 ```
 
-Options: `-SkipSmoke` builds without running the packaged self-check;
-`-Version` prints the version the build will carry and exits.
+O processo:
 
-The script:
+1. Instala as dependências Python de build e desktop
+2. Executa `npm ci` e `npm run build` no frontend
+3. Remove somente as saídas anteriores pertencentes a este build
+4. Empacota Python, pywebview, bibliotecas, manifests e renderer
+5. Confere os executáveis e arquivos essenciais
+6. Executa `--smoke` e `--version` pelo executável de diagnóstico
 
-1. installs the pinned PyInstaller into `.venv`;
-2. removes only its own previous output (`dist\PepitosAIHub` and
-   `build\pepitos_ai_hub`), never `dist\` or `build\` wholesale;
-3. runs PyInstaller with `packaging\pepitos_ai_hub.spec`;
-4. verifies `PepitosAIHub.exe` exists and that `profiles\`, `manifests\`,
-   `workflows\` and `assets\` were bundled with their sentinel files;
-5. runs `PepitosAIHub.exe --smoke` and `--version` on the result.
+Use `-SkipSmoke` apenas quando precisar omitir a verificação final. `-Version` imprime a versão sem compilar.
 
-## Output
+## Distribuir a pasta completa
 
+A saída contém dois executáveis que usam os mesmos arquivos internos:
+
+```text
+dist/PepitosAIHub/
+  PepitosAIHub.exe
+  PepitosAIHub-CLI.exe
+  _internal/
+    desktop-ui/dist/
+    profiles/
+    manifests/
+    workflows/
+    assets/
 ```
-dist\PepitosAIHub\
-    PepitosAIHub.exe        the Hub
-    _internal\              Python runtime, libraries, and the product's data:
-        profiles\  manifests\  workflows\  assets\
+
+Abra `PepitosAIHub.exe` para usar a janela nativa sem console. Não copie apenas o executável; `_internal` contém o renderer e as dependências. O tamanho final depende das bibliotecas empacotadas e deve ser medido no build, não inferido de versões anteriores.
+
+## Executar diagnósticos
+
+Use o CLI quando precisar de saída textual ou entrada pelo terminal:
+
+```powershell
+.\PepitosAIHub-CLI.exe --smoke
+.\PepitosAIHub-CLI.exe --doctor
+.\PepitosAIHub-CLI.exe --hf-status
 ```
 
-About 24 MB. Ship the whole folder; the executable does not run without
-`_internal`. `dist\` and `build\` are ignored by git - binaries are never
-committed.
+`--hf-login` e `--hf-logout` continuam disponíveis no CLI. Na janela desktop, use **Configurações → Hugging Face** para essa credencial, **Configurações → Civitai** para os modelos Capella hospedados lá e **Configurações → Pesquisa web e referências** para ligar/desligar a pesquisa, informar um SearXNG e cadastrar chaves Brave/Unsplash/Pexels opcionais. As chaves são validadas antes de salvar e protegidas pelo DPAPI do usuário atual; os valores nunca voltam para a interface. Reinicie os serviços depois de alterar Unsplash/Pexels. Não cole tokens em issues, capturas de tela ou logs.
 
-## How to run it
+Agentes de código operam o Hub sem janela pelo mesmo CLI: `hub state`, `hub commands`, `hub run <comando> [--args JSON] [--wait]` e `hub serve --no-open`, com saída JSON. Enquanto a janela está aberta, apenas comandos de leitura funcionam; os demais saem com `desktop_running`. Veja o [guia para agentes](docs/AGENT_WORKFLOW.md).
 
-Double-click `PepitosAIHub.exe`, or run it from a terminal. The console window
-that opens **is** the Hub: it is a terminal application, so it needs a console
-host to draw in. That window is not an extra helper. The services it starts
-(Ollama, Open WebUI, ComfyUI, and pip during installation) run with
-`CREATE_NO_WINDOW` and never open windows of their own.
+## Executar a interface no navegador para desenvolvimento
 
-`PepitosAIHub.exe --smoke` prints a JSON report of what the build can see and
-exits 0 when everything resolves. `--version` and `--doctor` work as they do
-on a checkout.
+O mesmo servidor e os mesmos assets podem abrir no navegador, sem simular o backend:
 
-## What the build changes about behaviour
+```powershell
+.\.venv\Scripts\python.exe -m local_ai_stack.desktop --browser
+.\.venv\Scripts\python.exe -m local_ai_stack.desktop --browser --no-open
+```
 
-**Resources.** `local_ai_stack.resources` answers "where is the product's
-data?" - the checkout root when run from source, the bundle's `_internal`
-when frozen (`sys._MEIPASS`). Nothing depends on the working directory.
-`PEPITOS_AI_HUB_RESOURCES` overrides it.
+`--no-open` só imprime a URL, sem abrir o navegador; é o modo para automação. `PepitosAIHub-CLI.exe hub serve [--no-open]` faz o mesmo no bundle. Só uma instância do Hub (janela ou navegador) abre por vez; a segunda informa que o Hub já está aberto e encerra.
 
-**State.** Unchanged: `%LOCALAPPDATA%\PepitosAIHub\state` for the default
-install, and the selection file lives there too. The build never writes
-inside `_internal`.
+O servidor escuta somente em `127.0.0.1`, em uma porta escolhida pelo sistema. A URL de desenvolvimento inclui uma credencial temporária no fragmento; não a publique. Essa opção é para depuração local, não para disponibilizar o Hub na rede.
 
-**Portable.** "Beside the Hub" now means beside the executable:
-`dist\PepitosAIHub\stack\`. That is the folder to copy to another disk. It is
-next to `_internal`, never inside it.
+## Recursos e dados de usuário
 
-**Managed Python.** A frozen build has no Python to create environments from -
-its `sys.executable` is the Hub itself, and `find_interpreter` refuses to offer
-it. Instead the product provisions the interpreter pinned in
-`manifests/artifacts.yaml` (`python-windows-amd64`: python-build-standalone
-CPython 3.11.16, SHA-256 verified) into `<root>\runtime\python` the first time
-Open WebUI or ComfyUI needs one, under the same marker discipline as Ollama.
-Both components share it. A source checkout keeps using its own `.venv`
-Python exactly as before; the choice is made once, in
-`integration.default_provisioners`, from whether the process is frozen.
+`local_ai_stack.resources.resource_root()` resolve os arquivos embarcados em `_internal` ou no checkout. `PEPITOS_AI_HUB_RESOURCES` permite usar outra raiz de recursos durante desenvolvimento.
 
-**Folder picker.** The native dialog (`folder_picker.py`, ctypes/COM) is
-bundled; `--smoke` proves it imports. Whether the window actually opens is
-part of the manual smoke below.
+As instalações e o registro global mantêm seus caminhos anteriores. Uma instalação portátil usa `stack/` ao lado do executável, nunca dentro de `_internal`. Credenciais protegidas por DPAPI pertencem ao usuário e computador Windows; copiar a pasta da aplicação não transfere os logins. Configurações sem segredo, como ligar a pesquisa e o endereço do SearXNG, ficam no diretório de configuração do usuário.
 
-## Known limitations
+O Hub provisiona seu Python gerenciado para Open WebUI e ComfyUI quando necessário. O Python embutido no executável não deve ser usado para criar esses ambientes.
 
-- Unsigned. SmartScreen will warn on first run of a downloaded copy; that is
-  expected for v0.1 and is not addressed here (no signing, no installer, no
-  MSI, no winget, no auto-update).
-- One-directory build by design: `PepitosAIHub.exe` must stay with its
-  `_internal` folder. A single-file build was rejected - slower start,
-  self-extracting behaviour antivirus dislikes, and bundled data hidden in a
-  temp directory.
-- The Hub is a console application. Launching it from Explorer opens a console
-  host; there is no windowed mode.
-- Windows/NVIDIA only, matching the product's v0.1 target. The build does not
-  run elsewhere and does not try to.
-- The managed Python is downloaded on first install (~48 MB), the same way
-  Ollama and the models are.
+## WebView2 e falhas de abertura
 
-## Manual smoke procedure
+Se a janela não abrir, confira o [runtime WebView2 da Microsoft](https://developer.microsoft.com/microsoft-edge/webview2/). O Hub usa esse runtime em vez de distribuir outro Chromium.
 
-Automated checks cover imports, resources, paths and the interpreter
-decision. These need a person:
+Se o smoke apontar ausência de `desktop-ui/dist/index.html`, compile o frontend antes de empacotar. Se um bundle movido falhar, confira se a pasta `_internal` foi copiada integralmente.
 
-1. Copy `dist\PepitosAIHub\` somewhere that is not the checkout (for example
-   `C:\Temp\PepitosAIHub`). Double-click `PepitosAIHub.exe`. Expect the
-   first-run wizard in a console window, no traceback.
-2. Welcome -> Perfil -> Local: choose **Personalizado**. Press
-   **Escolher pasta...**: the Windows folder dialog must open. Cancel; the
-   field must be unchanged. Press it again, pick a folder; the field must show
-   it and **Continuar** must enable.
-3. Review shows the profile and the exact folder. Press **Instalar**.
-4. Watch the install pane. Under Open WebUI or ComfyUI (whichever comes first)
-   expect "Preparing the managed Python 3.11.16" then a download of
-   `cpython-3.11.16+…-install_only.tar.gz`. Confirm
-   `<root>\runtime\python\python.exe` appears with a `.pepito-managed.json`
-   marker beside it, and that no `PepitosAIHub.exe -m venv` ever shows up in
-   the details.
-5. Confirm no extra console windows flash while Ollama, Open WebUI and
-   ComfyUI start.
-6. **Abrir Open WebUI** must open the browser on the managed endpoint.
-7. Close the Hub, reopen it: it must go straight to the Dashboard.
-8. Right-click `PepitosAIHub.exe` -> Properties -> Details: version 0.1.0,
-   product name "Pepito's AI Hub".
+## Limites de distribuição
+
+O build permanece sem assinatura de código. SmartScreen pode exibir um aviso; o redesign não adiciona certificado, instalador MSI ou atualização automática.
+
+O teste de imports e recursos não prova que WebView2 abriu nem que modelos rodaram na GPU. Execute o [checklist desktop](docs/testing/desktop-ui-checklist.md) e, para Capella, o [checklist RTX 5090](docs/testing/capella-5090-checklist.md).

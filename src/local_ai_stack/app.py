@@ -260,15 +260,19 @@ class UnwiredHubApplication:
         return InstallationView(ready=False)
 
     def profile_choices(self) -> tuple[ProfileChoice, ...]:
-        return tuple(
-            ProfileChoice(
-                profile.id,
-                profile.name,
-                profile.description,
-                evaluate_compatibility(self.facts, profile).compatible,
+        choices = []
+        for profile in offered_profiles(self.profiles):
+            report = evaluate_compatibility(self.facts, profile)
+            choices.append(
+                ProfileChoice(
+                    profile.id,
+                    profile.name,
+                    profile.description,
+                    report.compatible,
+                    blockers=tuple(issue.code for issue in report.blockers),
+                )
             )
-            for profile in offered_profiles(self.profiles)
-        )
+        return tuple(choices)
 
     def install(self, selection: InstallSelection) -> str:
         raise HubUnavailable(UNWIRED_MESSAGE)
@@ -929,6 +933,7 @@ class LocalAIStackApp(App):
     # --- operations ---------------------------------------------------------
 
     def on_operation_observed(self, message: OperationObserved) -> None:
+        was_busy = self.busy_with_operation()
         view = observe(self.operation_view, message.event)
         if view is self.operation_view:
             return
@@ -941,9 +946,11 @@ class LocalAIStackApp(App):
         wizard = self.wizard
         if wizard is not None:
             wizard.show_operation(view)
-        if view is not None and view.terminal:
-            # The application settled before it sent this: committed, recorded
-            # or refused. The screens now follow whatever it committed.
+        if view is not None and view.terminal and was_busy:
+            # A subscription also replays an already finished operation. Keep
+            # its outcome visible, but do not adopt/refresh again: startup is
+            # already loading the committed installation. Only an operation
+            # launched here or observed running needs to settle the shell.
             self._end_operation()
             if kind == "switch":
                 self._show_switch_outcome()

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 from hub_fakes import FakeFolderPicker, FakeHubApplication
+from internal_profile_support import INTERNAL_PROFILE_ID, internal_profile_yaml
 from test_app import all_profiles, integration_snapshot, reference_facts, stopped_runtime
 from test_tui_operations import click, pump, run, text, wizard
 from textual.widgets import Button, Input, Select, Static
@@ -119,11 +120,11 @@ def test_an_older_config_without_recent_paths_still_loads():
 def test_an_older_custom_config_migrates_its_installed_root_into_history():
     text_without = (
         "schema_version: 1\nprofile: {id: test}\n"
-        "installation: {mode: custom, root: 'C:\\Users\\Pedro\\Desktop\\Capellah_gpt'}\n"
+        "installation: {mode: custom, root: 'C:\\Users\\User\\Desktop\\Capellah_gpt'}\n"
         "general: {ui: {theme: null, pet: null}}\n"
     )
     loaded = loads(text_without)
-    assert loaded.general.recent_custom_roots == (r"C:\Users\Pedro\Desktop\Capellah_gpt",)
+    assert loaded.general.recent_custom_roots == (r"C:\Users\User\Desktop\Capellah_gpt",)
     assert loads(dumps(loaded)).general.recent_custom_roots == loaded.general.recent_custom_roots
 
 
@@ -173,13 +174,20 @@ class StubBackend:
 
 
 def adapter_for(tmp_path: Path, *, outcome: str = "failed", conflict: bool = False):
+    repo_root = tmp_path / "fixture-repo"
+    profiles_dir = repo_root / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+    (profiles_dir / f"{INTERNAL_PROFILE_ID}.yaml").write_text(
+        internal_profile_yaml(), encoding="utf-8"
+    )
+
     def resolve(location):
         return resolve_installation(
             location, repo_root=tmp_path / "repo", env={ENV_ROOT: str(tmp_path / "default")}
         )
 
     return create_hub_application(
-        PROJECT_ROOT,
+        repo_root,
         resolve=resolve,
         backend_factory=lambda installation: StubBackend(
             installation, outcome=outcome, conflict=conflict
@@ -195,8 +203,14 @@ def attempt(adapter, selection: InstallSelection) -> None:
 def test_recent_paths_survive_a_restart(tmp_path):
     first = adapter_for(tmp_path)
     try:
-        attempt(first, InstallSelection("test", InstallLocationMode.CUSTOM, str(tmp_path / "a")))
-        attempt(first, InstallSelection("test", InstallLocationMode.CUSTOM, str(tmp_path / "b")))
+        attempt(
+            first,
+            InstallSelection(INTERNAL_PROFILE_ID, InstallLocationMode.CUSTOM, str(tmp_path / "a")),
+        )
+        attempt(
+            first,
+            InstallSelection(INTERNAL_PROFILE_ID, InstallLocationMode.CUSTOM, str(tmp_path / "b")),
+        )
     finally:
         first.close()
 
@@ -213,7 +227,9 @@ def test_a_failed_install_still_records_its_root(tmp_path):
     root = tmp_path / "Capellah_gpt"
     adapter = adapter_for(tmp_path, outcome="failed")
     try:
-        attempt(adapter, InstallSelection("test", InstallLocationMode.CUSTOM, str(root)))
+        attempt(
+            adapter, InstallSelection(INTERNAL_PROFILE_ID, InstallLocationMode.CUSTOM, str(root))
+        )
         assert not adapter.installation().ready
         assert adapter.recent_custom_roots() == (str(root),)
     finally:
@@ -225,7 +241,9 @@ def test_a_custom_root_cancelled_at_conflict_preflight_is_not_recorded(tmp_path)
     adapter = adapter_for(tmp_path, conflict=True)
     try:
         with pytest.raises(ConflictResolutionRequired):
-            adapter.install(InstallSelection("test", InstallLocationMode.CUSTOM, str(root)))
+            adapter.install(
+                InstallSelection(INTERNAL_PROFILE_ID, InstallLocationMode.CUSTOM, str(root))
+            )
         assert adapter.recent_custom_roots() == ()
     finally:
         adapter.close()
@@ -241,9 +259,9 @@ def test_default_and_portable_attempts_never_register_and_keep_history(tmp_path)
     adapter = adapter_for(tmp_path)
     try:
         custom = str(tmp_path / "custom")
-        attempt(adapter, InstallSelection("test", InstallLocationMode.CUSTOM, custom))
-        attempt(adapter, InstallSelection("test", InstallLocationMode.DEFAULT))
-        attempt(adapter, InstallSelection("test", InstallLocationMode.PORTABLE))
+        attempt(adapter, InstallSelection(INTERNAL_PROFILE_ID, InstallLocationMode.CUSTOM, custom))
+        attempt(adapter, InstallSelection(INTERNAL_PROFILE_ID, InstallLocationMode.DEFAULT))
+        attempt(adapter, InstallSelection(INTERNAL_PROFILE_ID, InstallLocationMode.PORTABLE))
         assert adapter.recent_custom_roots() == (custom,)
     finally:
         adapter.close()
@@ -255,7 +273,9 @@ def test_the_persisted_history_never_exceeds_five(tmp_path):
         for index in range(7):
             attempt(
                 adapter,
-                InstallSelection("test", InstallLocationMode.CUSTOM, str(tmp_path / f"r{index}")),
+                InstallSelection(
+                    INTERNAL_PROFILE_ID, InstallLocationMode.CUSTOM, str(tmp_path / f"r{index}")
+                ),
             )
     finally:
         adapter.close()

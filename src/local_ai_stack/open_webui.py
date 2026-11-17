@@ -38,6 +38,7 @@ from pathlib import Path
 
 from .components import ComponentId
 from .markers import ManagedMarker, marker_path, read_marker, write_marker
+from .open_webui_native import NativeExtensionError, sync_native_extension
 from .operation_contracts import OperationActivityCategory, TransferProgress
 from .provisioning import (
     ComponentState,
@@ -161,6 +162,18 @@ class OpenWebUIProvisioner(Provisioner):
                 detail="The managed marker exists but the Open WebUI command is missing.",
                 evidence=(str(self.marker_path(context)),),
             )
+        if not environment.script_is_current(CONSOLE_SCRIPT):
+            return Detection(
+                component_id=self.component_id,
+                state=ComponentState.INVALID,
+                ownership=Ownership.MANAGED,
+                path=executable,
+                detail=(
+                    "The Open WebUI command still points at the folder this installation "
+                    "was moved from. Repairing the installation rebuilds it."
+                ),
+                evidence=(str(executable),),
+            )
         return Detection(
             component_id=self.component_id,
             state=ComponentState.INSTALLED,
@@ -194,6 +207,17 @@ class OpenWebUIProvisioner(Provisioner):
     def _read_marker(self, context: ProvisionContext) -> ManagedMarker | None:
         return read_marker(self.managed_dir(context), component=self.component_id)
 
+    def _installed_version(self, context: ProvisionContext) -> str | None:
+        return distribution_version(context.runner, self.environment(context), DISTRIBUTION)
+
+    def _is_at_pin(self, context: ProvisionContext, detection: Detection) -> bool:
+        return (
+            detection.is_managed
+            and detection.is_usable
+            and self.version is not None
+            and self._installed_version(context) == self.version
+        )
+
     # --- verificacao -------------------------------------------------------
 
     def verify(self, context: ProvisionContext) -> Detection:
@@ -226,7 +250,7 @@ class OpenWebUIProvisioner(Provisioner):
     def plan(self, context: ProvisionContext) -> ProvisionPlan:
         detection = self.detect(context)
 
-        if detection.is_managed and detection.is_usable:
+        if self._is_at_pin(context, detection):
             return ProvisionPlan(self.component_id, (), detection)
         if detection.is_external and not self.install_alongside_external:
             return ProvisionPlan(self.component_id, (), detection)
@@ -249,27 +273,36 @@ class OpenWebUIProvisioner(Provisioner):
             )
 
         environment = self.environment(context)
-        return ProvisionPlan(
-            self.component_id,
-            (
+        upgrading = detection.is_managed and detection.is_usable
+        steps = []
+        if not upgrading:
+            steps.append(
                 ProvisionStep(
                     action="create-venv",
                     target=str(environment.root),
                     summary=f"Create a Python {describe_range(PYTHON_MINIMUM, PYTHON_BELOW)} environment.",
+                )
+            )
+        steps.extend(
+            (
+                ProvisionStep(
+                    action="upgrade-package" if upgrading else "install-package",
+                    target=requirement,
+                    summary=f"Install {requirement} into the managed environment.",
                 ),
                 ProvisionStep(
-                    action="install-package",
-                    target=requirement,
-                    summary=f"Install {requirement} into the environment.",
+                    action="sync-native-extension",
+                    target=str(environment.root),
+                    summary="Install the versioned native image gallery and mask editor.",
                 ),
                 ProvisionStep(
                     action="mark-managed",
                     target=str(self.marker_path(context)),
-                    summary="Write the managed marker so this install is provably ours.",
+                    summary="Record the exact installed pin after verification.",
                 ),
-            ),
-            detection,
+            )
         )
+        return ProvisionPlan(self.component_id, tuple(steps), detection)
 
     # --- aplicacao ---------------------------------------------------------
 
@@ -284,8 +317,33 @@ class OpenWebUIProvisioner(Provisioner):
         plan = self.plan(context)
         detection = plan.detection
 
-        if detection.is_managed and detection.is_usable:
-            return self.skipped(detection, "A managed Open WebUI is already installed.")
+        if self._is_at_pin(context, detection):
+            if dry_run:
+                return self.skipped(
+                    detection, f"Managed Open WebUI {self.version} is already installed."
+                )
+            try:
+                changed = sync_native_extension(
+                    context, self.environment(context), version=self.version
+                )
+            except (NativeExtensionError, OSError) as exc:
+                return self.failed(
+                    detection,
+                    FailureReason.PRECONDITION,
+                    "Could not repair the managed Open WebUI native extension.",
+                    str(exc),
+                )
+            if not changed:
+                return self.skipped(
+                    detection,
+                    f"Managed Open WebUI {self.version} and its native image extension are "
+                    "up to date.",
+                )
+            return self.installed(
+                detection,
+                plan.steps,
+                f"Managed Open WebUI {self.version} native image extension synchronized.",
+            )
 
         if detection.is_external and not self.install_alongside_external:
             return self.skipped(
@@ -306,6 +364,12 @@ class OpenWebUIProvisioner(Provisioner):
                     "A managed install needs an exact version so it is reproducible. "
                     "Nothing is resolved from PyPI at install time."
                 ),
+            )
+        if self.version != "0.12.0":
+            return self.failed(
+                detection,
+                FailureReason.PRECONDITION,
+                "The native image extension requires the Open WebUI 0.12.0 pin.",
             )
 
         context.emit(
@@ -415,6 +479,24 @@ class OpenWebUIProvisioner(Provisioner):
         on_pip_output = PipOutputParser(self._pip_progress(context, start)).feed
         try:
             pip_install(context.runner, environment, [requirement], on_output=on_pip_output)
+            if not environment.script_is_current(CONSOLE_SCRIPT):
+                # A moved installation: the package is satisfied, so pip left
+                # the old launcher alone. Reinstalling just this distribution,
+                # without its dependencies, writes it again for this folder.
+                context.emit(
+                    self.component_id,
+                    f"Rebuilding the {CONSOLE_SCRIPT} command for this folder",
+                    activity=build_activity(
+                        OperationActivityCategory.DEPENDENCY, "rebuilding", CONSOLE_SCRIPT
+                    ),
+                )
+                pip_install(
+                    context.runner,
+                    environment,
+                    [requirement],
+                    extra_args=("--force-reinstall", "--no-deps"),
+                    on_output=on_pip_output,
+                )
         except PythonEnvironmentError as exc:
             message = f"Could not install {requirement}."
             if exc.failure is not None:
@@ -425,12 +507,29 @@ class OpenWebUIProvisioner(Provisioner):
                 message,
             )
 
+        if not environment.script_is_current(CONSOLE_SCRIPT):
+            return self.failed(
+                detection,
+                FailureReason.FILESYSTEM,
+                f"The {CONSOLE_SCRIPT} command still points at another folder.",
+                f"Looked in {environment.bin_dir}.",
+            )
+
         if not self.managed_executable(context).is_file():
             return self.failed(
                 detection,
                 FailureReason.FILESYSTEM,
                 f"{DISTRIBUTION} installed but the {CONSOLE_SCRIPT} command is missing.",
                 f"Looked in {environment.bin_dir}.",
+            )
+        try:
+            sync_native_extension(context, environment, version=self.version)
+        except (NativeExtensionError, OSError) as exc:
+            return self.failed(
+                detection,
+                FailureReason.PRECONDITION,
+                "Open WebUI installed, but its native image extension could not be synchronized.",
+                str(exc),
             )
 
         # Last, and only now: the install is complete, so it may claim ownership.
@@ -478,11 +577,12 @@ class OpenWebUIProvisioner(Provisioner):
                 )
             context.emit(
                 self.component_id,
-                f"{pip_event.action.capitalize()} {pip_event.package}",
+                pip_event.message,
                 activity=build_activity(
                     OperationActivityCategory.DEPENDENCY,
                     pip_event.action,
-                    pip_event.package,
+                    pip_event.item,
+                    detail="pip (Python)",
                     elapsed_seconds=elapsed,
                 ),
                 transfer=transfer,

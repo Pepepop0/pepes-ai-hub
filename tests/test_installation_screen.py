@@ -24,7 +24,7 @@ from local_ai_stack.tui.navigation import Section
 from local_ai_stack.tui.widgets import InstallPanel
 from local_ai_stack.tui.wizard import WizardScreen
 
-PEPEH = Path(r"C:\Users\Pedro\Desktop\PEPEH")
+PEPEH = Path(r"C:\Users\User\Desktop\PEPEH")
 PEPINHO = Path(r"D:\Pepinho")
 CAPELLA = Path(r"E:\AI\Capella")
 
